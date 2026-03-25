@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+
+# Vite
+*.local
+.vite/
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Claude Code (local only — contains project instructions)
+CLAUDE.md
+.claude/
+
+# Tauri — auto-generated, not needed in source control
+src-tauri/gen/
+
+# Tauri — mobile platform icons (desktop-only app)
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# TypeScript
+*.tsbuildinfo

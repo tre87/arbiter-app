@@ -1,0 +1,39 @@
+:root {
+  /* Blue palette */
+  --azure:               #3399FF;   /* PRIMARY */
+  --azure-deep:          #027DFF;
+  --azure-baby:          #88D1F1;
+  --azure-tropical:      #41AADE;
+
+  /* Backgrounds */
+  --color-bg:              #121212;
+  --color-bg-subtle:       #1c1c1c;
+  --color-bg-elevated:     #252525;
+
+  /* Cards */
+  --color-card-bg:         #1c1c1c;
+  --color-card-border:     #2c2c2c;
+  --color-card-border-hover: #3a3a3a;
+  --color-card-border-active: var(--azure);
+  --color-card-outer-border: var(--color-card-border);
+
+  /* Text */
+  --color-text-primary:    #e8eaed;
+  --color-text-secondary:  #a0aab8;
+  --color-text-muted:      #6b7a8d;
+
+  /* Accent */
+  --color-accent:          var(--azure);
+  --color-accent-hover:    var(--azure-baby);
+  --color-accent-dim:      rgba(51, 153, 255, 0.15);
+  --color-accent-dim-border: rgba(51, 153, 255, 0.35);
+
+  /* Lights */
+  --color-active-light:    var(--azure-tropical);
+  --color-active-light-dim: rgba(65, 170, 222, 0.12);
+
+  /* Status */
+  --color-success:         #22c55e;
+  --color-warning:         #f59e0b;
+  --color-danger:          #ef4444;
+}

@@ -1,0 +1,1 @@
+{"auth":{"identifier":"auth","description":"Capability for the auth login WebView","local":true,"windows":["auth"],"permissions":["core:default"]},"default":{"identifier":"default","description":"Capability for the main window","local":true,"windows":["main"],"permissions":["core:default","shell:default"]}}

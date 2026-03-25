@@ -1,0 +1,37 @@
+[package]
+name = "arbiter"
+version = "0.1.0"
+description = "Arbiter - parallel Claude Code session manager"
+authors = []
+edition = "2021"
+
+[lib]
+name = "arbiter_lib"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "arbiter"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.8"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+
+[profile.dev]
+codegen-units = 1
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
