@@ -3,6 +3,8 @@ import { onMounted, onBeforeUnmount } from 'vue'
 import { usePaneStore } from './stores/pane'
 import SplitView from './components/SplitView.vue'
 import StatsBar from './components/StatsBar.vue'
+import MdiIcon from './components/MdiIcon.vue'
+import { mdiCogOutline } from '@mdi/js'
 import logoUrl from './assets/logo.svg'
 
 const store = usePaneStore()
@@ -45,8 +47,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { cap
         <img :src="logoUrl" class="titlebar-logo" alt="Arbiter" />
         <span class="titlebar-title">Arbiter</span>
       </div>
-      <div class="titlebar-stats">
+      <div class="titlebar-center">
         <StatsBar />
+      </div>
+      <div class="titlebar-actions">
+        <button class="settings-btn" title="Settings" @click="() => {}">
+          <MdiIcon :path="mdiCogOutline" :size="16" />
+        </button>
       </div>
     </div>
     <div class="workspace">
@@ -67,21 +74,48 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { cap
   height: 46px;
   background: var(--color-bg-subtle);
   border-bottom: 1px solid var(--color-card-border);
-  display: flex;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
   padding: 0 12px 0 6px;
   user-select: none;
   -webkit-app-region: drag;
   flex-shrink: 0;
-  gap: 10px;
 }
 
-.titlebar-stats {
-  margin-left: auto;
+.titlebar-center {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 10px;
   -webkit-app-region: no-drag;
+}
+
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  -webkit-app-region: no-drag;
+}
+
+.settings-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid var(--color-card-border);
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 4px;
+  line-height: 1;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.settings-btn:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-text-muted);
+  background: var(--color-bg-elevated);
 }
 
 .titlebar-brand {

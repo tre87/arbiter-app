@@ -409,9 +409,6 @@ onBeforeUnmount(() => {
 .terminal-inner {
   flex: 1;
   overflow: hidden;
-}
-
-.terminal-inner :deep(.xterm-screen) {
-  padding: 2px;
+  padding: 4px;
 }
 </style>
