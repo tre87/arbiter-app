@@ -3,10 +3,14 @@ import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
+import { CanvasAddon } from '@xterm/addon-canvas'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
+import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
+import { mdiInformationOutline, mdiChevronDoubleRight } from '@mdi/js'
+import TerminalFooter from './TerminalFooter.vue'
 
 const props = defineProps<{ paneId: string }>()
 const store = usePaneStore()
@@ -15,10 +19,38 @@ const isFocused = computed(() => store.focusedId === props.paneId)
 
 let term: Terminal
 let fitAddon: FitAddon
+let canvasAddon: CanvasAddon | null = null
 let unlisten: UnlistenFn | null = null
 let sessionId: string | null = null
 let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
+
+// ── Claude detection state ───────────────────────────────────────────────────
+const claudeRunning = ref(false)
+const footerVisible = ref(true)
+const claudeStatus = ref<{
+  session_id: string
+  model_id?: string | null
+  input_tokens?: number | null
+  output_tokens?: number | null
+  cache_creation_input_tokens?: number | null
+  cache_read_input_tokens?: number | null
+  folder?: string | null
+  branch?: string | null
+} | null>(null)
+
+const infoPanelOpen = ref(false)
+
+function toggleInfoPanel() {
+  infoPanelOpen.value = !infoPanelOpen.value
+}
+
+// Unlisten callbacks for Rust-emitted Claude lifecycle events
+let unlistenStarted: (() => void) | null = null
+let unlistenStatus:  (() => void) | null = null
+let unlistenExited:  (() => void) | null = null
+
+// ── Toolbar actions ───────────────────────────────────────────────────────────
 
 function scheduleFit() {
   if (fitTimer) clearTimeout(fitTimer)
@@ -43,6 +75,19 @@ function continueClaude() {
   }
 }
 
+function modelLabel(id: string | null | undefined): string {
+  if (!id) return ''
+  const m = id.match(/(opus|sonnet|haiku|flash)[- ]?(\d+)[- ]?(\d+)?/)
+  if (m) {
+    const family = m[1].charAt(0).toUpperCase() + m[1].slice(1)
+    const ver = m[3] ? `${m[2]}.${m[3]}` : m[2]
+    return `${family} ${ver}`
+  }
+  return id.replace('claude-', '')
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
 onMounted(async () => {
   term = new Terminal({
     theme: {
@@ -62,7 +107,7 @@ onMounted(async () => {
     },
     fontFamily: "Consolas, 'Cascadia Code', Menlo, 'SF Mono', monospace",
     fontSize: 12,
-    lineHeight: 1.4,
+    lineHeight: 1.0,
     cursorBlink: true,
     cursorStyle: 'bar',
     scrollback: 5000,
@@ -73,23 +118,54 @@ onMounted(async () => {
   term.loadAddon(fitAddon)
   term.loadAddon(new WebLinksAddon())
   term.open(terminalEl.value!)
-  // Defer until after the flex layout has settled
   await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
   fitAddon.fit()
 
+  // Canvas renderer: proper pixel-aligned glyph drawing without WebGL context limits
+  try {
+    canvasAddon = new CanvasAddon()
+    term.loadAddon(canvasAddon)
+  } catch {
+    canvasAddon = null
+  }
+
   term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
 
-  // Wire up resize BEFORE creating the session so no event is missed
   term.onResize(({ cols, rows }) => {
     if (sessionId) invoke('resize_session', { sessionId, cols, rows })
   })
 
-  // Create PTY with the actual fitted dimensions so it matches xterm from the start
-  sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows })
+  // Reuse existing PTY session if the pane survived a split/remount; otherwise create fresh
+  const existingSession = store.getPtySession(props.paneId)
+  if (existingSession) {
+    sessionId = existingSession
 
-  unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
-    term.write(event.payload)
-  })
+    // Subscribe to live output BEFORE resize so we don't miss the shell redraw
+    unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
+      term.write(event.payload)
+    })
+
+    // Resize the PTY to match the new container — the shell gets notified and redraws.
+    // We intentionally skip replaying the raw buffer here: it was captured at the old
+    // terminal width, so escape sequences (cursor positioning, line wraps) would render
+    // as garbled text at the new width. The running process redraws after the resize.
+    invoke('resize_session', { sessionId, cols: term.cols, rows: term.rows })
+
+    // Restore footer if Claude was running before the remount
+    const status = await invoke('get_active_claude_status', { sessionId }).catch(() => null) as typeof claudeStatus.value
+    if (status) {
+      claudeStatus.value = status
+      claudeRunning.value = true
+      footerVisible.value = true
+    }
+  } else {
+    sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows })
+    store.setPtySession(props.paneId, sessionId)
+
+    unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
+      term.write(event.payload)
+    })
+  }
 
   term.onData((data) => {
     if (sessionId) invoke('write_to_session', { sessionId, data })
@@ -99,13 +175,35 @@ onMounted(async () => {
   resizeObserver.observe(terminalEl.value!)
 
   if (isFocused.value) term.focus()
+
+  // Subscribe to Rust-emitted Claude lifecycle events for this pane
+  unlistenStarted = await listen(`claude-started-${sessionId}`, (event) => {
+    claudeStatus.value = event.payload as typeof claudeStatus.value
+    claudeRunning.value = true
+    footerVisible.value = true
+  })
+  unlistenStatus = await listen(`claude-status-${sessionId}`, (event) => {
+    claudeStatus.value = event.payload as typeof claudeStatus.value
+  })
+  unlistenExited = await listen(`claude-exited-${sessionId}`, () => {
+    claudeRunning.value = false
+    infoPanelOpen.value = false
+  })
 })
 
 onBeforeUnmount(() => {
+  unlistenStarted?.()
+  unlistenStatus?.()
+  unlistenExited?.()
   if (fitTimer) clearTimeout(fitTimer)
   unlisten?.()
   resizeObserver?.disconnect()
-  if (sessionId) invoke('close_session', { sessionId })
+  // Only close the PTY session if this pane has been removed from the layout tree.
+  // During a split the pane node survives, so we keep the session alive for reconnection.
+  if (sessionId && !store.hasPaneId(props.paneId)) {
+    invoke('close_session', { sessionId })
+    store.removePtySession(props.paneId)
+  }
   term?.dispose()
 })
 </script>
@@ -113,15 +211,66 @@ onBeforeUnmount(() => {
 <template>
   <div class="terminal-pane" :class="{ focused: isFocused }" @mousedown="store.setFocus(paneId)">
     <div class="pane-toolbar">
-      <button class="toolbar-btn claude-btn" title="Launch claude" @click="launchClaude" @mousedown.stop>
-        <ClaudeIcon :size="14" />
-      </button>
-      <button class="toolbar-btn claude-btn continue-btn" title="claude --continue" @click="continueClaude" @mousedown.stop>
-        <ClaudeIcon :size="14" />
-        <span class="continue-arrow">&gt;&gt;</span>
+      <template v-if="!claudeRunning">
+        <button class="toolbar-btn claude-btn" title="Launch claude" @click="launchClaude" @mousedown.stop>
+          <ClaudeIcon :size="14" />
+        </button>
+        <button class="toolbar-btn claude-btn" title="claude --continue" @click="continueClaude" @mousedown.stop>
+          <ClaudeIcon :size="14" />
+          <MdiIcon :path="mdiChevronDoubleRight" :size="14" class="continue-icon" />
+        </button>
+      </template>
+      <span class="toolbar-spacer" />
+      <button
+        v-if="claudeRunning"
+        class="toolbar-btn info-btn"
+        :class="{ active: infoPanelOpen }"
+        title="Session info"
+        @click="toggleInfoPanel"
+        @mousedown.stop
+      >
+        <MdiIcon :path="mdiInformationOutline" :size="14" />
       </button>
     </div>
+
+    <!-- Info panel overlay -->
+    <div v-if="infoPanelOpen && claudeStatus" class="info-panel">
+      <div class="info-row">
+        <span class="info-label">Session ID</span>
+        <span class="info-value id-value">{{ claudeStatus.session_id }}</span>
+      </div>
+      <div v-if="claudeStatus.model_id" class="info-row">
+        <span class="info-label">Model</span>
+        <span class="info-value">{{ modelLabel(claudeStatus.model_id) }}</span>
+      </div>
+      <div v-if="claudeStatus.folder" class="info-row">
+        <span class="info-label">Folder</span>
+        <span class="info-value">{{ claudeStatus.folder }}</span>
+      </div>
+      <div v-if="claudeStatus.branch" class="info-row">
+        <span class="info-label">Branch</span>
+        <span class="info-value">{{ claudeStatus.branch }}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Tokens in</span>
+        <span class="info-value">{{ claudeStatus.input_tokens?.toLocaleString() ?? '—' }}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Tokens out</span>
+        <span class="info-value">{{ claudeStatus.output_tokens?.toLocaleString() ?? '—' }}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Cache write</span>
+        <span class="info-value">{{ claudeStatus.cache_creation_input_tokens?.toLocaleString() ?? '—' }}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Cache read</span>
+        <span class="info-value">{{ claudeStatus.cache_read_input_tokens?.toLocaleString() ?? '—' }}</span>
+      </div>
+    </div>
+
     <div ref="terminalEl" class="terminal-inner" />
+    <TerminalFooter v-if="claudeRunning && footerVisible" :status="claudeStatus" />
   </div>
 </template>
 
@@ -162,18 +311,33 @@ onBeforeUnmount(() => {
   z-index: 1;
 }
 
+.toolbar-spacer { flex: 1; }
+
+.claude-btn {
+  gap: 2px;
+}
+
+.claude-btn:hover {
+  border-color: #D9775744;
+}
+
+.continue-icon {
+  color: var(--color-text-muted);
+}
+
+.claude-btn:hover .continue-icon {
+  color: #D97757;
+}
+
 .toolbar-btn {
   display: flex;
   align-items: center;
-  gap: 5px;
   background: none;
   border: 1px solid var(--color-card-border);
   border-radius: 3px;
   color: var(--color-text-muted);
   cursor: pointer;
-  font-size: 11px;
-  font-family: inherit;
-  padding: 2px 6px;
+  padding: 2px 5px;
   line-height: 1;
   transition: color 0.15s, border-color 0.15s, background 0.15s;
   user-select: none;
@@ -181,22 +345,65 @@ onBeforeUnmount(() => {
 
 .toolbar-btn:hover {
   background: var(--color-bg-elevated);
-  border-color: var(--color-card-border);
   color: var(--color-text-primary);
 }
 
-.claude-btn:hover {
-  border-color: #D9775744;
+.info-btn {
+  opacity: 0.5;
 }
 
-.continue-arrow {
-  font-size: 12px;
+.info-btn:hover,
+.info-btn.active {
+  opacity: 1;
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.info-panel {
+  position: absolute;
+  top: 31px;
+  right: 6px;
+  z-index: 20;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-card-border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-family: Consolas, 'Cascadia Code', Menlo, 'SF Mono', monospace;
+  font-size: 11px;
+  min-width: 220px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 0;
+}
+
+.info-row + .info-row {
+  border-top: 1px solid var(--color-card-border);
+}
+
+.info-label {
   color: var(--color-text-muted);
-  line-height: 1;
+  opacity: 0.7;
+  white-space: nowrap;
 }
 
-.claude-btn:hover .continue-arrow {
+.info-value {
+  color: var(--color-text-primary);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.id-value {
   color: #D97757;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  font-size: 10px;
 }
 
 .terminal-inner {
@@ -204,9 +411,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-/* Add breathing room between characters and the focus border
-   without touching FitAddon's container measurement */
 .terminal-inner :deep(.xterm-screen) {
-  margin: 2px;
+  padding: 2px;
 }
 </style>

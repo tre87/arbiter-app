@@ -23,6 +23,14 @@ function handleKeyDown(e: KeyboardEvent) {
     e.preventDefault()
     e.stopPropagation()
     store.splitFocused('vertical')
+    return
+  }
+
+  // Ctrl+W → close focused pane
+  if (!e.shiftKey && e.key === 'w') {
+    e.preventDefault()
+    e.stopPropagation()
+    store.closeFocused()
   }
 }
 

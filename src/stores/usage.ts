@@ -75,8 +75,10 @@ export const useUsageStore = defineStore('usage', () => {
     if (!period?.resets_at) return ''
     const ms = new Date(period.resets_at).getTime() - Date.now()
     if (ms <= 0) return 'now'
-    const h = Math.floor(ms / 3_600_000)
+    const d = Math.floor(ms / 86_400_000)
+    const h = Math.floor((ms % 86_400_000) / 3_600_000)
     const m = Math.floor((ms % 3_600_000) / 60_000)
+    if (d > 0) return `${d}d ${h}h`
     if (h > 0) return `${h}h ${m}m`
     return `${m}m`
   }
