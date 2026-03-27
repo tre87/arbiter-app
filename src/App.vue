@@ -1,43 +1,196 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { usePaneStore } from './stores/pane'
 import SplitView from './components/SplitView.vue'
 import StatsBar from './components/StatsBar.vue'
+import CloseDialog from './components/CloseDialog.vue'
 import MdiIcon from './components/MdiIcon.vue'
-import { mdiCogOutline } from '@mdi/js'
+import { mdiCogOutline, mdiKeyboardOutline } from '@mdi/js'
+import ShortcutsDialog from './components/ShortcutsDialog.vue'
+import SettingsDialog from './components/SettingsDialog.vue'
 import logoUrl from './assets/logo.svg'
+import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from './utils/spatial'
+import type { ArbiterConfig, CloseOptions, SavedTerminal } from './types/config'
 
 const store = usePaneStore()
+const showCloseDialog = ref(false)
+const closeOptions = ref<CloseOptions>({ saveLayout: true, savePaths: true, saveSessions: true })
+
+// ── Startup: load config and restore layout ──────────────────────────────────
+
+async function loadAndRestore() {
+  try {
+    const config = await invoke<ArbiterConfig | null>('load_config')
+    if (!config) return
+
+    // Restore close dialog checkbox states
+    if (config.closeOptions) {
+      closeOptions.value = { ...config.closeOptions }
+    }
+
+    // Restore window geometry
+    if (config.window) {
+      const win = getCurrentWindow()
+      try {
+        await win.setSize(new (await import('@tauri-apps/api/dpi')).LogicalSize(config.window.width, config.window.height))
+        await win.setPosition(new (await import('@tauri-apps/api/dpi')).LogicalPosition(config.window.x, config.window.y))
+      } catch { /* ignore if position is off-screen */ }
+    }
+
+    // Restore layout
+    if (config.layout && config.terminals) {
+      store.restoreFromSaved(config.layout, config.terminals)
+    }
+  } catch {
+    // Config load failed — start fresh
+  }
+}
+
+// ── Close intercept ──────────────────────────────────────────────────────────
+
+async function setupCloseHandler() {
+  const win = getCurrentWindow()
+  await win.onCloseRequested(async (event) => {
+    event.preventDefault()
+    showCloseDialog.value = true
+  })
+}
+
+async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveSessions: boolean) {
+  showCloseDialog.value = false
+  closeOptions.value = { saveLayout, savePaths, saveSessions }
+
+  try {
+    const config: ArbiterConfig = {
+      closeOptions: { saveLayout, savePaths, saveSessions },
+    }
+
+    if (saveLayout) {
+      // Save window geometry
+      const win = getCurrentWindow()
+      try {
+        const size = await win.outerSize()
+        const pos = await win.outerPosition()
+        config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y }
+      } catch { /* ignore */ }
+
+      // Save layout tree
+      const { layout, terminals: terminalMeta } = store.serializeLayout()
+      const savedTerminals: SavedTerminal[] = []
+
+      for (const t of terminalMeta) {
+        const entry: SavedTerminal = { name: t.name }
+
+        if (savePaths) {
+          const sessionId = store.getPtySession(t.id)
+          if (sessionId) {
+            try {
+              const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
+              if (cwd) entry.cwd = cwd
+            } catch { /* ignore */ }
+          }
+        }
+
+        if (saveSessions) {
+          const claudeId = store.getClaudeSessionId(t.id)
+          if (claudeId) entry.claudeSessionId = claudeId
+        }
+
+        savedTerminals.push(entry)
+      }
+
+      config.layout = layout
+      config.terminals = savedTerminals
+    }
+
+    await invoke('save_config', { config })
+  } catch (e) {
+    console.error('Failed to save config:', e)
+  }
+
+  // Exit the app via Rust — guaranteed to work
+  await invoke('exit_app')
+}
+
+function handleCloseCancel() {
+  showCloseDialog.value = false
+}
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────────────
+
+const arrowToDirection: Record<string, Direction> = {
+  ArrowLeft: 'left',
+  ArrowRight: 'right',
+  ArrowUp: 'up',
+  ArrowDown: 'down',
+}
 
 function handleKeyDown(e: KeyboardEvent) {
-  if (!e.ctrlKey) return
-
-  // Ctrl+Shift+T → split horizontal (stacked top/bottom)
-  if (e.shiftKey && e.key === 'T') {
+  // Alt+Shift+Arrow → resize focused pane
+  if (e.altKey && e.shiftKey && !e.ctrlKey) {
+    const direction = arrowToDirection[e.code]
+    if (!direction) return
     e.preventDefault()
     e.stopPropagation()
-    store.splitFocused('horizontal')
+    const result = findResizableSplit(store.root, store.focusedId, direction)
+    if (result) {
+      store.adjustSplitSize(result.splitId, result.delta * 5)
+    }
     return
   }
 
-  // Ctrl+T → split vertical (side by side)
-  if (!e.shiftKey && e.key === 't') {
+  if (!e.ctrlKey || !e.shiftKey) return
+
+  // Ctrl+Shift+Arrow → navigate panes
+  const direction = arrowToDirection[e.code]
+  if (direction) {
+    e.preventDefault()
+    e.stopPropagation()
+    const rects = computeLeafRects(store.root)
+    const neighbor = findNeighbor(rects, store.focusedId, direction)
+    if (neighbor) store.setFocus(neighbor)
+    return
+  }
+
+  // Ctrl+Shift+R → split right (vertical, side by side)
+  if (e.code === 'KeyR') {
     e.preventDefault()
     e.stopPropagation()
     store.splitFocused('vertical')
     return
   }
 
-  // Ctrl+W → close focused pane
-  if (!e.shiftKey && e.key === 'w') {
+  // Ctrl+Shift+D → split down (horizontal, stacked)
+  if (e.code === 'KeyD') {
+    e.preventDefault()
+    e.stopPropagation()
+    store.splitFocused('horizontal')
+    return
+  }
+
+  // Ctrl+Shift+W → close focused pane
+  if (e.code === 'KeyW') {
     e.preventDefault()
     e.stopPropagation()
     store.closeFocused()
   }
 }
 
-onMounted(() => window.addEventListener('keydown', handleKeyDown, { capture: true }))
-onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { capture: true }))
+// ── Settings menu ────────────────────────────────────────────────────────────
+
+const settingsOpen = ref(false)
+const shortcutsOpen = ref(false)
+
+onMounted(async () => {
+  window.addEventListener('keydown', handleKeyDown, { capture: true })
+  await loadAndRestore()
+  await setupCloseHandler()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeyDown, { capture: true })
+})
 </script>
 
 <template>
@@ -51,7 +204,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { cap
         <StatsBar />
       </div>
       <div class="titlebar-actions">
-        <button class="settings-btn" title="Settings" @click="() => {}">
+        <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
+          <MdiIcon :path="mdiKeyboardOutline" :size="16" />
+        </button>
+        <button class="settings-btn" title="Settings" @click="settingsOpen = true">
           <MdiIcon :path="mdiCogOutline" :size="16" />
         </button>
       </div>
@@ -59,6 +215,18 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { cap
     <div class="workspace">
       <SplitView :node="store.root" />
     </div>
+
+    <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
+    <SettingsDialog v-if="settingsOpen" @close="settingsOpen = false" />
+
+    <CloseDialog
+      v-if="showCloseDialog"
+      :initial-save-layout="closeOptions.saveLayout"
+      :initial-save-paths="closeOptions.savePaths"
+      :initial-save-sessions="closeOptions.saveSessions"
+      @confirm="handleCloseConfirm"
+      @cancel="handleCloseCancel"
+    />
   </div>
 </template>
 
@@ -113,10 +281,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { cap
 }
 
 .settings-btn:hover {
-  color: var(--color-text-primary);
-  border-color: var(--color-text-muted);
+  color: var(--color-accent);
+  border-color: var(--color-accent);
   background: var(--color-bg-elevated);
 }
+
 
 .titlebar-brand {
   display: flex;
@@ -131,11 +300,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeyDown, { cap
 }
 
 .titlebar-title {
-  font-family: 'Chakra Petch', sans-serif;
+  font-family: 'DM Sans', sans-serif;
   font-weight: 700;
-  font-size: 13px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+  font-size: 15px;
+  letter-spacing: 0.06em;
   background: linear-gradient(
     90deg,
     var(--azure-baby)    0%,

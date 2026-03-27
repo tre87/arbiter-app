@@ -15,6 +15,7 @@ struct PtySession {
     _master: Box<dyn portable_pty::MasterPty + Send>,
     shell_pid: Option<u32>,
     output_buffer: Arc<Mutex<Vec<u8>>>,
+    cwd: Arc<Mutex<Option<String>>>,
 }
 
 // Arc so the watcher background thread can share ownership
@@ -24,7 +25,7 @@ struct Sessions(Arc<Mutex<HashMap<String, PtySession>>>);
 struct ClaudeMonitor(Arc<Mutex<HashMap<String, (u32, PathBuf)>>>);
 
 #[tauri::command]
-fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<ClaudeMonitor>, cols: Option<u16>, rows: Option<u16>) -> Result<String, String> {
+fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<ClaudeMonitor>, cols: Option<u16>, rows: Option<u16>, cwd: Option<String>) -> Result<String, String> {
     let session_id = Uuid::new_v4().to_string();
     let sid = session_id.clone();
 
@@ -40,6 +41,12 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
 
     let mut cmd = build_shell_command();
     cmd.env("TERM", "xterm-256color");
+    if let Some(ref dir) = cwd {
+        let p = std::path::Path::new(dir);
+        if p.is_dir() {
+            cmd.cwd(p);
+        }
+    }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let shell_pid = child.process_id();
@@ -52,6 +59,8 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
 
     let output_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let buf_writer = output_buffer.clone();
+    let session_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(cwd.clone()));
+    let cwd_writer = session_cwd.clone();
 
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
@@ -59,11 +68,51 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
     std::thread::spawn(move || {
         const MAX_BUF: usize = 102_400; // 100 KB rolling buffer
         let mut buf = [0u8; 4096];
+        // Accumulates partial OSC sequences across chunks
+        let mut osc_buf = String::new();
+        let mut in_osc = false;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = &buf[..n];
+
+                    // Scan for OSC 7 sequences: \x1b]7;file:///path\x07 or \x1b]7;file:///path\x1b\\
+                    let text = String::from_utf8_lossy(chunk);
+                    for ch in text.chars() {
+                        if in_osc {
+                            if ch == '\x07' || (osc_buf.ends_with('\x1b') && ch == '\\') {
+                                // End of OSC — parse the URI
+                                let payload = if osc_buf.ends_with('\x1b') {
+                                    &osc_buf[..osc_buf.len() - 1]
+                                } else {
+                                    &osc_buf
+                                };
+                                if let Some(path) = parse_osc7_uri(payload) {
+                                    *cwd_writer.lock().unwrap() = Some(path);
+                                }
+                                osc_buf.clear();
+                                in_osc = false;
+                            } else {
+                                osc_buf.push(ch);
+                                // Safety: bail if OSC is absurdly long (not a real OSC 7)
+                                if osc_buf.len() > 1024 {
+                                    osc_buf.clear();
+                                    in_osc = false;
+                                }
+                            }
+                        } else if ch == '\x1b' {
+                            // Might be start of OSC — peek handled on next char
+                            osc_buf.clear();
+                            osc_buf.push(ch);
+                        } else if osc_buf == "\x1b" && ch == ']' {
+                            osc_buf.clear();
+                            in_osc = true;
+                        } else {
+                            osc_buf.clear();
+                        }
+                    }
+
                     {
                         let mut b = buf_writer.lock().unwrap();
                         b.extend_from_slice(chunk);
@@ -86,6 +135,7 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
             _master: pair.master,
             shell_pid,
             output_buffer,
+            cwd: session_cwd,
         },
     );
 
@@ -889,18 +939,152 @@ fn read_claude_session(since_ms: Option<u64>) -> Option<ClaudeSessionStatus> {
     })
 }
 
+/// Parse an OSC 7 payload like "7;file:///C:/Users/foo/bar" → "C:/Users/foo/bar"
+/// Also handles "7;file:///home/user/dir" on Unix.
+fn parse_osc7_uri(payload: &str) -> Option<String> {
+    // OSC 7 format: "7;file://hostname/path" or "7;file:///path"
+    let uri = payload.strip_prefix("7;")?;
+    let path_part = uri.strip_prefix("file://")?;
+    // Skip hostname (everything up to the next /)
+    let path = if path_part.starts_with('/') {
+        // "file:///path" — no hostname
+        path_part.to_string()
+    } else {
+        // "file://hostname/path"
+        let idx = path_part.find('/')?;
+        path_part[idx..].to_string()
+    };
+    // URL-decode percent-encoded characters
+    let decoded = url_decode(&path);
+    // On Windows, file URIs produce "/C:/path" — strip the leading slash
+    #[cfg(target_os = "windows")]
+    {
+        let trimmed = decoded.strip_prefix('/').unwrap_or(&decoded);
+        if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+            return Some(trimmed.replace('/', "\\"));
+        }
+        return Some(trimmed.to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(decoded)
+    }
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next().and_then(|c| (c as char).to_digit(16));
+            let lo = chars.next().and_then(|c| (c as char).to_digit(16));
+            if let (Some(h), Some(l)) = (hi, lo) {
+                result.push((h * 16 + l) as u8 as char);
+            }
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+
+// ── Config persistence ──────────────────────────────────────────────────────
+
+fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(dir.join("config.json"))
+}
+
+#[tauri::command]
+fn save_config(app: AppHandle, config: serde_json::Value) -> Result<(), String> {
+    let path = config_path(&app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_config(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    let path = config_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let config: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    Ok(Some(config))
+}
+
+/// Returns the last known working directory for a session, tracked via OSC 7.
+#[tauri::command]
+fn get_session_cwd(session_id: String, sessions: State<Sessions>) -> Option<String> {
+    let map = sessions.0.lock().unwrap();
+    let session = map.get(&session_id)?;
+    let cwd = session.cwd.lock().unwrap().clone();
+    cwd
+}
+
+#[tauri::command]
+fn exit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+fn get_locale() -> String {
+    // On Windows, sys-locale returns the display language (e.g. en-US) not the
+    // regional format (e.g. da-DK). Read the regional format from the registry.
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "(Get-ItemProperty 'HKCU:\\Control Panel\\International').LocaleName"])
+            .output()
+        {
+            let locale = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !locale.is_empty() {
+                return locale;
+            }
+        }
+    }
+    sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string())
+}
+
 // ── Shell ───────────────────────────────────────────────────────────────────
 
 fn build_shell_command() -> CommandBuilder {
     #[cfg(target_os = "windows")]
     {
-        CommandBuilder::new("powershell.exe")
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        // -NoExit keeps the shell interactive after running the setup command.
+        // The prompt override emits OSC 7 with the cwd on every prompt render.
+        cmd.args([
+            "-NoExit",
+            "-Command",
+            concat!(
+                "$__arbiter_orig_prompt = $function:prompt; ",
+                "function prompt { ",
+                    "$loc = (Get-Location).Path; ",
+                    "$uri = 'file:///' + ($loc -replace '\\\\','/'); ",
+                    "$e = [char]27; $bel = [char]7; ",
+                    "[Console]::Write(\"${e}]7;${uri}${bel}\"); ",
+                    "& $__arbiter_orig_prompt ",
+                "}"
+            ),
+        ]);
+        cmd
     }
     #[cfg(not(target_os = "windows"))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let mut cmd = CommandBuilder::new(&shell);
         cmd.arg("-l");
+        // Set PROMPT_COMMAND for bash; zsh users typically have precmd via their rc files.
+        cmd.env(
+            "PROMPT_COMMAND",
+            r#"printf '\e]7;file://%s%s\a' "$(hostname)" "$(pwd)""#,
+        );
         cmd
     }
 }
@@ -946,6 +1130,11 @@ pub fn run() {
             open_login_window,
             read_claude_session,
             get_active_claude_status,
+            save_config,
+            load_config,
+            get_session_cwd,
+            exit_app,
+            get_locale,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

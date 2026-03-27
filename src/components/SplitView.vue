@@ -23,7 +23,10 @@ function startDrag(e: MouseEvent) {
   const onMove = (ev: MouseEvent) => {
     const pos = isVertical ? ev.clientX - rect.left : ev.clientY - rect.top
     const total = isVertical ? rect.width : rect.height
-    const pct = Math.max(10, Math.min(90, (pos / total) * 100))
+    // Pixel-based minimum: 100px width, 80px height
+    const minPx = isVertical ? 100 : 80
+    const minPct = Math.max(5, (minPx / total) * 100)
+    const pct = Math.max(minPct, Math.min(100 - minPct, (pos / total) * 100))
     store.updateSplitSizes(node.id, [pct, 100 - pct])
   }
 

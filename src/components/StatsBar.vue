@@ -1,9 +1,50 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { useUsageStore } from '../stores/usage'
+import { useDevSettingsStore } from '../stores/devSettings'
 import PulseLoader from './PulseLoader.vue'
 
 const store = useUsageStore()
+const devStore = useDevSettingsStore()
+const osLocale = ref('en-US')
+
+// Peak hours: weekdays 5am–11am PT (UTC-7 standard / UTC-8 daylight)
+// We use America/Los_Angeles to handle DST automatically
+const realPeakHours = ref(false)
+const isPeakHours = computed(() => devStore.forcePeakHours || realPeakHours.value)
+
+function checkPeakHours() {
+  const now = new Date()
+  const ptTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
+  const day = ptTime.getDay() // 0=Sun, 6=Sat
+  const hour = ptTime.getHours()
+  realPeakHours.value = day >= 1 && day <= 5 && hour >= 5 && hour < 11
+}
+
+let peakTimer: ReturnType<typeof setInterval> | null = null
+
+const peakTooltip = computed(() => {
+  // Convert 5am and 11am PT to the user's local timezone
+  // Use a fixed date (a Monday) to get the conversion right
+  const base = new Date()
+  const startPT = new Date(base.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
+  startPT.setHours(5, 0, 0, 0)
+  const endPT = new Date(base.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
+  endPT.setHours(11, 0, 0, 0)
+
+  // Compute offset between local and PT
+  const localNow = base.getTime()
+  const ptNow = new Date(base.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })).getTime()
+  const offsetMs = localNow - ptNow
+
+  const localStart = new Date(startPT.getTime() + offsetMs)
+  const localEnd = new Date(endPT.getTime() + offsetMs)
+
+  const fmt = (d: Date) => d.toLocaleTimeString(osLocale.value, { hour: 'numeric', minute: '2-digit' })
+
+  return `Peak hours (weekdays ${fmt(localStart)}–${fmt(localEnd)}) — 5h session limits drain faster`
+})
 
 // Countdown to next auto-refresh
 const countdown = ref(120)
@@ -22,16 +63,22 @@ watch(() => store.loading, (loading, was) => {
   if (was && !loading) resetCountdown()
 })
 
-onMounted(() => {
+onMounted(async () => {
   store.startPolling()
   cdTimer = setInterval(() => {
     countdown.value = countdown.value > 0 ? countdown.value - 1 : 120
   }, 1000)
+  checkPeakHours()
+  peakTimer = setInterval(checkPeakHours, 60_000)
+  try {
+    osLocale.value = await invoke<string>('get_locale')
+  } catch { /* fallback to en-US */ }
 })
 
 onBeforeUnmount(() => {
   store.stopPolling()
   if (cdTimer) clearInterval(cdTimer)
+  if (peakTimer) clearInterval(peakTimer)
 })
 </script>
 
@@ -49,13 +96,17 @@ onBeforeUnmount(() => {
 
   <!-- Stats -->
   <template v-else-if="store.data">
+    <span class="plan-badge">{{ store.data.plan }}</span>
+
+    <span v-if="isPeakHours" class="peak-badge" :title="peakTooltip">⚡ PEAK</span>
+
     <!-- 5h -->
     <div v-if="store.data.five_hour" class="stat">
       <span class="stat-label">5h</span>
       <div class="bar-track">
         <div class="bar-fill blue" :style="{ width: store.data.five_hour.utilization + '%' }" />
+        <span class="bar-text">{{ Math.round(store.data.five_hour.utilization) }}%</span>
       </div>
-      <span class="stat-pct">{{ Math.round(store.data.five_hour.utilization) }}%</span>
       <span class="stat-reset">{{ store.formatReset(store.data.five_hour) || '—' }}</span>
     </div>
 
@@ -64,8 +115,8 @@ onBeforeUnmount(() => {
       <span class="stat-label">7d</span>
       <div class="bar-track">
         <div class="bar-fill green" :style="{ width: store.data.seven_day.utilization + '%' }" />
+        <span class="bar-text">{{ Math.round(store.data.seven_day.utilization) }}%</span>
       </div>
-      <span class="stat-pct">{{ Math.round(store.data.seven_day.utilization) }}%</span>
       <span class="stat-reset">{{ store.formatReset(store.data.seven_day) || '—' }}</span>
     </div>
 
@@ -74,8 +125,8 @@ onBeforeUnmount(() => {
       <span class="stat-label">Opus</span>
       <div class="bar-track">
         <div class="bar-fill green" :style="{ width: store.data.seven_day_opus.utilization + '%' }" />
+        <span class="bar-text">{{ Math.round(store.data.seven_day_opus.utilization) }}%</span>
       </div>
-      <span class="stat-pct">{{ Math.round(store.data.seven_day_opus.utilization) }}%</span>
       <span class="stat-reset">{{ store.formatReset(store.data.seven_day_opus) || '—' }}</span>
     </div>
 
@@ -84,19 +135,15 @@ onBeforeUnmount(() => {
       <span class="stat-label">Sonnet</span>
       <div class="bar-track">
         <div class="bar-fill blue" :style="{ width: store.data.seven_day_sonnet.utilization + '%' }" />
+        <span class="bar-text">{{ Math.round(store.data.seven_day_sonnet.utilization) }}%</span>
       </div>
-      <span class="stat-pct">{{ Math.round(store.data.seven_day_sonnet.utilization) }}%</span>
       <span class="stat-reset">{{ store.formatReset(store.data.seven_day_sonnet) || '—' }}</span>
     </div>
 
-    <div class="vdivider" />
-    <span class="plan-badge">{{ store.data.plan }}</span>
-
-    <!-- Refresh button + countdown beneath -->
-    <div class="refresh-group">
-      <button class="stats-btn" title="Refresh" @click="store.fetch(); resetCountdown()">↺</button>
+    <button class="refresh-btn" title="Click to refresh" @click="store.fetch(); resetCountdown()">
+      <span class="refresh-icon" :class="{ spinning: store.loading }">↺</span>
       <span class="refresh-cd">{{ fmtCountdown(countdown) }}</span>
-    </div>
+    </button>
   </template>
 
   <!-- Error -->
@@ -112,79 +159,127 @@ onBeforeUnmount(() => {
   color: var(--color-text-muted);
 }
 
-/* Each stat = 2-row grid: [label | bar | pct] / [_ | reset(centered) | _] */
 .stat {
-  display: grid;
-  grid-template-columns: max-content 72px 28px;
-  grid-template-rows: auto auto;
-  row-gap: 3px;
-  column-gap: 6px;
+  display: flex;
   align-items: center;
+  gap: 5px;
 }
 
 .stat-label {
-  grid-column: 1;
-  grid-row: 1;
   font-size: 11px;
   color: var(--color-text-muted);
-  text-align: right;
+  white-space: nowrap;
 }
 
 .bar-track {
-  grid-column: 2;
-  grid-row: 1;
-  height: 4px;
+  position: relative;
+  width: 72px;
+  height: 16px;
   background: var(--color-card-border);
-  border-radius: 2px;
+  border-radius: 3px;
   overflow: hidden;
 }
 
 .bar-fill {
-  height: 100%;
-  border-radius: 2px;
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
   transition: width 0.4s ease;
 }
 
 .bar-fill.blue  { background: var(--color-accent); }
 .bar-fill.green { background: var(--color-success); }
 
-.stat-pct {
-  grid-column: 3;
-  grid-row: 1;
-  font-size: 11px;
-  color: var(--color-text-secondary);
-  text-align: left;
+.bar-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  z-index: 1;
+  pointer-events: none;
 }
 
 .stat-reset {
-  grid-column: 2;
-  grid-row: 2;
-  font-size: 11px;
+  font-size: 10px;
   color: var(--color-text-muted);
-  line-height: 1;
-  text-align: center;
-}
-
-.vdivider {
-  width: 1px;
-  height: 18px;
-  background: var(--color-card-border);
-  flex-shrink: 0;
+  white-space: nowrap;
+  opacity: 0.7;
 }
 
 .plan-badge {
   font-size: 10px;
   font-weight: 600;
   color: var(--color-accent);
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
+  line-height: 1;
+  border: 1px solid var(--color-card-border);
+  border-radius: 3px;
+  padding: 4px 7px;
 }
 
-.refresh-group {
+.peak-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-warning, #e8a735);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1;
+  border: 1px solid var(--color-warning, #e8a735);
+  border-radius: 3px;
+  padding: 4px 7px;
+  opacity: 0.9;
+}
+
+.refresh-btn {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
+  background: none;
+  border: 1px solid var(--color-card-border);
+  border-radius: 3px;
+  padding: 4px 7px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: border-color 0.15s;
+}
+
+.refresh-btn:hover {
+  border-color: var(--color-accent);
+}
+
+.refresh-btn:hover .refresh-icon,
+.refresh-btn:hover .refresh-cd {
+  color: var(--color-accent);
+}
+
+.refresh-icon {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1;
+  transition: color 0.15s;
+}
+
+.refresh-icon.spinning {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.refresh-cd {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.15s;
 }
 
 .stats-btn {
@@ -208,13 +303,6 @@ onBeforeUnmount(() => {
   font-size: 10px;
   font-family: inherit;
   padding: 2px 7px;
-}
-
-.refresh-cd {
-  font-size: 11px;
-  color: var(--color-text-muted);
-  line-height: 1;
-  font-variant-numeric: tabular-nums;
 }
 
 .error-text {

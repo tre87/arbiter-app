@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -9,7 +9,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
-import { mdiInformationOutline, mdiChevronDoubleRight } from '@mdi/js'
+import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline } from '@mdi/js'
 import TerminalFooter from './TerminalFooter.vue'
 
 const props = defineProps<{ paneId: string }>()
@@ -43,6 +43,34 @@ const infoPanelOpen = ref(false)
 
 function toggleInfoPanel() {
   infoPanelOpen.value = !infoPanelOpen.value
+}
+
+// ── Inline name editing ──────────────────────────────────────────────────────
+const isEditingName = ref(false)
+const editNameValue = ref('')
+const nameInputEl = ref<HTMLInputElement>()
+
+const terminalName = computed(() => store.getTerminalName(props.paneId))
+
+function startEditName() {
+  editNameValue.value = terminalName.value
+  isEditingName.value = true
+  nextTick(() => {
+    nameInputEl.value?.focus()
+    nameInputEl.value?.select()
+  })
+}
+
+function commitName() {
+  const trimmed = editNameValue.value.trim()
+  if (trimmed && trimmed !== terminalName.value) {
+    store.setTerminalName(props.paneId, trimmed)
+  }
+  isEditingName.value = false
+}
+
+function cancelEditName() {
+  isEditingName.value = false
 }
 
 // Unlisten callbacks for Rust-emitted Claude lifecycle events
@@ -159,12 +187,22 @@ onMounted(async () => {
       footerVisible.value = true
     }
   } else {
-    sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows })
+    const savedCwd = store.consumeSavedCwd(props.paneId)
+    sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null })
     store.setPtySession(props.paneId, sessionId)
 
     unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
       term.write(event.payload)
     })
+
+    // Auto-resume Claude session if one was saved
+    // The shell already starts in the saved cwd (passed to create_session above)
+    const savedClaudeId = store.consumeSavedClaudeSession(props.paneId)
+    if (savedClaudeId && sessionId) {
+      setTimeout(() => {
+        invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
+      }, 500)
+    }
   }
 
   term.onData((data) => {
@@ -181,13 +219,20 @@ onMounted(async () => {
     claudeStatus.value = event.payload as typeof claudeStatus.value
     claudeRunning.value = true
     footerVisible.value = true
+    if (claudeStatus.value?.session_id) {
+      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
+    }
   })
   unlistenStatus = await listen(`claude-status-${sessionId}`, (event) => {
     claudeStatus.value = event.payload as typeof claudeStatus.value
+    if (claudeStatus.value?.session_id) {
+      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
+    }
   })
   unlistenExited = await listen(`claude-exited-${sessionId}`, () => {
     claudeRunning.value = false
     infoPanelOpen.value = false
+    store.clearClaudeSessionId(props.paneId)
   })
 })
 
@@ -211,6 +256,29 @@ onBeforeUnmount(() => {
 <template>
   <div class="terminal-pane" :class="{ focused: isFocused }" @mousedown="store.setFocus(paneId)">
     <div class="pane-toolbar">
+      <!-- Left: Terminal name + edit -->
+      <div class="toolbar-name" @mousedown.stop>
+        <template v-if="isEditingName">
+          <input
+            ref="nameInputEl"
+            v-model="editNameValue"
+            class="name-input"
+            @keydown.enter="commitName"
+            @keydown.escape="cancelEditName"
+            @blur="commitName"
+          />
+        </template>
+        <template v-else>
+          <span class="name-label">{{ terminalName }}</span>
+          <button class="toolbar-btn edit-btn" title="Rename terminal" @click="startEditName">
+            <MdiIcon :path="mdiPencilOutline" :size="11" />
+          </button>
+        </template>
+      </div>
+
+      <span class="toolbar-spacer" />
+
+      <!-- Right: Claude buttons -->
       <template v-if="!claudeRunning">
         <button class="toolbar-btn claude-btn" title="Launch claude" @click="launchClaude" @mousedown.stop>
           <ClaudeIcon :size="14" />
@@ -220,7 +288,8 @@ onBeforeUnmount(() => {
           <MdiIcon :path="mdiChevronDoubleRight" :size="14" class="continue-icon" />
         </button>
       </template>
-      <span class="toolbar-spacer" />
+
+      <!-- Right: Info button -->
       <button
         v-if="claudeRunning"
         class="toolbar-btn info-btn"
@@ -308,10 +377,49 @@ onBeforeUnmount(() => {
   background: var(--color-bg-subtle);
   border-bottom: 1px solid var(--color-card-border);
   flex-shrink: 0;
-  z-index: 1;
 }
 
 .toolbar-spacer { flex: 1; }
+
+.toolbar-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.name-label {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+  user-select: none;
+}
+
+.name-input {
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--color-text-primary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-accent);
+  border-radius: 3px;
+  padding: 1px 4px;
+  outline: none;
+  width: 120px;
+}
+
+.edit-btn {
+  padding: 1px 3px;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.toolbar-name:hover .edit-btn,
+.edit-btn:focus {
+  opacity: 1;
+}
 
 .claude-btn {
   gap: 2px;
@@ -408,7 +516,9 @@ onBeforeUnmount(() => {
 
 .terminal-inner {
   flex: 1;
+  min-height: 0;
   overflow: hidden;
   padding: 4px;
 }
+
 </style>

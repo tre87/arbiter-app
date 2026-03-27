@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 notify  = { version = "6", default-features = false, features = ["macos_fsevent"] }
+sys-locale = "0.3"
 
 [profile.dev]
 codegen-units = 1
