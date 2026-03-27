@@ -1093,6 +1093,7 @@ fn build_shell_command() -> CommandBuilder {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_window_state::Builder::new().build())
         .manage({
             let inner: Arc<Mutex<HashMap<String, PtySession>>> = Arc::new(Mutex::new(HashMap::new()));
             Sessions(inner)
@@ -1115,6 +1116,12 @@ pub fn run() {
             let sessions_arc = app.state::<Sessions>().0.clone();
             let monitor_arc  = app.state::<ClaudeMonitor>().0.clone();
             start_claude_watcher(app.handle().clone(), sessions_arc, monitor_arc);
+
+            // Show the main window after the window-state plugin has restored
+            // its position/size so there's no visible jump.
+            if let Some(w) = app.get_webview_window("main") {
+                w.show().unwrap_or_default();
+            }
 
             Ok(())
         })
