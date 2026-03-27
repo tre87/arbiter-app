@@ -7,6 +7,7 @@ import { CanvasAddon } from '@xterm/addon-canvas'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
+import { useDevSettingsStore } from '../stores/devSettings'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
 import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline } from '@mdi/js'
@@ -14,6 +15,7 @@ import TerminalFooter from './TerminalFooter.vue'
 
 const props = defineProps<{ paneId: string }>()
 const store = usePaneStore()
+const devSettings = useDevSettingsStore()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
 
@@ -24,6 +26,7 @@ let unlisten: UnlistenFn | null = null
 let sessionId: string | null = null
 let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
+let focusHandler: (() => void) | null = null
 
 // ── Claude detection state ───────────────────────────────────────────────────
 const claudeRunning = ref(false)
@@ -38,6 +41,11 @@ const claudeStatus = ref<{
   folder?: string | null
   branch?: string | null
 } | null>(null)
+
+const sessionCwd = ref<string | null>(null)
+const folderName = ref<string | null>(null)
+const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
+let unlistenCwd: (() => void) | null = null
 
 const infoPanelOpen = ref(false)
 
@@ -80,9 +88,45 @@ let unlistenExited:  (() => void) | null = null
 
 // ── Toolbar actions ───────────────────────────────────────────────────────────
 
+// Fit terminal cols/rows to container, bypassing FitAddon's circular css.cell.width.
+function safeFit() {
+  if (!term) return
+  const core = (term as any)._core
+  const dw: number | undefined = core?._renderService?.dimensions?.device?.cell?.width
+  const dh: number | undefined = core?._renderService?.dimensions?.device?.cell?.height
+  if (!dw || !dh) {
+    fitAddon?.fit()
+    return
+  }
+
+  const dpr = window.devicePixelRatio || 1
+  const parent = term.element?.parentElement
+  if (!parent) return
+
+  const parentWidth = parseFloat(window.getComputedStyle(parent).width)
+  const parentHeight = parseFloat(window.getComputedStyle(parent).height)
+  if (!parentWidth || !parentHeight) return
+
+  const viewportEl = term.element?.querySelector('.xterm-viewport') as HTMLElement | null
+  const scrollbarWidth = viewportEl ? (viewportEl.offsetWidth - viewportEl.clientWidth) : 0
+
+  const available = parentWidth - scrollbarWidth
+  let cols = Math.max(2, Math.floor(available / (dw / dpr)))
+  const rows = Math.max(1, Math.floor(parentHeight / (dh / dpr)))
+
+  // Verify canvas won't overflow
+  while (cols > 2 && Math.round(dw * cols / dpr) > available) {
+    cols--
+  }
+
+  if (term.cols !== cols || term.rows !== rows) {
+    term.resize(cols, rows)
+  }
+}
+
 function scheduleFit() {
   if (fitTimer) clearTimeout(fitTimer)
-  fitTimer = setTimeout(() => fitAddon?.fit(), 50)
+  fitTimer = setTimeout(safeFit, 50)
 }
 
 watch(isFocused, (focused) => {
@@ -146,16 +190,23 @@ onMounted(async () => {
   term.loadAddon(fitAddon)
   term.loadAddon(new WebLinksAddon())
   term.open(terminalEl.value!)
-  await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
-  fitAddon.fit()
 
-  // Canvas renderer: proper pixel-aligned glyph drawing without WebGL context limits
+  // Register focus handler immediately so App.vue's polling can reach us
+  focusHandler = () => { if (isFocused.value) term?.focus() }
+  window.addEventListener('arbiter:request-focus', focusHandler)
+
+  await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+
+  // Canvas renderer BEFORE fit — canvas may use different cell metrics
   try {
     canvasAddon = new CanvasAddon()
     term.loadAddon(canvasAddon)
   } catch {
     canvasAddon = null
   }
+
+  // Fit after canvas addon so dimensions match actual rendering
+  safeFit()
 
   term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
 
@@ -188,17 +239,40 @@ onMounted(async () => {
     }
   } else {
     const savedCwd = store.consumeSavedCwd(props.paneId)
+    const savedClaudeId = store.consumeSavedClaudeSession(props.paneId)
+
+    // Pre-populate footer state BEFORE creating the session so the terminal
+    // has its final height (with footer visible) when we measure rows/cols.
+    if (savedCwd) {
+      sessionCwd.value = savedCwd
+      folderName.value = savedCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
+      const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
+      gitInfo.value = git
+      if (savedClaudeId) {
+        claudeRunning.value = true
+        footerVisible.value = true
+      }
+      // Let Vue re-render the footer, then refit terminal to the new smaller area
+      await nextTick()
+      await new Promise<void>(r => requestAnimationFrame(() => r()))
+      safeFit()
+    }
+
     sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null })
     store.setPtySession(props.paneId, sessionId)
 
+    // During resume, auto-scroll until Claude takes over the alternate screen
+    let resumeAutoScroll = false
+
     unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
       term.write(event.payload)
+      if (resumeAutoScroll && term.buffer.active.type === 'normal') {
+        term.scrollToBottom()
+      }
     })
 
-    // Auto-resume Claude session if one was saved
-    // The shell already starts in the saved cwd (passed to create_session above)
-    const savedClaudeId = store.consumeSavedClaudeSession(props.paneId)
     if (savedClaudeId && sessionId) {
+      resumeAutoScroll = true
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
       }, 500)
@@ -212,7 +286,15 @@ onMounted(async () => {
   resizeObserver = new ResizeObserver(scheduleFit)
   resizeObserver.observe(terminalEl.value!)
 
-  if (isFocused.value) term.focus()
+  // Initial focus is handled by App.vue polling for the textarea.
+
+  // Listen for cwd changes (emitted by Rust when OSC 7 fires with a new path)
+  unlistenCwd = await listen(`cwd-changed-${sessionId}`, (event) => {
+    const data = event.payload as { cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }
+    sessionCwd.value = data.cwd
+    folderName.value = data.folder
+    gitInfo.value = data.git
+  }) as unknown as (() => void)
 
   // Subscribe to Rust-emitted Claude lifecycle events for this pane
   unlistenStarted = await listen(`claude-started-${sessionId}`, (event) => {
@@ -237,9 +319,11 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
   unlistenStarted?.()
   unlistenStatus?.()
   unlistenExited?.()
+  unlistenCwd?.()
   if (fitTimer) clearTimeout(fitTimer)
   unlisten?.()
   resizeObserver?.disconnect()
@@ -339,7 +423,14 @@ onBeforeUnmount(() => {
     </div>
 
     <div ref="terminalEl" class="terminal-inner" />
-    <TerminalFooter v-if="claudeRunning && footerVisible" :status="claudeStatus" />
+    <TerminalFooter
+      v-if="(claudeRunning && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd)"
+      :claude-running="claudeRunning"
+      :status="claudeStatus"
+      :folder-name="folderName"
+      :git-info="gitInfo"
+      :session-id="sessionId"
+    />
   </div>
 </template>
 
@@ -518,7 +609,6 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  padding: 4px;
 }
 
 </style>

@@ -196,8 +196,14 @@ export const usePaneStore = defineStore('pane', () => {
     return v
   }
 
+  // ── Focus trigger ────────────────────────────────────────────────────────
+  // Bumped by App.vue after layout restore so TerminalPane watchers can
+  // pick up the initial focusedId (which was set before they mounted).
+  const focusTrigger = ref(0)
+  function triggerFocus() { focusTrigger.value++ }
+
   // ── Serialization ────────────────────────────────────────────────────────
-  function serializeLayout(): { layout: SavedPaneNode; terminals: { id: string; name: string }[] } {
+  function serializeLayout(): { layout: SavedPaneNode; terminals: { id: string; name: string }[]; focusedTerminalIndex: number } {
     const terminals: { id: string; name: string }[] = []
 
     function walk(node: PaneNode): SavedPaneNode {
@@ -216,10 +222,11 @@ export const usePaneStore = defineStore('pane', () => {
     }
 
     const layout = walk(root.value)
-    return { layout, terminals }
+    const focusedTerminalIndex = terminals.findIndex(t => t.id === focusedId.value)
+    return { layout, terminals, focusedTerminalIndex: focusedTerminalIndex >= 0 ? focusedTerminalIndex : 0 }
   }
 
-  function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[]) {
+  function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number) {
     // Reset counters
     nextId = 1
     nextTerminalNumber = 1
@@ -228,10 +235,14 @@ export const usePaneStore = defineStore('pane', () => {
     savedCwds.value = {}
     savedClaudeSessions.value = {}
 
+    // Track terminal IDs by their index so we can restore focus
+    const terminalIdsByIndex: string[] = []
+
     function build(node: SavedPaneNode): PaneNode {
       if (node.type === 'terminal') {
         const id = genId()
         const t = terminals[node.index]
+        terminalIdsByIndex[node.index] = id
         if (t) {
           terminalNames.value[id] = t.name
           // Track the highest terminal number to continue from there
@@ -260,12 +271,18 @@ export const usePaneStore = defineStore('pane', () => {
 
     const newRoot = build(saved)
     root.value = newRoot
-    // Focus the first leaf
-    function firstLeaf(node: PaneNode): string {
-      if (node.type === 'terminal') return node.id
-      return firstLeaf(node.first)
+
+    // Restore focus to the saved terminal, or fall back to first leaf
+    const restoredFocusId = focusedTerminalIndex != null ? terminalIdsByIndex[focusedTerminalIndex] : undefined
+    if (restoredFocusId) {
+      focusedId.value = restoredFocusId
+    } else {
+      function firstLeaf(node: PaneNode): string {
+        if (node.type === 'terminal') return node.id
+        return firstLeaf(node.first)
+      }
+      focusedId.value = firstLeaf(newRoot)
     }
-    focusedId.value = firstLeaf(newRoot)
   }
 
   return {
@@ -276,6 +293,7 @@ export const usePaneStore = defineStore('pane', () => {
     claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId,
     savedCwds, savedClaudeSessions,
     getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession,
+    focusTrigger, triggerFocus,
     serializeLayout, restoreFromSaved,
   }
 })

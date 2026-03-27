@@ -65,20 +65,48 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
     let event_name = format!("pty-output-{}", sid);
+    let cwd_event_name = format!("cwd-changed-{}", sid);
     std::thread::spawn(move || {
         const MAX_BUF: usize = 102_400; // 100 KB rolling buffer
         let mut buf = [0u8; 4096];
+        // Holds trailing bytes from an incomplete UTF-8 sequence at chunk boundary
+        let mut utf8_remainder: Vec<u8> = Vec::new();
         // Accumulates partial OSC sequences across chunks
         let mut osc_buf = String::new();
         let mut in_osc = false;
+        let mut prev_cwd: Option<String> = None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let chunk = &buf[..n];
+                    // Prepend any leftover bytes from the previous read
+                    let chunk: Vec<u8> = if utf8_remainder.is_empty() {
+                        buf[..n].to_vec()
+                    } else {
+                        let mut combined = std::mem::take(&mut utf8_remainder);
+                        combined.extend_from_slice(&buf[..n]);
+                        combined
+                    };
+
+                    // Find the last valid UTF-8 boundary so we don't corrupt
+                    // multi-byte characters (like ━) split across reads.
+                    let valid_up_to = match std::str::from_utf8(&chunk) {
+                        Ok(_) => chunk.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    // Keep trailing incomplete bytes for next read
+                    if valid_up_to < chunk.len() {
+                        utf8_remainder = chunk[valid_up_to..].to_vec();
+                    }
+                    let valid_chunk = &chunk[..valid_up_to];
+                    if valid_chunk.is_empty() {
+                        continue;
+                    }
+
+                    // Safe: we just validated this is valid UTF-8
+                    let text = unsafe { std::str::from_utf8_unchecked(valid_chunk) };
 
                     // Scan for OSC 7 sequences: \x1b]7;file:///path\x07 or \x1b]7;file:///path\x1b\\
-                    let text = String::from_utf8_lossy(chunk);
                     for ch in text.chars() {
                         if in_osc {
                             if ch == '\x07' || (osc_buf.ends_with('\x1b') && ch == '\\') {
@@ -89,7 +117,20 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
                                     &osc_buf
                                 };
                                 if let Some(path) = parse_osc7_uri(payload) {
-                                    *cwd_writer.lock().unwrap() = Some(path);
+                                    let changed = prev_cwd.as_ref() != Some(&path);
+                                    *cwd_writer.lock().unwrap() = Some(path.clone());
+                                    if changed {
+                                        prev_cwd = Some(path.clone());
+                                        let git = get_git_info(&path);
+                                        let folder = std::path::Path::new(&path)
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string());
+                                        app_handle.emit(&cwd_event_name, serde_json::json!({
+                                            "cwd": path,
+                                            "folder": folder,
+                                            "git": { "is_repo": git.is_repo, "branch": git.branch }
+                                        })).ok();
+                                    }
                                 }
                                 osc_buf.clear();
                                 in_osc = false;
@@ -115,14 +156,13 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
 
                     {
                         let mut b = buf_writer.lock().unwrap();
-                        b.extend_from_slice(chunk);
+                        b.extend_from_slice(valid_chunk);
                         if b.len() > MAX_BUF {
                             let excess = b.len() - MAX_BUF;
                             b.drain(..excess);
                         }
                     }
-                    let output = String::from_utf8_lossy(chunk).to_string();
-                    let _ = app_handle.emit(&event_name, output);
+                    let _ = app_handle.emit(&event_name, text.to_string());
                 }
             }
         }
@@ -1026,6 +1066,50 @@ fn get_session_cwd(session_id: String, sessions: State<Sessions>) -> Option<Stri
     cwd
 }
 
+#[derive(Serialize, Clone)]
+struct GitInfo {
+    is_repo: bool,
+    branch: Option<String>,
+}
+
+/// Standalone git info lookup (usable from both Tauri commands and background threads)
+fn get_git_info(cwd: &str) -> GitInfo {
+    let path = std::path::Path::new(cwd);
+    if !path.is_dir() {
+        return GitInfo { is_repo: false, branch: None };
+    }
+    let is_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !is_repo {
+        return GitInfo { is_repo: false, branch: None };
+    }
+    let branch = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty());
+    GitInfo { is_repo, branch }
+}
+
+#[tauri::command]
+fn get_session_git_info(cwd: String) -> GitInfo {
+    get_git_info(&cwd)
+}
+
 #[tauri::command]
 fn exit_app(app: AppHandle) {
     app.exit(0);
@@ -1140,6 +1224,7 @@ pub fn run() {
             save_config,
             load_config,
             get_session_cwd,
+            get_session_git_info,
             exit_app,
             get_locale,
         ])

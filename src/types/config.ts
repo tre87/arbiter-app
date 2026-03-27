@@ -3,6 +3,7 @@ export interface ArbiterConfig {
   window?: WindowGeometry
   layout?: SavedPaneNode
   terminals?: SavedTerminal[]
+  focusedTerminalIndex?: number
 }
 
 export interface CloseOptions {

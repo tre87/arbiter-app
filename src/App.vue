@@ -30,18 +30,20 @@ async function loadAndRestore() {
       closeOptions.value = { ...config.closeOptions }
     }
 
-    // Restore window geometry
+    // Restore window geometry — wait for the OS to actually apply the resize
     if (config.window) {
       const win = getCurrentWindow()
       try {
         await win.setSize(new (await import('@tauri-apps/api/dpi')).LogicalSize(config.window.width, config.window.height))
         await win.setPosition(new (await import('@tauri-apps/api/dpi')).LogicalPosition(config.window.x, config.window.y))
+        // OS window resize is async; give it time to propagate to the DOM
+        await new Promise(r => setTimeout(r, 150))
       } catch { /* ignore if position is off-screen */ }
     }
 
     // Restore layout
     if (config.layout && config.terminals) {
-      store.restoreFromSaved(config.layout, config.terminals)
+      store.restoreFromSaved(config.layout, config.terminals, config.focusedTerminalIndex)
     }
   } catch {
     // Config load failed — start fresh
@@ -53,6 +55,10 @@ async function loadAndRestore() {
 async function setupCloseHandler() {
   const win = getCurrentWindow()
   await win.onCloseRequested(async (event) => {
+    // Single terminal — nothing worth saving, just exit
+    if (store.root.type === 'terminal') {
+      return
+    }
     event.preventDefault()
     showCloseDialog.value = true
   })
@@ -77,7 +83,7 @@ async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveS
       } catch { /* ignore */ }
 
       // Save layout tree
-      const { layout, terminals: terminalMeta } = store.serializeLayout()
+      const { layout, terminals: terminalMeta, focusedTerminalIndex } = store.serializeLayout()
       const savedTerminals: SavedTerminal[] = []
 
       for (const t of terminalMeta) {
@@ -103,6 +109,7 @@ async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveS
 
       config.layout = layout
       config.terminals = savedTerminals
+      config.focusedTerminalIndex = focusedTerminalIndex
     }
 
     await invoke('save_config', { config })
@@ -187,6 +194,21 @@ onMounted(async () => {
   window.addEventListener('keydown', handleKeyDown, { capture: true })
   await loadAndRestore()
   await setupCloseHandler()
+
+  // Dispatch custom event so the focused TerminalPane focuses its own xterm.
+  // Poll because terminals mount asynchronously after layout restore.
+  let focusAttempts = 0
+  const focusInterval = setInterval(() => {
+    window.dispatchEvent(new Event('arbiter:request-focus'))
+    // Verify: check if any textarea inside the focused pane got focus
+    const pane = document.querySelector('.terminal-pane.focused')
+    const textarea = pane?.querySelector('textarea')
+    if (textarea && document.activeElement === textarea) {
+      clearInterval(focusInterval)
+      return
+    }
+    if (++focusAttempts >= 30) clearInterval(focusInterval) // give up after 3s
+  }, 100)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeyDown, { capture: true })

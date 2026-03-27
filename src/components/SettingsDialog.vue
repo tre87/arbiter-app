@@ -45,6 +45,16 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
       </div>
 
       <div class="section">
+        <h4 class="section-title">Display</h4>
+        <div class="section-body">
+          <label class="toggle-row">
+            <span class="toggle-label">Always show footer bar</span>
+            <input type="checkbox" v-model="devStore.alwaysShowFooter" class="toggle-input" />
+          </label>
+        </div>
+      </div>
+
+      <div class="section">
         <h4 class="section-title">Developer</h4>
         <div class="section-body">
           <label class="toggle-row">
