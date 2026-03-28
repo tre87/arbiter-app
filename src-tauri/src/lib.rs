@@ -537,6 +537,31 @@ fn handle_new_session(
             spawn_exit_watcher(app.clone(), monitor.clone(), pane_id, claude_pid);
             return true;
         }
+
+        // Session clear/restart: a new JSONL appeared in the same sessions dir as
+        // an already-tracked pane (same project, same Claude process after /clear).
+        // Swap the tracked JSONL path so the footer picks up the reset tokens.
+        if let Some(new_parent) = jsonl_path.parent() {
+            let mut mon = monitor.lock().unwrap();
+            let same_dir_pane = mon.iter()
+                .find(|(_, (_, p))| {
+                    !p.as_os_str().is_empty() && p != jsonl_path && p.parent() == Some(new_parent)
+                })
+                .map(|(id, (pid, _))| (id.clone(), *pid));
+            if let Some((pane_id, existing_pid)) = same_dir_pane {
+                mon.insert(pane_id.clone(), (existing_pid, jsonl_path.to_path_buf()));
+                drop(mon);
+                let status = parse_jsonl_status(jsonl_path).unwrap_or_else(|| ClaudeSessionStatus {
+                    session_id: jsonl_path.file_stem()
+                        .and_then(|s| s.to_str()).unwrap_or("").to_string(),
+                    model_id: None, input_tokens: None, output_tokens: None,
+                    cache_creation_input_tokens: None, cache_read_input_tokens: None,
+                    folder: None, branch: None,
+                });
+                app.emit(&format!("claude-status-{}", pane_id), &status).ok();
+                return true;
+            }
+        }
     }
     false
 }

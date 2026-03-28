@@ -25,6 +25,7 @@ use winapi::um::winnt::HANDLE;
 pub type HPCON = HANDLE;
 
 pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
+#[allow(dead_code)]
 pub const PSEUDOCONSOLE_WIN32_INPUT_MODE: DWORD = 0x4;
 #[allow(dead_code)]
 pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: DWORD = 0x8;

@@ -173,11 +173,15 @@ export const usePaneStore = defineStore('pane', () => {
     }
     return undefined
   }
+  function isClaudeRunning(paneId: string): boolean {
+    return paneId in claudeSessionIds.value
+  }
 
   // ── Saved metadata for restoration ────────────────────────────────────────
   // After restoreFromSaved, TerminalPane reads these to pass cwd / resume Claude
   const savedCwds = ref<Record<string, string>>({})
   const savedClaudeSessions = ref<Record<string, string>>({})
+  const savedClaudeWasRunning = ref<Record<string, boolean>>({})
 
   function getSavedCwd(paneId: string): string | undefined {
     return savedCwds.value[paneId]
@@ -193,6 +197,11 @@ export const usePaneStore = defineStore('pane', () => {
   function consumeSavedClaudeSession(paneId: string): string | undefined {
     const v = savedClaudeSessions.value[paneId]
     delete savedClaudeSessions.value[paneId]
+    return v
+  }
+  function consumeSavedClaudeWasRunning(paneId: string): boolean {
+    const v = savedClaudeWasRunning.value[paneId] ?? false
+    delete savedClaudeWasRunning.value[paneId]
     return v
   }
 
@@ -234,6 +243,7 @@ export const usePaneStore = defineStore('pane', () => {
     ptySessionIds.value = {}
     savedCwds.value = {}
     savedClaudeSessions.value = {}
+    savedClaudeWasRunning.value = {}
 
     // Track terminal IDs by their index so we can restore focus
     const terminalIdsByIndex: string[] = []
@@ -253,6 +263,7 @@ export const usePaneStore = defineStore('pane', () => {
           }
           if (t.cwd) savedCwds.value[id] = t.cwd
           if (t.claudeSessionId) savedClaudeSessions.value[id] = t.claudeSessionId
+          if (t.claudeWasRunning) savedClaudeWasRunning.value[id] = true
         } else {
           assignTerminalName(id)
         }
@@ -290,9 +301,9 @@ export const usePaneStore = defineStore('pane', () => {
     updateSplitSizes, adjustSplitSize,
     setPtySession, getPtySession, hasPaneId, removePtySession,
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
-    claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId,
+    claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId, isClaudeRunning,
     savedCwds, savedClaudeSessions,
-    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession,
+    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession, consumeSavedClaudeWasRunning,
     focusTrigger, triggerFocus,
     serializeLayout, restoreFromSaved,
   }

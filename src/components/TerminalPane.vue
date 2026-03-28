@@ -110,7 +110,12 @@ function safeFit() {
   const viewportEl = term.element?.querySelector('.xterm-viewport') as HTMLElement | null
   const scrollbarWidth = viewportEl ? (viewportEl.offsetWidth - viewportEl.clientWidth) : 0
 
-  const available = parentWidth - scrollbarWidth
+  // Account for padding on .terminal-inner
+  const parentStyle = window.getComputedStyle(parent)
+  const paddingLeft = parseFloat(parentStyle.paddingLeft) || 0
+  const paddingRight = parseFloat(parentStyle.paddingRight) || 0
+
+  const available = parentWidth - scrollbarWidth - paddingLeft - paddingRight
   let cols = Math.max(2, Math.floor(available / (dw / dpr)))
   const rows = Math.max(1, Math.floor(parentHeight / (dh / dpr)))
 
@@ -240,6 +245,7 @@ onMounted(async () => {
   } else {
     const savedCwd = store.consumeSavedCwd(props.paneId)
     const savedClaudeId = store.consumeSavedClaudeSession(props.paneId)
+    const savedClaudeWasRunning = store.consumeSavedClaudeWasRunning(props.paneId)
 
     // Pre-populate footer state BEFORE creating the session so the terminal
     // has its final height (with footer visible) when we measure rows/cols.
@@ -248,7 +254,7 @@ onMounted(async () => {
       folderName.value = savedCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
       const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
       gitInfo.value = git
-      if (savedClaudeId) {
+      if (savedClaudeId || savedClaudeWasRunning) {
         claudeRunning.value = true
         footerVisible.value = true
       }
@@ -272,9 +278,16 @@ onMounted(async () => {
     })
 
     if (savedClaudeId && sessionId) {
+      // Resume specific session
       resumeAutoScroll = true
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
+      }, 500)
+    } else if (savedClaudeWasRunning && sessionId) {
+      // Claude was running but no session to resume (e.g. after /clear) — start fresh
+      resumeAutoScroll = true
+      setTimeout(() => {
+        invoke('write_to_session', { sessionId, data: 'claude\r' })
       }, 500)
     }
   }
@@ -609,6 +622,7 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  padding-left: 4px;
 }
 
 </style>

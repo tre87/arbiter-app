@@ -102,6 +102,7 @@ async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveS
         if (saveSessions) {
           const claudeId = store.getClaudeSessionId(t.id)
           if (claudeId) entry.claudeSessionId = claudeId
+          if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
         }
 
         savedTerminals.push(entry)

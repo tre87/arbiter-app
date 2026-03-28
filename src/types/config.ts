@@ -33,4 +33,5 @@ export interface SavedTerminal {
   name: string
   cwd?: string
   claudeSessionId?: string
+  claudeWasRunning?: boolean
 }
