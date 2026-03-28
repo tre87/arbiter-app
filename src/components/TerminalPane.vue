@@ -348,10 +348,11 @@ onBeforeUnmount(() => {
   }
   term?.dispose()
 })
+
 </script>
 
 <template>
-  <div class="terminal-pane" :class="{ focused: isFocused }" @mousedown="store.setFocus(paneId)">
+  <div class="terminal-pane" :class="{ focused: isFocused }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
     <div class="pane-toolbar">
       <!-- Left: Terminal name + edit -->
       <div class="toolbar-name" @mousedown.stop>
@@ -471,6 +472,7 @@ onBeforeUnmount(() => {
 .terminal-pane.focused::after {
   border-color: var(--color-accent);
 }
+
 
 .pane-toolbar {
   display: flex;

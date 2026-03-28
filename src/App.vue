@@ -2,6 +2,7 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { usePaneStore } from './stores/pane'
 import SplitView from './components/SplitView.vue'
 import StatsBar from './components/StatsBar.vue'
@@ -191,10 +192,46 @@ function handleKeyDown(e: KeyboardEvent) {
 const settingsOpen = ref(false)
 const shortcutsOpen = ref(false)
 
+// ── Drag and drop ────────────────────────────────────────────────────────────
+
+let unlistenDragDrop: (() => void) | null = null
+
+async function setupDragDrop() {
+  const webview = getCurrentWebview()
+  unlistenDragDrop = await webview.onDragDropEvent((event) => {
+    if (event.payload.type !== 'drop') return
+    const paths = (event.payload as any).paths as string[]
+    if (!paths?.length) return
+
+    // Position is in physical pixels — convert to logical for elementFromPoint
+    const dpr = window.devicePixelRatio || 1
+    const x = event.payload.position.x / dpr
+    const y = event.payload.position.y / dpr
+
+    // Find which terminal pane the drop landed on
+    const el = document.elementFromPoint(x, y)
+    const paneEl = el?.closest('.terminal-pane') as HTMLElement | null
+    if (!paneEl) return
+
+    // Get the pane ID from the data attribute
+    const paneId = paneEl.dataset.paneId
+    if (!paneId) return
+
+    // Write paths to the pane's PTY session
+    const ptySessionId = store.getPtySession(paneId)
+    if (!ptySessionId) return
+
+    const quoted = paths.map(p => p.includes(' ') ? `"${p}"` : p)
+    invoke('write_to_session', { sessionId: ptySessionId, data: quoted.join(' ') })
+    store.setFocus(paneId)
+  })
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', handleKeyDown, { capture: true })
   await loadAndRestore()
   await setupCloseHandler()
+  await setupDragDrop()
 
   // Dispatch custom event so the focused TerminalPane focuses its own xterm.
   // Poll because terminals mount asynchronously after layout restore.
@@ -213,6 +250,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeyDown, { capture: true })
+  unlistenDragDrop?.()
 })
 </script>
 
