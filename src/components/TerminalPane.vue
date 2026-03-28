@@ -329,6 +329,12 @@ onMounted(async () => {
     infoPanelOpen.value = false
     store.clearClaudeSessionId(props.paneId)
   })
+
+  // Focus this terminal if it's the focused pane — must happen after full setup
+  if (isFocused.value) {
+    await nextTick()
+    term?.focus()
+  }
 })
 
 onBeforeUnmount(() => {

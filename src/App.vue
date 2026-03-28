@@ -233,20 +233,16 @@ onMounted(async () => {
   await setupCloseHandler()
   await setupDragDrop()
 
-  // Dispatch custom event so the focused TerminalPane focuses its own xterm.
-  // Poll because terminals mount asynchronously after layout restore.
-  let focusAttempts = 0
-  const focusInterval = setInterval(() => {
-    window.dispatchEvent(new Event('arbiter:request-focus'))
-    // Verify: check if any textarea inside the focused pane got focus
+  // WebView2 on Windows has a separate internal focus from the Win32 window.
+  // MoveFocus(PROGRAMMATIC) via Rust pushes focus into the web content layer,
+  // after which JS .focus() on the xterm textarea actually works.
+  setTimeout(async () => {
+    await invoke('focus_webview')
+    // Now that WebView2 content has native focus, focus the xterm textarea
     const pane = document.querySelector('.terminal-pane.focused')
-    const textarea = pane?.querySelector('textarea')
-    if (textarea && document.activeElement === textarea) {
-      clearInterval(focusInterval)
-      return
-    }
-    if (++focusAttempts >= 30) clearInterval(focusInterval) // give up after 3s
-  }, 100)
+    const textarea = pane?.querySelector('textarea') as HTMLTextAreaElement | null
+    textarea?.focus()
+  }, 200)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeyDown, { capture: true })

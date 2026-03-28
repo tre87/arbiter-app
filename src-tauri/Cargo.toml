@@ -30,6 +30,9 @@ notify  = { version = "6", default-features = false, features = ["macos_fsevent"
 sys-locale = "0.3"
 tauri-plugin-window-state = "2"
 
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+
 [profile.dev]
 codegen-units = 1
 

@@ -1141,6 +1141,20 @@ fn exit_app(app: AppHandle) {
 }
 
 #[tauri::command]
+fn focus_webview(webview_window: tauri::WebviewWindow) {
+    #[cfg(windows)]
+    {
+        let _ = webview_window.with_webview(|webview| {
+            unsafe {
+                use webview2_com::Microsoft::Web::WebView2::Win32::*;
+                let controller = webview.controller();
+                let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        });
+    }
+}
+
+#[tauri::command]
 fn get_locale() -> String {
     // On Windows, sys-locale returns the display language (e.g. en-US) not the
     // regional format (e.g. da-DK). Read the regional format from the registry.
@@ -1252,6 +1266,7 @@ pub fn run() {
             get_session_git_info,
             exit_app,
             get_locale,
+            focus_webview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
