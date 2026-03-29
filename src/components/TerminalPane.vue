@@ -3,7 +3,7 @@ import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import { CanvasAddon } from '@xterm/addon-canvas'
+import { WebglAddon } from '@xterm/addon-webgl'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
@@ -21,7 +21,7 @@ const isFocused = computed(() => store.focusedId === props.paneId)
 
 let term: Terminal
 let fitAddon: FitAddon
-let canvasAddon: CanvasAddon | null = null
+let webglAddon: WebglAddon | null = null
 let unlisten: UnlistenFn | null = null
 let sessionId: string | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -169,6 +169,7 @@ function modelLabel(id: string | null | undefined): string {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 onMounted(async () => {
+  // ── Terminal setup (matches VS Code's xterm integration) ─────────────────────
   term = new Terminal({
     theme: {
       background: '#121212',
@@ -200,8 +201,6 @@ onMounted(async () => {
   term.open(terminalEl.value!)
 
   // Detect Claude working via OSC 0 title changes.
-  // Claude CLI sets the title with braille spinner chars (⠋⠙⠹…) while
-  // thinking/working, and ✳ when idle/ready.
   term.parser.registerOscHandler(0, (data) => {
     terminalTitle.value = data
     if (claudeRunning.value) {
@@ -218,15 +217,20 @@ onMounted(async () => {
 
   await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
 
-  // Canvas renderer BEFORE fit — canvas may use different cell metrics
+  // WebGL renderer (same as VS Code)
   try {
-    canvasAddon = new CanvasAddon()
-    term.loadAddon(canvasAddon)
-  } catch {
-    canvasAddon = null
+    webglAddon = new WebglAddon()
+    term.loadAddon(webglAddon)
+    webglAddon.onContextLoss(() => {
+      webglAddon?.dispose()
+      webglAddon = null
+    })
+  } catch (e) {
+    console.warn('WebGL addon failed, using DOM renderer:', e)
+    webglAddon = null
   }
 
-  // Fit after canvas addon so dimensions match actual rendering
+  // Fit after renderer addon so dimensions match actual rendering
   safeFit()
 
   term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
@@ -283,25 +287,15 @@ onMounted(async () => {
     sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null })
     store.setPtySession(props.paneId, sessionId)
 
-    // During resume, auto-scroll until Claude takes over the alternate screen
-    let resumeAutoScroll = false
-
     unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
       term.write(event.payload)
-      if (resumeAutoScroll && term.buffer.active.type === 'normal') {
-        term.scrollToBottom()
-      }
     })
 
     if (savedClaudeId && sessionId) {
-      // Resume specific session
-      resumeAutoScroll = true
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
       }, 500)
     } else if (savedClaudeWasRunning && sessionId) {
-      // Claude was running but no session to resume (e.g. after /clear) — start fresh
-      resumeAutoScroll = true
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: 'claude\r' })
       }, 500)
@@ -702,5 +696,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   padding-left: 4px;
 }
+
+
 
 </style>
