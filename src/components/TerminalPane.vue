@@ -47,6 +47,9 @@ const folderName = ref<string | null>(null)
 const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
 let unlistenCwd: (() => void) | null = null
 
+const claudeWorking = ref(false)
+const terminalTitle = ref('')
+
 const infoPanelOpen = ref(false)
 
 function toggleInfoPanel() {
@@ -196,6 +199,19 @@ onMounted(async () => {
   term.loadAddon(new WebLinksAddon())
   term.open(terminalEl.value!)
 
+  // Detect Claude working via OSC 0 title changes.
+  // Claude CLI sets the title with braille spinner chars (⠋⠙⠹…) while
+  // thinking/working, and ✳ when idle/ready.
+  term.parser.registerOscHandler(0, (data) => {
+    terminalTitle.value = data
+    if (claudeRunning.value) {
+      const hasSpinner = /[\u2800-\u28FF]/.test(data)
+      const isIdle = /✳/.test(data)
+      claudeWorking.value = hasSpinner && !isIdle
+    }
+    return false
+  })
+
   // Register focus handler immediately so App.vue's polling can reach us
   focusHandler = () => { if (isFocused.value) term?.focus() }
   window.addEventListener('arbiter:request-focus', focusHandler)
@@ -326,6 +342,7 @@ onMounted(async () => {
   })
   unlistenExited = await listen(`claude-exited-${sessionId}`, () => {
     claudeRunning.value = false
+    claudeWorking.value = false
     infoPanelOpen.value = false
     store.clearClaudeSessionId(props.paneId)
   })
@@ -360,7 +377,11 @@ onBeforeUnmount(() => {
 <template>
   <div class="terminal-pane" :class="{ focused: isFocused }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
     <div class="pane-toolbar">
-      <!-- Left: Terminal name + edit -->
+      <!-- Left: Process title from OSC 0 -->
+      <span class="toolbar-process" v-if="terminalTitle">{{ terminalTitle }}</span>
+      <span class="toolbar-process" v-else>&nbsp;</span>
+
+      <!-- Center: Terminal name + edit -->
       <div class="toolbar-name" @mousedown.stop>
         <template v-if="isEditingName">
           <input
@@ -443,6 +464,9 @@ onBeforeUnmount(() => {
     </div>
 
     <div ref="terminalEl" class="terminal-inner" />
+    <div v-if="claudeWorking" class="progress-bar">
+      <div class="progress-bar-inner" />
+    </div>
     <TerminalFooter
       v-if="(claudeRunning && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd)"
       :claude-running="claudeRunning"
@@ -481,6 +505,7 @@ onBeforeUnmount(() => {
 
 
 .pane-toolbar {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -493,7 +518,22 @@ onBeforeUnmount(() => {
 
 .toolbar-spacer { flex: 1; }
 
+.toolbar-process {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  opacity: 0.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+  user-select: none;
+  min-width: 0;
+}
+
 .toolbar-name {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 4px;
@@ -502,7 +542,7 @@ onBeforeUnmount(() => {
 
 .name-label {
   font-size: 11px;
-  color: var(--color-text-secondary);
+  color: var(--azure-tropical);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -624,6 +664,36 @@ onBeforeUnmount(() => {
   font-weight: 600;
   letter-spacing: 0.3px;
   font-size: 10px;
+}
+
+.progress-bar {
+  position: absolute;
+  top: 30px; /* right below the toolbar */
+  left: 0;
+  right: 0;
+  height: 3px;
+  overflow: hidden;
+  z-index: 5;
+  pointer-events: none;
+}
+
+.progress-bar-inner {
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--azure) 50%,
+    transparent 100%
+  );
+  background-size: 50% 100%;
+  background-repeat: no-repeat;
+  animation: progress-slide 3s ease-in-out infinite alternate;
+}
+
+@keyframes progress-slide {
+  0%   { background-position: -20% 0; }
+  100% { background-position: 120% 0; }
 }
 
 .terminal-inner {
