@@ -1,6 +1,17 @@
+export interface SavedWorkspace {
+  name: string
+  layout: SavedPaneNode
+  terminals: SavedTerminal[]
+  focusedTerminalIndex?: number
+}
+
 export interface ArbiterConfig {
   closeOptions: CloseOptions
   window?: WindowGeometry
+  // Multi-workspace (new format)
+  workspaces?: SavedWorkspace[]
+  activeWorkspaceIndex?: number
+  // Legacy single-workspace (backward compat)
   layout?: SavedPaneNode
   terminals?: SavedTerminal[]
   focusedTerminalIndex?: number

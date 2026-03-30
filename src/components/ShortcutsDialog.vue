@@ -2,7 +2,11 @@
 defineEmits<{ close: [] }>()
 
 const shortcuts = [
-  { action: 'Close tab', keys: ['Ctrl', 'Shift', 'W'] },
+  { action: 'New workspace', keys: ['Ctrl', 'T'] },
+  { action: 'Next workspace', keys: ['Ctrl', 'Tab'] },
+  { action: 'Previous workspace', keys: ['Ctrl', 'Shift', 'Tab'] },
+  { action: 'Switch to workspace 1-9', keys: ['Ctrl', '1-9'] },
+  { action: 'Close pane', keys: ['Ctrl', 'Shift', 'W'] },
   { action: 'Split right', keys: ['Ctrl', 'Shift', 'R'] },
   { action: 'Split down', keys: ['Ctrl', 'Shift', 'D'] },
   { action: 'Navigate panes', keys: ['Ctrl', 'Shift', 'Arrow'] },

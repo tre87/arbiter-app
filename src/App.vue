@@ -11,9 +11,11 @@ import MdiIcon from './components/MdiIcon.vue'
 import { mdiCogOutline, mdiKeyboardOutline } from '@mdi/js'
 import ShortcutsDialog from './components/ShortcutsDialog.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
+import WorkspaceTabs from './components/WorkspaceTabs.vue'
+import WindowControls from './components/WindowControls.vue'
 import logoUrl from './assets/logo.svg'
 import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from './utils/spatial'
-import type { ArbiterConfig, CloseOptions, SavedTerminal } from './types/config'
+import type { ArbiterConfig, CloseOptions, SavedTerminal, SavedWorkspace } from './types/config'
 
 const store = usePaneStore()
 const showCloseDialog = ref(false)
@@ -42,8 +44,10 @@ async function loadAndRestore() {
       } catch { /* ignore if position is off-screen */ }
     }
 
-    // Restore layout
-    if (config.layout && config.terminals) {
+    // Restore layout — prefer multi-workspace format, fall back to legacy
+    if (config.workspaces?.length) {
+      store.restoreAllWorkspaces(config.workspaces, config.activeWorkspaceIndex)
+    } else if (config.layout && config.terminals) {
       store.restoreFromSaved(config.layout, config.terminals, config.focusedTerminalIndex)
     }
   } catch {
@@ -56,8 +60,8 @@ async function loadAndRestore() {
 async function setupCloseHandler() {
   const win = getCurrentWindow()
   await win.onCloseRequested(async (event) => {
-    // Single terminal — nothing worth saving, just exit
-    if (store.root.type === 'terminal') {
+    // Single workspace with single terminal — nothing worth saving, just exit
+    if (store.workspaces.length === 1 && store.root.type === 'terminal') {
       return
     }
     event.preventDefault()
@@ -83,35 +87,45 @@ async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveS
         config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y }
       } catch { /* ignore */ }
 
-      // Save layout tree
-      const { layout, terminals: terminalMeta, focusedTerminalIndex } = store.serializeLayout()
-      const savedTerminals: SavedTerminal[] = []
+      // Save all workspaces
+      const serialized = store.serializeAll()
+      const savedWorkspaces: SavedWorkspace[] = []
 
-      for (const t of terminalMeta) {
-        const entry: SavedTerminal = { name: t.name }
+      for (const ws of serialized.workspaces) {
+        const savedTerminals: SavedTerminal[] = []
 
-        if (savePaths) {
-          const sessionId = store.getPtySession(t.id)
-          if (sessionId) {
-            try {
-              const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
-              if (cwd) entry.cwd = cwd
-            } catch { /* ignore */ }
+        for (const t of ws.terminals) {
+          const entry: SavedTerminal = { name: t.name }
+
+          if (savePaths) {
+            const sessionId = store.getPtySession(t.id)
+            if (sessionId) {
+              try {
+                const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
+                if (cwd) entry.cwd = cwd
+              } catch { /* ignore */ }
+            }
           }
+
+          if (saveSessions) {
+            const claudeId = store.getClaudeSessionId(t.id)
+            if (claudeId) entry.claudeSessionId = claudeId
+            if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
+          }
+
+          savedTerminals.push(entry)
         }
 
-        if (saveSessions) {
-          const claudeId = store.getClaudeSessionId(t.id)
-          if (claudeId) entry.claudeSessionId = claudeId
-          if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
-        }
-
-        savedTerminals.push(entry)
+        savedWorkspaces.push({
+          name: ws.name,
+          layout: ws.layout,
+          terminals: savedTerminals,
+          focusedTerminalIndex: ws.focusedTerminalIndex,
+        })
       }
 
-      config.layout = layout
-      config.terminals = savedTerminals
-      config.focusedTerminalIndex = focusedTerminalIndex
+      config.workspaces = savedWorkspaces
+      config.activeWorkspaceIndex = serialized.activeWorkspaceIndex
     }
 
     await invoke('save_config', { config })
@@ -148,6 +162,40 @@ function handleKeyDown(e: KeyboardEvent) {
       store.adjustSplitSize(result.splitId, result.delta * 5)
     }
     return
+  }
+
+  // Ctrl+T → new workspace tab
+  if (e.ctrlKey && !e.shiftKey && e.code === 'KeyT') {
+    e.preventDefault()
+    e.stopPropagation()
+    store.addWorkspace()
+    return
+  }
+
+  // Ctrl+Tab / Ctrl+Shift+Tab → next/prev workspace
+  if (e.ctrlKey && e.code === 'Tab') {
+    e.preventDefault()
+    e.stopPropagation()
+    const count = store.workspaces.length
+    if (count <= 1) return
+    const delta = e.shiftKey ? -1 : 1
+    const next = (store.activeWorkspaceIndex + delta + count) % count
+    store.switchWorkspace(next)
+    return
+  }
+
+  // Ctrl+1..9 → switch to workspace by number
+  if (e.ctrlKey && !e.shiftKey && !e.altKey) {
+    const digitMatch = e.code.match(/^Digit([1-9])$/)
+    if (digitMatch) {
+      const idx = parseInt(digitMatch[1], 10) - 1
+      if (idx < store.workspaces.length) {
+        e.preventDefault()
+        e.stopPropagation()
+        store.switchWorkspace(idx)
+        return
+      }
+    }
   }
 
   if (!e.ctrlKey || !e.shiftKey) return
@@ -257,10 +305,9 @@ onBeforeUnmount(() => {
         <img :src="logoUrl" class="titlebar-logo" alt="Arbiter" />
         <span class="titlebar-title">Arbiter</span>
       </div>
-      <div class="titlebar-center">
+      <WorkspaceTabs />
+      <div class="titlebar-right">
         <StatsBar />
-      </div>
-      <div class="titlebar-actions">
         <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
           <MdiIcon :path="mdiKeyboardOutline" :size="16" />
         </button>
@@ -268,6 +315,7 @@ onBeforeUnmount(() => {
           <MdiIcon :path="mdiCogOutline" :size="16" />
         </button>
       </div>
+      <WindowControls />
     </div>
     <div class="workspace">
       <SplitView :node="store.root" />
@@ -296,58 +344,23 @@ onBeforeUnmount(() => {
 }
 
 .titlebar {
-  height: 46px;
+  height: 44px;
   background: var(--color-bg-subtle);
   border-bottom: 1px solid var(--color-card-border);
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   align-items: center;
-  padding: 0 12px 0 6px;
+  padding: 0 0 0 6px;
   user-select: none;
   -webkit-app-region: drag;
   flex-shrink: 0;
 }
 
-.titlebar-center {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  -webkit-app-region: no-drag;
-}
-
-.titlebar-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  -webkit-app-region: no-drag;
-}
-
-.settings-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: none;
-  border: 1px solid var(--color-card-border);
-  border-radius: 4px;
-  color: var(--color-text-muted);
-  cursor: pointer;
-  padding: 4px;
-  line-height: 1;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-}
-
-.settings-btn:hover {
-  color: var(--color-accent);
-  border-color: var(--color-accent);
-  background: var(--color-bg-elevated);
-}
-
-
 .titlebar-brand {
   display: flex;
   align-items: center;
   gap: 5px;
+  padding-right: 8px;
 }
 
 .titlebar-logo {
@@ -379,6 +392,34 @@ onBeforeUnmount(() => {
 @keyframes title-shimmer {
   from { background-position: 0% center; }
   to   { background-position: 100% center; }
+}
+
+.titlebar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+}
+
+.settings-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid var(--color-card-border);
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 4px;
+  line-height: 1;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.settings-btn:hover {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+  background: var(--color-bg-elevated);
 }
 
 .workspace {

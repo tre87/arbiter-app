@@ -1,17 +1,34 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import type { PaneNode, TerminalLeaf } from '../types/pane'
-import type { SavedPaneNode, SavedTerminal } from '../types/config'
+import { ref, computed } from 'vue'
+import type { PaneNode, TerminalLeaf, Workspace } from '../types/pane'
+import type { SavedPaneNode, SavedTerminal, SavedWorkspace } from '../types/config'
 
 let nextId = 1
 const genId = () => String(nextId++)
 
 let nextTerminalNumber = 1
+let nextWorkspaceNumber = 1
 
 export const usePaneStore = defineStore('pane', () => {
+  // ── Multi-workspace state ─────────────────────────────────────────────────
   const initialLeaf: TerminalLeaf = { type: 'terminal', id: genId() }
-  const root = ref<PaneNode>(initialLeaf)
-  const focusedId = ref<string>(initialLeaf.id)
+  const workspaces = ref<Workspace[]>([{
+    id: genId(),
+    name: `Workspace ${nextWorkspaceNumber++}`,
+    root: initialLeaf,
+    focusedId: initialLeaf.id,
+  }])
+  const activeWorkspaceIndex = ref(0)
+
+  // Computed delegates to active workspace — all existing code reads/writes these
+  const root = computed({
+    get: () => workspaces.value[activeWorkspaceIndex.value].root,
+    set: (val) => { workspaces.value[activeWorkspaceIndex.value].root = val },
+  })
+  const focusedId = computed({
+    get: () => workspaces.value[activeWorkspaceIndex.value].focusedId,
+    set: (val) => { workspaces.value[activeWorkspaceIndex.value].focusedId = val },
+  })
 
   // Maps paneId → PTY sessionId so sessions survive Vue remounts (e.g. splits)
   const ptySessionIds = ref<Record<string, string>>({})
@@ -47,7 +64,8 @@ export const usePaneStore = defineStore('pane', () => {
       if (node.type === 'terminal') return node.id === id
       return check(node.first) || check(node.second)
     }
-    return check(root.value)
+    // Check all workspaces — pane may be in a background tab
+    return workspaces.value.some(ws => check(ws.root))
   }
 
   function removePtySession(paneId: string) {
@@ -106,9 +124,7 @@ export const usePaneStore = defineStore('pane', () => {
 
     root.value = remove(root.value)
 
-    // Focus the leaf in the sibling closest to where the closed pane was:
-    // closed right/bottom → focus the rightmost/bottommost leaf of left/top sibling
-    // closed left/top → focus the leftmost/topmost leaf of right/bottom sibling
+    // Focus the leaf in the sibling closest to where the closed pane was
     function firstLeaf(node: PaneNode): string {
       if (node.type === 'terminal') return node.id
       return firstLeaf(node.first)
@@ -211,8 +227,74 @@ export const usePaneStore = defineStore('pane', () => {
   const focusTrigger = ref(0)
   function triggerFocus() { focusTrigger.value++ }
 
+  // ── Workspace CRUD ────────────────────────────────────────────────────────
+
+  function addWorkspace() {
+    const leaf: TerminalLeaf = { type: 'terminal', id: genId() }
+    const ws: Workspace = {
+      id: genId(),
+      name: `Workspace ${nextWorkspaceNumber++}`,
+      root: leaf,
+      focusedId: leaf.id,
+    }
+    workspaces.value.push(ws)
+    activeWorkspaceIndex.value = workspaces.value.length - 1
+    assignTerminalName(leaf.id)
+  }
+
+  function removeWorkspace(index: number) {
+    if (workspaces.value.length <= 1) return
+
+    // Collect all pane IDs in the workspace to clean up sessions
+    const ws = workspaces.value[index]
+    function collectPaneIds(node: PaneNode): string[] {
+      if (node.type === 'terminal') return [node.id]
+      return [...collectPaneIds(node.first), ...collectPaneIds(node.second)]
+    }
+    const paneIds = collectPaneIds(ws.root)
+
+    workspaces.value.splice(index, 1)
+
+    // Adjust active index
+    if (activeWorkspaceIndex.value >= workspaces.value.length) {
+      activeWorkspaceIndex.value = workspaces.value.length - 1
+    } else if (activeWorkspaceIndex.value > index) {
+      activeWorkspaceIndex.value--
+    }
+
+    return paneIds // Caller can use these to close PTY sessions
+  }
+
+  function switchWorkspace(index: number) {
+    if (index >= 0 && index < workspaces.value.length) {
+      activeWorkspaceIndex.value = index
+    }
+  }
+
+  function moveWorkspace(from: number, to: number) {
+    if (from === to) return
+    const active = activeWorkspaceIndex.value
+    const ws = workspaces.value.splice(from, 1)[0]
+    workspaces.value.splice(to, 0, ws)
+    // Adjust active index to follow the previously active workspace
+    if (active === from) {
+      activeWorkspaceIndex.value = to
+    } else if (from < active && to >= active) {
+      activeWorkspaceIndex.value--
+    } else if (from > active && to <= active) {
+      activeWorkspaceIndex.value++
+    }
+  }
+
+  function renameWorkspace(index: number, name: string) {
+    if (index >= 0 && index < workspaces.value.length) {
+      workspaces.value[index].name = name
+    }
+  }
+
   // ── Serialization ────────────────────────────────────────────────────────
-  function serializeLayout(): { layout: SavedPaneNode; terminals: { id: string; name: string }[]; focusedTerminalIndex: number } {
+
+  function serializeWorkspace(ws: Workspace): { layout: SavedPaneNode; terminals: { id: string; name: string }[]; focusedTerminalIndex: number } {
     const terminals: { id: string; name: string }[] = []
 
     function walk(node: PaneNode): SavedPaneNode {
@@ -230,22 +312,27 @@ export const usePaneStore = defineStore('pane', () => {
       }
     }
 
-    const layout = walk(root.value)
-    const focusedTerminalIndex = terminals.findIndex(t => t.id === focusedId.value)
+    const layout = walk(ws.root)
+    const focusedTerminalIndex = terminals.findIndex(t => t.id === ws.focusedId)
     return { layout, terminals, focusedTerminalIndex: focusedTerminalIndex >= 0 ? focusedTerminalIndex : 0 }
   }
 
-  function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number) {
-    // Reset counters
-    nextId = 1
-    nextTerminalNumber = 1
-    terminalNames.value = {}
-    ptySessionIds.value = {}
-    savedCwds.value = {}
-    savedClaudeSessions.value = {}
-    savedClaudeWasRunning.value = {}
+  // Legacy single-workspace serialization (delegates to active workspace)
+  function serializeLayout() {
+    return serializeWorkspace(workspaces.value[activeWorkspaceIndex.value])
+  }
 
-    // Track terminal IDs by their index so we can restore focus
+  function serializeAll(): { workspaces: { name: string; layout: SavedPaneNode; terminals: { id: string; name: string }[]; focusedTerminalIndex: number }[]; activeWorkspaceIndex: number } {
+    return {
+      workspaces: workspaces.value.map(ws => ({
+        name: ws.name,
+        ...serializeWorkspace(ws),
+      })),
+      activeWorkspaceIndex: activeWorkspaceIndex.value,
+    }
+  }
+
+  function buildWorkspace(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number, wsName?: string): Workspace {
     const terminalIdsByIndex: string[] = []
 
     function build(node: SavedPaneNode): PaneNode {
@@ -255,7 +342,6 @@ export const usePaneStore = defineStore('pane', () => {
         terminalIdsByIndex[node.index] = id
         if (t) {
           terminalNames.value[id] = t.name
-          // Track the highest terminal number to continue from there
           const match = t.name.match(/^Terminal (\d+)$/)
           if (match) {
             const n = parseInt(match[1], 10)
@@ -281,30 +367,90 @@ export const usePaneStore = defineStore('pane', () => {
     }
 
     const newRoot = build(saved)
-    root.value = newRoot
-
-    // Restore focus to the saved terminal, or fall back to first leaf
     const restoredFocusId = focusedTerminalIndex != null ? terminalIdsByIndex[focusedTerminalIndex] : undefined
-    if (restoredFocusId) {
-      focusedId.value = restoredFocusId
-    } else {
-      function firstLeaf(node: PaneNode): string {
-        if (node.type === 'terminal') return node.id
-        return firstLeaf(node.first)
-      }
-      focusedId.value = firstLeaf(newRoot)
+
+    function firstLeaf(node: PaneNode): string {
+      if (node.type === 'terminal') return node.id
+      return firstLeaf(node.first)
+    }
+
+    return {
+      id: genId(),
+      name: wsName ?? `Workspace ${nextWorkspaceNumber++}`,
+      root: newRoot,
+      focusedId: restoredFocusId ?? firstLeaf(newRoot),
     }
   }
 
+  // Legacy single-workspace restore
+  function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number) {
+    nextId = 1
+    nextTerminalNumber = 1
+    nextWorkspaceNumber = 1
+    terminalNames.value = {}
+    ptySessionIds.value = {}
+    savedCwds.value = {}
+    savedClaudeSessions.value = {}
+    savedClaudeWasRunning.value = {}
+
+    const ws = buildWorkspace(saved, terminals, focusedTerminalIndex, 'Workspace 1')
+    nextWorkspaceNumber = 2
+    workspaces.value = [ws]
+    activeWorkspaceIndex.value = 0
+  }
+
+  function restoreAllWorkspaces(savedWorkspaces: SavedWorkspace[], savedActiveIndex?: number) {
+    nextId = 1
+    nextTerminalNumber = 1
+    nextWorkspaceNumber = 1
+    terminalNames.value = {}
+    ptySessionIds.value = {}
+    savedCwds.value = {}
+    savedClaudeSessions.value = {}
+    savedClaudeWasRunning.value = {}
+
+    const restored = savedWorkspaces.map(sw =>
+      buildWorkspace(sw.layout, sw.terminals, sw.focusedTerminalIndex, sw.name)
+    )
+
+    if (restored.length === 0) {
+      // Fallback: create a fresh workspace
+      const leaf: TerminalLeaf = { type: 'terminal', id: genId() }
+      assignTerminalName(leaf.id)
+      restored.push({
+        id: genId(),
+        name: `Workspace ${nextWorkspaceNumber++}`,
+        root: leaf,
+        focusedId: leaf.id,
+      })
+    }
+
+    workspaces.value = restored
+    activeWorkspaceIndex.value = (savedActiveIndex != null && savedActiveIndex < restored.length) ? savedActiveIndex : 0
+  }
+
   return {
-    root, focusedId, splitFocused, closeFocused, setFocus,
+    // Workspace state
+    workspaces, activeWorkspaceIndex,
+    root, focusedId,
+    // Workspace CRUD
+    addWorkspace, removeWorkspace, switchWorkspace, moveWorkspace, renameWorkspace,
+    // Pane operations
+    splitFocused, closeFocused, setFocus,
     updateSplitSizes, adjustSplitSize,
+    // PTY session mapping
     setPtySession, getPtySession, hasPaneId, removePtySession,
+    // Terminal names
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
+    // Claude session tracking
     claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId, isClaudeRunning,
+    // Saved state for restoration
     savedCwds, savedClaudeSessions,
     getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession, consumeSavedClaudeWasRunning,
+    // Focus trigger
     focusTrigger, triggerFocus,
-    serializeLayout, restoreFromSaved,
+    // Serialization
+    serializeLayout, serializeAll,
+    restoreFromSaved, restoreAllWorkspaces,
   }
 })

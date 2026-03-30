@@ -5,6 +5,18 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "shell:default"
+    "shell:default",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-is-minimized",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-outer-position",
+    "core:window:allow-set-focus"
   ]
 }

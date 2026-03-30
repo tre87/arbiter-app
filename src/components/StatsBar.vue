@@ -174,9 +174,9 @@ onBeforeUnmount(() => {
 .bar-track {
   position: relative;
   width: 72px;
-  height: 16px;
+  height: 18px;
   background: var(--color-card-border);
-  border-radius: 3px;
+  border-radius: 4px;
   overflow: hidden;
 }
 
@@ -219,8 +219,12 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   line-height: 1;
   border: 1px solid var(--color-card-border);
-  border-radius: 3px;
-  padding: 4px 7px;
+  border-radius: 4px;
+  padding: 5px 7px;
+  height: 26px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
 }
 
 .peak-badge {
@@ -231,8 +235,12 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   line-height: 1;
   border: 1px solid var(--color-warning, #e8a735);
-  border-radius: 3px;
-  padding: 4px 7px;
+  border-radius: 4px;
+  padding: 5px 7px;
+  height: 26px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
   opacity: 0.9;
 }
 
@@ -242,8 +250,10 @@ onBeforeUnmount(() => {
   gap: 4px;
   background: none;
   border: 1px solid var(--color-card-border);
-  border-radius: 3px;
-  padding: 4px 7px;
+  border-radius: 4px;
+  padding: 5px 7px;
+  height: 26px;
+  box-sizing: border-box;
   cursor: pointer;
   -webkit-app-region: no-drag;
   transition: border-color 0.15s;

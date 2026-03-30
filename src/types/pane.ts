@@ -13,3 +13,10 @@ export interface SplitNode {
 }
 
 export type PaneNode = TerminalLeaf | SplitNode
+
+export interface Workspace {
+  id: string
+  name: string
+  root: PaneNode
+  focusedId: string
+}
