@@ -98,7 +98,7 @@ onBeforeUnmount(() => {
   <template v-else-if="store.data">
     <span class="plan-badge">{{ store.data.plan }}</span>
 
-    <span v-if="isPeakHours" class="peak-badge" :title="peakTooltip">⚡ PEAK</span>
+    <span v-if="isPeakHours" class="peak-badge" :title="peakTooltip"><span class="peak-icon">⚡</span> PEAK</span>
 
     <!-- 5h -->
     <div v-if="store.data.five_hour" class="stat">
@@ -242,6 +242,11 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   opacity: 0.9;
+}
+
+.peak-icon {
+  font-style: normal;
+  line-height: 0;
 }
 
 .refresh-btn {

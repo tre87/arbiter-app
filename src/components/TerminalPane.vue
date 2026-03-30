@@ -249,6 +249,12 @@ onMounted(async () => {
       term.write(event.payload)
     })
 
+    // Fetch the last OSC 0 title the shell emitted while this terminal wasn't mounted
+    const savedTitle = await invoke<string | null>('get_session_title', { sessionId })
+    if (savedTitle) {
+      terminalTitle.value = savedTitle
+    }
+
     // Resize the PTY to match the new container — the shell gets notified and redraws.
     // We intentionally skip replaying the raw buffer here: it was captured at the old
     // terminal width, so escape sequences (cursor positioning, line wraps) would render
@@ -514,8 +520,8 @@ onBeforeUnmount(() => {
 
 .toolbar-process {
   font-size: 10px;
-  color: var(--color-text-muted);
-  opacity: 0.5;
+  color: var(--color-text-secondary);
+  opacity: 0.8;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -16,6 +16,7 @@ struct PtySession {
     shell_pid: Option<u32>,
     output_buffer: Arc<Mutex<Vec<u8>>>,
     cwd: Arc<Mutex<Option<String>>>,
+    title: Arc<Mutex<Option<String>>>,
 }
 
 // Arc so the watcher background thread can share ownership
@@ -61,6 +62,8 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
     let buf_writer = output_buffer.clone();
     let session_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(cwd.clone()));
     let cwd_writer = session_cwd.clone();
+    let session_title: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let title_writer = session_title.clone();
 
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
@@ -116,6 +119,12 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
                                 } else {
                                     &osc_buf
                                 };
+                                // OSC 0 / OSC 2: set title (payload = "0;title" or "2;title")
+                                if payload.starts_with("0;") || payload.starts_with("2;") {
+                                    let title = payload[2..].to_string();
+                                    *title_writer.lock().unwrap() = Some(title);
+                                }
+                                // OSC 7: CWD change
                                 if let Some(path) = parse_osc7_uri(payload) {
                                     let changed = prev_cwd.as_ref() != Some(&path);
                                     *cwd_writer.lock().unwrap() = Some(path.clone());
@@ -176,6 +185,7 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
             shell_pid,
             output_buffer,
             cwd: session_cwd,
+            title: session_title,
         },
     );
 
@@ -1091,6 +1101,14 @@ fn get_session_cwd(session_id: String, sessions: State<Sessions>) -> Option<Stri
     cwd
 }
 
+#[tauri::command]
+fn get_session_title(session_id: String, sessions: State<Sessions>) -> Option<String> {
+    let map = sessions.0.lock().unwrap();
+    let session = map.get(&session_id)?;
+    let title = session.title.lock().unwrap().clone();
+    title
+}
+
 #[derive(Serialize, Clone)]
 struct GitInfo {
     is_repo: bool,
@@ -1272,6 +1290,7 @@ pub fn run() {
             save_config,
             load_config,
             get_session_cwd,
+            get_session_title,
             get_session_git_info,
             exit_app,
             get_locale,

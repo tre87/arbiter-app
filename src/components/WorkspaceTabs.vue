@@ -307,12 +307,11 @@ function onPointerDown(e: PointerEvent, index: number) {
   cursor: pointer;
   padding: 0;
   flex-shrink: 0;
-  opacity: 0;
-  transition: opacity 0.1s, background 0.1s, color 0.1s;
+  display: none;
 }
 
 .tab:hover .tab-close {
-  opacity: 1;
+  display: flex;
 }
 
 .tab-close:hover {
