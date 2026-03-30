@@ -10,7 +10,7 @@ import { usePaneStore } from '../stores/pane'
 import { useDevSettingsStore } from '../stores/devSettings'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
-import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline } from '@mdi/js'
+import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline, mdiBash, mdiPowershell } from '@mdi/js'
 import TerminalFooter from './TerminalFooter.vue'
 
 const props = defineProps<{ paneId: string }>()
@@ -55,6 +55,13 @@ const infoPanelOpen = ref(false)
 function toggleInfoPanel() {
   infoPanelOpen.value = !infoPanelOpen.value
 }
+
+// ── Shell switching (Windows only) ──────────────────────────────────────────
+const isWindows = navigator.platform.startsWith('Win')
+const gitBashPath = ref<string | null>(null)
+const shellIdle = ref(false)
+const currentShell = ref<'powershell' | 'gitbash'>('powershell')
+let idleTimer: ReturnType<typeof setInterval> | null = null
 
 // ── Inline name editing ──────────────────────────────────────────────────────
 const isEditingName = ref(false)
@@ -141,6 +148,10 @@ watch(isFocused, (focused) => {
   if (focused) term?.focus()
 })
 
+watch(() => claudeRunning.value, () => {
+  if (isWindows && gitBashPath.value) startIdlePolling()
+})
+
 function launchClaude() {
   if (sessionId) {
     invoke('write_to_session', { sessionId, data: 'claude\r' })
@@ -153,6 +164,101 @@ function continueClaude() {
     invoke('write_to_session', { sessionId, data: 'claude --continue\r' })
     term?.focus()
   }
+}
+
+// ── Event subscription helper ────────────────────────────────────────────────
+async function subscribeToSession(sid: string) {
+  unlistenCwd = await listen(`cwd-changed-${sid}`, (event) => {
+    const data = event.payload as { cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }
+    sessionCwd.value = data.cwd
+    folderName.value = data.folder
+    gitInfo.value = data.git
+  }) as unknown as (() => void)
+  unlistenStarted = await listen(`claude-started-${sid}`, (event) => {
+    claudeStatus.value = event.payload as typeof claudeStatus.value
+    claudeRunning.value = true
+    footerVisible.value = true
+    if (claudeStatus.value?.session_id) {
+      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
+    }
+  })
+  unlistenStatus = await listen(`claude-status-${sid}`, (event) => {
+    claudeStatus.value = event.payload as typeof claudeStatus.value
+    if (claudeStatus.value?.session_id) {
+      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
+    }
+  })
+  unlistenExited = await listen(`claude-exited-${sid}`, () => {
+    claudeRunning.value = false
+    claudeWorking.value = false
+    infoPanelOpen.value = false
+    store.clearClaudeSessionId(props.paneId)
+  })
+}
+
+function unsubscribeAll() {
+  unlisten?.(); unlisten = null
+  unlistenCwd?.(); unlistenCwd = null
+  unlistenStarted?.(); unlistenStarted = null
+  unlistenStatus?.(); unlistenStatus = null
+  unlistenExited?.(); unlistenExited = null
+}
+
+// ── Shell switching ──────────────────────────────────────────────────────────
+function startIdlePolling() {
+  if (idleTimer) { clearInterval(idleTimer); idleTimer = null }
+  if (!claudeRunning.value && gitBashPath.value && sessionId) {
+    const check = async () => {
+      if (sessionId) {
+        shellIdle.value = await invoke<boolean>('check_shell_idle', { sessionId })
+      }
+    }
+    check()
+    idleTimer = setInterval(check, 2000)
+  } else {
+    shellIdle.value = false
+  }
+}
+
+async function switchShell() {
+  if (!sessionId) return
+  const cwd = sessionCwd.value
+
+  // Stop idle polling during switch
+  if (idleTimer) { clearInterval(idleTimer); idleTimer = null }
+
+  // Tear down
+  unsubscribeAll()
+  await invoke('close_session', { sessionId })
+  store.removePtySession(props.paneId)
+
+  // Clear terminal
+  term.clear()
+  term.reset()
+
+  // Toggle shell
+  const newShell = currentShell.value === 'powershell' ? gitBashPath.value : null
+  currentShell.value = newShell ? 'gitbash' : 'powershell'
+  store.setTerminalShell(props.paneId, currentShell.value)
+
+  // Create new session
+  sessionId = await invoke<string>('create_session', {
+    cols: term.cols,
+    rows: term.rows,
+    cwd: cwd ?? null,
+    shell: newShell,
+  })
+  store.setPtySession(props.paneId, sessionId)
+
+  // Re-subscribe
+  unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
+    term.write(event.payload)
+  })
+  await subscribeToSession(sessionId)
+
+  // Restart idle polling
+  startIdlePolling()
+  term.focus()
 }
 
 function modelLabel(id: string | null | undefined): string {
@@ -239,6 +345,11 @@ onMounted(async () => {
     if (sessionId) invoke('resize_session', { sessionId, cols, rows })
   })
 
+  // Detect Git Bash early so default shell choice works for new sessions
+  if (isWindows) {
+    gitBashPath.value = await invoke<string | null>('check_git_bash')
+  }
+
   // Reuse existing PTY session if the pane survived a split/remount; otherwise create fresh
   const existingSession = store.getPtySession(props.paneId)
   if (existingSession) {
@@ -290,7 +401,14 @@ onMounted(async () => {
       safeFit()
     }
 
-    sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null })
+    // Determine shell: prefer saved shell, then default setting
+    const savedShell = store.consumeSavedShell(props.paneId)
+    const shellType = savedShell ?? (isWindows && devSettings.defaultShell === 'gitbash' ? 'gitbash' : 'powershell')
+    const shellPath = (shellType === 'gitbash' && gitBashPath.value) ? gitBashPath.value : null
+    currentShell.value = shellPath ? 'gitbash' : 'powershell'
+    store.setTerminalShell(props.paneId, currentShell.value)
+
+    sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null, shell: shellPath })
     store.setPtySession(props.paneId, sessionId)
 
     unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
@@ -317,35 +435,13 @@ onMounted(async () => {
 
   // Initial focus is handled by App.vue polling for the textarea.
 
-  // Listen for cwd changes (emitted by Rust when OSC 7 fires with a new path)
-  unlistenCwd = await listen(`cwd-changed-${sessionId}`, (event) => {
-    const data = event.payload as { cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }
-    sessionCwd.value = data.cwd
-    folderName.value = data.folder
-    gitInfo.value = data.git
-  }) as unknown as (() => void)
+  // Subscribe to cwd/Claude lifecycle events
+  await subscribeToSession(sessionId!)
 
-  // Subscribe to Rust-emitted Claude lifecycle events for this pane
-  unlistenStarted = await listen(`claude-started-${sessionId}`, (event) => {
-    claudeStatus.value = event.payload as typeof claudeStatus.value
-    claudeRunning.value = true
-    footerVisible.value = true
-    if (claudeStatus.value?.session_id) {
-      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
-    }
-  })
-  unlistenStatus = await listen(`claude-status-${sessionId}`, (event) => {
-    claudeStatus.value = event.payload as typeof claudeStatus.value
-    if (claudeStatus.value?.session_id) {
-      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
-    }
-  })
-  unlistenExited = await listen(`claude-exited-${sessionId}`, () => {
-    claudeRunning.value = false
-    claudeWorking.value = false
-    infoPanelOpen.value = false
-    store.clearClaudeSessionId(props.paneId)
-  })
+  // Start idle polling for shell switch button (Windows only)
+  if (isWindows && gitBashPath.value) {
+    startIdlePolling()
+  }
 
   // Focus this terminal if it's the focused pane — must happen after full setup
   if (isFocused.value) {
@@ -356,10 +452,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
-  unlistenStarted?.()
-  unlistenStatus?.()
-  unlistenExited?.()
-  unlistenCwd?.()
+  unsubscribeAll()
+  if (idleTimer) clearInterval(idleTimer)
   if (fitTimer) clearTimeout(fitTimer)
   unlisten?.()
   resizeObserver?.disconnect()
@@ -411,6 +505,15 @@ onBeforeUnmount(() => {
         <button class="toolbar-btn claude-btn" title="claude --continue" @click="continueClaude" @mousedown.stop>
           <ClaudeIcon :size="14" />
           <MdiIcon :path="mdiChevronDoubleRight" :size="14" class="continue-icon" />
+        </button>
+        <button
+          v-if="gitBashPath && shellIdle"
+          class="toolbar-btn shell-btn"
+          :title="currentShell === 'powershell' ? 'Switch to Git Bash' : 'Switch to PowerShell'"
+          @click="switchShell"
+          @mousedown.stop
+        >
+          <MdiIcon :path="currentShell === 'powershell' ? mdiBash : mdiPowershell" :size="14" />
         </button>
       </template>
 
@@ -587,6 +690,10 @@ onBeforeUnmount(() => {
 
 .claude-btn:hover .continue-icon {
   color: #D97757;
+}
+
+.shell-btn:hover {
+  color: var(--color-accent);
 }
 
 .toolbar-btn {

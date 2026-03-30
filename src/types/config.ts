@@ -45,4 +45,5 @@ export interface SavedTerminal {
   cwd?: string
   claudeSessionId?: string
   claudeWasRunning?: boolean
+  shell?: 'powershell' | 'gitbash'
 }

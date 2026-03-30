@@ -26,7 +26,7 @@ struct Sessions(Arc<Mutex<HashMap<String, PtySession>>>);
 struct ClaudeMonitor(Arc<Mutex<HashMap<String, (u32, PathBuf)>>>);
 
 #[tauri::command]
-fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<ClaudeMonitor>, cols: Option<u16>, rows: Option<u16>, cwd: Option<String>) -> Result<String, String> {
+fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<ClaudeMonitor>, cols: Option<u16>, rows: Option<u16>, cwd: Option<String>, shell: Option<String>) -> Result<String, String> {
     let session_id = Uuid::new_v4().to_string();
     let sid = session_id.clone();
 
@@ -40,7 +40,7 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
         })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = build_shell_command();
+    let mut cmd = build_shell_command(shell.as_deref());
     cmd.env("TERM", "xterm-256color");
     if let Some(ref dir) = cwd {
         let p = std::path::Path::new(dir);
@@ -1239,32 +1239,120 @@ fn get_locale() -> String {
 
 // ── Shell ───────────────────────────────────────────────────────────────────
 
-fn build_shell_command() -> CommandBuilder {
+#[tauri::command]
+fn check_git_bash() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let mut cmd = CommandBuilder::new("powershell.exe");
-        // -NoExit keeps the shell interactive after running the setup command.
-        // The prompt override emits OSC 7 with the cwd on every prompt render.
-        cmd.args([
-            "-NoExit",
-            "-Command",
-            concat!(
-                "$__arbiter_orig_prompt = $function:prompt; ",
-                "function prompt { ",
-                    "$loc = (Get-Location).Path; ",
-                    "$uri = 'file:///' + ($loc -replace '\\\\','/'); ",
-                    "$e = [char]27; $bel = [char]7; ",
-                    "[Console]::Write(\"${e}]7;${uri}${bel}\"); ",
-                    "& $__arbiter_orig_prompt ",
-                "}"
-            ),
-        ]);
-        cmd
+        let candidates = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        // Fallback: check PATH via `where bash.exe`, filtering out WSL/System32
+        if let Ok(output) = std::process::Command::new("where").arg("bash.exe").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let lower = line.to_lowercase();
+                    if lower.contains("git") && !lower.contains("system32") {
+                        return Some(line.trim().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    { None }
+}
+
+#[tauri::command]
+fn check_shell_idle(session_id: String, sessions: State<Sessions>) -> bool {
+    let map = sessions.0.lock().unwrap();
+    if let Some(session) = map.get(&session_id) {
+        if let Some(shell_pid) = session.shell_pid {
+            let mut sys = System::new();
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::new(),
+            );
+
+            // Collect all PIDs that are part of the "shell itself":
+            // the initial shell PID plus any direct child that is also a shell
+            // (e.g. bash --login spawns a child bash).
+            let shell_names: &[&str] = &["powershell.exe", "pwsh.exe", "bash.exe", "sh.exe", "zsh", "fish"];
+            let mut shell_pids = std::collections::HashSet::new();
+            shell_pids.insert(shell_pid);
+
+            // Find child shells (direct children of shell_pid that are shell processes)
+            for (_pid, proc) in sys.processes() {
+                if let Some(parent) = proc.parent() {
+                    if parent.as_u32() == shell_pid {
+                        let name = proc.name().to_string_lossy().to_lowercase();
+                        if shell_names.iter().any(|s| name == *s) {
+                            shell_pids.insert(proc.pid().as_u32());
+                        }
+                    }
+                }
+            }
+
+            // Check if any non-shell child processes exist under any shell PID
+            for (_pid, proc) in sys.processes() {
+                if let Some(parent) = proc.parent() {
+                    if shell_pids.contains(&parent.as_u32()) && !shell_pids.contains(&proc.pid().as_u32()) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(bash_path) = shell {
+            // Git Bash on Windows — use PROMPT_COMMAND with pwd -W for Windows paths
+            let mut cmd = CommandBuilder::new(bash_path);
+            cmd.args(["--login", "-i"]);
+            cmd.env(
+                "PROMPT_COMMAND",
+                r#"printf '\e]7;file:///%s\a' "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
+            );
+            cmd
+        } else {
+            let mut cmd = CommandBuilder::new("powershell.exe");
+            // -NoExit keeps the shell interactive after running the setup command.
+            // The prompt override emits OSC 7 with the cwd on every prompt render.
+            cmd.args([
+                "-NoExit",
+                "-Command",
+                concat!(
+                    "$__arbiter_orig_prompt = $function:prompt; ",
+                    "function prompt { ",
+                        "$loc = (Get-Location).Path; ",
+                        "$uri = 'file:///' + ($loc -replace '\\\\','/'); ",
+                        "$e = [char]27; $bel = [char]7; ",
+                        "[Console]::Write(\"${e}]7;${uri}${bel}\"); ",
+                        "& $__arbiter_orig_prompt ",
+                    "}"
+                ),
+            ]);
+            cmd
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
+        let _ = shell; // unused on non-Windows
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let mut cmd = CommandBuilder::new(&sh);
         cmd.arg("-l");
         // Set PROMPT_COMMAND for bash; zsh users typically have precmd via their rc files.
         cmd.env(
@@ -1341,6 +1429,8 @@ pub fn run() {
             exit_app,
             get_locale,
             focus_webview,
+            check_git_bash,
+            check_shell_idle,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -70,6 +70,13 @@ function collectLeafIds(node: PaneNode): string[] {
 }
 
 async function bootstrapBackgroundSessions() {
+  // Detect Git Bash once for all background sessions
+  const isWindows = navigator.platform.startsWith('Win')
+  let gitBashPath: string | null = null
+  if (isWindows) {
+    gitBashPath = await invoke<string | null>('check_git_bash')
+  }
+
   for (let i = 0; i < store.workspaces.length; i++) {
     if (i === store.activeWorkspaceIndex) continue // active tab mounts normally
     const ws = store.workspaces[i]
@@ -80,8 +87,14 @@ async function bootstrapBackgroundSessions() {
       const claudeId = store.consumeSavedClaudeSession(paneId)
       const claudeWasRunning = store.consumeSavedClaudeWasRunning(paneId)
 
+      // Use saved shell for this pane, fall back to default setting
+      const savedShell = store.consumeSavedShell(paneId)
+      const shellType = savedShell ?? (devStore.defaultShell === 'gitbash' ? 'gitbash' : 'powershell')
+      const shellPath = (shellType === 'gitbash' && gitBashPath) ? gitBashPath : null
+      store.setTerminalShell(paneId, shellPath ? 'gitbash' : 'powershell')
+
       try {
-        const sessionId = await invoke<string>('create_session', { cols: 80, rows: 24, cwd: cwd ?? null })
+        const sessionId = await invoke<string>('create_session', { cols: 80, rows: 24, cwd: cwd ?? null, shell: shellPath })
         store.setPtySession(paneId, sessionId)
 
         if (claudeId) {
@@ -159,6 +172,10 @@ async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveS
             if (claudeId) entry.claudeSessionId = claudeId
             if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
           }
+
+          // Always save shell type so it survives restart
+          const shell = store.getTerminalShell(t.id)
+          if (shell !== 'powershell') entry.shell = shell
 
           savedTerminals.push(entry)
         }

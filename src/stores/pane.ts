@@ -57,6 +57,17 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value[id] = name
   }
 
+  // Terminal shell types (for persistence across restarts)
+  const terminalShells = ref<Record<string, 'powershell' | 'gitbash'>>({})
+
+  function setTerminalShell(id: string, shell: 'powershell' | 'gitbash') {
+    terminalShells.value[id] = shell
+  }
+
+  function getTerminalShell(id: string): 'powershell' | 'gitbash' {
+    return terminalShells.value[id] ?? 'powershell'
+  }
+
   function nextWorkspaceName(): string {
     const n = nextAvailableNumber('Workspace', workspaces.value.map(ws => ws.name))
     return `Workspace ${n}`
@@ -212,6 +223,7 @@ export const usePaneStore = defineStore('pane', () => {
   const savedCwds = ref<Record<string, string>>({})
   const savedClaudeSessions = ref<Record<string, string>>({})
   const savedClaudeWasRunning = ref<Record<string, boolean>>({})
+  const savedShells = ref<Record<string, 'powershell' | 'gitbash'>>({})
 
   function getSavedCwd(paneId: string): string | undefined {
     return savedCwds.value[paneId]
@@ -232,6 +244,11 @@ export const usePaneStore = defineStore('pane', () => {
   function consumeSavedClaudeWasRunning(paneId: string): boolean {
     const v = savedClaudeWasRunning.value[paneId] ?? false
     delete savedClaudeWasRunning.value[paneId]
+    return v
+  }
+  function consumeSavedShell(paneId: string): 'powershell' | 'gitbash' | undefined {
+    const v = savedShells.value[paneId]
+    delete savedShells.value[paneId]
     return v
   }
 
@@ -359,6 +376,7 @@ export const usePaneStore = defineStore('pane', () => {
           if (t.cwd) savedCwds.value[id] = t.cwd
           if (t.claudeSessionId) savedClaudeSessions.value[id] = t.claudeSessionId
           if (t.claudeWasRunning) savedClaudeWasRunning.value[id] = true
+          if (t.shell) savedShells.value[id] = t.shell
         } else {
           assignTerminalName(id)
         }
@@ -399,6 +417,7 @@ export const usePaneStore = defineStore('pane', () => {
     savedCwds.value = {}
     savedClaudeSessions.value = {}
     savedClaudeWasRunning.value = {}
+    savedShells.value = {}
 
     const ws = buildWorkspace(saved, terminals, focusedTerminalIndex, 'Workspace 1')
     workspaces.value = [ws]
@@ -412,6 +431,7 @@ export const usePaneStore = defineStore('pane', () => {
     savedCwds.value = {}
     savedClaudeSessions.value = {}
     savedClaudeWasRunning.value = {}
+    savedShells.value = {}
 
     const restored = savedWorkspaces.map(sw =>
       buildWorkspace(sw.layout, sw.terminals, sw.focusedTerminalIndex, sw.name)
@@ -445,11 +465,12 @@ export const usePaneStore = defineStore('pane', () => {
     setPtySession, getPtySession, hasPaneId, removePtySession,
     // Terminal names
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
+    terminalShells, getTerminalShell, setTerminalShell,
     // Claude session tracking
     claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId, isClaudeRunning,
     // Saved state for restoration
     savedCwds, savedClaudeSessions,
-    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession, consumeSavedClaudeWasRunning,
+    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession, consumeSavedClaudeWasRunning, consumeSavedShell,
     // Focus trigger
     focusTrigger, triggerFocus,
     // Serialization

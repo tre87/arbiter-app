@@ -5,6 +5,7 @@ export const useDevSettingsStore = defineStore('devSettings', () => {
   const forcePeakHours = ref(false)
   const alwaysShowFooter = ref(false)
   const hideUsageBar = ref(false)
+  const defaultShell = ref<'powershell' | 'gitbash'>('powershell')
 
-  return { forcePeakHours, alwaysShowFooter, hideUsageBar }
+  return { forcePeakHours, alwaysShowFooter, hideUsageBar, defaultShell }
 })
