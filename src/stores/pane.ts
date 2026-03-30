@@ -394,9 +394,22 @@ export const usePaneStore = defineStore('pane', () => {
     savedClaudeWasRunning.value = {}
 
     const ws = buildWorkspace(saved, terminals, focusedTerminalIndex, 'Workspace 1')
-    nextWorkspaceNumber = 2
     workspaces.value = [ws]
     activeWorkspaceIndex.value = 0
+    syncWorkspaceNumber()
+  }
+
+  function syncWorkspaceNumber() {
+    // Scan all workspace names for "Workspace N" and continue from the highest
+    let max = 0
+    for (const ws of workspaces.value) {
+      const match = ws.name.match(/^Workspace (\d+)$/)
+      if (match) {
+        const n = parseInt(match[1], 10)
+        if (n > max) max = n
+      }
+    }
+    nextWorkspaceNumber = max + 1
   }
 
   function restoreAllWorkspaces(savedWorkspaces: SavedWorkspace[], savedActiveIndex?: number) {
@@ -414,7 +427,6 @@ export const usePaneStore = defineStore('pane', () => {
     )
 
     if (restored.length === 0) {
-      // Fallback: create a fresh workspace
       const leaf: TerminalLeaf = { type: 'terminal', id: genId() }
       assignTerminalName(leaf.id)
       restored.push({
@@ -427,6 +439,7 @@ export const usePaneStore = defineStore('pane', () => {
 
     workspaces.value = restored
     activeWorkspaceIndex.value = (savedActiveIndex != null && savedActiveIndex < restored.length) ? savedActiveIndex : 0
+    syncWorkspaceNumber()
   }
 
   return {

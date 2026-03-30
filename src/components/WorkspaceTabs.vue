@@ -94,40 +94,56 @@ function onWheel(e: WheelEvent) {
   }
 }
 
-// ── Drag reorder ────────────────────────────────────────────────────────────
+// ── Drag reorder (pointer-based, works inside -webkit-app-region: drag) ─────
 const dragIndex = ref<number | null>(null)
 const dragOverIndex = ref<number | null>(null)
 
-function onDragStart(e: DragEvent, index: number) {
-  dragIndex.value = index
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move'
-    e.dataTransfer.setData('text/plain', String(index))
+let dragStartX = 0
+let dragStarted = false
+const DRAG_THRESHOLD = 5
+
+function onPointerDown(e: PointerEvent, index: number) {
+  if (e.button !== 0) return
+  dragStartX = e.clientX
+  dragStarted = false
+  const pointerId = e.pointerId
+
+  // Use document-level listeners so we track the pointer everywhere
+  const onPointerMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== pointerId) return
+    if (!dragStarted && Math.abs(ev.clientX - dragStartX) >= DRAG_THRESHOLD) {
+      dragStarted = true
+      dragIndex.value = index
+    }
+    if (!dragStarted || !tabsContainer.value) return
+    // Hit-test by comparing pointer X against each tab's bounding rect
+    const tabs = Array.from(tabsContainer.value.querySelectorAll('.tab')) as HTMLElement[]
+    let overIdx: number | null = null
+    for (let t = 0; t < tabs.length; t++) {
+      const rect = tabs[t].getBoundingClientRect()
+      if (ev.clientX >= rect.left && ev.clientX < rect.right &&
+          ev.clientY >= rect.top && ev.clientY < rect.bottom) {
+        overIdx = t
+        break
+      }
+    }
+    dragOverIndex.value = overIdx
   }
-}
 
-function onDragOver(e: DragEvent, index: number) {
-  e.preventDefault()
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
-  dragOverIndex.value = index
-}
-
-function onDragLeave() {
-  dragOverIndex.value = null
-}
-
-function onDrop(e: DragEvent, toIndex: number) {
-  e.preventDefault()
-  if (dragIndex.value != null && dragIndex.value !== toIndex) {
-    store.moveWorkspace(dragIndex.value, toIndex)
+  const onPointerUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== pointerId) return
+    document.removeEventListener('pointermove', onPointerMove)
+    document.removeEventListener('pointerup', onPointerUp)
+    if (dragStarted && dragIndex.value != null && dragOverIndex.value != null && dragIndex.value !== dragOverIndex.value) {
+      store.moveWorkspace(dragIndex.value, dragOverIndex.value)
+    }
+    dragIndex.value = null
+    dragOverIndex.value = null
+    dragStarted = false
   }
-  dragIndex.value = null
-  dragOverIndex.value = null
-}
 
-function onDragEnd() {
-  dragIndex.value = null
-  dragOverIndex.value = null
+  document.addEventListener('pointermove', onPointerMove)
+  document.addEventListener('pointerup', onPointerUp)
 }
 </script>
 
@@ -143,15 +159,10 @@ function onDragEnd() {
         dragging: dragIndex === i,
       }"
       :title="ws.name"
-      draggable="true"
       @click="onTabClick(i)"
       @mousedown="onTabMouseDown($event, i)"
+      @pointerdown="onPointerDown($event, i)"
       @contextmenu="onContextMenu($event, i)"
-      @dragstart="onDragStart($event, i)"
-      @dragover="onDragOver($event, i)"
-      @dragleave="onDragLeave"
-      @drop="onDrop($event, i)"
-      @dragend="onDragEnd"
     >
       <input
         v-if="editingIndex === i"
@@ -173,9 +184,10 @@ function onDragEnd() {
         <MdiIcon :path="mdiClose" :size="12" />
       </button>
     </div>
-    <button class="tab-add" title="New workspace (Ctrl+T)" @click="store.addWorkspace()">
+    <button class="tab-add" title="New workspace (Ctrl+Shift+T)" @click="store.addWorkspace()">
       +
     </button>
+    <div class="tab-drag-spacer" />
   </div>
 
   <!-- Context menu -->
@@ -207,8 +219,8 @@ function onDragEnd() {
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  -webkit-app-region: no-drag;
   scrollbar-width: none;
+  -webkit-app-region: no-drag;
 }
 
 .workspace-tabs::-webkit-scrollbar {
@@ -233,6 +245,8 @@ function onDragEnd() {
   transition: color 0.15s, background 0.15s;
   position: relative;
   overflow: hidden;
+  -webkit-app-region: no-drag;
+  touch-action: none;
 }
 
 .tab:hover {
@@ -316,6 +330,7 @@ function onDragEnd() {
   height: 100%;
   background: none;
   border: none;
+  -webkit-app-region: no-drag;
   color: var(--color-text-muted);
   font-size: 18px;
   cursor: pointer;
@@ -326,6 +341,13 @@ function onDragEnd() {
 .tab-add:hover {
   color: var(--color-text-primary);
   background: var(--color-bg-elevated);
+}
+
+.tab-drag-spacer {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  -webkit-app-region: drag;
 }
 
 /* Context menu */

@@ -16,6 +16,7 @@ import WindowControls from './components/WindowControls.vue'
 import logoUrl from './assets/logo.svg'
 import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from './utils/spatial'
 import type { ArbiterConfig, CloseOptions, SavedTerminal, SavedWorkspace } from './types/config'
+import type { PaneNode } from './types/pane'
 
 const store = usePaneStore()
 const showCloseDialog = ref(false)
@@ -50,8 +51,52 @@ async function loadAndRestore() {
     } else if (config.layout && config.terminals) {
       store.restoreFromSaved(config.layout, config.terminals, config.focusedTerminalIndex)
     }
+
+    // Eagerly create PTY sessions for background workspace terminals.
+    // The active workspace's terminals will be handled by TerminalPane onMounted.
+    // Background terminals need sessions created now so Claude can start running
+    // before the user switches to that tab.
+    bootstrapBackgroundSessions()
   } catch {
     // Config load failed — start fresh
+  }
+}
+
+function collectLeafIds(node: PaneNode): string[] {
+  if (node.type === 'terminal') return [node.id]
+  return [...collectLeafIds(node.first), ...collectLeafIds(node.second)]
+}
+
+async function bootstrapBackgroundSessions() {
+  for (let i = 0; i < store.workspaces.length; i++) {
+    if (i === store.activeWorkspaceIndex) continue // active tab mounts normally
+    const ws = store.workspaces[i]
+    const paneIds = collectLeafIds(ws.root)
+    for (const paneId of paneIds) {
+      if (store.getPtySession(paneId)) continue // already has a session
+      const cwd = store.consumeSavedCwd(paneId)
+      const claudeId = store.consumeSavedClaudeSession(paneId)
+      const claudeWasRunning = store.consumeSavedClaudeWasRunning(paneId)
+
+      try {
+        const sessionId = await invoke<string>('create_session', { cols: 80, rows: 24, cwd: cwd ?? null })
+        store.setPtySession(paneId, sessionId)
+
+        if (claudeId) {
+          // Register so it persists on save even if this tab is never visited
+          store.setClaudeSessionId(paneId, claudeId, 1)
+          setTimeout(() => {
+            invoke('write_to_session', { sessionId, data: `claude --resume ${claudeId}\r` })
+          }, 500)
+        } else if (claudeWasRunning) {
+          // Mark as running so isClaudeRunning returns true on save
+          store.setClaudeSessionId(paneId, '', 0)
+          setTimeout(() => {
+            invoke('write_to_session', { sessionId, data: 'claude\r' })
+          }, 500)
+        }
+      } catch { /* ignore failed session creation */ }
+    }
   }
 }
 
@@ -164,8 +209,8 @@ function handleKeyDown(e: KeyboardEvent) {
     return
   }
 
-  // Ctrl+T → new workspace tab
-  if (e.ctrlKey && !e.shiftKey && e.code === 'KeyT') {
+  // Ctrl+Shift+T → new workspace tab
+  if (e.ctrlKey && e.shiftKey && e.code === 'KeyT') {
     e.preventDefault()
     e.stopPropagation()
     store.addWorkspace()
@@ -227,11 +272,15 @@ function handleKeyDown(e: KeyboardEvent) {
     return
   }
 
-  // Ctrl+Shift+W → close focused pane
+  // Ctrl+Shift+W → close focused pane, or close workspace if last pane
   if (e.code === 'KeyW') {
     e.preventDefault()
     e.stopPropagation()
-    store.closeFocused()
+    if (store.root.type === 'terminal' && store.workspaces.length > 1) {
+      store.removeWorkspace(store.activeWorkspaceIndex)
+    } else {
+      store.closeFocused()
+    }
   }
 }
 
