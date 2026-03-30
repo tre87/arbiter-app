@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 import { useDevSettingsStore } from '../stores/devSettings'
+import { useUsageStore } from '../stores/usage'
 
 const emit = defineEmits<{ close: [] }>()
 const devStore = useDevSettingsStore()
+const usageStore = useUsageStore()
 
 async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   try {
@@ -45,11 +47,36 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
       </div>
 
       <div class="section">
+        <h4 class="section-title">Account</h4>
+        <div class="section-body">
+          <template v-if="usageStore.data">
+            <div class="account-info">
+              <span class="account-detail" v-if="usageStore.data.account_name">{{ usageStore.data.account_name }}</span>
+              <span class="account-detail muted" v-if="usageStore.data.account_email">{{ usageStore.data.account_email }}</span>
+              <span class="account-detail" v-if="!usageStore.data.account_name && !usageStore.data.account_email">Signed in ({{ usageStore.data.plan }})</span>
+            </div>
+            <button class="menu-item menu-item-danger" @click="usageStore.logout()">Sign out</button>
+          </template>
+          <template v-else-if="usageStore.needsLogin">
+            <span class="account-detail muted" style="padding: 7px 10px;">Not signed in</span>
+            <button class="menu-item" @click="usageStore.openLogin()">Sign in</button>
+          </template>
+          <template v-else>
+            <span class="account-detail muted" style="padding: 7px 10px;">Loading...</span>
+          </template>
+        </div>
+      </div>
+
+      <div class="section">
         <h4 class="section-title">Display</h4>
         <div class="section-body">
           <label class="toggle-row">
             <span class="toggle-label">Always show footer bar</span>
             <input type="checkbox" v-model="devStore.alwaysShowFooter" class="toggle-input" />
+          </label>
+          <label class="toggle-row">
+            <span class="toggle-label">Hide usage bar</span>
+            <input type="checkbox" v-model="devStore.hideUsageBar" class="toggle-input" />
           </label>
         </div>
       </div>
@@ -139,6 +166,23 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 .menu-item-danger:hover {
   background: rgba(239, 68, 68, 0.15);
   color: var(--color-danger);
+}
+
+.account-info {
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.account-detail {
+  font-size: 12px;
+  color: var(--color-text-primary);
+}
+
+.account-detail.muted {
+  color: var(--color-text-muted);
+  font-size: 11px;
 }
 
 .toggle-row {

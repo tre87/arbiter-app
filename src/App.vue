@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { usePaneStore } from './stores/pane'
+import { useDevSettingsStore } from './stores/devSettings'
 import SplitView from './components/SplitView.vue'
 import StatsBar from './components/StatsBar.vue'
 import CloseDialog from './components/CloseDialog.vue'
@@ -19,6 +20,7 @@ import type { ArbiterConfig, CloseOptions, SavedTerminal, SavedWorkspace } from 
 import type { PaneNode } from './types/pane'
 
 const store = usePaneStore()
+const devStore = useDevSettingsStore()
 const showCloseDialog = ref(false)
 const closeOptions = ref<CloseOptions>({ saveLayout: true, savePaths: true, saveSessions: true })
 
@@ -356,7 +358,7 @@ onBeforeUnmount(() => {
       </div>
       <WorkspaceTabs />
       <div class="titlebar-right">
-        <StatsBar />
+        <StatsBar v-if="!devStore.hideUsageBar" />
         <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
           <MdiIcon :path="mdiKeyboardOutline" :size="16" />
         </button>

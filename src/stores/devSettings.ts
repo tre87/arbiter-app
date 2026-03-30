@@ -4,6 +4,7 @@ import { ref } from 'vue'
 export const useDevSettingsStore = defineStore('devSettings', () => {
   const forcePeakHours = ref(false)
   const alwaysShowFooter = ref(false)
+  const hideUsageBar = ref(false)
 
-  return { forcePeakHours, alwaysShowFooter }
+  return { forcePeakHours, alwaysShowFooter, hideUsageBar }
 })

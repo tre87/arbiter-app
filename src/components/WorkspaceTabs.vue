@@ -231,8 +231,9 @@ function onPointerDown(e: PointerEvent, index: number) {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 0 6px;
-  height: 100%;
+  padding: 0 8px;
+  height: 24px;
+  margin: auto 0;
   min-width: 60px;
   max-width: 180px;
   flex-shrink: 1;
@@ -241,7 +242,7 @@ function onPointerDown(e: PointerEvent, index: number) {
   font-size: 12px;
   font-weight: 400;
   white-space: nowrap;
-  border-radius: 4px 4px 0 0;
+  border-radius: 4px;
   transition: color 0.15s, background 0.15s;
   position: relative;
   overflow: hidden;

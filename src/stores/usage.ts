@@ -14,6 +14,8 @@ export interface UsageData {
   seven_day_opus: UsagePeriod | null
   seven_day_sonnet: UsagePeriod | null
   plan: string
+  account_email: string | null
+  account_name: string | null
 }
 
 export const useUsageStore = defineStore('usage', () => {
@@ -52,6 +54,12 @@ export const useUsageStore = defineStore('usage', () => {
     await invoke('open_login_window')
   }
 
+  async function logout() {
+    await invoke('logout_usage')
+    data.value = null
+    needsLogin.value = true
+  }
+
   function startPolling() {
     fetch()
     // Poll every 2s while pending (WebView still loading), then settle to 2min
@@ -87,7 +95,7 @@ export const useUsageStore = defineStore('usage', () => {
 
   return {
     data, loading, pending, needsLogin, error,
-    fetch, openLogin, startPolling, stopPolling,
+    fetch, openLogin, logout, startPolling, stopPolling,
     formatReset, primaryReset,
   }
 })

@@ -6,15 +6,23 @@ import type { SavedPaneNode, SavedTerminal, SavedWorkspace } from '../types/conf
 let nextId = 1
 const genId = () => String(nextId++)
 
-let nextTerminalNumber = 1
-let nextWorkspaceNumber = 1
+function nextAvailableNumber(prefix: string, usedNames: Iterable<string>): number {
+  const used = new Set<number>()
+  for (const name of usedNames) {
+    const match = name.match(new RegExp(`^${prefix} (\\d+)$`))
+    if (match) used.add(parseInt(match[1], 10))
+  }
+  let n = 1
+  while (used.has(n)) n++
+  return n
+}
 
 export const usePaneStore = defineStore('pane', () => {
   // ── Multi-workspace state ─────────────────────────────────────────────────
   const initialLeaf: TerminalLeaf = { type: 'terminal', id: genId() }
   const workspaces = ref<Workspace[]>([{
     id: genId(),
-    name: `Workspace ${nextWorkspaceNumber++}`,
+    name: 'Workspace 1',
     root: initialLeaf,
     focusedId: initialLeaf.id,
   }])
@@ -37,7 +45,8 @@ export const usePaneStore = defineStore('pane', () => {
   const terminalNames = ref<Record<string, string>>({})
 
   function assignTerminalName(id: string) {
-    terminalNames.value[id] = `Terminal ${nextTerminalNumber++}`
+    const n = nextAvailableNumber('Terminal', Object.values(terminalNames.value))
+    terminalNames.value[id] = `Terminal ${n}`
   }
 
   function getTerminalName(id: string): string {
@@ -46,6 +55,11 @@ export const usePaneStore = defineStore('pane', () => {
 
   function setTerminalName(id: string, name: string) {
     terminalNames.value[id] = name
+  }
+
+  function nextWorkspaceName(): string {
+    const n = nextAvailableNumber('Workspace', workspaces.value.map(ws => ws.name))
+    return `Workspace ${n}`
   }
 
   // Assign name to the initial leaf
@@ -233,7 +247,7 @@ export const usePaneStore = defineStore('pane', () => {
     const leaf: TerminalLeaf = { type: 'terminal', id: genId() }
     const ws: Workspace = {
       id: genId(),
-      name: `Workspace ${nextWorkspaceNumber++}`,
+      name: nextWorkspaceName(),
       root: leaf,
       focusedId: leaf.id,
     }
@@ -342,11 +356,6 @@ export const usePaneStore = defineStore('pane', () => {
         terminalIdsByIndex[node.index] = id
         if (t) {
           terminalNames.value[id] = t.name
-          const match = t.name.match(/^Terminal (\d+)$/)
-          if (match) {
-            const n = parseInt(match[1], 10)
-            if (n >= nextTerminalNumber) nextTerminalNumber = n + 1
-          }
           if (t.cwd) savedCwds.value[id] = t.cwd
           if (t.claudeSessionId) savedClaudeSessions.value[id] = t.claudeSessionId
           if (t.claudeWasRunning) savedClaudeWasRunning.value[id] = true
@@ -376,7 +385,7 @@ export const usePaneStore = defineStore('pane', () => {
 
     return {
       id: genId(),
-      name: wsName ?? `Workspace ${nextWorkspaceNumber++}`,
+      name: wsName ?? nextWorkspaceName(),
       root: newRoot,
       focusedId: restoredFocusId ?? firstLeaf(newRoot),
     }
@@ -385,8 +394,6 @@ export const usePaneStore = defineStore('pane', () => {
   // Legacy single-workspace restore
   function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number) {
     nextId = 1
-    nextTerminalNumber = 1
-    nextWorkspaceNumber = 1
     terminalNames.value = {}
     ptySessionIds.value = {}
     savedCwds.value = {}
@@ -396,26 +403,10 @@ export const usePaneStore = defineStore('pane', () => {
     const ws = buildWorkspace(saved, terminals, focusedTerminalIndex, 'Workspace 1')
     workspaces.value = [ws]
     activeWorkspaceIndex.value = 0
-    syncWorkspaceNumber()
-  }
-
-  function syncWorkspaceNumber() {
-    // Scan all workspace names for "Workspace N" and continue from the highest
-    let max = 0
-    for (const ws of workspaces.value) {
-      const match = ws.name.match(/^Workspace (\d+)$/)
-      if (match) {
-        const n = parseInt(match[1], 10)
-        if (n > max) max = n
-      }
-    }
-    nextWorkspaceNumber = max + 1
   }
 
   function restoreAllWorkspaces(savedWorkspaces: SavedWorkspace[], savedActiveIndex?: number) {
     nextId = 1
-    nextTerminalNumber = 1
-    nextWorkspaceNumber = 1
     terminalNames.value = {}
     ptySessionIds.value = {}
     savedCwds.value = {}
@@ -431,7 +422,7 @@ export const usePaneStore = defineStore('pane', () => {
       assignTerminalName(leaf.id)
       restored.push({
         id: genId(),
-        name: `Workspace ${nextWorkspaceNumber++}`,
+        name: nextWorkspaceName(),
         root: leaf,
         focusedId: leaf.id,
       })
@@ -439,7 +430,6 @@ export const usePaneStore = defineStore('pane', () => {
 
     workspaces.value = restored
     activeWorkspaceIndex.value = (savedActiveIndex != null && savedActiveIndex < restored.length) ? savedActiveIndex : 0
-    syncWorkspaceNumber()
   }
 
   return {

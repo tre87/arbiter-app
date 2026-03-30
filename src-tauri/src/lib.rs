@@ -760,6 +760,15 @@ const USAGE_INIT_SCRIPT: &str = r#"
             const usageResp = await fetch('/api/organizations/' + orgId + '/usage');
             if (!usageResp.ok) return;
             const usage = await usageResp.json();
+            // Attach account info for display in settings
+            try {
+                const accResp = await fetch('/api/account');
+                if (accResp.ok) {
+                    const acc = await accResp.json();
+                    usage.__account_email = acc.email_address || acc.email || null;
+                    usage.__account_name = acc.full_name || acc.name || null;
+                }
+            } catch(_) {}
             window.__TAURI_INTERNALS__.invoke('report_usage', { data: JSON.stringify(usage) });
         } catch (_) {}
     }
@@ -816,6 +825,8 @@ struct UsageResponse {
     seven_day_opus: Option<UsagePeriod>,
     seven_day_sonnet: Option<UsagePeriod>,
     plan: String,
+    account_email: Option<String>,
+    account_name: Option<String>,
 }
 
 fn parse_usage_period(obj: &serde_json::Value) -> Option<UsagePeriod> {
@@ -846,8 +857,12 @@ async fn report_usage(data: String, cache: State<'_, Cache>, app: AppHandle) -> 
         "Free"
     }.to_string();
 
+    let account_email = json.get("__account_email").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let account_name = json.get("__account_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+
     cache.0.lock().unwrap().store(UsageResponse {
         five_hour, seven_day, seven_day_opus, seven_day_sonnet, plan,
+        account_email, account_name,
     });
 
     // Hide the login window once we have data
@@ -866,6 +881,36 @@ async fn report_usage(data: String, cache: State<'_, Cache>, app: AppHandle) -> 
 fn report_auth_error(cache: State<'_, Cache>, app: AppHandle) {
     cache.0.lock().unwrap().set_needs_login();
     app.emit("usage-updated", ()).ok();
+}
+
+// Logs out by clearing WebView2 cookies and resetting usage cache
+#[tauri::command]
+async fn logout_usage(cache: State<'_, Cache>, app: AppHandle) -> Result<(), String> {
+    // Clear the auth WebView cookies by navigating to a logout-triggering script
+    if let Some(w) = app.get_webview_window(AUTH_WINDOW_LABEL) {
+        w.eval(r#"
+            document.cookie.split(';').forEach(function(c) {
+                document.cookie = c.replace(/^ +/, '').replace(/=.*/, '=;expires=' + new Date().toUTCString() + ';path=/');
+            });
+            if (window.cookieStore) {
+                cookieStore.getAll().then(function(cookies) {
+                    cookies.forEach(function(c) { cookieStore.delete(c.name); });
+                });
+            }
+            fetch('/api/logout', { method: 'POST' }).catch(function(){});
+        "#).map_err(|e| e.to_string())?;
+        w.hide().ok();
+    }
+
+    // Reset cache to needs-login state
+    {
+        let mut guard = cache.0.lock().unwrap();
+        guard.data = None;
+        guard.set_needs_login();
+    }
+    app.emit("usage-updated", ()).ok();
+
+    Ok(())
 }
 
 // Returns cached usage; errors distinguish "still loading" from "must log in"
@@ -1285,6 +1330,7 @@ pub fn run() {
             report_usage,
             report_auth_error,
             open_login_window,
+            logout_usage,
             read_claude_session,
             get_active_claude_status,
             save_config,
