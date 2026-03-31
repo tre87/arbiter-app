@@ -148,8 +148,11 @@ watch(isFocused, (focused) => {
   if (focused) term?.focus()
 })
 
-watch(() => claudeRunning.value, () => {
+watch(() => claudeRunning.value, (running) => {
   if (isWindows && gitBashPath.value) startIdlePolling()
+  // Hide the cursor while Claude is running — Claude Code sends its own
+  // cursor visibility sequences but ConPTY can swallow them on Windows.
+  if (term) term.write(running ? '\x1b[?25l' : '\x1b[?25h')
 })
 
 function launchClaude() {
@@ -354,6 +357,7 @@ onMounted(async () => {
   const existingSession = store.getPtySession(props.paneId)
   if (existingSession) {
     sessionId = existingSession
+    currentShell.value = store.getTerminalShell(props.paneId)
 
     // Subscribe to live output BEFORE resize so we don't miss the shell redraw
     unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
@@ -469,7 +473,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="terminal-pane" :class="{ focused: isFocused }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
+  <div class="terminal-pane" :class="{ focused: isFocused, 'claude-active': claudeRunning }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
     <div class="pane-toolbar">
       <!-- Left: Process title from OSC 0 -->
       <span class="toolbar-process" v-if="terminalTitle">{{ terminalTitle }}</span>
