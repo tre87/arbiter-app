@@ -84,7 +84,7 @@ impl PsuedoCon {
                 size,
                 input.as_raw_handle() as _,
                 output.as_raw_handle() as _,
-                PSEUDOCONSOLE_RESIZE_QUIRK,
+                PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_PASSTHROUGH_MODE,
                 &mut con,
             )
         };
