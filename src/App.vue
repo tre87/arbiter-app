@@ -21,6 +21,7 @@ import type { PaneNode } from './types/pane'
 
 const store = usePaneStore()
 const devStore = useDevSettingsStore()
+const ready = ref(false)
 const showCloseDialog = ref(false)
 const closeOptions = ref<CloseOptions>({ saveLayout: true, savePaths: true, saveSessions: true })
 
@@ -346,6 +347,7 @@ async function setupDragDrop() {
 onMounted(async () => {
   window.addEventListener('keydown', handleKeyDown, { capture: true })
   await loadAndRestore()
+  ready.value = true
   await setupCloseHandler()
   await setupDragDrop()
 
@@ -373,7 +375,7 @@ onBeforeUnmount(() => {
         <img :src="logoUrl" class="titlebar-logo" alt="Arbiter" />
         <span class="titlebar-title">Arbiter</span>
       </div>
-      <WorkspaceTabs />
+      <WorkspaceTabs v-if="ready" />
       <div class="titlebar-right">
         <StatsBar v-if="!devStore.hideUsageBar" />
         <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
@@ -385,7 +387,7 @@ onBeforeUnmount(() => {
       </div>
       <WindowControls />
     </div>
-    <div class="workspace">
+    <div v-if="ready" class="workspace">
       <SplitView :node="store.root" />
     </div>
 
