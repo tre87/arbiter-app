@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { emit } from '@tauri-apps/api/event'
 import type { PaneNode, TerminalLeaf, Workspace } from '../types/pane'
 import type { SavedPaneNode, SavedTerminal, SavedWorkspace } from '../types/config'
 
@@ -148,6 +149,7 @@ export const usePaneStore = defineStore('pane', () => {
     }
 
     root.value = remove(root.value)
+    delete terminalStatuses.value[target]
 
     // Focus the leaf in the sibling closest to where the closed pane was
     function firstLeaf(node: PaneNode): string {
@@ -193,6 +195,46 @@ export const usePaneStore = defineStore('pane', () => {
       return node
     }
     root.value = update(root.value)
+  }
+
+  // ── Terminal status tracking (for workspace overview) ─────────────────────
+  const terminalStatuses = ref<Record<string, 'idle' | 'running' | 'working'>>({})
+
+  function setTerminalStatus(paneId: string, status: 'idle' | 'running' | 'working') {
+    terminalStatuses.value[paneId] = status
+    emitOverviewUpdate()
+  }
+
+  function emitOverviewUpdate() {
+    const terminals = getAllTerminals().map(t => ({
+      paneId: t.paneId,
+      workspaceIndex: t.workspaceIndex,
+      workspaceName: t.workspaceName,
+      name: getTerminalName(t.paneId),
+      status: getTerminalStatus(t.paneId),
+    }))
+    emit('overview-update', terminals)
+  }
+
+  function getTerminalStatus(paneId: string): 'idle' | 'running' | 'working' {
+    return terminalStatuses.value[paneId] ?? (isClaudeRunning(paneId) ? 'working' : 'idle')
+  }
+
+  function getAllTerminals(): Array<{ paneId: string; workspaceIndex: number; workspaceName: string }> {
+    const result: Array<{ paneId: string; workspaceIndex: number; workspaceName: string }> = []
+    for (let i = 0; i < workspaces.value.length; i++) {
+      const ws = workspaces.value[i]
+      function collect(node: PaneNode) {
+        if (node.type === 'terminal') {
+          result.push({ paneId: node.id, workspaceIndex: i, workspaceName: ws.name })
+        } else {
+          collect(node.first)
+          collect(node.second)
+        }
+      }
+      collect(ws.root)
+    }
+    return result
   }
 
   // ── Active Claude session IDs (set by TerminalPane when Claude starts) ───
@@ -283,6 +325,7 @@ export const usePaneStore = defineStore('pane', () => {
       return [...collectPaneIds(node.first), ...collectPaneIds(node.second)]
     }
     const paneIds = collectPaneIds(ws.root)
+    for (const id of paneIds) delete terminalStatuses.value[id]
 
     workspaces.value.splice(index, 1)
 
@@ -468,6 +511,8 @@ export const usePaneStore = defineStore('pane', () => {
     terminalShells, getTerminalShell, setTerminalShell,
     // Claude session tracking
     claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId, isClaudeRunning,
+    // Terminal status
+    terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,
     // Saved state for restoration
     savedCwds, savedClaudeSessions,
     getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession, consumeSavedClaudeWasRunning, consumeSavedShell,

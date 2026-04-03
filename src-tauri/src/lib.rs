@@ -741,6 +741,22 @@ fn start_claude_watcher(
 // ── Usage cache ────────────────────────────────────────────────────────────
 
 const AUTH_WINDOW_LABEL: &str = "auth";
+const OVERVIEW_WINDOW_LABEL: &str = "overview";
+
+#[tauri::command]
+fn open_overview_window(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
+        if w.is_visible().unwrap_or(false) {
+            w.hide().map_err(|e| e.to_string())?;
+        } else {
+            w.show().map_err(|e| e.to_string())?;
+            w.set_focus().map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
 
 // Injected into the auth WebView. Uses the browser's own session cookies.
 const USAGE_INIT_SCRIPT: &str = r#"
@@ -1375,6 +1391,7 @@ pub fn run() {
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED
                         | tauri_plugin_window_state::StateFlags::FULLSCREEN,
                 )
+                .with_denylist(&[AUTH_WINDOW_LABEL, OVERVIEW_WINDOW_LABEL])
                 .build(),
         )
         .manage({
@@ -1395,6 +1412,19 @@ pub fn run() {
                 .initialization_script(USAGE_INIT_SCRIPT)
                 .build()?;
 
+            // Create a hidden overview window at startup so WebView2
+            // initialises during the event-loop setup phase (avoids the
+            // deadlock that occurs when building a window from a command).
+            WebviewWindowBuilder::new(app, OVERVIEW_WINDOW_LABEL, tauri::WebviewUrl::default())
+                .title("Arbiter – Overview")
+                .inner_size(240.0, 320.0)
+                .min_inner_size(180.0, 120.0)
+                .always_on_top(true)
+                .decorations(false)
+                .resizable(true)
+                .visible(false)
+                .build()?;
+
             // Start the event-driven Claude session watcher
             let sessions_arc = app.state::<Sessions>().0.clone();
             let monitor_arc  = app.state::<ClaudeMonitor>().0.clone();
@@ -1407,6 +1437,15 @@ pub fn run() {
             }
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Intercept close on the overview window — hide instead of destroy
+            if window.label() == OVERVIEW_WINDOW_LABEL {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    window.hide().unwrap_or_default();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -1431,6 +1470,7 @@ pub fn run() {
             focus_webview,
             check_git_bash,
             check_shell_idle,
+            open_overview_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

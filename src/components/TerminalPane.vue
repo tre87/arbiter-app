@@ -149,7 +149,7 @@ watch(isFocused, (focused) => {
 })
 
 watch(() => claudeRunning.value, () => {
-  if (isWindows && gitBashPath.value) startIdlePolling()
+  startIdlePolling()
 })
 
 function launchClaude() {
@@ -178,6 +178,7 @@ async function subscribeToSession(sid: string) {
     claudeStatus.value = event.payload as typeof claudeStatus.value
     claudeRunning.value = true
     footerVisible.value = true
+    store.setTerminalStatus(props.paneId, 'working')
     if (claudeStatus.value?.session_id) {
       store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
     }
@@ -193,6 +194,8 @@ async function subscribeToSession(sid: string) {
     claudeWorking.value = false
     infoPanelOpen.value = false
     store.clearClaudeSessionId(props.paneId)
+    store.setTerminalStatus(props.paneId, 'idle')
+    startIdlePolling()
   })
 }
 
@@ -207,10 +210,12 @@ function unsubscribeAll() {
 // ── Shell switching ──────────────────────────────────────────────────────────
 function startIdlePolling() {
   if (idleTimer) { clearInterval(idleTimer); idleTimer = null }
-  if (!claudeRunning.value && gitBashPath.value && sessionId) {
+  if (!claudeRunning.value && sessionId) {
     const check = async () => {
       if (sessionId) {
-        shellIdle.value = await invoke<boolean>('check_shell_idle', { sessionId })
+        const idle = await invoke<boolean>('check_shell_idle', { sessionId })
+        shellIdle.value = idle
+        store.setTerminalStatus(props.paneId, idle ? 'idle' : 'running')
       }
     }
     check()
@@ -313,6 +318,7 @@ onMounted(async () => {
       const hasSpinner = /[\u2800-\u28FF]/.test(data)
       const isIdle = /✳/.test(data)
       claudeWorking.value = hasSpinner && !isIdle
+      store.setTerminalStatus(props.paneId, claudeWorking.value ? 'working' : 'idle')
     }
     return false
   })
@@ -439,10 +445,8 @@ onMounted(async () => {
   // Subscribe to cwd/Claude lifecycle events
   await subscribeToSession(sessionId!)
 
-  // Start idle polling for shell switch button (Windows only)
-  if (isWindows && gitBashPath.value) {
-    startIdlePolling()
-  }
+  // Start idle polling for status detection
+  startIdlePolling()
 
   // Focus this terminal if it's the focused pane — must happen after full setup
   if (isFocused.value) {

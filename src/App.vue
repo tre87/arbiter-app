@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { usePaneStore } from './stores/pane'
@@ -9,7 +10,7 @@ import SplitView from './components/SplitView.vue'
 import StatsBar from './components/StatsBar.vue'
 import CloseDialog from './components/CloseDialog.vue'
 import MdiIcon from './components/MdiIcon.vue'
-import { mdiCogOutline, mdiKeyboardOutline } from '@mdi/js'
+import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline } from '@mdi/js'
 import ShortcutsDialog from './components/ShortcutsDialog.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
@@ -276,6 +277,14 @@ function handleKeyDown(e: KeyboardEvent) {
     return
   }
 
+  // Ctrl+Shift+O → workspace overview
+  if (e.code === 'KeyO') {
+    e.preventDefault()
+    e.stopPropagation()
+    openOverviewWindow()
+    return
+  }
+
   // Ctrl+Shift+R → split right (vertical, side by side)
   if (e.code === 'KeyR') {
     e.preventDefault()
@@ -309,9 +318,15 @@ function handleKeyDown(e: KeyboardEvent) {
 const settingsOpen = ref(false)
 const shortcutsOpen = ref(false)
 
+function openOverviewWindow() {
+  invoke('open_overview_window')
+}
+
 // ── Drag and drop ────────────────────────────────────────────────────────────
 
 let unlistenDragDrop: (() => void) | null = null
+let unlistenOverviewRequest: (() => void) | null = null
+let unlistenOverviewNavigate: (() => void) | null = null
 
 async function setupDragDrop() {
   const webview = getCurrentWebview()
@@ -351,6 +366,17 @@ onMounted(async () => {
   await setupCloseHandler()
   await setupDragDrop()
 
+  // Listen for overview window requests
+  unlistenOverviewRequest = await listen('overview-request-update', () => {
+    store.emitOverviewUpdate()
+  }) as unknown as (() => void)
+  unlistenOverviewNavigate = await listen<{ workspaceIndex: number; paneId: string }>('overview-navigate', (event) => {
+    store.switchWorkspace(event.payload.workspaceIndex)
+    store.setFocus(event.payload.paneId)
+    store.triggerFocus()
+    getCurrentWindow().setFocus()
+  }) as unknown as (() => void)
+
   // WebView2 on Windows has a separate internal focus from the Win32 window.
   // MoveFocus(PROGRAMMATIC) via Rust pushes focus into the web content layer,
   // after which JS .focus() on the xterm textarea actually works.
@@ -365,6 +391,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeyDown, { capture: true })
   unlistenDragDrop?.()
+  unlistenOverviewRequest?.()
+  unlistenOverviewNavigate?.()
 })
 </script>
 
@@ -378,6 +406,9 @@ onBeforeUnmount(() => {
       <WorkspaceTabs v-if="ready" />
       <div class="titlebar-right">
         <StatsBar v-if="!devStore.hideUsageBar" />
+        <button class="settings-btn" title="Workspace overview (Ctrl+Shift+O)" @click="openOverviewWindow()">
+          <MdiIcon :path="mdiViewDashboardOutline" :size="16" />
+        </button>
         <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
           <MdiIcon :path="mdiKeyboardOutline" :size="16" />
         </button>
