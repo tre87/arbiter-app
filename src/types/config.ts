@@ -8,6 +8,7 @@ export interface SavedWorkspace {
 export interface ArbiterConfig {
   closeOptions: CloseOptions
   window?: WindowGeometry
+  overview?: WindowGeometry
   // Multi-workspace (new format)
   workspaces?: SavedWorkspace[]
   activeWorkspaceIndex?: number

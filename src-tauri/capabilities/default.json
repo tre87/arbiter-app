@@ -18,6 +18,8 @@
     "core:window:allow-set-position",
     "core:window:allow-outer-size",
     "core:window:allow-outer-position",
-    "core:window:allow-set-focus"
+    "core:window:allow-set-focus",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
   ]
 }

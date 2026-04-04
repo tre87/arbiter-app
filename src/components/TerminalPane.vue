@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
+import { readText as clipboardRead, writeText as clipboardWrite } from '@tauri-apps/plugin-clipboard-manager'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
@@ -95,6 +96,7 @@ function cancelEditName() {
 let unlistenStarted: (() => void) | null = null
 let unlistenStatus:  (() => void) | null = null
 let unlistenExited:  (() => void) | null = null
+let unlistenActivity: (() => void) | null = null
 
 // ── Toolbar actions ───────────────────────────────────────────────────────────
 
@@ -148,8 +150,10 @@ watch(isFocused, (focused) => {
   if (focused) term?.focus()
 })
 
+// shellIdle polling is only needed for the shell switch button on Windows.
+// Shell activity is now event-driven via shell-activity-{sid} from the backend.
 watch(() => claudeRunning.value, () => {
-  startIdlePolling()
+  if (isWindows && gitBashPath.value) startIdlePolling()
 })
 
 function launchClaude() {
@@ -178,7 +182,6 @@ async function subscribeToSession(sid: string) {
     claudeStatus.value = event.payload as typeof claudeStatus.value
     claudeRunning.value = true
     footerVisible.value = true
-    store.setTerminalStatus(props.paneId, 'working')
     if (claudeStatus.value?.session_id) {
       store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
     }
@@ -195,8 +198,13 @@ async function subscribeToSession(sid: string) {
     infoPanelOpen.value = false
     store.clearClaudeSessionId(props.paneId)
     store.setTerminalStatus(props.paneId, 'idle')
-    startIdlePolling()
   })
+  unlistenActivity = await listen(`shell-activity-${sid}`, (event) => {
+    const idle = event.payload as boolean
+    if (!claudeRunning.value) {
+      store.setTerminalStatus(props.paneId, idle ? 'idle' : 'running')
+    }
+  }) as unknown as (() => void)
 }
 
 function unsubscribeAll() {
@@ -205,17 +213,16 @@ function unsubscribeAll() {
   unlistenStarted?.(); unlistenStarted = null
   unlistenStatus?.(); unlistenStatus = null
   unlistenExited?.(); unlistenExited = null
+  unlistenActivity?.(); unlistenActivity = null
 }
 
 // ── Shell switching ──────────────────────────────────────────────────────────
 function startIdlePolling() {
   if (idleTimer) { clearInterval(idleTimer); idleTimer = null }
-  if (!claudeRunning.value && sessionId) {
+  if (!claudeRunning.value && gitBashPath.value && sessionId) {
     const check = async () => {
       if (sessionId) {
-        const idle = await invoke<boolean>('check_shell_idle', { sessionId })
-        shellIdle.value = idle
-        store.setTerminalStatus(props.paneId, idle ? 'idle' : 'running')
+        shellIdle.value = await invoke<boolean>('check_shell_idle', { sessionId })
       }
     }
     check()
@@ -285,7 +292,8 @@ onMounted(async () => {
     theme: {
       background: '#121212',
       foreground: '#e8eaed',
-      cursor: '#3399FF',
+      cursor: '#aeafad',
+      cursorAccent: '#000000',
       selectionBackground: 'rgba(51,153,255,0.25)',
       black: '#1e1e1e',
       brightBlack: '#555',
@@ -300,8 +308,10 @@ onMounted(async () => {
     fontFamily: "Consolas, 'Cascadia Code', Menlo, 'SF Mono', monospace",
     fontSize: 12,
     lineHeight: 1.0,
-    cursorBlink: true,
-    cursorStyle: 'bar',
+    cursorBlink: false,
+    cursorStyle: 'block',
+    cursorInactiveStyle: 'outline',
+    cursorWidth: 1,
     scrollback: 5000,
     allowTransparency: true,
   })
@@ -385,6 +395,16 @@ onMounted(async () => {
       claudeStatus.value = status
       claudeRunning.value = true
       footerVisible.value = true
+      // Derive working state from the restored title (OSC handler didn't run during unmount)
+      if (savedTitle) {
+        const hasSpinner = /[\u2800-\u28FF]/.test(savedTitle)
+        const isIdle = /✳/.test(savedTitle)
+        claudeWorking.value = hasSpinner && !isIdle
+        store.setTerminalStatus(props.paneId, claudeWorking.value ? 'working' : 'idle')
+      }
+    } else {
+      // Claude not running — clear any stale working status from before unmount
+      store.setTerminalStatus(props.paneId, 'idle')
     }
   } else {
     const savedCwd = store.consumeSavedCwd(props.paneId)
@@ -433,6 +453,33 @@ onMounted(async () => {
     }
   }
 
+  // Clipboard and special key handling
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true
+    // Ctrl+Shift+C or Ctrl+C with selection → copy
+    if (e.ctrlKey && e.code === 'KeyC' && (e.shiftKey || term.hasSelection())) {
+      if (term.hasSelection()) {
+        clipboardWrite(term.getSelection())
+        term.clearSelection()
+      }
+      return false
+    }
+    // Ctrl+Shift+V or Ctrl+V → paste
+    if (e.ctrlKey && e.code === 'KeyV') {
+      e.preventDefault()
+      clipboardRead().then(text => {
+        if (text && sessionId) invoke('write_to_session', { sessionId, data: text })
+      })
+      return false
+    }
+    // Ctrl+Enter → send newline (for Claude multi-line input)
+    if (e.ctrlKey && e.code === 'Enter') {
+      if (sessionId) invoke('write_to_session', { sessionId, data: '\n' })
+      return false
+    }
+    return true
+  })
+
   term.onData((data) => {
     if (sessionId) invoke('write_to_session', { sessionId, data })
   })
@@ -445,8 +492,8 @@ onMounted(async () => {
   // Subscribe to cwd/Claude lifecycle events
   await subscribeToSession(sessionId!)
 
-  // Start idle polling for status detection
-  startIdlePolling()
+  // Idle polling only for Windows shell switch button
+  if (isWindows && gitBashPath.value) startIdlePolling()
 
   // Focus this terminal if it's the focused pane — must happen after full setup
   if (isFocused.value) {

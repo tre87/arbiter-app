@@ -217,7 +217,7 @@ export const usePaneStore = defineStore('pane', () => {
   }
 
   function getTerminalStatus(paneId: string): 'idle' | 'running' | 'working' {
-    return terminalStatuses.value[paneId] ?? (isClaudeRunning(paneId) ? 'working' : 'idle')
+    return terminalStatuses.value[paneId] ?? 'idle'
   }
 
   function getAllTerminals(): Array<{ paneId: string; workspaceIndex: number; workspaceName: string }> {

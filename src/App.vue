@@ -25,6 +25,7 @@ const devStore = useDevSettingsStore()
 const ready = ref(false)
 const showCloseDialog = ref(false)
 const closeOptions = ref<CloseOptions>({ saveLayout: true, savePaths: true, saveSessions: true })
+const overviewOpen = ref(false)
 
 // ── Startup: load config and restore layout ──────────────────────────────────
 
@@ -42,8 +43,8 @@ async function loadAndRestore() {
     if (config.window) {
       const win = getCurrentWindow()
       try {
-        await win.setSize(new (await import('@tauri-apps/api/dpi')).LogicalSize(config.window.width, config.window.height))
-        await win.setPosition(new (await import('@tauri-apps/api/dpi')).LogicalPosition(config.window.x, config.window.y))
+        await win.setSize(new (await import('@tauri-apps/api/dpi')).PhysicalSize(config.window.width, config.window.height))
+        await win.setPosition(new (await import('@tauri-apps/api/dpi')).PhysicalPosition(config.window.x, config.window.y))
         // OS window resize is async; give it time to propagate to the DOM
         await new Promise(r => setTimeout(r, 150))
       } catch { /* ignore if position is off-screen */ }
@@ -54,6 +55,15 @@ async function loadAndRestore() {
       store.restoreAllWorkspaces(config.workspaces, config.activeWorkspaceIndex)
     } else if (config.layout && config.terminals) {
       store.restoreFromSaved(config.layout, config.terminals, config.focusedTerminalIndex)
+    }
+
+    // Restore overview window if it was open
+    if (config.overview) {
+      overviewOpen.value = true
+      invoke('restore_overview_window', {
+        x: config.overview.x, y: config.overview.y,
+        width: config.overview.width, height: config.overview.height,
+      })
     }
 
     // Eagerly create PTY sessions for background workspace terminals.
@@ -122,8 +132,15 @@ async function bootstrapBackgroundSessions() {
 async function setupCloseHandler() {
   const win = getCurrentWindow()
   await win.onCloseRequested(async (event) => {
-    // Single workspace with single terminal — nothing worth saving, just exit
+    // Single workspace with single terminal — nothing worth saving except overview
     if (store.workspaces.length === 1 && store.root.type === 'terminal') {
+      try {
+        const overviewState = await invoke<{ x: number; y: number; width: number; height: number } | null>('get_overview_state')
+        if (overviewState) {
+          const config: ArbiterConfig = { closeOptions: closeOptions.value, overview: overviewState }
+          await invoke('save_config', { config })
+        }
+      } catch { /* ignore */ }
       return
     }
     event.preventDefault()
@@ -140,12 +157,20 @@ async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveS
       closeOptions: { saveLayout, savePaths, saveSessions },
     }
 
+    // Save overview window state (always, regardless of saveLayout)
+    try {
+      const overviewState = await invoke<{ x: number; y: number; width: number; height: number } | null>('get_overview_state')
+      if (overviewState) {
+        config.overview = overviewState
+      }
+    } catch { /* ignore */ }
+
     if (saveLayout) {
       // Save window geometry
       const win = getCurrentWindow()
       try {
-        const size = await win.outerSize()
-        const pos = await win.outerPosition()
+        const size = await win.innerSize()
+        const pos = await win.innerPosition()
         config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y }
       } catch { /* ignore */ }
 
@@ -281,7 +306,7 @@ function handleKeyDown(e: KeyboardEvent) {
   if (e.code === 'KeyO') {
     e.preventDefault()
     e.stopPropagation()
-    openOverviewWindow()
+    toggleOverviewWindow()
     return
   }
 
@@ -318,8 +343,15 @@ function handleKeyDown(e: KeyboardEvent) {
 const settingsOpen = ref(false)
 const shortcutsOpen = ref(false)
 
-function openOverviewWindow() {
-  invoke('open_overview_window')
+function toggleOverviewWindow() {
+  overviewOpen.value = !overviewOpen.value
+  invoke(overviewOpen.value ? 'show_overview_window' : 'hide_overview_window')
+}
+
+function resetOverviewWindow(e: MouseEvent) {
+  e.preventDefault()
+  invoke('reset_overview_window', { toDefault: e.shiftKey })
+  overviewOpen.value = true
 }
 
 // ── Drag and drop ────────────────────────────────────────────────────────────
@@ -327,6 +359,7 @@ function openOverviewWindow() {
 let unlistenDragDrop: (() => void) | null = null
 let unlistenOverviewRequest: (() => void) | null = null
 let unlistenOverviewNavigate: (() => void) | null = null
+let unlistenOverviewClosed: (() => void) | null = null
 
 async function setupDragDrop() {
   const webview = getCurrentWebview()
@@ -361,12 +394,8 @@ async function setupDragDrop() {
 
 onMounted(async () => {
   window.addEventListener('keydown', handleKeyDown, { capture: true })
-  await loadAndRestore()
-  ready.value = true
-  await setupCloseHandler()
-  await setupDragDrop()
 
-  // Listen for overview window requests
+  // Set up overview listeners before loadAndRestore, which may show the overview window
   unlistenOverviewRequest = await listen('overview-request-update', () => {
     store.emitOverviewUpdate()
   }) as unknown as (() => void)
@@ -376,6 +405,23 @@ onMounted(async () => {
     store.triggerFocus()
     getCurrentWindow().setFocus()
   }) as unknown as (() => void)
+  unlistenOverviewClosed = await listen('overview-closed', () => {
+    overviewOpen.value = false
+    // No need to invoke hide — the overview window hid itself
+  }) as unknown as (() => void)
+
+  await loadAndRestore()
+  ready.value = true
+  await setupCloseHandler()
+  await setupDragDrop()
+
+  // Push terminal data to overview window after everything is initialized.
+  // The overview WebView loads asynchronously, so also push after a delay
+  // to cover the case where it mounts after this point.
+  if (overviewOpen.value) {
+    store.emitOverviewUpdate()
+    setTimeout(() => store.emitOverviewUpdate(), 1000)
+  }
 
   // WebView2 on Windows has a separate internal focus from the Win32 window.
   // MoveFocus(PROGRAMMATIC) via Rust pushes focus into the web content layer,
@@ -393,6 +439,7 @@ onBeforeUnmount(() => {
   unlistenDragDrop?.()
   unlistenOverviewRequest?.()
   unlistenOverviewNavigate?.()
+  unlistenOverviewClosed?.()
 })
 </script>
 
@@ -406,7 +453,7 @@ onBeforeUnmount(() => {
       <WorkspaceTabs v-if="ready" />
       <div class="titlebar-right">
         <StatsBar v-if="!devStore.hideUsageBar" />
-        <button class="settings-btn" title="Workspace overview (Ctrl+Shift+O)" @click="openOverviewWindow()">
+        <button class="settings-btn" :class="{ active: overviewOpen }" title="Workspace overview (Ctrl+Shift+O)" @click="toggleOverviewWindow()" @contextmenu="resetOverviewWindow">
           <MdiIcon :path="mdiViewDashboardOutline" :size="16" />
         </button>
         <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
@@ -419,7 +466,7 @@ onBeforeUnmount(() => {
       <WindowControls />
     </div>
     <div v-if="ready" class="workspace">
-      <SplitView :node="store.root" />
+      <SplitView :node="store.root" :key="store.workspaces[store.activeWorkspaceIndex].id" />
     </div>
 
     <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
@@ -521,6 +568,11 @@ onBeforeUnmount(() => {
   color: var(--color-accent);
   border-color: var(--color-accent);
   background: var(--color-bg-elevated);
+}
+
+.settings-btn.active {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
 }
 
 .workspace {

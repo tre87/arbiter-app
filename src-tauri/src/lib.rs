@@ -418,7 +418,38 @@ fn spawn_exit_watcher(
     });
 }
 
+/// Check whether the shell has any non-shell child processes.
+/// Returns `true` if the shell is idle (no children besides other shells).
+fn is_shell_idle(sys: &System, shell_pid: u32) -> bool {
+    let shell_names: &[&str] = &["powershell.exe", "pwsh.exe", "bash.exe", "sh.exe", "zsh", "fish"];
+    let mut shell_pids = std::collections::HashSet::new();
+    shell_pids.insert(shell_pid);
+
+    // Find child shells (e.g. bash --login spawns a child bash)
+    for (_pid, proc) in sys.processes() {
+        if let Some(parent) = proc.parent() {
+            if parent.as_u32() == shell_pid {
+                let name = proc.name().to_string_lossy().to_lowercase();
+                if shell_names.iter().any(|s| name == *s) {
+                    shell_pids.insert(proc.pid().as_u32());
+                }
+            }
+        }
+    }
+
+    // Check if any non-shell child processes exist under any shell PID
+    for (_pid, proc) in sys.processes() {
+        if let Some(parent) = proc.parent() {
+            if shell_pids.contains(&parent.as_u32()) && !shell_pids.contains(&proc.pid().as_u32()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Permanent per-pane monitor: detect Claude → associate JSONL → watch exit → loop.
+/// Also continuously monitors shell child processes and emits activity events.
 /// Runs for the lifetime of the PTY session. Complements the file-system watcher
 /// as a reliable fallback (the watcher can miss events on Windows).
 fn spawn_pane_monitor(
@@ -442,14 +473,19 @@ fn spawn_pane_monitor(
         .unwrap_or_default();
 
     std::thread::spawn(move || {
+        let mut was_idle = true;
+
         loop {
             // ── Phase 1: wait for Claude to appear under our shell ───────────
+            // Also monitors shell activity (child processes) and emits events.
             let mut start_time: u64 = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 if !sessions.lock().unwrap().contains_key(&pane_id) { return; }
                 // If file watcher already tracked this pane, skip to exit-wait
                 if monitor.lock().unwrap().contains_key(&pane_id) { break; }
+
+                // Check for Claude first
                 if let Some((pid, st)) = find_claude_for_shell(shell_pid) {
                     start_time = st;
                     // Register immediately so the file watcher knows this pane is taken
@@ -464,6 +500,21 @@ fn spawn_pane_monitor(
                     app.emit(&format!("claude-started-{}", pane_id), &status).ok();
                     spawn_exit_watcher(app.clone(), monitor.clone(), pane_id.clone(), pid);
                     break;
+                }
+
+                // No Claude found — check shell activity for non-Claude processes
+                {
+                    let mut sys = System::new();
+                    sys.refresh_processes_specifics(
+                        sysinfo::ProcessesToUpdate::All,
+                        true,
+                        ProcessRefreshKind::new(),
+                    );
+                    let idle = is_shell_idle(&sys, shell_pid);
+                    if idle != was_idle {
+                        was_idle = idle;
+                        app.emit(&format!("shell-activity-{}", pane_id), idle).ok();
+                    }
                 }
             }
 
@@ -498,7 +549,9 @@ fn spawn_pane_monitor(
                 if !sessions.lock().unwrap().contains_key(&pane_id) { return; }
                 if !monitor.lock().unwrap().contains_key(&pane_id) { break; }
             }
-            // Loop back to Phase 1 to detect next Claude launch
+            // Claude exited — reset activity state and loop back to Phase 1
+            was_idle = true;
+            app.emit(&format!("shell-activity-{}", pane_id), true).ok();
         }
     });
 }
@@ -743,18 +796,125 @@ fn start_claude_watcher(
 const AUTH_WINDOW_LABEL: &str = "auth";
 const OVERVIEW_WINDOW_LABEL: &str = "overview";
 
-#[tauri::command]
-fn open_overview_window(app: AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
-        if w.is_visible().unwrap_or(false) {
-            w.hide().map_err(|e| e.to_string())?;
-        } else {
-            w.show().map_err(|e| e.to_string())?;
-            w.set_focus().map_err(|e| e.to_string())?;
+/// Check if a point is visible on any monitor
+fn is_position_on_screen(app: &AppHandle, x: i32, y: i32, w: u32, h: u32) -> bool {
+    if let Ok(monitors) = app.available_monitors() {
+        for mon in monitors {
+            let mp = mon.position();
+            let ms = mon.size();
+            // Window is on-screen if at least 50px of it overlaps a monitor
+            let overlap_x = (x + w as i32).min(mp.x + ms.width as i32) - x.max(mp.x);
+            let overlap_y = (y + h as i32).min(mp.y + ms.height as i32) - y.max(mp.y);
+            if overlap_x >= 50 && overlap_y >= 30 {
+                return true;
+            }
         }
-        return Ok(());
     }
+    false
+}
 
+const OVERVIEW_DEFAULT_WIDTH: f64 = 240.0;
+const OVERVIEW_DEFAULT_HEIGHT: f64 = 320.0;
+
+fn center_overview_on_main(app: &AppHandle, w: &tauri::WebviewWindow) {
+    if let Some(main) = app.get_webview_window("main") {
+        if let (Ok(mp), Ok(ms)) = (main.outer_position(), main.outer_size()) {
+            let x = mp.x + (ms.width as i32 - OVERVIEW_DEFAULT_WIDTH as i32) / 2;
+            let y = mp.y + (ms.height as i32 - OVERVIEW_DEFAULT_HEIGHT as i32) / 2;
+            w.set_position(tauri::PhysicalPosition::new(x, y)).ok();
+        }
+    }
+    w.set_size(tauri::PhysicalSize::new(OVERVIEW_DEFAULT_WIDTH as u32, OVERVIEW_DEFAULT_HEIGHT as u32)).ok();
+}
+
+#[tauri::command]
+fn show_overview_window(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
+        // Validate position is on-screen (may have moved off after sleep/monitor change)
+        if let (Ok(pos), Ok(size)) = (w.inner_position(), w.inner_size()) {
+            if !is_position_on_screen(&app, pos.x, pos.y, size.width, size.height) {
+                center_overview_on_main(&app, &w);
+            }
+        }
+        w.show().map_err(|e| e.to_string())?;
+        w.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_overview_window(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
+        w.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_overview_state(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
+        let visible = w.is_visible().unwrap_or(false);
+        if visible {
+            let pos = w.inner_position().map_err(|e| e.to_string())?;
+            let size = w.inner_size().map_err(|e| e.to_string())?;
+            return Ok(Some(serde_json::json!({
+                "x": pos.x,
+                "y": pos.y,
+                "width": size.width,
+                "height": size.height,
+            })));
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+fn restore_overview_window(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
+        if is_position_on_screen(&app, x, y, width, height) {
+            w.set_position(tauri::PhysicalPosition::new(x, y)).map_err(|e| e.to_string())?;
+            w.set_size(tauri::PhysicalSize::new(width, height)).map_err(|e| e.to_string())?;
+        } else {
+            center_overview_on_main(&app, &w);
+        }
+        w.show().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_overview_window(app: AppHandle, to_default: bool) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERVIEW_WINDOW_LABEL) {
+        if to_default {
+            center_overview_on_main(&app, &w);
+        } else {
+            // Restore to saved config position
+            let path = config_path(&app)?;
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(ov) = config.get("overview") {
+                            let x = ov.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                            let y = ov.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                            let width = ov.get("width").and_then(|v| v.as_u64()).unwrap_or(OVERVIEW_DEFAULT_WIDTH as u64) as u32;
+                            let height = ov.get("height").and_then(|v| v.as_u64()).unwrap_or(OVERVIEW_DEFAULT_HEIGHT as u64) as u32;
+                            if is_position_on_screen(&app, x, y, width, height) {
+                                w.set_position(tauri::PhysicalPosition::new(x, y)).ok();
+                                w.set_size(tauri::PhysicalSize::new(width, height)).ok();
+                                w.show().map_err(|e| e.to_string())?;
+                                w.set_focus().map_err(|e| e.to_string())?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback to default if no saved config or position is off-screen
+            center_overview_on_main(&app, &w);
+        }
+        w.show().map_err(|e| e.to_string())?;
+        w.set_focus().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1297,35 +1457,7 @@ fn check_shell_idle(session_id: String, sessions: State<Sessions>) -> bool {
                 true,
                 ProcessRefreshKind::new(),
             );
-
-            // Collect all PIDs that are part of the "shell itself":
-            // the initial shell PID plus any direct child that is also a shell
-            // (e.g. bash --login spawns a child bash).
-            let shell_names: &[&str] = &["powershell.exe", "pwsh.exe", "bash.exe", "sh.exe", "zsh", "fish"];
-            let mut shell_pids = std::collections::HashSet::new();
-            shell_pids.insert(shell_pid);
-
-            // Find child shells (direct children of shell_pid that are shell processes)
-            for (_pid, proc) in sys.processes() {
-                if let Some(parent) = proc.parent() {
-                    if parent.as_u32() == shell_pid {
-                        let name = proc.name().to_string_lossy().to_lowercase();
-                        if shell_names.iter().any(|s| name == *s) {
-                            shell_pids.insert(proc.pid().as_u32());
-                        }
-                    }
-                }
-            }
-
-            // Check if any non-shell child processes exist under any shell PID
-            for (_pid, proc) in sys.processes() {
-                if let Some(parent) = proc.parent() {
-                    if shell_pids.contains(&parent.as_u32()) && !shell_pids.contains(&proc.pid().as_u32()) {
-                        return false;
-                    }
-                }
-            }
-            return true;
+            return is_shell_idle(&sys, shell_pid);
         }
     }
     false
@@ -1383,6 +1515,7 @@ fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(
@@ -1470,7 +1603,11 @@ pub fn run() {
             focus_webview,
             check_git_bash,
             check_shell_idle,
-            open_overview_window,
+            show_overview_window,
+            hide_overview_window,
+            get_overview_state,
+            restore_overview_window,
+            reset_overview_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

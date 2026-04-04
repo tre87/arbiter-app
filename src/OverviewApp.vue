@@ -38,7 +38,8 @@ function handleClick(workspaceIndex: number, paneId: string) {
   emit('overview-navigate', { workspaceIndex, paneId })
 }
 
-function hideWindow() {
+async function hideWindow() {
+  await emit('overview-closed')
   getCurrentWindow().hide()
 }
 
