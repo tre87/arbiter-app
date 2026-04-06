@@ -420,21 +420,33 @@ fn spawn_exit_watcher(
 
 /// Check whether the shell has any non-shell child processes.
 /// Returns `true` if the shell is idle (no children besides other shells).
+/// Recursively walks the process tree to handle nested shells (e.g. git bash).
 fn is_shell_idle(sys: &System, shell_pid: u32) -> bool {
-    let shell_names: &[&str] = &["powershell.exe", "pwsh.exe", "bash.exe", "sh.exe", "zsh", "fish"];
+    let shell_names: &[&str] = &[
+        "powershell.exe", "pwsh.exe", "bash.exe", "sh.exe", "zsh", "fish",
+        "conhost.exe", "winpty-agent.exe", "cygwin-console-helper.exe",
+    ];
     let mut shell_pids = std::collections::HashSet::new();
     shell_pids.insert(shell_pid);
 
-    // Find child shells (e.g. bash --login spawns a child bash)
-    for (_pid, proc) in sys.processes() {
-        if let Some(parent) = proc.parent() {
-            if parent.as_u32() == shell_pid {
-                let name = proc.name().to_string_lossy().to_lowercase();
-                if shell_names.iter().any(|s| name == *s) {
-                    shell_pids.insert(proc.pid().as_u32());
+    // Recursively find all shell-like descendants
+    loop {
+        let mut added = false;
+        for (_pid, proc) in sys.processes() {
+            if shell_pids.contains(&proc.pid().as_u32()) {
+                continue;
+            }
+            if let Some(parent) = proc.parent() {
+                if shell_pids.contains(&parent.as_u32()) {
+                    let name = proc.name().to_string_lossy().to_lowercase();
+                    if shell_names.iter().any(|s| name == *s) {
+                        shell_pids.insert(proc.pid().as_u32());
+                        added = true;
+                    }
                 }
             }
         }
+        if !added { break; }
     }
 
     // Check if any non-shell child processes exist under any shell PID
