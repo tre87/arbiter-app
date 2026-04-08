@@ -20,6 +20,7 @@
     "core:window:allow-outer-position",
     "core:window:allow-set-focus",
     "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "dialog:allow-open"
   ]
 }

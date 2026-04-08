@@ -3,13 +3,16 @@ import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import PulseLoader from './components/PulseLoader.vue'
+import MdiIcon from './components/MdiIcon.vue'
+import { mdiConsole, mdiFolder } from '@mdi/js'
 
 interface TerminalInfo {
   paneId: string
   workspaceIndex: number
   workspaceName: string
+  workspaceType: 'terminal' | 'project'
   name: string
-  status: 'idle' | 'running' | 'working'
+  status: 'idle' | 'running' | 'ready' | 'working' | 'attention'
 }
 
 const terminals = ref<TerminalInfo[]>([])
@@ -20,13 +23,14 @@ const grouped = computed(() => {
   const groups: Array<{
     workspaceName: string
     workspaceIndex: number
+    workspaceType: 'terminal' | 'project'
     terminals: TerminalInfo[]
   }> = []
 
   let currentGroup: typeof groups[number] | null = null
   for (const t of terminals.value) {
     if (!currentGroup || currentGroup.workspaceIndex !== t.workspaceIndex) {
-      currentGroup = { workspaceName: t.workspaceName, workspaceIndex: t.workspaceIndex, terminals: [] }
+      currentGroup = { workspaceName: t.workspaceName, workspaceIndex: t.workspaceIndex, workspaceType: t.workspaceType, terminals: [] }
       groups.push(currentGroup)
     }
     currentGroup.terminals.push(t)
@@ -41,6 +45,10 @@ function handleClick(workspaceIndex: number, paneId: string) {
 async function hideWindow() {
   await emit('overview-closed')
   getCurrentWindow().hide()
+}
+
+function handleContextMenu(e: MouseEvent) {
+  e.preventDefault()
 }
 
 onMounted(async () => {
@@ -58,10 +66,12 @@ onMounted(async () => {
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') hideWindow()
   })
+  window.addEventListener('contextmenu', handleContextMenu)
 })
 
 onBeforeUnmount(() => {
   unlistenUpdate?.()
+  window.removeEventListener('contextmenu', handleContextMenu)
 })
 </script>
 
@@ -75,7 +85,10 @@ onBeforeUnmount(() => {
       <div v-if="error" class="overview-empty" style="color: #ef4444">{{ error }}</div>
       <div v-else-if="grouped.length === 0" class="overview-empty">No terminals</div>
       <div v-for="group in grouped" :key="group.workspaceIndex" class="overview-group">
-        <div class="overview-ws-header">{{ group.workspaceName }}</div>
+        <div class="overview-ws-header">
+          <MdiIcon :path="group.workspaceType === 'project' ? mdiFolder : mdiConsole" :size="12" />
+          {{ group.workspaceName }}
+        </div>
         <div
           v-for="t in group.terminals"
           :key="t.paneId"
@@ -86,6 +99,8 @@ onBeforeUnmount(() => {
           <span class="overview-status">
             <span v-if="t.status === 'idle'" class="status-dot idle" />
             <span v-else-if="t.status === 'running'" class="status-dot running" />
+            <span v-else-if="t.status === 'ready'" class="status-dot ready" />
+            <span v-else-if="t.status === 'attention'" class="status-dot attention" />
             <PulseLoader v-else size="3px" gap="3px" />
           </span>
         </div>
@@ -162,6 +177,9 @@ onBeforeUnmount(() => {
 }
 
 .overview-ws-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   padding: 4px 12px 2px;
   font-size: 10px;
   font-weight: 600;
@@ -212,6 +230,16 @@ onBeforeUnmount(() => {
 .status-dot.running {
   background: var(--color-success);
   animation: pulse-running 1.5s ease-in-out infinite;
+}
+
+.status-dot.ready {
+  background: var(--color-success);
+  opacity: 0.7;
+}
+
+.status-dot.attention {
+  background: #e5a03c;
+  animation: pulse-running 1.2s ease-in-out infinite;
 }
 
 @keyframes pulse-running {

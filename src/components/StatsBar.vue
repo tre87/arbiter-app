@@ -22,7 +22,24 @@ function checkPeakHours() {
   realPeakHours.value = day >= 1 && day <= 5 && hour >= 5 && hour < 11
 }
 
-let peakTimer: ReturnType<typeof setInterval> | null = null
+// Schedule a one-shot wakeup at the next PT hour boundary (minute 00).
+// At each fire, recompute peak state and schedule the next one. No periodic polling.
+let peakTimeout: ReturnType<typeof setTimeout> | null = null
+function scheduleNextPeakCheck() {
+  const now = new Date()
+  const ptNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
+  const next = new Date(ptNow)
+  next.setMinutes(0, 0, 0)
+  next.setHours(ptNow.getHours() + 1)
+  // Convert the PT wall-clock target back to a local-time delay
+  const ptOffsetMs = now.getTime() - ptNow.getTime()
+  const fireAt = next.getTime() + ptOffsetMs
+  const delay = Math.max(1000, fireAt - now.getTime())
+  peakTimeout = setTimeout(() => {
+    checkPeakHours()
+    scheduleNextPeakCheck()
+  }, delay)
+}
 
 const peakTooltip = computed(() => {
   // Convert 5am and 11am PT to the user's local timezone
@@ -69,7 +86,7 @@ onMounted(async () => {
     countdown.value = countdown.value > 0 ? countdown.value - 1 : 120
   }, 1000)
   checkPeakHours()
-  peakTimer = setInterval(checkPeakHours, 60_000)
+  scheduleNextPeakCheck()
   try {
     osLocale.value = await invoke<string>('get_locale')
   } catch { /* fallback to en-US */ }
@@ -78,7 +95,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   store.stopPolling()
   if (cdTimer) clearInterval(cdTimer)
-  if (peakTimer) clearInterval(peakTimer)
+  if (peakTimeout) { clearTimeout(peakTimeout); peakTimeout = null }
 })
 </script>
 

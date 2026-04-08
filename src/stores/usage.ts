@@ -25,7 +25,6 @@ export const useUsageStore = defineStore('usage', () => {
   const needsLogin = ref(false)
   const error = ref<string | null>(null)
 
-  let pollTimer: ReturnType<typeof setInterval> | null = null
   let unlisten: (() => void) | null = null
 
   async function fetch() {
@@ -60,22 +59,14 @@ export const useUsageStore = defineStore('usage', () => {
     needsLogin.value = true
   }
 
+  // Event-driven only. The backend's injected WebView script calls `report_usage`
+  // on load and every 120s, which emits `usage-updated` — the sole refresh trigger.
   function startPolling() {
     fetch()
-    // Poll every 2s while pending (WebView still loading), then settle to 2min
-    pollTimer = setInterval(() => {
-      if (pending.value) fetch()
-    }, 2_000)
-
-    listen<void>('usage-updated', () => {
-      fetch()
-      // Switch to slow polling once we have a real response
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = setInterval(fetch, 120_000) }
-    }).then(fn => { unlisten = fn })
+    listen<void>('usage-updated', () => { fetch() }).then(fn => { unlisten = fn })
   }
 
   function stopPolling() {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
     if (unlisten) { unlisten(); unlisten = null }
   }
 

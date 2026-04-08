@@ -30,9 +30,11 @@ notify  = { version = "6", default-features = false, features = ["macos_fsevent"
 sys-locale = "0.3"
 tauri-plugin-window-state = "2"
 tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-dialog = "2.7.0"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [profile.dev]
 codegen-units = 1

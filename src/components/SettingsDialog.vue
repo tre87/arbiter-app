@@ -30,12 +30,10 @@ onMounted(async () => {
 async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   try {
     const current = await invoke<Record<string, any> | null>('load_config')
-    const config: Record<string, any> = {
-      closeOptions: current?.closeOptions,
-    }
+    const config: Record<string, any> = {}
 
     if (what === 'all' || what === 'layout') {
-      // Keep only closeOptions
+      // Drop everything
     } else if (what === 'paths') {
       config.layout = current?.layout
       config.window = current?.window

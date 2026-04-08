@@ -8,17 +8,39 @@ import { readText as clipboardRead, writeText as clipboardWrite } from '@tauri-a
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
+import { useProjectStore } from '../stores/project'
 import { useDevSettingsStore } from '../stores/devSettings'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
 import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline, mdiBash, mdiPowershell } from '@mdi/js'
 import TerminalFooter from './TerminalFooter.vue'
 
-const props = defineProps<{ paneId: string }>()
+const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
+const projectStore = useProjectStore()
 const devSettings = useDevSettingsStore()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
+function syncProjectStatus(status: typeof claudeStatus.value, state?: 'idle' | 'ready' | 'working' | 'attention' | 'exited') {
+  const wtId = projectStore.getWorktreeIdForPane(props.paneId)
+  if (!wtId) return
+  const update: Record<string, any> = {}
+  if (status) {
+    if (status.model_id) update.model = status.model_id
+    if (status.input_tokens != null) update.inputTokens = status.input_tokens
+    if (status.output_tokens != null) update.outputTokens = status.output_tokens
+    if (status.cache_read_input_tokens != null) update.cacheReadTokens = status.cache_read_input_tokens
+    if (status.cache_creation_input_tokens != null) update.cacheWriteTokens = status.cache_creation_input_tokens
+    if (status.session_id) update.sessionId = status.session_id
+    const total = (status.input_tokens ?? 0)
+      + (status.output_tokens ?? 0)
+      + (status.cache_creation_input_tokens ?? 0)
+      + (status.cache_read_input_tokens ?? 0)
+    update.contextPercent = Math.min(100, (total / 200_000) * 100)
+  }
+  if (state) update.status = state
+  projectStore.updateClaudeStatus(wtId, update)
+}
 
 let term: Terminal
 let fitAddon: FitAddon
@@ -49,7 +71,20 @@ const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
 let unlistenCwd: (() => void) | null = null
 
 const claudeWorking = ref(false)
+const claudeNeedsAttention = ref(false)
 const terminalTitle = ref('')
+
+function computeClaudeState(): 'ready' | 'working' | 'attention' {
+  if (claudeWorking.value) return 'working'
+  if (claudeNeedsAttention.value) return 'attention'
+  return 'ready'
+}
+
+function pushClaudeState() {
+  const s = computeClaudeState()
+  store.setTerminalStatus(props.paneId, s)
+  syncProjectStatus(null, s)
+}
 
 const infoPanelOpen = ref(false)
 
@@ -62,7 +97,6 @@ const isWindows = navigator.platform.startsWith('Win')
 const gitBashPath = ref<string | null>(null)
 const shellIdle = ref(false)
 const currentShell = ref<'powershell' | 'gitbash'>('powershell')
-let idleTimer: ReturnType<typeof setInterval> | null = null
 
 // ── Inline name editing ──────────────────────────────────────────────────────
 const isEditingName = ref(false)
@@ -150,10 +184,11 @@ watch(isFocused, (focused) => {
   if (focused) term?.focus()
 })
 
-// shellIdle polling is only needed for the shell switch button on Windows.
-// Shell activity is now event-driven via shell-activity-{sid} from the backend.
-watch(() => claudeRunning.value, () => {
-  if (isWindows && gitBashPath.value) startIdlePolling()
+// shellIdle is driven purely by the shell-activity-{sid} event from the backend
+// (see subscribeToSession). When Claude is running the shell-switch button is
+// hidden regardless, so we just clear it on claudeRunning transitions.
+watch(() => claudeRunning.value, (running) => {
+  if (running) shellIdle.value = false
 })
 
 function launchClaude() {
@@ -185,24 +220,33 @@ async function subscribeToSession(sid: string) {
     if (claudeStatus.value?.session_id) {
       store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
     }
+    // Don't hardcode 'working' here — actual working state comes from the
+    // terminal title spinner (OSC parser sets claudeWorking). On resume the
+    // session is idle until the user types something.
+    syncProjectStatus(claudeStatus.value, computeClaudeState())
   })
   unlistenStatus = await listen(`claude-status-${sid}`, (event) => {
     claudeStatus.value = event.payload as typeof claudeStatus.value
     if (claudeStatus.value?.session_id) {
       store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
     }
+    syncProjectStatus(claudeStatus.value)
   })
   unlistenExited = await listen(`claude-exited-${sid}`, () => {
     claudeRunning.value = false
     claudeWorking.value = false
+    claudeNeedsAttention.value = false
     infoPanelOpen.value = false
     store.clearClaudeSessionId(props.paneId)
     store.setTerminalStatus(props.paneId, 'idle')
+    syncProjectStatus(null, 'exited')
   })
   unlistenActivity = await listen(`shell-activity-${sid}`, (event) => {
     const idle = event.payload as boolean
     if (!claudeRunning.value) {
       store.setTerminalStatus(props.paneId, idle ? 'idle' : 'running')
+      // Also drives the "switch to git-bash" button visibility on Windows.
+      if (isWindows && gitBashPath.value) shellIdle.value = idle
     }
   }) as unknown as (() => void)
 }
@@ -217,27 +261,9 @@ function unsubscribeAll() {
 }
 
 // ── Shell switching ──────────────────────────────────────────────────────────
-function startIdlePolling() {
-  if (idleTimer) { clearInterval(idleTimer); idleTimer = null }
-  if (!claudeRunning.value && gitBashPath.value && sessionId) {
-    const check = async () => {
-      if (sessionId) {
-        shellIdle.value = await invoke<boolean>('check_shell_idle', { sessionId })
-      }
-    }
-    check()
-    idleTimer = setInterval(check, 2000)
-  } else {
-    shellIdle.value = false
-  }
-}
-
 async function switchShell() {
   if (!sessionId) return
   const cwd = sessionCwd.value
-
-  // Stop idle polling during switch
-  if (idleTimer) { clearInterval(idleTimer); idleTimer = null }
 
   // Tear down
   unsubscribeAll()
@@ -268,8 +294,8 @@ async function switchShell() {
   })
   await subscribeToSession(sessionId)
 
-  // Restart idle polling
-  startIdlePolling()
+  // shellIdle will be driven by the shell-activity event on the new session
+  shellIdle.value = false
   term.focus()
 }
 
@@ -327,10 +353,35 @@ onMounted(async () => {
     if (claudeRunning.value) {
       const hasSpinner = /[\u2800-\u28FF]/.test(data)
       const isIdle = /✳/.test(data)
+      const wasWorking = claudeWorking.value
       claudeWorking.value = hasSpinner && !isIdle
-      store.setTerminalStatus(props.paneId, claudeWorking.value ? 'working' : 'idle')
+      // Resuming work clears any pending attention prompt
+      if (claudeWorking.value) claudeNeedsAttention.value = false
+      // Ignore the brief idle flicker right after a work cycle — a BEL
+      // arriving shortly will upgrade to 'attention'.
+      if (wasWorking && !claudeWorking.value && !claudeNeedsAttention.value) {
+        // Leave as idle; will flip to attention if a bell follows.
+      }
+      pushClaudeState()
     }
     return false
+  })
+
+  // BEL (\x07) is Claude Code's "waiting for user input" signal (permission
+  // prompts, option menus). Surface it as 'needs attention'.
+  term.onBell(() => {
+    if (claudeRunning.value && !claudeWorking.value) {
+      claudeNeedsAttention.value = true
+      pushClaudeState()
+    }
+  })
+
+  // Any user input clears the attention flag for this terminal.
+  term.onData(() => {
+    if (claudeNeedsAttention.value) {
+      claudeNeedsAttention.value = false
+      pushClaudeState()
+    }
   })
 
   // Register focus handler immediately so App.vue's polling can reach us
@@ -400,7 +451,7 @@ onMounted(async () => {
         const hasSpinner = /[\u2800-\u28FF]/.test(savedTitle)
         const isIdle = /✳/.test(savedTitle)
         claudeWorking.value = hasSpinner && !isIdle
-        store.setTerminalStatus(props.paneId, claudeWorking.value ? 'working' : 'idle')
+        pushClaudeState()
       }
     } else {
       // Claude not running — clear any stale working status from before unmount
@@ -443,6 +494,11 @@ onMounted(async () => {
     })
 
     if (savedClaudeId && sessionId) {
+      // Pre-register the expected Claude session id so the JSONL watcher
+      // adopts the resumed file into *this* pane (and not whichever empty
+      // pane the HashMap iterator yields first when several panes are
+      // resuming concurrently).
+      invoke('set_expected_claude_session', { sessionId, claudeSessionId: savedClaudeId }).catch(() => {})
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
       }, 500)
@@ -489,11 +545,8 @@ onMounted(async () => {
 
   // Initial focus is handled by App.vue polling for the textarea.
 
-  // Subscribe to cwd/Claude lifecycle events
+  // Subscribe to cwd/Claude lifecycle events (also drives shellIdle via shell-activity)
   await subscribeToSession(sessionId!)
-
-  // Idle polling only for Windows shell switch button
-  if (isWindows && gitBashPath.value) startIdlePolling()
 
   // Focus this terminal if it's the focused pane — must happen after full setup
   if (isFocused.value) {
@@ -505,7 +558,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
   unsubscribeAll()
-  if (idleTimer) clearInterval(idleTimer)
   if (fitTimer) clearTimeout(fitTimer)
   unlisten?.()
   resizeObserver?.disconnect()
@@ -521,8 +573,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="terminal-pane" :class="{ focused: isFocused }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
-    <div class="pane-toolbar">
+  <div class="terminal-pane" :class="{ focused: isFocused, compact }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
+    <div v-if="!compact" class="pane-toolbar">
       <!-- Left: Process title from OSC 0 -->
       <span class="toolbar-process" v-if="terminalTitle">{{ terminalTitle }}</span>
       <span class="toolbar-process" v-else>&nbsp;</span>
@@ -853,6 +905,10 @@ onBeforeUnmount(() => {
 @keyframes progress-slide {
   0%   { background-position: -20% 0; }
   100% { background-position: 120% 0; }
+}
+
+.compact .progress-bar {
+  top: 0;
 }
 
 .terminal-inner {

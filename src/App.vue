@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { usePaneStore } from './stores/pane'
+import { useProjectStore } from './stores/project'
 import { useDevSettingsStore } from './stores/devSettings'
 import SplitView from './components/SplitView.vue'
+import ProjectWorkspaceView from './components/ProjectWorkspaceView.vue'
 import StatsBar from './components/StatsBar.vue'
-import CloseDialog from './components/CloseDialog.vue'
+import ConfirmDialog from './components/ConfirmDialog.vue'
+import { useConfirm } from './composables/useConfirm'
 import MdiIcon from './components/MdiIcon.vue'
 import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline } from '@mdi/js'
 import ShortcutsDialog from './components/ShortcutsDialog.vue'
@@ -17,15 +20,135 @@ import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import WindowControls from './components/WindowControls.vue'
 import logoUrl from './assets/logo.svg'
 import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from './utils/spatial'
-import type { ArbiterConfig, CloseOptions, SavedTerminal, SavedWorkspace } from './types/config'
-import type { PaneNode } from './types/pane'
+import type { ArbiterConfig, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace } from './types/config'
+import type { PaneNode, Workspace } from './types/pane'
 
 const store = usePaneStore()
 const devStore = useDevSettingsStore()
 const ready = ref(false)
-const showCloseDialog = ref(false)
-const closeOptions = ref<CloseOptions>({ saveLayout: true, savePaths: true, saveSessions: true })
 const overviewOpen = ref(false)
+
+// ── Auto-save (crash-safe persistence) ──────────────────────────────────────
+// Purely event-driven: every reactive state change runs the watcher below,
+// which calls performAutoSave once per Vue tick (mutations are batched). A
+// simple in-flight/pending pair serializes overlapping saves so we never have
+// two writers racing on the same file.
+
+let saveInFlight = false
+let savePending = false
+
+async function performAutoSave() {
+  if (!ready.value) return
+  if (saveInFlight) {
+    savePending = true
+    return
+  }
+  saveInFlight = true
+  try {
+    const config: ArbiterConfig = {}
+
+    // Save window geometry — only if values look sane
+    const win = getCurrentWindow()
+    try {
+      const size = await win.innerSize()
+      const pos = await win.outerPosition()
+      if (size.width > 200 && size.height > 200 && pos.x > -10000 && pos.y > -10000 && pos.x < 10000 && pos.y < 10000) {
+        config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y }
+      }
+    } catch { /* ignore */ }
+
+    // Save overview state (always persist visibility flag; geometry only if visible)
+    config.overviewVisible = overviewOpen.value
+    try {
+      const overviewState = await invoke<{ x: number; y: number; width: number; height: number } | null>('get_overview_state')
+      if (overviewState) config.overview = overviewState
+    } catch { /* ignore */ }
+
+    // Save all workspaces with current state
+    const serialized = store.serializeAll()
+
+    async function enrichTerminal(t: { id: string; name: string }): Promise<SavedTerminal> {
+      const entry: SavedTerminal = { name: t.name }
+      const sessionId = store.getPtySession(t.id)
+      if (sessionId) {
+        try {
+          const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
+          if (cwd) entry.cwd = cwd
+        } catch { /* ignore */ }
+      }
+      const claudeId = store.getClaudeSessionId(t.id)
+      if (claudeId) entry.claudeSessionId = claudeId
+      if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
+      const shell = store.getTerminalShell(t.id)
+      if (shell !== 'powershell') entry.shell = shell
+      return entry
+    }
+
+    const savedWorkspaces: SavedWorkspace[] = []
+    for (const ws of serialized.workspaces) {
+      if (ws.type === 'project') {
+        const savedWorktrees = []
+        for (const wt of ws.worktrees) {
+          const terminals = await Promise.all(wt.terminals.map(enrichTerminal))
+          savedWorktrees.push({
+            branchName: wt.branchName,
+            path: wt.path,
+            isMain: wt.isMain,
+            parentBranch: wt.parentBranch,
+            claudePaneIndex: wt.claudePaneIndex,
+            defaultTerminalIndex: wt.defaultTerminalIndex,
+            layout: wt.layout,
+            terminals,
+            explorerExpandedPaths: wt.explorerExpandedPaths,
+          })
+        }
+        savedWorkspaces.push({
+          type: 'project' as const,
+          name: ws.name,
+          repoRoot: ws.repoRoot,
+          worktrees: savedWorktrees,
+          activeWorktreeId: ws.activeWorktreeId,
+        } satisfies SavedProjectWorkspace)
+      } else {
+        const terminals = await Promise.all(ws.terminals.map(enrichTerminal))
+        savedWorkspaces.push({
+          type: 'terminal' as const,
+          name: ws.name,
+          layout: ws.layout,
+          terminals,
+          focusedTerminalIndex: ws.focusedTerminalIndex,
+        } satisfies SavedTerminalWorkspace)
+      }
+    }
+
+    config.workspaces = savedWorkspaces
+    config.activeWorkspaceIndex = serialized.activeWorkspaceIndex
+
+    await invoke('save_config', { config })
+  } catch (e) {
+    console.error('Auto-save failed:', e)
+  } finally {
+    saveInFlight = false
+    if (savePending) {
+      savePending = false
+      // Run again to capture changes that arrived during the in-flight save
+      performAutoSave()
+    }
+  }
+}
+
+// Watch store state and save on every change. Vue batches mutations within a
+// tick, so a burst of updates produces one save call (or one queued one).
+watch(
+  () => [
+    store.workspaces,
+    store.activeWorkspaceIndex,
+    store.terminalStatuses,
+    store.claudeSessionIds,
+  ],
+  performAutoSave,
+  { deep: true }
+)
 
 // ── Startup: load config and restore layout ──────────────────────────────────
 
@@ -34,20 +157,18 @@ async function loadAndRestore() {
     const config = await invoke<ArbiterConfig | null>('load_config')
     if (!config) return
 
-    // Restore close dialog checkbox states
-    if (config.closeOptions) {
-      closeOptions.value = { ...config.closeOptions }
-    }
-
-    // Restore window geometry — wait for the OS to actually apply the resize
+    // Restore window geometry — validate before applying
     if (config.window) {
-      const win = getCurrentWindow()
-      try {
-        await win.setSize(new (await import('@tauri-apps/api/dpi')).PhysicalSize(config.window.width, config.window.height))
-        await win.setPosition(new (await import('@tauri-apps/api/dpi')).PhysicalPosition(config.window.x, config.window.y))
-        // OS window resize is async; give it time to propagate to the DOM
-        await new Promise(r => setTimeout(r, 150))
-      } catch { /* ignore if position is off-screen */ }
+      const { width, height, x, y } = config.window
+      // Reject bogus geometry: too small, or wildly off-screen
+      if (width > 200 && height > 200 && x > -10000 && y > -10000 && x < 10000 && y < 10000) {
+        const win = getCurrentWindow()
+        try {
+          await win.setSize(new (await import('@tauri-apps/api/dpi')).PhysicalSize(width, height))
+          await win.setPosition(new (await import('@tauri-apps/api/dpi')).PhysicalPosition(x, y))
+          await new Promise(r => setTimeout(r, 150))
+        } catch { /* ignore if position is off-screen */ }
+      }
     }
 
     // Restore layout — prefer multi-workspace format, fall back to legacy
@@ -57,8 +178,8 @@ async function loadAndRestore() {
       store.restoreFromSaved(config.layout, config.terminals, config.focusedTerminalIndex)
     }
 
-    // Restore overview window if it was open
-    if (config.overview) {
+    // Restore overview window only if it was visible last session
+    if (config.overviewVisible && config.overview) {
       overviewOpen.value = true
       invoke('restore_overview_window', {
         x: config.overview.x, y: config.overview.y,
@@ -81,6 +202,13 @@ function collectLeafIds(node: PaneNode): string[] {
   return [...collectLeafIds(node.first), ...collectLeafIds(node.second)]
 }
 
+function collectAllLeafIds(ws: Workspace): string[] {
+  if (ws.type === 'project') {
+    return ws.worktrees.flatMap(wt => collectLeafIds(wt.root))
+  }
+  return collectLeafIds(ws.root)
+}
+
 async function bootstrapBackgroundSessions() {
   // Detect Git Bash once for all background sessions
   const isWindows = navigator.platform.startsWith('Win')
@@ -92,7 +220,7 @@ async function bootstrapBackgroundSessions() {
   for (let i = 0; i < store.workspaces.length; i++) {
     if (i === store.activeWorkspaceIndex) continue // active tab mounts normally
     const ws = store.workspaces[i]
-    const paneIds = collectLeafIds(ws.root)
+    const paneIds = collectAllLeafIds(ws)
     for (const paneId of paneIds) {
       if (store.getPtySession(paneId)) continue // already has a session
       const cwd = store.consumeSavedCwd(paneId)
@@ -128,108 +256,16 @@ async function bootstrapBackgroundSessions() {
 }
 
 // ── Close intercept ──────────────────────────────────────────────────────────
+// State is autosaved continuously, so the close handler just flushes any
+// pending save and exits. No dialog, no save options.
 
 async function setupCloseHandler() {
   const win = getCurrentWindow()
-  await win.onCloseRequested(async (event) => {
-    // Single workspace with single terminal — nothing worth saving except overview
-    if (store.workspaces.length === 1 && store.root.type === 'terminal') {
-      try {
-        const overviewState = await invoke<{ x: number; y: number; width: number; height: number } | null>('get_overview_state')
-        if (overviewState) {
-          const config: ArbiterConfig = { closeOptions: closeOptions.value, overview: overviewState }
-          await invoke('save_config', { config })
-        }
-      } catch { /* ignore */ }
-      return
-    }
-    event.preventDefault()
-    showCloseDialog.value = true
+  await win.onCloseRequested(async (_event) => {
+    // Autosave runs on every state change, so by the time the user clicks close
+    // the disk is already up to date. No final flush needed.
+    await invoke('exit_app')
   })
-}
-
-async function handleCloseConfirm(saveLayout: boolean, savePaths: boolean, saveSessions: boolean) {
-  showCloseDialog.value = false
-  closeOptions.value = { saveLayout, savePaths, saveSessions }
-
-  try {
-    const config: ArbiterConfig = {
-      closeOptions: { saveLayout, savePaths, saveSessions },
-    }
-
-    // Save overview window state (always, regardless of saveLayout)
-    try {
-      const overviewState = await invoke<{ x: number; y: number; width: number; height: number } | null>('get_overview_state')
-      if (overviewState) {
-        config.overview = overviewState
-      }
-    } catch { /* ignore */ }
-
-    if (saveLayout) {
-      // Save window geometry
-      const win = getCurrentWindow()
-      try {
-        const size = await win.innerSize()
-        const pos = await win.innerPosition()
-        config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y }
-      } catch { /* ignore */ }
-
-      // Save all workspaces
-      const serialized = store.serializeAll()
-      const savedWorkspaces: SavedWorkspace[] = []
-
-      for (const ws of serialized.workspaces) {
-        const savedTerminals: SavedTerminal[] = []
-
-        for (const t of ws.terminals) {
-          const entry: SavedTerminal = { name: t.name }
-
-          if (savePaths) {
-            const sessionId = store.getPtySession(t.id)
-            if (sessionId) {
-              try {
-                const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
-                if (cwd) entry.cwd = cwd
-              } catch { /* ignore */ }
-            }
-          }
-
-          if (saveSessions) {
-            const claudeId = store.getClaudeSessionId(t.id)
-            if (claudeId) entry.claudeSessionId = claudeId
-            if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
-          }
-
-          // Always save shell type so it survives restart
-          const shell = store.getTerminalShell(t.id)
-          if (shell !== 'powershell') entry.shell = shell
-
-          savedTerminals.push(entry)
-        }
-
-        savedWorkspaces.push({
-          name: ws.name,
-          layout: ws.layout,
-          terminals: savedTerminals,
-          focusedTerminalIndex: ws.focusedTerminalIndex,
-        })
-      }
-
-      config.workspaces = savedWorkspaces
-      config.activeWorkspaceIndex = serialized.activeWorkspaceIndex
-    }
-
-    await invoke('save_config', { config })
-  } catch (e) {
-    console.error('Failed to save config:', e)
-  }
-
-  // Exit the app via Rust — guaranteed to work
-  await invoke('exit_app')
-}
-
-function handleCloseCancel() {
-  showCloseDialog.value = false
 }
 
 // ── Keyboard shortcuts ───────────────────────────────────────────────────────
@@ -330,12 +366,29 @@ function handleKeyDown(e: KeyboardEvent) {
   if (e.code === 'KeyW') {
     e.preventDefault()
     e.stopPropagation()
-    if (store.root.type === 'terminal' && store.workspaces.length > 1) {
-      store.removeWorkspace(store.activeWorkspaceIndex)
+    const currentWs = store.workspaces[store.activeWorkspaceIndex]
+    if (currentWs.type === 'terminal' && store.root.type === 'terminal' && store.workspaces.length > 1) {
+      confirmCloseWorkspace(store.activeWorkspaceIndex)
     } else {
       store.closeFocused()
     }
   }
+}
+
+const { confirm: confirmDialog } = useConfirm()
+
+async function confirmCloseWorkspace(index: number) {
+  const ws = store.workspaces[index]
+  if (!ws) return
+  const ok = await confirmDialog({
+    title: `Close workspace "${ws.name}"?`,
+    message: ws.type === 'project'
+      ? 'All terminals in this project workspace will be closed.'
+      : 'All terminals in this workspace will be closed.',
+    confirmText: 'Close',
+    danger: true,
+  })
+  if (ok) store.removeWorkspace(index)
 }
 
 // ── Settings menu ────────────────────────────────────────────────────────────
@@ -392,8 +445,13 @@ async function setupDragDrop() {
   })
 }
 
+function handleContextMenu(e: MouseEvent) {
+  e.preventDefault()
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', handleKeyDown, { capture: true })
+  window.addEventListener('contextmenu', handleContextMenu)
 
   // Set up overview listeners before loadAndRestore, which may show the overview window
   unlistenOverviewRequest = await listen('overview-request-update', () => {
@@ -412,6 +470,8 @@ onMounted(async () => {
 
   await loadAndRestore()
   ready.value = true
+  // Init project workspaces (reads model from .claude/settings.json)
+  useProjectStore().initAllProjectWorkspaces()
   await setupCloseHandler()
   await setupDragDrop()
 
@@ -436,6 +496,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeyDown, { capture: true })
+  window.removeEventListener('contextmenu', handleContextMenu)
   unlistenDragDrop?.()
   unlistenOverviewRequest?.()
   unlistenOverviewNavigate?.()
@@ -466,20 +527,22 @@ onBeforeUnmount(() => {
       <WindowControls />
     </div>
     <div v-if="ready" class="workspace">
-      <SplitView :node="store.root" :key="store.workspaces[store.activeWorkspaceIndex].id" />
+      <ProjectWorkspaceView
+        v-if="store.workspaces[store.activeWorkspaceIndex].type === 'project'"
+        :workspace="store.workspaces[store.activeWorkspaceIndex] as any"
+        :key="store.workspaces[store.activeWorkspaceIndex].id"
+      />
+      <SplitView
+        v-else
+        :node="store.root"
+        :key="store.workspaces[store.activeWorkspaceIndex].id"
+      />
     </div>
 
     <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
     <SettingsDialog v-if="settingsOpen" @close="settingsOpen = false" />
 
-    <CloseDialog
-      v-if="showCloseDialog"
-      :initial-save-layout="closeOptions.saveLayout"
-      :initial-save-paths="closeOptions.savePaths"
-      :initial-save-sessions="closeOptions.saveSessions"
-      @confirm="handleCloseConfirm"
-      @cancel="handleCloseCancel"
-    />
+    <ConfirmDialog />
   </div>
 </template>
 
@@ -577,7 +640,12 @@ onBeforeUnmount(() => {
 
 .workspace {
   flex: 1;
+  min-height: 0;
   overflow: hidden;
   background: var(--color-bg);
+  position: relative;
+}
+.workspace > * {
+  height: 100%;
 }
 </style>

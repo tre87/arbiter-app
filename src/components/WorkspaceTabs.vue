@@ -1,10 +1,78 @@
 <script setup lang="ts">
 import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
+import { useProjectStore } from '../stores/project'
+import { useConfirm } from '../composables/useConfirm'
 import MdiIcon from './MdiIcon.vue'
-import { mdiClose } from '@mdi/js'
+import { mdiClose, mdiFolder, mdiConsole } from '@mdi/js'
 
 const store = usePaneStore()
+const projectStore = useProjectStore()
+const { confirm: confirmDialog } = useConfirm()
+
+async function confirmAndCloseWorkspace(index: number) {
+  const ws = store.workspaces[index]
+  if (!ws || store.workspaces.length <= 1) return
+  const ok = await confirmDialog({
+    title: `Close workspace "${ws.name}"?`,
+    message: ws.type === 'project'
+      ? 'All terminals in this project workspace will be closed.'
+      : 'All terminals in this workspace will be closed.',
+    confirmText: 'Close',
+    danger: true,
+  })
+  if (ok) store.removeWorkspace(index)
+}
+
+// ── New workspace dropdown ──────────────────────────────────────────────────
+const showNewMenu = ref(false)
+const addBtnEl = ref<HTMLElement | null>(null)
+const addMenuPos = ref<{ x: number; y: number } | null>(null)
+
+function toggleNewMenu() {
+  if (showNewMenu.value) {
+    showNewMenu.value = false
+    return
+  }
+  // Position below the + button
+  if (addBtnEl.value) {
+    const rect = addBtnEl.value.getBoundingClientRect()
+    addMenuPos.value = { x: rect.left, y: rect.bottom + 2 }
+  }
+  showNewMenu.value = true
+}
+
+function closeNewMenu() {
+  showNewMenu.value = false
+}
+
+function newTerminalWorkspace() {
+  closeNewMenu()
+  store.addWorkspace()
+}
+
+async function newProjectWorkspace() {
+  closeNewMenu()
+  try {
+    // Use Tauri dialog plugin to pick folder
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const selected = await open({ directory: true, title: 'Select Project Folder' })
+    if (!selected || typeof selected !== 'string') return
+
+    // Verify it's a git repo
+    const repoRoot = await invoke<string | null>('git_repo_root', { path: selected })
+    if (!repoRoot) {
+      // Not a git repo — could show error, for now just use the selected path
+      // and let the worktree commands fail gracefully
+      return
+    }
+
+    await projectStore.createProjectWorkspace(repoRoot)
+  } catch (e) {
+    console.error('Failed to create project workspace:', e)
+  }
+}
 
 // ── Inline rename ───────────────────────────────────────────────────────────
 const editingIndex = ref<number | null>(null)
@@ -57,13 +125,15 @@ function onContextRename() {
 
 function onContextClose() {
   if (contextMenu.value) {
-    store.removeWorkspace(contextMenu.value.index)
+    const index = contextMenu.value.index
     closeContextMenu()
+    confirmAndCloseWorkspace(index)
   }
 }
 
 function onDocumentClick() {
   closeContextMenu()
+  closeNewMenu()
 }
 
 onMounted(() => document.addEventListener('click', onDocumentClick))
@@ -78,7 +148,7 @@ function onTabClick(index: number) {
 function onTabMouseDown(e: MouseEvent, index: number) {
   if (e.button === 1) {
     e.preventDefault()
-    store.removeWorkspace(index)
+    confirmAndCloseWorkspace(index)
   }
 }
 
@@ -174,21 +244,44 @@ function onPointerDown(e: PointerEvent, index: number) {
         @keydown="onRenameKeydown"
         @click.stop
       />
-      <span v-else class="tab-label">{{ ws.name.length > 40 ? ws.name.slice(0, 40) + '…' : ws.name }}</span>
+      <span v-else class="tab-label">
+        <MdiIcon v-if="ws.type === 'project'" :path="mdiFolder" :size="12" class="tab-type-icon" />
+        <MdiIcon v-else :path="mdiConsole" :size="12" class="tab-type-icon" />
+        {{ ws.name.length > 40 ? ws.name.slice(0, 40) + '…' : ws.name }}
+      </span>
       <button
         v-if="store.workspaces.length > 1 && editingIndex !== i"
         class="tab-close"
         title="Close workspace"
-        @click.stop="store.removeWorkspace(i)"
+        @click.stop="confirmAndCloseWorkspace(i)"
       >
         <MdiIcon :path="mdiClose" :size="12" />
       </button>
     </div>
-    <button class="tab-add" title="New workspace (Ctrl+Shift+T)" @click="store.addWorkspace()">
+    <button ref="addBtnEl" class="tab-add" title="New workspace (Ctrl+Shift+T)" @click.stop="toggleNewMenu">
       +
     </button>
     <div class="tab-drag-spacer" />
   </div>
+
+  <!-- New workspace menu -->
+  <Teleport to="body">
+    <div
+      v-if="showNewMenu && addMenuPos"
+      class="new-menu"
+      :style="{ left: addMenuPos.x + 'px', top: addMenuPos.y + 'px' }"
+      @click.stop
+    >
+      <button class="new-menu-item" @click="newTerminalWorkspace">
+        <MdiIcon :path="mdiConsole" :size="14" />
+        Terminal Workspace
+      </button>
+      <button class="new-menu-item" @click="newProjectWorkspace">
+        <MdiIcon :path="mdiFolder" :size="14" />
+        Project Workspace
+      </button>
+    </div>
+  </Teleport>
 
   <!-- Context menu -->
   <Teleport to="body">
@@ -341,6 +434,43 @@ function onPointerDown(e: PointerEvent, index: number) {
 .tab-add:hover {
   color: var(--color-text-primary);
   background: var(--color-bg-elevated);
+}
+
+.tab-type-icon {
+  opacity: 0.5;
+  margin-right: 2px;
+}
+
+.new-menu {
+  position: fixed;
+  z-index: 9999;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-card-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 180px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.new-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 6px 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.new-menu-item:hover {
+  background: var(--color-accent, var(--azure));
+  color: #fff;
 }
 
 .tab-drag-spacer {
