@@ -70,17 +70,30 @@ async function performAutoSave() {
     async function enrichTerminal(t: { id: string; name: string }): Promise<SavedTerminal> {
       const entry: SavedTerminal = { name: t.name }
       const sessionId = store.getPtySession(t.id)
+      // Prefer live PTY state when the pane is mounted; otherwise fall back to
+      // the saved* in-memory maps. Without this fallback, freshly-created
+      // worktrees (whose panes haven't mounted yet) and restored background
+      // workspaces (where bootstrap hasn't yet attached PTYs) get persisted as
+      // empty terminals — wiping cwd / claude-resume info from disk.
       if (sessionId) {
         try {
           const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
           if (cwd) entry.cwd = cwd
         } catch { /* ignore */ }
+        const claudeId = store.getClaudeSessionId(t.id)
+        if (claudeId) entry.claudeSessionId = claudeId
+        if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
+        const shell = store.getTerminalShell(t.id)
+        if (shell !== 'powershell') entry.shell = shell
+      } else {
+        const savedCwd = store.getSavedCwd(t.id)
+        if (savedCwd) entry.cwd = savedCwd
+        const savedClaudeId = store.getSavedClaudeSession(t.id)
+        if (savedClaudeId) entry.claudeSessionId = savedClaudeId
+        if (store.getSavedClaudeWasRunning(t.id) || store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
+        const savedShell = store.getSavedShell(t.id)
+        if (savedShell && savedShell !== 'powershell') entry.shell = savedShell
       }
-      const claudeId = store.getClaudeSessionId(t.id)
-      if (claudeId) entry.claudeSessionId = claudeId
-      if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
-      const shell = store.getTerminalShell(t.id)
-      if (shell !== 'powershell') entry.shell = shell
       return entry
     }
 
@@ -187,6 +200,15 @@ async function loadAndRestore() {
       })
     }
 
+    // Populate the project store's paneToWorktree map BEFORE bootstrap so
+    // the listeners bootstrap attaches per pane can resolve worktreeIds from
+    // the event handlers. (Otherwise the first claude-started event can fire
+    // before init has registered the pane → worktree mapping, and the card
+    // status update is dropped on the floor.) This is a synchronous helper;
+    // the slower model fetches + refs watchers run via initAllProjectWorkspaces
+    // after ready.value flips true.
+    useProjectStore().registerAllProjectPanes()
+
     // Eagerly create PTY sessions for background workspace terminals.
     // The active workspace's terminals will be handled by TerminalPane onMounted.
     // Background terminals need sessions created now so Claude can start running
@@ -216,11 +238,24 @@ async function bootstrapBackgroundSessions() {
   if (isWindows) {
     gitBashPath = await invoke<string | null>('check_git_bash')
   }
+  const projectStore = useProjectStore()
 
   for (let i = 0; i < store.workspaces.length; i++) {
-    if (i === store.activeWorkspaceIndex) continue // active tab mounts normally
     const ws = store.workspaces[i]
-    const paneIds = collectAllLeafIds(ws)
+    const isActiveWs = i === store.activeWorkspaceIndex
+    // For the active workspace: a terminal workspace's panes all mount
+    // normally via TerminalPane, but a project workspace only mounts the
+    // *active* worktree — the other worktrees need background bootstrap so
+    // their Claude instances launch without the user clicking in.
+    let paneIds: string[]
+    if (isActiveWs) {
+      if (ws.type !== 'project') continue
+      paneIds = ws.worktrees
+        .filter(wt => wt.id !== ws.activeWorktreeId)
+        .flatMap(wt => collectLeafIds(wt.root))
+    } else {
+      paneIds = collectAllLeafIds(ws)
+    }
     for (const paneId of paneIds) {
       if (store.getPtySession(paneId)) continue // already has a session
       const cwd = store.consumeSavedCwd(paneId)
@@ -236,6 +271,26 @@ async function bootstrapBackgroundSessions() {
       try {
         const sessionId = await invoke<string>('create_session', { cols: 80, rows: 24, cwd: cwd ?? null, shell: shellPath })
         store.setPtySession(paneId, sessionId)
+        // Directly attach project store listeners for worktree claude panes.
+        // The project store's reactive watch on paneToWorktree → session would
+        // also pick this up, but the store may not even be instantiated yet
+        // on startup (initAllProjectWorkspaces runs after bootstrap), so the
+        // watch isn't set up in time. Explicit call eliminates that race and
+        // is a no-op for panes that aren't registered to a worktree.
+        projectStore.ensurePaneListeners(paneId)
+
+        if (claudeId || claudeWasRunning) {
+          // Optimistically flip the worktree card from "Terminal" → "Idle"
+          // the moment we decide to launch Claude. The claude-started event
+          // listener will later fill in model/tokens when Claude reports in,
+          // but this avoids the card sitting on "Terminal" for several
+          // seconds (or forever if the JSONL detection path silently drops
+          // the event for a background worktree).
+          const wtId = projectStore.getWorktreeIdForPane(paneId)
+          if (wtId) {
+            projectStore.updateClaudeStatus(wtId, { status: 'ready' })
+          }
+        }
 
         if (claudeId) {
           // Register so it persists on save even if this tab is never visited
@@ -470,7 +525,8 @@ onMounted(async () => {
 
   await loadAndRestore()
   ready.value = true
-  // Init project workspaces (reads model from .claude/settings.json)
+  // Fetch project models and set up refs watchers (panes were already
+  // registered synchronously inside loadAndRestore).
   useProjectStore().initAllProjectWorkspaces()
   await setupCloseHandler()
   await setupDragDrop()

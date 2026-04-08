@@ -17,6 +17,10 @@ struct PtySession {
     output_buffer: Arc<Mutex<Vec<u8>>>,
     cwd: Arc<Mutex<Option<String>>>,
     title: Arc<Mutex<Option<String>>>,
+    // Latest OSC 133 idle state — None before any prompt-marker seen.
+    // Queried by the frontend on (re)mount so a subscription that races
+    // past the first idle transition can still show the shell-switch button.
+    shell_idle: Arc<Mutex<Option<bool>>>,
 }
 
 // Arc so the watcher background thread can share ownership
@@ -83,6 +87,8 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
     let cwd_writer = session_cwd.clone();
     let session_title: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let title_writer = session_title.clone();
+    let session_shell_idle: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let shell_idle_writer = session_shell_idle.clone();
 
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
@@ -170,6 +176,7 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
                                         _ => None,
                                     };
                                     if let Some(idle) = idle {
+                                        *shell_idle_writer.lock().unwrap() = Some(idle);
                                         if prev_idle != Some(idle) {
                                             prev_idle = Some(idle);
                                             app_handle.emit(&activity_event_name, idle).ok();
@@ -238,6 +245,7 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
             output_buffer,
             cwd: session_cwd,
             title: session_title,
+            shell_idle: session_shell_idle,
         },
     );
 
@@ -1343,6 +1351,17 @@ fn get_session_title(session_id: String, sessions: State<Sessions>) -> Option<St
     title
 }
 
+/// Returns the last known OSC 133 idle state, or None before any prompt
+/// marker has been seen. Lets a newly mounted TerminalPane recover idle
+/// state without waiting for the next idle↔busy transition.
+#[tauri::command]
+fn get_session_shell_idle(session_id: String, sessions: State<Sessions>) -> Option<bool> {
+    let map = sessions.0.lock().unwrap();
+    let session = map.get(&session_id)?;
+    let idle = *session.shell_idle.lock().unwrap();
+    idle
+}
+
 #[derive(Serialize, Clone)]
 struct GitInfo {
     is_repo: bool,
@@ -2111,6 +2130,7 @@ pub fn run() {
             load_config,
             get_session_cwd,
             get_session_title,
+            get_session_shell_idle,
             get_session_git_info,
             exit_app,
             get_locale,

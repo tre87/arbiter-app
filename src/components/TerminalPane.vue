@@ -74,6 +74,11 @@ const claudeWorking = ref(false)
 const claudeNeedsAttention = ref(false)
 const terminalTitle = ref('')
 
+// True when this pane lives inside a project workspace. Project workspaces
+// render git actions in the worktree sidebar, so the terminal footer should
+// only appear when Claude is running (to show claude stats).
+const inProjectWorkspace = computed(() => store.isPaneInProjectWorkspace(props.paneId))
+
 function computeClaudeState(): 'ready' | 'working' | 'attention' {
   if (claudeWorking.value) return 'working'
   if (claudeNeedsAttention.value) return 'attention'
@@ -249,6 +254,23 @@ async function subscribeToSession(sid: string) {
       if (isWindows && gitBashPath.value) shellIdle.value = idle
     }
   }) as unknown as (() => void)
+
+  // Recover state that may have been emitted before these listeners were
+  // attached — both OSC 7 (cwd) and OSC 133;A (idle) typically fire at the
+  // shell's very first prompt, and the backend only re-emits on transitions.
+  const currentCwd = await invoke<string | null>('get_session_cwd', { sessionId: sid }).catch(() => null)
+  if (currentCwd && !sessionCwd.value) {
+    sessionCwd.value = currentCwd
+    folderName.value = currentCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
+    const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: currentCwd }).catch(() => null)
+    if (git) gitInfo.value = git
+  }
+  if (isWindows && gitBashPath.value && !claudeRunning.value) {
+    const currentIdle = await invoke<boolean | null>('get_session_shell_idle', { sessionId: sid }).catch(() => null)
+    if (currentIdle !== null && currentIdle !== undefined) {
+      shellIdle.value = currentIdle
+    }
+  }
 }
 
 function unsubscribeAll() {
@@ -499,10 +521,19 @@ onMounted(async () => {
       // pane the HashMap iterator yields first when several panes are
       // resuming concurrently).
       invoke('set_expected_claude_session', { sessionId, claudeSessionId: savedClaudeId }).catch(() => {})
+      // Pre-seed the store so an autosave that fires before the JSONL
+      // watcher reports back still persists the resume id (otherwise a
+      // quick close-then-reopen wipes the saved session from disk).
+      store.setClaudeSessionId(props.paneId, savedClaudeId, 0)
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
       }, 500)
     } else if (savedClaudeWasRunning && sessionId) {
+      // Pre-seed with the empty-string sentinel so isClaudeRunning is true
+      // before the JSONL watcher reports back. Without this, an autosave
+      // before Claude has actually started would persist the pane as not
+      // running and lose the auto-launch intent on the next restart.
+      store.setClaudeSessionId(props.paneId, '', 0)
       setTimeout(() => {
         invoke('write_to_session', { sessionId, data: 'claude\r' })
       }, 500)
@@ -675,12 +706,15 @@ onBeforeUnmount(() => {
       <div class="progress-bar-inner" />
     </div>
     <TerminalFooter
-      v-if="(claudeRunning && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd)"
+      v-if="inProjectWorkspace
+        ? (claudeRunning && footerVisible)
+        : ((claudeRunning && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd))"
       :claude-running="claudeRunning"
       :status="claudeStatus"
       :folder-name="folderName"
       :git-info="gitInfo"
       :session-id="sessionId"
+      :hide-git-menu="inProjectWorkspace"
     />
   </div>
 </template>
@@ -699,15 +733,18 @@ onBeforeUnmount(() => {
 .terminal-pane::after {
   content: '';
   position: absolute;
-  inset: 0;
-  border: 1px solid transparent;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: transparent;
   pointer-events: none;
-  transition: border-color 0.12s;
+  transition: background-color 0.12s;
   z-index: 10;
 }
 
 .terminal-pane.focused::after {
-  border-color: var(--color-accent);
+  background: linear-gradient(90deg, transparent 0%, var(--color-accent) 50%, transparent 100%);
 }
 
 
@@ -749,12 +786,17 @@ onBeforeUnmount(() => {
 
 .name-label {
   font-size: 11px;
-  color: var(--azure-tropical);
+  color: var(--color-text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 160px;
   user-select: none;
+  transition: color 0.12s;
+}
+
+.terminal-pane.focused .name-label {
+  color: var(--azure-tropical);
 }
 
 .name-input {

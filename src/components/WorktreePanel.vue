@@ -2,7 +2,9 @@
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore } from '../stores/project'
+import { usePaneStore } from '../stores/pane'
 import WorktreeCard from './WorktreeCard.vue'
+import GitMenu from './GitMenu.vue'
 import MdiIcon from './MdiIcon.vue'
 import { mdiPlus, mdiSourceMerge, mdiRobotOutline, mdiClose, mdiDice5Outline, mdiChevronDown, mdiDeleteOutline, mdiDeleteAlertOutline } from '@mdi/js'
 import type { ProjectWorkspace, Worktree } from '../types/pane'
@@ -32,6 +34,20 @@ const props = defineProps<{
 }>()
 
 const projectStore = useProjectStore()
+const paneStore = usePaneStore()
+
+// Active worktree's terminal-pane PTY session — where git commands from the
+// sidebar Git menu get written. Using the default terminal (not the Claude
+// pane) avoids typing git commands into an active Claude prompt.
+const activeWorktree = computed(() =>
+  props.workspace.worktrees.find(w => w.id === props.workspace.activeWorktreeId)
+)
+const activeTerminalSessionId = computed(() => {
+  const wt = activeWorktree.value
+  if (!wt) return null
+  return paneStore.getPtySession(wt.defaultTerminalPaneId) ?? null
+})
+const activeBranchLabel = computed(() => activeWorktree.value?.branchName ?? '')
 
 // Sort: main first, then alphabetical
 const sortedWorktrees = computed(() => {
@@ -371,6 +387,17 @@ async function ctxDismissMerged() {
       />
     </div>
 
+    <!-- Git actions menu for the active worktree. Commands run in the
+         worktree's terminal pane so they never land in a Claude prompt. -->
+    <div v-if="activeWorktree" class="panel-footer">
+      <GitMenu
+        :session-id="activeTerminalSessionId"
+        :label="activeBranchLabel"
+        variant="full"
+        open-direction="up"
+      />
+    </div>
+
     <!-- Right-click context menu -->
     <Teleport to="body">
       <div
@@ -593,6 +620,13 @@ async function ctxDismissMerged() {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.panel-footer {
+  padding: 8px 10px;
+  border-top: 1px solid var(--color-card-border);
+  background: var(--color-bg-subtle);
+  flex-shrink: 0;
 }
 
 /* ── Dialogs ────────────────────────────────────────────────────────────── */

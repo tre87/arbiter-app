@@ -143,6 +143,20 @@ export const usePaneStore = defineStore('pane', () => {
     })
   }
 
+  // True if the given pane lives inside any project workspace's worktree tree.
+  // Used by TerminalPane to hide its footer (git/cwd info is shown in the
+  // worktree sidebar instead).
+  function isPaneInProjectWorkspace(id: string): boolean {
+    function check(node: PaneNode): boolean {
+      if (node.type === 'terminal') return node.id === id
+      return check(node.first) || check(node.second)
+    }
+    return workspaces.value.some(ws => {
+      if (ws.type !== 'project') return false
+      return ws.worktrees.some(wt => check(wt.root))
+    })
+  }
+
   function removePtySession(paneId: string) {
     delete ptySessionIds.value[paneId]
   }
@@ -351,10 +365,16 @@ export const usePaneStore = defineStore('pane', () => {
     delete savedClaudeWasRunning.value[paneId]
     return v
   }
+  function getSavedClaudeWasRunning(paneId: string): boolean {
+    return savedClaudeWasRunning.value[paneId] ?? false
+  }
   function consumeSavedShell(paneId: string): 'powershell' | 'gitbash' | undefined {
     const v = savedShells.value[paneId]
     delete savedShells.value[paneId]
     return v
+  }
+  function getSavedShell(paneId: string): 'powershell' | 'gitbash' | undefined {
+    return savedShells.value[paneId]
   }
 
   // ── Focus trigger ────────────────────────────────────────────────────────
@@ -859,7 +879,7 @@ export const usePaneStore = defineStore('pane', () => {
     splitFocused, closeFocused, setFocus,
     updateSplitSizes, adjustSplitSize,
     // PTY session mapping
-    setPtySession, getPtySession, hasPaneId, removePtySession,
+    setPtySession, getPtySession, hasPaneId, isPaneInProjectWorkspace, removePtySession,
     // Terminal names
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
     terminalShells, getTerminalShell, setTerminalShell,
@@ -869,7 +889,8 @@ export const usePaneStore = defineStore('pane', () => {
     terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,
     // Saved state for restoration
     savedCwds, savedClaudeSessions,
-    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession, consumeSavedClaudeWasRunning, consumeSavedShell,
+    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession,
+    getSavedClaudeWasRunning, consumeSavedClaudeWasRunning, getSavedShell, consumeSavedShell,
     // Focus trigger
     focusTrigger, triggerFocus,
     // Serialization

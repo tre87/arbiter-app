@@ -155,8 +155,10 @@ const progressColor = computed(() => {
   background: var(--color-bg-elevated);
 }
 .worktree-card.active {
-  border-color: var(--azure);
-  background: var(--color-bg-elevated);
+  background: rgba(86, 156, 214, 0.12);
+}
+.worktree-card.active .branch-name {
+  color: var(--azure);
 }
 .worktree-card.merged {
   cursor: default;
@@ -203,10 +205,11 @@ const progressColor = computed(() => {
 .branch-name {
   font-weight: 600;
   font-size: 13px;
-  color: var(--color-text-primary);
+  color: var(--color-text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: color 0.12s;
 }
 
 .spacer { flex: 1; }
