@@ -2,7 +2,8 @@
 import { computed } from 'vue'
 import RobotIcon from './RobotIcon.vue'
 import MdiIcon from './MdiIcon.vue'
-import { mdiSleep, mdiExitRun, mdiBellRing, mdiCogPlay, mdiSourceMerge, mdiClose, mdiConsole } from '@mdi/js'
+import ClaudeIcon from './ClaudeIcon.vue'
+import { mdiBellRing, mdiCogPlay, mdiSourceMerge, mdiClose, mdiConsole } from '@mdi/js'
 import type { WorktreeClaudeStatus } from '../stores/project'
 
 const props = defineProps<{
@@ -33,10 +34,10 @@ function onContextMenu(e: MouseEvent) {
 
 const statusLabel = computed(() => {
   switch (props.status.status) {
-    case 'working': return 'Working'
+    case 'working': return 'Working...'
     case 'attention': return 'Needs attention'
-    case 'exited': return 'Exited'
     case 'ready': return 'Idle'
+    case 'exited': return 'Terminal'
     default: return 'Terminal'
   }
 })
@@ -109,8 +110,7 @@ const progressColor = computed(() => {
           <span v-else class="status-badge" :class="statusClass">
             <MdiIcon v-if="status.status === 'working'" :path="mdiCogPlay" :size="12" class="icon-spin" />
             <MdiIcon v-else-if="status.status === 'attention'" :path="mdiBellRing" :size="12" class="icon-ring" />
-            <MdiIcon v-else-if="status.status === 'ready'" :path="mdiSleep" :size="12" />
-            <MdiIcon v-else-if="status.status === 'exited'" :path="mdiExitRun" :size="12" />
+            <ClaudeIcon v-else-if="status.status === 'ready'" :size="12" />
             <MdiIcon v-else :path="mdiConsole" :size="12" />
             {{ statusLabel }}
           </span>
@@ -256,7 +256,6 @@ const progressColor = computed(() => {
 }
 .status-working   { color: var(--azure); }
 .status-attention { color: #e5a03c; }
-.status-idle      { color: var(--color-text-muted); }
 .status-ready     { color: var(--color-text-muted); }
 .status-exited    { color: var(--color-text-muted); opacity: 0.7; }
 .status-merged    { color: #a371f7; }

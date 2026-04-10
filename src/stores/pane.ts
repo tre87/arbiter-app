@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { emit } from '@tauri-apps/api/event'
-import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree } from '../types/pane'
+import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree, ClaudePaneState } from '../types/pane'
 import type { SavedPaneNode, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace, LegacySavedWorkspace } from '../types/config'
 
 let nextId = 1
@@ -315,33 +315,46 @@ export const usePaneStore = defineStore('pane', () => {
     return result
   }
 
-  // ── Active Claude session IDs (set by TerminalPane when Claude starts) ───
-  const claudeSessionIds = ref<Record<string, string>>({})
-  const claudeOutputTokens = ref<Record<string, number>>({})
+  // ── Centralized Claude lifecycle state (per pane) ─────────────────────────
+  const claudePaneStates = ref<Record<string, ClaudePaneState>>({})
 
-  function setClaudeSessionId(paneId: string, sessionId: string, outputTokens?: number) {
-    claudeSessionIds.value[paneId] = sessionId
-    claudeOutputTokens.value[paneId] = outputTokens ?? 0
+  const defaultClaudePaneState: ClaudePaneState = {
+    lifecycle: 'closed', sessionId: null, confirmed: false,
+    model: null, inputTokens: 0, outputTokens: 0,
+    cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0,
   }
-  function clearClaudeSessionId(paneId: string) {
-    delete claudeSessionIds.value[paneId]
-    delete claudeOutputTokens.value[paneId]
+
+  function getClaudePaneState(paneId: string): ClaudePaneState {
+    return claudePaneStates.value[paneId] ?? { ...defaultClaudePaneState }
   }
-  function getClaudeSessionId(paneId: string): string | undefined {
-    // Return any non-empty saved id. (Empty string is a sentinel used while
-    // waiting for the real id after auto-launch; don't persist that.)
-    const id = claudeSessionIds.value[paneId]
-    return id ? id : undefined
+
+  function updateClaudePaneState(paneId: string, update: Partial<ClaudePaneState>) {
+    const current = getClaudePaneState(paneId)
+    claudePaneStates.value[paneId] = { ...current, ...update }
   }
-  function isClaudeRunning(paneId: string): boolean {
-    return paneId in claudeSessionIds.value
+
+  function clearClaudePaneState(paneId: string) {
+    delete claudePaneStates.value[paneId]
+  }
+
+  function isClaudeActive(paneId: string): boolean {
+    const s = claudePaneStates.value[paneId]
+    return !!s && s.lifecycle !== 'closed'
+  }
+
+  function getClaudeSessionForSave(paneId: string): { sessionId: string | null; wasOpen: boolean } {
+    const s = claudePaneStates.value[paneId]
+    if (!s || s.lifecycle === 'closed') return { sessionId: null, wasOpen: false }
+    return {
+      sessionId: s.confirmed && s.sessionId ? s.sessionId : null,
+      wasOpen: true,
+    }
   }
 
   // ── Saved metadata for restoration ────────────────────────────────────────
   // After restoreFromSaved, TerminalPane reads these to pass cwd / resume Claude
   const savedCwds = ref<Record<string, string>>({})
-  const savedClaudeSessions = ref<Record<string, string>>({})
-  const savedClaudeWasRunning = ref<Record<string, boolean>>({})
+  const savedClaudeRestore = ref<Record<string, { sessionId: string | null; wasOpen: boolean }>>({})
   const savedShells = ref<Record<string, 'powershell' | 'gitbash'>>({})
 
   function getSavedCwd(paneId: string): string | undefined {
@@ -352,21 +365,10 @@ export const usePaneStore = defineStore('pane', () => {
     delete savedCwds.value[paneId]
     return v
   }
-  function getSavedClaudeSession(paneId: string): string | undefined {
-    return savedClaudeSessions.value[paneId]
-  }
-  function consumeSavedClaudeSession(paneId: string): string | undefined {
-    const v = savedClaudeSessions.value[paneId]
-    delete savedClaudeSessions.value[paneId]
+  function consumeSavedClaudeRestore(paneId: string): { sessionId: string | null; wasOpen: boolean } | undefined {
+    const v = savedClaudeRestore.value[paneId]
+    delete savedClaudeRestore.value[paneId]
     return v
-  }
-  function consumeSavedClaudeWasRunning(paneId: string): boolean {
-    const v = savedClaudeWasRunning.value[paneId] ?? false
-    delete savedClaudeWasRunning.value[paneId]
-    return v
-  }
-  function getSavedClaudeWasRunning(paneId: string): boolean {
-    return savedClaudeWasRunning.value[paneId] ?? false
   }
   function consumeSavedShell(paneId: string): 'powershell' | 'gitbash' | undefined {
     const v = savedShells.value[paneId]
@@ -442,6 +444,9 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value[termLeaf.id] = 'Terminal'
     savedCwds.value[claudeLeaf.id] = mainWorktreePath
     savedCwds.value[termLeaf.id] = mainWorktreePath
+    // Auto-launch claude in the main worktree's Claude pane on first mount.
+    savedClaudeRestore.value[claudeLeaf.id] = { sessionId: null, wasOpen: true }
+    claudePaneStates.value[claudeLeaf.id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
 
     workspaces.value.push(ws)
     activeWorkspaceIndex.value = workspaces.value.length - 1
@@ -487,9 +492,8 @@ export const usePaneStore = defineStore('pane', () => {
     // Auto-launch claude in the worktree's main (Claude) pane on first mount.
     // Also pre-mark it as "claude running" so the autosave persists the intent
     // even if the app exits before claude actually starts (~500ms after PTY).
-    savedClaudeWasRunning.value[claudeLeaf.id] = true
-    claudeSessionIds.value[claudeLeaf.id] = ''
-    claudeOutputTokens.value[claudeLeaf.id] = 0
+    savedClaudeRestore.value[claudeLeaf.id] = { sessionId: null, wasOpen: true }
+    claudePaneStates.value[claudeLeaf.id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
 
     ws.worktrees.push(worktree)
     ws.activeWorktreeId = worktreeId
@@ -721,8 +725,16 @@ export const usePaneStore = defineStore('pane', () => {
         if (t) {
           terminalNames.value[id] = t.name
           if (t.cwd) savedCwds.value[id] = t.cwd
-          if (t.claudeSessionId) savedClaudeSessions.value[id] = t.claudeSessionId
-          if (t.claudeWasRunning) savedClaudeWasRunning.value[id] = true
+          if (t.claudeSessionId || t.claudeWasRunning) {
+            savedClaudeRestore.value[id] = {
+              sessionId: t.claudeSessionId ?? null,
+              wasOpen: t.claudeWasRunning ?? !!t.claudeSessionId,
+            }
+            // Pre-seed lifecycle so isClaudeActive returns true immediately.
+            // Without this, the reactive watcher in project.ts would see
+            // 'closed' and set the card to 'exited' before TerminalPane mounts.
+            claudePaneStates.value[id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
+          }
           if (t.shell) savedShells.value[id] = t.shell
         } else {
           assignTerminalName(id)
@@ -769,8 +781,13 @@ export const usePaneStore = defineStore('pane', () => {
           if (t) {
             terminalNames.value[id] = t.name
             if (t.cwd) savedCwds.value[id] = t.cwd
-            if (t.claudeSessionId) savedClaudeSessions.value[id] = t.claudeSessionId
-            if (t.claudeWasRunning) savedClaudeWasRunning.value[id] = true
+            if (t.claudeSessionId || t.claudeWasRunning) {
+              savedClaudeRestore.value[id] = {
+                sessionId: t.claudeSessionId ?? null,
+                wasOpen: t.claudeWasRunning ?? !!t.claudeSessionId,
+              }
+              claudePaneStates.value[id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
+            }
             if (t.shell) savedShells.value[id] = t.shell
           } else {
             assignTerminalName(id)
@@ -822,8 +839,8 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value = {}
     ptySessionIds.value = {}
     savedCwds.value = {}
-    savedClaudeSessions.value = {}
-    savedClaudeWasRunning.value = {}
+    savedClaudeRestore.value = {}
+    claudePaneStates.value = {}
     savedShells.value = {}
 
     const ws = buildTerminalWorkspace(saved, terminals, focusedTerminalIndex, 'Workspace 1')
@@ -836,8 +853,8 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value = {}
     ptySessionIds.value = {}
     savedCwds.value = {}
-    savedClaudeSessions.value = {}
-    savedClaudeWasRunning.value = {}
+    savedClaudeRestore.value = {}
+    claudePaneStates.value = {}
     savedShells.value = {}
 
     const restored: Workspace[] = savedWorkspaces.map(sw => {
@@ -883,14 +900,14 @@ export const usePaneStore = defineStore('pane', () => {
     // Terminal names
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
     terminalShells, getTerminalShell, setTerminalShell,
-    // Claude session tracking
-    claudeSessionIds, setClaudeSessionId, clearClaudeSessionId, getClaudeSessionId, isClaudeRunning,
+    // Claude lifecycle state (centralized)
+    claudePaneStates, getClaudePaneState, updateClaudePaneState, clearClaudePaneState,
+    isClaudeActive, getClaudeSessionForSave,
     // Terminal status
     terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,
     // Saved state for restoration
-    savedCwds, savedClaudeSessions,
-    getSavedCwd, consumeSavedCwd, getSavedClaudeSession, consumeSavedClaudeSession,
-    getSavedClaudeWasRunning, consumeSavedClaudeWasRunning, getSavedShell, consumeSavedShell,
+    savedCwds, savedClaudeRestore,
+    getSavedCwd, consumeSavedCwd, consumeSavedClaudeRestore, getSavedShell, consumeSavedShell,
     // Focus trigger
     focusTrigger, triggerFocus,
     // Serialization

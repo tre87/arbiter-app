@@ -21,7 +21,7 @@ const projectStore = useProjectStore()
 const devSettings = useDevSettingsStore()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
-function syncProjectStatus(status: typeof claudeStatus.value, state?: 'idle' | 'ready' | 'working' | 'attention' | 'exited') {
+function syncProjectStatus(status: typeof claudeStatus.value, state?: 'ready' | 'working' | 'attention' | 'exited') {
   const wtId = projectStore.getWorktreeIdForPane(props.paneId)
   if (!wtId) return
   const update: Record<string, any> = {}
@@ -50,9 +50,17 @@ let sessionId: string | null = null
 let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
 let focusHandler: (() => void) | null = null
+let workspaceActivatedHandler: (() => void) | null = null
+// True once we've actually sent `claude` or `claude --resume` to the PTY.
+// Prevents the initial shell-idle event (which fires before the 500ms launch
+// timeout) from being misinterpreted as "Claude exited without JSONL".
+let claudeCommandSent = false
 
 // ── Claude detection state ───────────────────────────────────────────────────
-const claudeRunning = ref(false)
+// All Claude lifecycle state is centralized in the pane store (claudePaneStates).
+// TerminalPane reads it reactively and forwards events to the store.
+const claudeState = computed(() => store.getClaudePaneState(props.paneId))
+const claudeActive = computed(() => store.isClaudeActive(props.paneId))
 const footerVisible = ref(true)
 const claudeStatus = ref<{
   session_id: string
@@ -70,8 +78,6 @@ const folderName = ref<string | null>(null)
 const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
 let unlistenCwd: (() => void) | null = null
 
-const claudeWorking = ref(false)
-const claudeNeedsAttention = ref(false)
 const terminalTitle = ref('')
 
 // True when this pane lives inside a project workspace. Project workspaces
@@ -79,16 +85,13 @@ const terminalTitle = ref('')
 // only appear when Claude is running (to show claude stats).
 const inProjectWorkspace = computed(() => store.isPaneInProjectWorkspace(props.paneId))
 
-function computeClaudeState(): 'ready' | 'working' | 'attention' {
-  if (claudeWorking.value) return 'working'
-  if (claudeNeedsAttention.value) return 'attention'
-  return 'ready'
-}
+// Derived booleans for template usage
+const claudeWorking = computed(() => claudeState.value.lifecycle === 'working')
 
 function pushClaudeState() {
-  const s = computeClaudeState()
-  store.setTerminalStatus(props.paneId, s)
-  syncProjectStatus(null, s)
+  const s = claudeState.value.lifecycle === 'closed' ? 'idle' as const : claudeState.value.lifecycle === 'launching' ? 'ready' as const : claudeState.value.lifecycle
+  store.setTerminalStatus(props.paneId, s === 'idle' ? 'idle' : s)
+  syncProjectStatus(null, s === 'idle' ? 'exited' : s)
 }
 
 const infoPanelOpen = ref(false)
@@ -191,13 +194,17 @@ watch(isFocused, (focused) => {
 
 // shellIdle is driven purely by the shell-activity-{sid} event from the backend
 // (see subscribeToSession). When Claude is running the shell-switch button is
-// hidden regardless, so we just clear it on claudeRunning transitions.
-watch(() => claudeRunning.value, (running) => {
-  if (running) shellIdle.value = false
+// hidden regardless, so we just clear it on claudeActive transitions.
+watch(claudeActive, (active) => {
+  if (active) shellIdle.value = false
 })
 
 function launchClaude() {
   if (sessionId) {
+    claudeCommandSent = true
+    store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false, sessionId: null })
+    footerVisible.value = true
+    syncProjectStatus(null, 'ready')
     invoke('write_to_session', { sessionId, data: 'claude\r' })
     term?.focus()
   }
@@ -205,6 +212,10 @@ function launchClaude() {
 
 function continueClaude() {
   if (sessionId) {
+    claudeCommandSent = true
+    store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false, sessionId: null })
+    footerVisible.value = true
+    syncProjectStatus(null, 'ready')
     invoke('write_to_session', { sessionId, data: 'claude --continue\r' })
     term?.focus()
   }
@@ -219,38 +230,72 @@ async function subscribeToSession(sid: string) {
     gitInfo.value = data.git
   }) as unknown as (() => void)
   unlistenStarted = await listen(`claude-started-${sid}`, (event) => {
-    claudeStatus.value = event.payload as typeof claudeStatus.value
-    claudeRunning.value = true
+    const payload = event.payload as typeof claudeStatus.value
+    claudeStatus.value = payload
     footerVisible.value = true
-    if (claudeStatus.value?.session_id) {
-      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
+    const update: Partial<import('../types/pane').ClaudePaneState> = {
+      lifecycle: 'ready',
+      confirmed: true,
     }
-    // Don't hardcode 'working' here — actual working state comes from the
-    // terminal title spinner (OSC parser sets claudeWorking). On resume the
-    // session is idle until the user types something.
-    syncProjectStatus(claudeStatus.value, computeClaudeState())
+    if (payload?.session_id) update.sessionId = payload.session_id
+    if (payload?.model_id) update.model = payload.model_id
+    if (payload?.input_tokens != null) update.inputTokens = payload.input_tokens
+    if (payload?.output_tokens != null) update.outputTokens = payload.output_tokens
+    if (payload?.cache_creation_input_tokens != null) update.cacheWriteTokens = payload.cache_creation_input_tokens
+    if (payload?.cache_read_input_tokens != null) update.cacheReadTokens = payload.cache_read_input_tokens
+    store.updateClaudePaneState(props.paneId, update)
+    syncProjectStatus(payload, 'ready')
   })
   unlistenStatus = await listen(`claude-status-${sid}`, (event) => {
-    claudeStatus.value = event.payload as typeof claudeStatus.value
-    if (claudeStatus.value?.session_id) {
-      store.setClaudeSessionId(props.paneId, claudeStatus.value.session_id, claudeStatus.value.output_tokens ?? 0)
+    const payload = event.payload as typeof claudeStatus.value
+    claudeStatus.value = payload
+    const update: Partial<import('../types/pane').ClaudePaneState> = {}
+    if (payload?.session_id) update.sessionId = payload.session_id
+    if (payload?.model_id) update.model = payload.model_id
+    if (payload?.input_tokens != null) update.inputTokens = payload.input_tokens
+    if (payload?.output_tokens != null) update.outputTokens = payload.output_tokens
+    if (payload?.cache_creation_input_tokens != null) update.cacheWriteTokens = payload.cache_creation_input_tokens
+    if (payload?.cache_read_input_tokens != null) update.cacheReadTokens = payload.cache_read_input_tokens
+    if (payload) {
+      const total = (payload.input_tokens ?? 0) + (payload.output_tokens ?? 0)
+        + (payload.cache_creation_input_tokens ?? 0) + (payload.cache_read_input_tokens ?? 0)
+      update.contextPercent = Math.min(100, (total / 200_000) * 100)
     }
-    syncProjectStatus(claudeStatus.value)
+    store.updateClaudePaneState(props.paneId, update)
+    syncProjectStatus(payload)
   })
   unlistenExited = await listen(`claude-exited-${sid}`, () => {
-    claudeRunning.value = false
-    claudeWorking.value = false
-    claudeNeedsAttention.value = false
     infoPanelOpen.value = false
-    store.clearClaudeSessionId(props.paneId)
+    claudeCommandSent = false
+    store.updateClaudePaneState(props.paneId, {
+      lifecycle: 'closed', confirmed: false,
+    })
     store.setTerminalStatus(props.paneId, 'idle')
     syncProjectStatus(null, 'exited')
   })
   unlistenActivity = await listen(`shell-activity-${sid}`, (event) => {
     const idle = event.payload as boolean
-    if (!claudeRunning.value) {
+    if (claudeActive.value) {
+      // Shell went idle while we think Claude is running. If the backend
+      // never confirmed Claude via JSONL detection (confirmed is false),
+      // Claude exited before creating a session file — e.g. the user typed
+      // /exit with no conversation, or Claude crashed on startup.
+      // Guard: only apply this after we've actually sent the claude command
+      // (claudeCommandSent). Without this, the initial shell-idle event
+      // that fires when the PTY first starts (before the 500ms launch
+      // timeout) would be misinterpreted as an exit.
+      if (idle && !claudeState.value.confirmed && claudeCommandSent) {
+        infoPanelOpen.value = false
+        claudeCommandSent = false
+        store.updateClaudePaneState(props.paneId, {
+          lifecycle: 'closed', confirmed: false,
+        })
+        store.setTerminalStatus(props.paneId, 'idle')
+        syncProjectStatus(null, 'exited')
+        if (isWindows && gitBashPath.value) shellIdle.value = true
+      }
+    } else {
       store.setTerminalStatus(props.paneId, idle ? 'idle' : 'running')
-      // Also drives the "switch to git-bash" button visibility on Windows.
       if (isWindows && gitBashPath.value) shellIdle.value = idle
     }
   }) as unknown as (() => void)
@@ -265,7 +310,7 @@ async function subscribeToSession(sid: string) {
     const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: currentCwd }).catch(() => null)
     if (git) gitInfo.value = git
   }
-  if (isWindows && gitBashPath.value && !claudeRunning.value) {
+  if (isWindows && gitBashPath.value && !claudeActive.value) {
     const currentIdle = await invoke<boolean | null>('get_session_shell_idle', { sessionId: sid }).catch(() => null)
     if (currentIdle !== null && currentIdle !== undefined) {
       shellIdle.value = currentIdle
@@ -372,17 +417,16 @@ onMounted(async () => {
   // Detect Claude working via OSC 0 title changes.
   term.parser.registerOscHandler(0, (data) => {
     terminalTitle.value = data
-    if (claudeRunning.value) {
+    if (claudeActive.value) {
       const hasSpinner = /[\u2800-\u28FF]/.test(data)
       const isIdle = /✳/.test(data)
-      const wasWorking = claudeWorking.value
-      claudeWorking.value = hasSpinner && !isIdle
-      // Resuming work clears any pending attention prompt
-      if (claudeWorking.value) claudeNeedsAttention.value = false
-      // Ignore the brief idle flicker right after a work cycle — a BEL
-      // arriving shortly will upgrade to 'attention'.
-      if (wasWorking && !claudeWorking.value && !claudeNeedsAttention.value) {
-        // Leave as idle; will flip to attention if a bell follows.
+      const wasWorking = claudeState.value.lifecycle === 'working'
+      const nowWorking = hasSpinner && !isIdle
+      if (nowWorking) {
+        store.updateClaudePaneState(props.paneId, { lifecycle: 'working' })
+      } else if (wasWorking) {
+        // Brief idle after work — leave as 'ready'; BEL will upgrade to 'attention'
+        store.updateClaudePaneState(props.paneId, { lifecycle: 'ready' })
       }
       pushClaudeState()
     }
@@ -392,16 +436,16 @@ onMounted(async () => {
   // BEL (\x07) is Claude Code's "waiting for user input" signal (permission
   // prompts, option menus). Surface it as 'needs attention'.
   term.onBell(() => {
-    if (claudeRunning.value && !claudeWorking.value) {
-      claudeNeedsAttention.value = true
+    if (claudeActive.value && claudeState.value.lifecycle !== 'working') {
+      store.updateClaudePaneState(props.paneId, { lifecycle: 'attention' })
       pushClaudeState()
     }
   })
 
   // Any user input clears the attention flag for this terminal.
   term.onData(() => {
-    if (claudeNeedsAttention.value) {
-      claudeNeedsAttention.value = false
+    if (claudeState.value.lifecycle === 'attention') {
+      store.updateClaudePaneState(props.paneId, { lifecycle: 'ready' })
       pushClaudeState()
     }
   })
@@ -409,6 +453,17 @@ onMounted(async () => {
   // Register focus handler immediately so App.vue's polling can reach us
   focusHandler = () => { if (isFocused.value) term?.focus() }
   window.addEventListener('arbiter:request-focus', focusHandler)
+
+  // Refit when this pane's workspace becomes the active one. Background
+  // workspaces render with `display: none` so ResizeObserver doesn't fire
+  // while they're hidden — if the window resized in the interim we need a
+  // one-shot refit on reveal. The offsetParent check ensures panes in
+  // other still-hidden workspaces stay idle. If dimensions haven't
+  // changed, safeFit no-ops and no PTY resize is issued.
+  workspaceActivatedHandler = () => {
+    if (terminalEl.value?.offsetParent !== null) scheduleFit()
+  }
+  window.addEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
 
   await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
 
@@ -466,23 +521,33 @@ onMounted(async () => {
     const status = await invoke('get_active_claude_status', { sessionId }).catch(() => null) as typeof claudeStatus.value
     if (status) {
       claudeStatus.value = status
-      claudeRunning.value = true
       footerVisible.value = true
-      // Derive working state from the restored title (OSC handler didn't run during unmount)
+      // Derive working state from the restored title
+      let lifecycle: 'ready' | 'working' = 'ready'
       if (savedTitle) {
         const hasSpinner = /[\u2800-\u28FF]/.test(savedTitle)
         const isIdle = /✳/.test(savedTitle)
-        claudeWorking.value = hasSpinner && !isIdle
-        pushClaudeState()
+        if (hasSpinner && !isIdle) lifecycle = 'working'
       }
+      store.updateClaudePaneState(props.paneId, {
+        lifecycle,
+        confirmed: true,
+        sessionId: status.session_id ?? null,
+        model: status.model_id ?? null,
+        inputTokens: status.input_tokens ?? 0,
+        outputTokens: status.output_tokens ?? 0,
+        cacheWriteTokens: status.cache_creation_input_tokens ?? 0,
+        cacheReadTokens: status.cache_read_input_tokens ?? 0,
+      })
+      pushClaudeState()
     } else {
       // Claude not running — clear any stale working status from before unmount
+      store.updateClaudePaneState(props.paneId, { lifecycle: 'closed', confirmed: false })
       store.setTerminalStatus(props.paneId, 'idle')
     }
   } else {
     const savedCwd = store.consumeSavedCwd(props.paneId)
-    const savedClaudeId = store.consumeSavedClaudeSession(props.paneId)
-    const savedClaudeWasRunning = store.consumeSavedClaudeWasRunning(props.paneId)
+    const claudeRestore = store.consumeSavedClaudeRestore(props.paneId)
 
     // Pre-populate footer state BEFORE creating the session so the terminal
     // has its final height (with footer visible) when we measure rows/cols.
@@ -491,8 +556,7 @@ onMounted(async () => {
       folderName.value = savedCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
       const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
       gitInfo.value = git
-      if (savedClaudeId || savedClaudeWasRunning) {
-        claudeRunning.value = true
+      if (claudeRestore?.wasOpen) {
         footerVisible.value = true
       }
       // Let Vue re-render the footer, then refit terminal to the new smaller area
@@ -515,28 +579,30 @@ onMounted(async () => {
       term.write(event.payload)
     })
 
-    if (savedClaudeId && sessionId) {
-      // Pre-register the expected Claude session id so the JSONL watcher
-      // adopts the resumed file into *this* pane (and not whichever empty
-      // pane the HashMap iterator yields first when several panes are
-      // resuming concurrently).
-      invoke('set_expected_claude_session', { sessionId, claudeSessionId: savedClaudeId }).catch(() => {})
-      // Pre-seed the store so an autosave that fires before the JSONL
-      // watcher reports back still persists the resume id (otherwise a
-      // quick close-then-reopen wipes the saved session from disk).
-      store.setClaudeSessionId(props.paneId, savedClaudeId, 0)
-      setTimeout(() => {
-        invoke('write_to_session', { sessionId, data: `claude --resume ${savedClaudeId}\r` })
-      }, 500)
-    } else if (savedClaudeWasRunning && sessionId) {
-      // Pre-seed with the empty-string sentinel so isClaudeRunning is true
-      // before the JSONL watcher reports back. Without this, an autosave
-      // before Claude has actually started would persist the pane as not
-      // running and lose the auto-launch intent on the next restart.
-      store.setClaudeSessionId(props.paneId, '', 0)
-      setTimeout(() => {
-        invoke('write_to_session', { sessionId, data: 'claude\r' })
-      }, 500)
+    if (claudeRestore && sessionId) {
+      if (claudeRestore.sessionId) {
+        // Resume conversation — pre-register expected session so JSONL watcher
+        // adopts the resumed file into *this* pane.
+        invoke('set_expected_claude_session', { sessionId, claudeSessionId: claudeRestore.sessionId }).catch(() => {})
+        store.updateClaudePaneState(props.paneId, {
+          lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
+        })
+        syncProjectStatus(null, 'ready')
+        setTimeout(() => {
+          claudeCommandSent = true
+          invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
+        }, 500)
+      } else if (claudeRestore.wasOpen) {
+        // Launch fresh — Claude was open but no conversation to resume
+        store.updateClaudePaneState(props.paneId, {
+          lifecycle: 'launching', confirmed: false,
+        })
+        syncProjectStatus(null, 'ready')
+        setTimeout(() => {
+          claudeCommandSent = true
+          invoke('write_to_session', { sessionId, data: 'claude\r' })
+        }, 500)
+      }
     }
   }
 
@@ -588,6 +654,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
+  if (workspaceActivatedHandler) window.removeEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
   unsubscribeAll()
   if (fitTimer) clearTimeout(fitTimer)
   unlisten?.()
@@ -633,7 +700,7 @@ onBeforeUnmount(() => {
       <span class="toolbar-spacer" />
 
       <!-- Right: Claude buttons -->
-      <template v-if="!claudeRunning">
+      <template v-if="!claudeActive">
         <button class="toolbar-btn claude-btn" title="Launch claude" @click="launchClaude" @mousedown.stop>
           <ClaudeIcon :size="14" />
         </button>
@@ -654,7 +721,7 @@ onBeforeUnmount(() => {
 
       <!-- Right: Info button -->
       <button
-        v-if="claudeRunning"
+        v-if="claudeActive"
         class="toolbar-btn info-btn"
         :class="{ active: infoPanelOpen }"
         title="Session info"
@@ -707,9 +774,9 @@ onBeforeUnmount(() => {
     </div>
     <TerminalFooter
       v-if="inProjectWorkspace
-        ? (claudeRunning && footerVisible)
-        : ((claudeRunning && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd))"
-      :claude-running="claudeRunning"
+        ? (claudeActive && footerVisible)
+        : ((claudeActive && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd))"
+      :claude-running="claudeActive"
       :status="claudeStatus"
       :folder-name="folderName"
       :git-info="gitInfo"

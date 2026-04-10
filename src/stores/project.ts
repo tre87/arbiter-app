@@ -27,7 +27,7 @@ export interface WorktreeClaudeStatus {
   cacheReadTokens: number
   cacheWriteTokens: number
   contextPercent: number
-  status: 'idle' | 'ready' | 'working' | 'attention' | 'exited'
+  status: 'ready' | 'working' | 'attention' | 'exited'
   sessionId: string | null
 }
 
@@ -72,7 +72,7 @@ export const useProjectStore = defineStore('project', () => {
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       contextPercent: 0,
-      status: 'idle',
+      status: 'exited',
       sessionId: null,
     }
   }
@@ -87,139 +87,40 @@ export const useProjectStore = defineStore('project', () => {
 
   function registerPaneWorktree(claudePaneId: string, worktreeId: string) {
     paneToWorktree.value[claudePaneId] = worktreeId
-    ensurePaneListeners(claudePaneId)
   }
 
-  // ── Background pane listeners ────────────────────────────────────────────
-  // TerminalPane drives Claude status for worktrees that are currently
-  // mounted. For background worktrees (other tabs, or non-active worktrees
-  // within an active project workspace) nothing mounts, so the sidebar card
-  // would forever show "Terminal" even though Claude is actually running.
-  //
-  // We mirror the same event subscriptions here at the store level:
-  //   - title-changed-{sid}  → working/ready transitions from OSC 0 title
-  //   - claude-started-{sid} → initial transition to 'ready' + model/tokens
-  //   - claude-status-{sid}  → token/model updates
-  //   - claude-exited-{sid}  → transition to 'exited'
-  //
-  // These run concurrently with any mounted TerminalPane's own listeners;
-  // both write the same data to updateClaudeStatus, so duplicates are fine.
-  interface PaneListeners {
-    title: () => void
-    started: () => void
-    status: () => void
-    exited: () => void
-  }
-  const paneListeners = new Map<string, PaneListeners>()
-  // Track the sessionId we subscribed with so we can resubscribe if it
-  // changes (e.g. user closes + recreates a pane).
-  const subscribedSessionFor = new Map<string, string>()
-
-  type ClaudeStatusPayload = {
-    session_id?: string
-    model_id?: string | null
-    input_tokens?: number | null
-    output_tokens?: number | null
-    cache_creation_input_tokens?: number | null
-    cache_read_input_tokens?: number | null
-  }
-
-  function applyClaudeStatusPayload(wtId: string, payload: ClaudeStatusPayload) {
-    const update: Partial<WorktreeClaudeStatus> = {}
-    if (payload.model_id) update.model = payload.model_id
-    if (payload.input_tokens != null) update.inputTokens = payload.input_tokens
-    if (payload.output_tokens != null) update.outputTokens = payload.output_tokens
-    if (payload.cache_read_input_tokens != null) update.cacheReadTokens = payload.cache_read_input_tokens
-    if (payload.cache_creation_input_tokens != null) update.cacheWriteTokens = payload.cache_creation_input_tokens
-    if (payload.session_id) update.sessionId = payload.session_id
-    const total = (payload.input_tokens ?? 0)
-      + (payload.output_tokens ?? 0)
-      + (payload.cache_creation_input_tokens ?? 0)
-      + (payload.cache_read_input_tokens ?? 0)
-    if (total > 0) update.contextPercent = Math.min(100, (total / 200_000) * 100)
-    updateClaudeStatus(wtId, update)
-  }
-
-  async function ensurePaneListeners(claudePaneId: string) {
-    const paneStore = getPaneStore()
-    const sessionId = paneStore.getPtySession(claudePaneId)
-    if (!sessionId) return
-    if (subscribedSessionFor.get(claudePaneId) === sessionId) return
-    // Previous session for this pane (if any) — tear down first.
-    disposePaneListeners(claudePaneId)
-
-    const title = await listen(`title-changed-${sessionId}`, (event) => {
-      const title = event.payload as string
-      const wtId = paneToWorktree.value[claudePaneId]
-      if (!wtId) return
-      const cur = getClaudeStatus(wtId)
-      // Only meaningful while Claude is alive. When Claude isn't running the
-      // OSC 0 title is whatever the shell set and must not flip working.
-      if (cur.status === 'idle' || cur.status === 'exited') return
-      const hasSpinner = /[\u2800-\u28FF]/.test(title)
-      const isClaudeIdleMarker = /✳/.test(title)
-      const nowWorking = hasSpinner && !isClaudeIdleMarker
-      if (nowWorking && cur.status !== 'working') {
-        updateClaudeStatus(wtId, { status: 'working' })
-      } else if (!nowWorking && cur.status === 'working') {
-        updateClaudeStatus(wtId, { status: 'ready' })
-      }
-    }) as unknown as (() => void)
-
-    const started = await listen(`claude-started-${sessionId}`, (event) => {
-      const wtId = paneToWorktree.value[claudePaneId]
-      if (!wtId) return
-      applyClaudeStatusPayload(wtId, event.payload as ClaudeStatusPayload)
-      // Flip to 'ready' on start; title listener will upgrade to 'working'
-      // once the spinner shows up.
-      const cur = getClaudeStatus(wtId)
-      if (cur.status === 'idle' || cur.status === 'exited') {
-        updateClaudeStatus(wtId, { status: 'ready' })
-      }
-    }) as unknown as (() => void)
-
-    const status = await listen(`claude-status-${sessionId}`, (event) => {
-      const wtId = paneToWorktree.value[claudePaneId]
-      if (!wtId) return
-      applyClaudeStatusPayload(wtId, event.payload as ClaudeStatusPayload)
-    }) as unknown as (() => void)
-
-    const exited = await listen(`claude-exited-${sessionId}`, () => {
-      const wtId = paneToWorktree.value[claudePaneId]
-      if (!wtId) return
-      updateClaudeStatus(wtId, { status: 'exited' })
-    }) as unknown as (() => void)
-
-    paneListeners.set(claudePaneId, { title, started, status, exited })
-    subscribedSessionFor.set(claudePaneId, sessionId)
-  }
-
-  function disposePaneListeners(claudePaneId: string) {
-    const ls = paneListeners.get(claudePaneId)
-    if (ls) {
-      for (const un of [ls.title, ls.started, ls.status, ls.exited]) {
-        try { un() } catch { /* ignore */ }
-      }
-    }
-    paneListeners.delete(claudePaneId)
-    subscribedSessionFor.delete(claudePaneId)
-  }
-
-  // PTY sessions are created asynchronously after `registerPaneWorktree` runs,
-  // so watch for session-id changes and (re)attach title listeners whenever a
-  // registered claude pane gains or swaps its sessionId.
+  // ── Reactive derivation from centralized claudePaneStates ────────────────
+  // Instead of duplicating event listeners from TerminalPane, we reactively
+  // watch the centralized ClaudePaneState in the pane store and derive the
+  // worktree card status from it. Single source of truth.
   watch(
     () => {
       const paneStore = getPaneStore()
-      const snapshot: Record<string, string | undefined> = {}
-      for (const paneId of Object.keys(paneToWorktree.value)) {
-        snapshot[paneId] = paneStore.getPtySession(paneId)
+      const snap: Record<string, { lifecycle: string; model: string | null; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; contextPercent: number; sessionId: string | null } | null> = {}
+      for (const [paneId, wtId] of Object.entries(paneToWorktree.value)) {
+        const state = paneStore.getClaudePaneState(paneId)
+        snap[wtId] = state
       }
-      return snapshot
+      return snap
     },
     (snap) => {
-      for (const [paneId, sid] of Object.entries(snap)) {
-        if (sid) ensurePaneListeners(paneId)
+      for (const [wtId, state] of Object.entries(snap)) {
+        if (!state || state.lifecycle === 'closed') {
+          updateClaudeStatus(wtId, { status: 'exited' })
+        } else {
+          const status = state.lifecycle === 'launching' ? 'ready' : state.lifecycle as WorktreeClaudeStatus['status']
+          const update: Partial<WorktreeClaudeStatus> = {
+            status,
+            inputTokens: state.inputTokens,
+            outputTokens: state.outputTokens,
+            cacheReadTokens: state.cacheReadTokens,
+            cacheWriteTokens: state.cacheWriteTokens,
+            contextPercent: state.contextPercent,
+          }
+          if (state.model) update.model = state.model
+          if (state.sessionId) update.sessionId = state.sessionId
+          updateClaudeStatus(wtId, update)
+        }
       }
     },
     { deep: true }
@@ -500,6 +401,7 @@ export const useProjectStore = defineStore('project', () => {
 
       const result = getPaneStore().addProjectWorkspace(repoName, normalizedRoot, branchName, mainPath)
       registerPaneWorktree(result.claudePaneId, result.worktreeId)
+      updateClaudeStatus(result.worktreeId, { status: 'ready' })
 
       // Pre-populate model from project settings if available
       try {
@@ -542,6 +444,7 @@ export const useProjectStore = defineStore('project', () => {
       if (!result) return null
 
       registerPaneWorktree(result.claudePaneId, result.worktreeId)
+      updateClaudeStatus(result.worktreeId, { status: 'ready' })
 
       // Pre-populate model from project settings
       try {
@@ -612,7 +515,6 @@ export const useProjectStore = defineStore('project', () => {
       getPaneStore().removeWorktreeFromProject(workspaceId, worktreeId)
 
       // Clean up status and caches
-      disposePaneListeners(wt.claudePaneId)
       delete claudeStatuses.value[worktreeId]
       delete directoryCache.value[worktreeId]
       delete gitStatusCache.value[worktreeId]
@@ -651,7 +553,6 @@ export const useProjectStore = defineStore('project', () => {
 
       getPaneStore().removeWorktreeFromProject(workspaceId, worktreeId)
 
-      disposePaneListeners(wt.claudePaneId)
       delete claudeStatuses.value[worktreeId]
       delete directoryCache.value[worktreeId]
       delete gitStatusCache.value[worktreeId]
@@ -679,6 +580,14 @@ export const useProjectStore = defineStore('project', () => {
       if (ws.type !== 'project') continue
       for (const wt of ws.worktrees) {
         registerPaneWorktree(wt.claudePaneId, wt.id)
+        // Eagerly set card status when Claude is expected to run (seeded
+        // during restore or workspace creation via the empty-string
+        // sentinel in claudeSessionIds). This fires before any
+        // TerminalPane mounts, so the sidebar card never flashes
+        // "Terminal" when it should show "Idle".
+        if (paneStore.isClaudeActive(wt.claudePaneId)) {
+          updateClaudeStatus(wt.id, { status: 'ready' })
+        }
       }
     }
   }
@@ -691,6 +600,15 @@ export const useProjectStore = defineStore('project', () => {
         // Registration is idempotent; safe to call even if already
         // registered by registerAllProjectPanes.
         registerPaneWorktree(wt.claudePaneId, wt.id)
+        // If Claude is expected to run (seeded by restore or workspace
+        // creation), flip the card from "Terminal" → "Idle" immediately.
+        // TerminalPane will later upgrade to "Working" via title events.
+        if (paneStore.isClaudeActive(wt.claudePaneId)) {
+          const cur = getClaudeStatus(wt.id)
+          if (cur.status === 'exited') {
+            updateClaudeStatus(wt.id, { status: 'ready' })
+          }
+        }
         try {
           const model = await invoke<string | null>('get_project_model', { projectPath: wt.path })
           if (model) updateClaudeStatus(wt.id, { model })
@@ -710,7 +628,6 @@ export const useProjectStore = defineStore('project', () => {
 
     for (const wt of ws.worktrees) {
       await unwatchAll(wt.id)
-      disposePaneListeners(wt.claudePaneId)
       delete claudeStatuses.value[wt.id]
       delete directoryCache.value[wt.id]
       delete gitStatusCache.value[wt.id]
@@ -736,7 +653,6 @@ export const useProjectStore = defineStore('project', () => {
     updateClaudeStatus,
     paneToWorktree,
     registerPaneWorktree,
-    ensurePaneListeners,
     getWorktreeIdForPane,
     // Worktree lifecycle
     createProjectWorkspace,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -21,7 +21,7 @@ import WindowControls from './components/WindowControls.vue'
 import logoUrl from './assets/logo.svg'
 import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from './utils/spatial'
 import type { ArbiterConfig, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace } from './types/config'
-import type { PaneNode, Workspace } from './types/pane'
+import type { PaneNode } from './types/pane'
 
 const store = usePaneStore()
 const devStore = useDevSettingsStore()
@@ -80,17 +80,24 @@ async function performAutoSave() {
           const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
           if (cwd) entry.cwd = cwd
         } catch { /* ignore */ }
-        const claudeId = store.getClaudeSessionId(t.id)
-        if (claudeId) entry.claudeSessionId = claudeId
-        if (store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
+        const claudeSave = store.getClaudeSessionForSave(t.id)
+        if (claudeSave.sessionId) entry.claudeSessionId = claudeSave.sessionId
+        if (claudeSave.wasOpen) entry.claudeWasRunning = true
         const shell = store.getTerminalShell(t.id)
         if (shell !== 'powershell') entry.shell = shell
       } else {
         const savedCwd = store.getSavedCwd(t.id)
         if (savedCwd) entry.cwd = savedCwd
-        const savedClaudeId = store.getSavedClaudeSession(t.id)
-        if (savedClaudeId) entry.claudeSessionId = savedClaudeId
-        if (store.getSavedClaudeWasRunning(t.id) || store.isClaudeRunning(t.id)) entry.claudeWasRunning = true
+        const savedRestore = store.savedClaudeRestore[t.id]
+        if (savedRestore) {
+          if (savedRestore.sessionId) entry.claudeSessionId = savedRestore.sessionId
+          if (savedRestore.wasOpen) entry.claudeWasRunning = true
+        } else {
+          // Check live state as last resort
+          const claudeSave = store.getClaudeSessionForSave(t.id)
+          if (claudeSave.sessionId) entry.claudeSessionId = claudeSave.sessionId
+          if (claudeSave.wasOpen) entry.claudeWasRunning = true
+        }
         const savedShell = store.getSavedShell(t.id)
         if (savedShell && savedShell !== 'powershell') entry.shell = savedShell
       }
@@ -157,11 +164,25 @@ watch(
     store.workspaces,
     store.activeWorkspaceIndex,
     store.terminalStatuses,
-    store.claudeSessionIds,
+    store.claudePaneStates,
   ],
   performAutoSave,
   { deep: true }
 )
+
+// When the active workspace changes, every TerminalPane now stays mounted
+// (see v-for/v-show block in the template). Panes in the newly-visible
+// workspace need a chance to refit — ResizeObserver doesn't fire while an
+// ancestor is `display: none`, so a window resize during backgrounding
+// wouldn't have reached them. We dispatch `arbiter:workspace-activated`
+// after the DOM updates and let each TerminalPane decide whether to refit
+// based on its own visibility.
+watch(() => store.activeWorkspaceIndex, async () => {
+  await nextTick()
+  requestAnimationFrame(() => {
+    window.dispatchEvent(new Event('arbiter:workspace-activated'))
+  })
+})
 
 // ── Startup: load config and restore layout ──────────────────────────────────
 
@@ -224,13 +245,6 @@ function collectLeafIds(node: PaneNode): string[] {
   return [...collectLeafIds(node.first), ...collectLeafIds(node.second)]
 }
 
-function collectAllLeafIds(ws: Workspace): string[] {
-  if (ws.type === 'project') {
-    return ws.worktrees.flatMap(wt => collectLeafIds(wt.root))
-  }
-  return collectLeafIds(ws.root)
-}
-
 async function bootstrapBackgroundSessions() {
   // Detect Git Bash once for all background sessions
   const isWindows = navigator.platform.startsWith('Win')
@@ -242,25 +256,22 @@ async function bootstrapBackgroundSessions() {
 
   for (let i = 0; i < store.workspaces.length; i++) {
     const ws = store.workspaces[i]
-    const isActiveWs = i === store.activeWorkspaceIndex
-    // For the active workspace: a terminal workspace's panes all mount
-    // normally via TerminalPane, but a project workspace only mounts the
-    // *active* worktree — the other worktrees need background bootstrap so
-    // their Claude instances launch without the user clicking in.
-    let paneIds: string[]
-    if (isActiveWs) {
-      if (ws.type !== 'project') continue
-      paneIds = ws.worktrees
-        .filter(wt => wt.id !== ws.activeWorktreeId)
-        .flatMap(wt => collectLeafIds(wt.root))
-    } else {
-      paneIds = collectAllLeafIds(ws)
-    }
+    // All workspaces now stay mounted across tab switches (v-show in App.vue),
+    // so every terminal workspace's panes and every project workspace's
+    // *active* worktree panes mount normally via TerminalPane and handle
+    // their own session creation + state restore. Bootstrap is only needed
+    // for the *non-active* worktrees inside project workspaces — those are
+    // keyed by activeWorktreeId in ProjectWorkspaceView and don't mount
+    // until the user switches to them, so Claude wouldn't auto-launch
+    // without this bootstrap path.
+    if (ws.type !== 'project') continue
+    const paneIds = ws.worktrees
+      .filter(wt => wt.id !== ws.activeWorktreeId)
+      .flatMap(wt => collectLeafIds(wt.root))
     for (const paneId of paneIds) {
       if (store.getPtySession(paneId)) continue // already has a session
       const cwd = store.consumeSavedCwd(paneId)
-      const claudeId = store.consumeSavedClaudeSession(paneId)
-      const claudeWasRunning = store.consumeSavedClaudeWasRunning(paneId)
+      const claudeRestore = store.consumeSavedClaudeRestore(paneId)
 
       // Use saved shell for this pane, fall back to default setting
       const savedShell = store.consumeSavedShell(paneId)
@@ -271,39 +282,29 @@ async function bootstrapBackgroundSessions() {
       try {
         const sessionId = await invoke<string>('create_session', { cols: 80, rows: 24, cwd: cwd ?? null, shell: shellPath })
         store.setPtySession(paneId, sessionId)
-        // Directly attach project store listeners for worktree claude panes.
-        // The project store's reactive watch on paneToWorktree → session would
-        // also pick this up, but the store may not even be instantiated yet
-        // on startup (initAllProjectWorkspaces runs after bootstrap), so the
-        // watch isn't set up in time. Explicit call eliminates that race and
-        // is a no-op for panes that aren't registered to a worktree.
-        projectStore.ensurePaneListeners(paneId)
 
-        if (claudeId || claudeWasRunning) {
+        if (claudeRestore) {
           // Optimistically flip the worktree card from "Terminal" → "Idle"
-          // the moment we decide to launch Claude. The claude-started event
-          // listener will later fill in model/tokens when Claude reports in,
-          // but this avoids the card sitting on "Terminal" for several
-          // seconds (or forever if the JSONL detection path silently drops
-          // the event for a background worktree).
           const wtId = projectStore.getWorktreeIdForPane(paneId)
           if (wtId) {
             projectStore.updateClaudeStatus(wtId, { status: 'ready' })
           }
-        }
 
-        if (claudeId) {
-          // Register so it persists on save even if this tab is never visited
-          store.setClaudeSessionId(paneId, claudeId, 1)
-          setTimeout(() => {
-            invoke('write_to_session', { sessionId, data: `claude --resume ${claudeId}\r` })
-          }, 500)
-        } else if (claudeWasRunning) {
-          // Mark as running so isClaudeRunning returns true on save
-          store.setClaudeSessionId(paneId, '', 0)
-          setTimeout(() => {
-            invoke('write_to_session', { sessionId, data: 'claude\r' })
-          }, 500)
+          if (claudeRestore.sessionId) {
+            store.updateClaudePaneState(paneId, {
+              lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
+            })
+            setTimeout(() => {
+              invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
+            }, 500)
+          } else if (claudeRestore.wasOpen) {
+            store.updateClaudePaneState(paneId, {
+              lifecycle: 'launching', confirmed: false,
+            })
+            setTimeout(() => {
+              invoke('write_to_session', { sessionId, data: 'claude\r' })
+            }, 500)
+          }
         }
       } catch { /* ignore failed session creation */ }
     }
@@ -582,18 +583,23 @@ onBeforeUnmount(() => {
       </div>
       <WindowControls />
     </div>
-    <div v-if="ready" class="workspace">
-      <ProjectWorkspaceView
-        v-if="store.workspaces[store.activeWorkspaceIndex].type === 'project'"
-        :workspace="store.workspaces[store.activeWorkspaceIndex] as any"
-        :key="store.workspaces[store.activeWorkspaceIndex].id"
-      />
-      <SplitView
-        v-else
-        :node="store.root"
-        :key="store.workspaces[store.activeWorkspaceIndex].id"
-      />
-    </div>
+    <template v-if="ready">
+      <div
+        v-for="(ws, i) in store.workspaces"
+        :key="ws.id"
+        v-show="i === store.activeWorkspaceIndex"
+        class="workspace"
+      >
+        <ProjectWorkspaceView
+          v-if="ws.type === 'project'"
+          :workspace="ws as any"
+        />
+        <SplitView
+          v-else
+          :node="(ws as any).root"
+        />
+      </div>
+    </template>
 
     <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
     <SettingsDialog v-if="settingsOpen" @close="settingsOpen = false" />
