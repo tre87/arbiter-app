@@ -404,21 +404,19 @@ export const usePaneStore = defineStore('pane', () => {
     })
     listeners.push(unStarted as unknown as () => void)
 
-    // claude-pty-active: PTY output while Claude is tracked → instant working detection.
-    // The backend emits this every 300ms when there's terminal output and a monitor
-    // entry exists. Much faster than JSONL token deltas.
+    // claude-pty-active: PTY output while Claude is already working.
+    // Only used to extend the working→ready timeout (keeps 'working' alive
+    // while output continues). Does NOT trigger the ready→working transition
+    // — that's driven by claude-status token changes, which are immune to
+    // false positives from resize redraws and TUI chrome.
     const unPtyActive = await listen(`claude-pty-active-${sid}`, () => {
       const state = getClaudePaneState(paneId)
-      if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
-        console.warn(`[claude-events] PTY-ACTIVE → working pane=${paneId}`)
-        updateClaudePaneState(paneId, { lifecycle: 'working' })
-      }
+      if (state.lifecycle !== 'working') return
       // Reset the working→ready timer on every burst of output
       if (workingTimers[paneId]) clearTimeout(workingTimers[paneId])
       workingTimers[paneId] = setTimeout(() => {
         const s = getClaudePaneState(paneId)
         if (s.lifecycle === 'working') {
-          console.warn(`[claude-events] working timeout → ready pane=${paneId}`)
           updateClaudePaneState(paneId, { lifecycle: 'ready' })
         }
         delete workingTimers[paneId]
@@ -426,11 +424,31 @@ export const usePaneStore = defineStore('pane', () => {
     })
     listeners.push(unPtyActive as unknown as () => void)
 
-    // claude-status: token/model updates from JSONL
+    // claude-status: token/model updates from JSONL.
+    // Also drives the ready→working transition: when output_tokens increases,
+    // Claude is actively generating. This is immune to false positives from
+    // resize redraws (which produce PTY output but don't change token counts).
     const unStatus = await listen<ClaudeStatusPayload>(`claude-status-${sid}`, (event) => {
       console.warn(`[claude-events] STATUS pane=${paneId}`, event.payload)
       const p = event.payload
+      const state = getClaudePaneState(paneId)
       const update: Partial<ClaudePaneState> = {}
+
+      // Detect working: output_tokens increased → Claude is generating
+      if (p?.output_tokens != null && p.output_tokens > (state.outputTokens ?? 0)) {
+        if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
+          update.lifecycle = 'working'
+        }
+        // Reset working→ready timer
+        if (workingTimers[paneId]) clearTimeout(workingTimers[paneId])
+        workingTimers[paneId] = setTimeout(() => {
+          const s = getClaudePaneState(paneId)
+          if (s.lifecycle === 'working') {
+            updateClaudePaneState(paneId, { lifecycle: 'ready' })
+          }
+          delete workingTimers[paneId]
+        }, 2000)
+      }
 
       if (p?.session_id) update.sessionId = p.session_id
       if (p?.model_id) update.model = p.model_id
