@@ -77,6 +77,13 @@ const tokenDisplay = computed(() => {
   return String(total)
 })
 
+const costDisplay = computed(() => {
+  const c = props.status.cost
+  if (c <= 0) return ''
+  if (c < 0.01) return '<$0.01'
+  return `$${c.toFixed(2)}`
+})
+
 const contextPercent = computed(() => Math.min(100, Math.max(0, props.status.contextPercent)))
 const progressColor = computed(() => {
   if (contextPercent.value > 80) return 'var(--color-danger)'
@@ -115,6 +122,7 @@ const progressColor = computed(() => {
             {{ statusLabel }}
           </span>
           <span v-if="!isMerged && claudeActive && tokenDisplay" class="token-count">{{ tokenDisplay }}</span>
+          <span v-if="!isMerged && claudeActive && costDisplay" class="cost-label">{{ costDisplay }}</span>
           <span class="spacer" />
           <span v-if="!isMerged && claudeActive" class="context-pct">
             {{ Math.round(contextPercent) }}%<span class="context-max">/{{ contextMaxLabel }}</span>
@@ -289,6 +297,11 @@ const progressColor = computed(() => {
 .token-count {
   font-size: 11px;
   color: var(--color-text-muted);
+}
+.cost-label {
+  font-size: 11px;
+  color: #4ec9b0;
+  font-weight: 600;
 }
 
 .end-btn {

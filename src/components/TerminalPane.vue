@@ -342,6 +342,7 @@ onMounted(async () => {
   term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
 
   term.onResize(({ cols, rows }) => {
+    store.markResize(props.paneId)
     if (sessionId) invoke('resize_session', { sessionId, cols, rows })
   })
 
@@ -365,6 +366,7 @@ onMounted(async () => {
     // We intentionally skip replaying the raw buffer here: it was captured at the old
     // terminal width, so escape sequences (cursor positioning, line wraps) would render
     // as garbled text at the new width. The running process redraws after the resize.
+    store.markResize(props.paneId)
     invoke('resize_session', { sessionId, cols: term.cols, rows: term.rows })
 
     // Claude state was maintained by persistent listeners in pane.ts while this

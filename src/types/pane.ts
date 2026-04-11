@@ -53,7 +53,7 @@ export type Workspace = TerminalWorkspace | ProjectWorkspace
 // ── Claude lifecycle state (centralized in pane store) ──────────────────────
 
 export interface ClaudePaneState {
-  /** closed = no Claude | launching = typed command, waiting for JSONL | ready = idle | working = spinner | attention = BEL */
+  /** closed = no Claude | launching = typed command, waiting for JSONL | ready = idle | working = active turn | attention = BEL */
   lifecycle: 'closed' | 'launching' | 'ready' | 'working' | 'attention'
   /** Non-empty once JSONL watcher confirms Claude. Null before confirmation or after exit. */
   sessionId: string | null
@@ -65,4 +65,6 @@ export interface ClaudePaneState {
   cacheReadTokens: number
   cacheWriteTokens: number
   contextPercent: number
+  /** Estimated session cost in USD, computed from token counts + model pricing */
+  cost: number
 }

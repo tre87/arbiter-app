@@ -98,7 +98,8 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
     let activity_event_name = format!("shell-activity-{}", sid);
     let title_event_name = format!("title-changed-{}", sid);
     let bell_event_name = format!("claude-bell-{}", sid);
-    let pty_active_event_name = format!("claude-pty-active-{}", sid);
+    let claude_activity_event_name = format!("claude-activity-{}", sid);
+    let context_event_name = format!("claude-context-{}", sid);
     let reader_sid = sid.clone();
     std::thread::spawn(move || {
         let sid = reader_sid;
@@ -114,9 +115,10 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
         // None until the shell first reports; we only emit on transitions.
         let mut prev_idle: Option<bool> = None;
         let mut prev_title: Option<String> = None;
-        // Debounced PTY-output activity signal for instant working detection.
+        // Debounced activity classification: "thinking" (spinner) or "generating" (text).
         // Only emitted when Claude is tracked for this session (monitor entry exists).
-        let mut last_pty_active_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        let mut last_activity_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        let mut last_activity_kind: Option<&str> = None;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -236,15 +238,60 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
                         }
                     }
 
-                    // Emit debounced PTY activity signal when Claude is tracked.
-                    // This provides instant "working" detection — the frontend
-                    // sees output within milliseconds of Claude generating text.
-                    if valid_chunk.len() > 1 {
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_pty_active_emit).as_millis() >= 300 {
-                            if monitor_arc.lock().unwrap().contains_key(&sid) {
-                                app_handle.emit(&pty_active_event_name, ()).ok();
-                                last_pty_active_emit = now;
+                    // Unified activity classification: thinking vs generating.
+                    // Spinners: Braille patterns U+2800-U+28FF (⠋⠙⠹⠸ etc.) and
+                    // dingbats U+2700-U+27BF — Claude Code uses these for its
+                    // animated thinking indicator.
+                    // Substantial printable text without spinners → "generating"
+                    // Pure ANSI escapes / short chunks → ignored (resize redraws)
+                    if monitor_arc.lock().unwrap().contains_key(&sid) {
+                        let is_spinner_char = |c: char| {
+                            ('\u{2800}'..='\u{28FF}').contains(&c) ||
+                            ('\u{2700}'..='\u{27BF}').contains(&c)
+                        };
+                        let has_spinner = text.chars().any(|c| is_spinner_char(c));
+                        // Count printable non-escape, non-control, non-spinner characters
+                        let printable_count = text.chars()
+                            .filter(|c| !c.is_control() && *c != '\x1b' && !is_spinner_char(*c))
+                            .count();
+
+                        let kind: Option<&str> = if has_spinner {
+                            Some("thinking")
+                        } else if printable_count > 10 {
+                            // Substantial text output without spinners = generating
+                            Some("generating")
+                        } else {
+                            None // Pure escape sequences or tiny output — ignore (resize, cursor moves)
+                        };
+
+                        if let Some(k) = kind {
+                            let now = std::time::Instant::now();
+                            // Emit if: different kind, or same kind but 200ms since last
+                            let should_emit = last_activity_kind != Some(k)
+                                || now.duration_since(last_activity_emit).as_millis() >= 200;
+                            if should_emit {
+                                app_handle.emit(&claude_activity_event_name, k).ok();
+                                last_activity_emit = now;
+                                last_activity_kind = Some(k);
+                            }
+                        }
+
+                        // Context window % detection from Claude's status bar.
+                        // Pattern: "context left until auto-compact: NN%"
+                        if let Some(idx) = text.find("context left until auto-compact") {
+                            let after = &text[idx..];
+                            // Find the digits before '%'
+                            if let Some(pct_end) = after.find('%') {
+                                let before_pct = &after[..pct_end];
+                                // Extract trailing digits
+                                let digits: String = before_pct.chars().rev()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect::<String>().chars().rev().collect();
+                                if let Ok(pct) = digits.parse::<u32>() {
+                                    // pct is "% left", convert to "% used"
+                                    let used = 100u32.saturating_sub(pct);
+                                    app_handle.emit(&context_event_name, used).ok();
+                                }
                             }
                         }
                     }

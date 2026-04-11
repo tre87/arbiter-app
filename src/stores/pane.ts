@@ -328,7 +328,22 @@ export const usePaneStore = defineStore('pane', () => {
   const defaultClaudePaneState: ClaudePaneState = {
     lifecycle: 'closed', sessionId: null, confirmed: false,
     model: null, inputTokens: 0, outputTokens: 0,
-    cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0,
+    cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0, cost: 0,
+  }
+
+  // Per-model pricing (USD per million tokens)
+  const MODEL_PRICING: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
+    'opus':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheWrite: 18.75 },
+    'sonnet': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheWrite: 3.75  },
+    'haiku':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheWrite: 1.00  },
+  }
+
+  function computeCost(model: string | null, input: number, output: number, cacheRead: number, cacheWrite: number): number {
+    if (!model) return 0
+    const key = Object.keys(MODEL_PRICING).find(k => model.includes(k))
+    if (!key) return 0
+    const p = MODEL_PRICING[key]
+    return (input * p.input + output * p.output + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite) / 1_000_000
   }
 
   function getClaudePaneState(paneId: string): ClaudePaneState {
@@ -366,9 +381,21 @@ export const usePaneStore = defineStore('pane', () => {
   // These live in the store (not in TerminalPane) so they survive component
   // unmount/remount cycles (e.g. worktree switching in project workspaces).
   const claudeEventListeners = ref<Record<string, Array<() => void>>>({})
-  const workingTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+  const idleTimers: Record<string, ReturnType<typeof setTimeout>> = {}
   // Tracks when lifecycle entered 'launching' for shell-activity grace period
   const launchTimestamps: Record<string, number> = {}
+  // Turn baseline: output_tokens at adoption time. Only enter thinking when
+  // tokens exceed this value (prevents false positives on startup/resume).
+  // -1 = sentinel meaning "capture from next claude-status".
+  const turnBaselines: Record<string, number> = {}
+  // Suppress spinner-based working detection for 500ms after resize
+  // (resize redraws can contain Braille chars from Claude's status bar)
+  const resizeTimestamps: Record<string, number> = {}
+
+  /** Called by TerminalPane on resize to suppress false activity detection */
+  function markResize(paneId: string) {
+    resizeTimestamps[paneId] = Date.now()
+  }
 
   interface ClaudeStatusPayload {
     session_id: string
@@ -388,7 +415,21 @@ export const usePaneStore = defineStore('pane', () => {
 
     const listeners: Array<() => void> = []
 
-    // claude-started: JSONL adopted → Claude confirmed running
+    // Helper: reset idle timer — when no activity event arrives within 800ms,
+    // revert to 'ready'. Called by both claude-activity and claude-status.
+    function resetIdleTimer() {
+      if (idleTimers[paneId]) clearTimeout(idleTimers[paneId])
+      idleTimers[paneId] = setTimeout(() => {
+        const s = getClaudePaneState(paneId)
+        if (s.lifecycle === 'working') {
+          turnBaselines[paneId] = s.outputTokens
+          updateClaudePaneState(paneId, { lifecycle: 'ready' })
+        }
+        delete idleTimers[paneId]
+      }, 300)
+    }
+
+    // ── claude-started: JSONL adopted → Claude confirmed running ──────────
     const unStarted = await listen<ClaudeStatusPayload>(`claude-started-${sid}`, (event) => {
       console.warn(`[claude-events] STARTED pane=${paneId}`, event.payload)
       const p = event.payload
@@ -400,54 +441,54 @@ export const usePaneStore = defineStore('pane', () => {
       if (p?.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
       if (p?.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
       delete launchTimestamps[paneId]
+      // Set baseline from started payload, or -1 sentinel to capture from next status
+      turnBaselines[paneId] = p?.output_tokens ?? -1
       updateClaudePaneState(paneId, update)
     })
     listeners.push(unStarted as unknown as () => void)
 
-    // claude-pty-active: PTY output while Claude is already working.
-    // Only used to extend the working→ready timeout (keeps 'working' alive
-    // while output continues). Does NOT trigger the ready→working transition
-    // — that's driven by claude-status token changes, which are immune to
-    // false positives from resize redraws and TUI chrome.
-    const unPtyActive = await listen(`claude-pty-active-${sid}`, () => {
+    // ── claude-activity: spinner detection from backend PTY reader ──────────
+    // Spinners (Braille chars) gate ready → working. Suppressed for 500ms
+    // after resize to avoid false positives from TUI redraws.
+    const unActivity = await listen<string>(`claude-activity-${sid}`, (event) => {
+      const activity = event.payload as 'thinking' | 'generating'
       const state = getClaudePaneState(paneId)
-      if (state.lifecycle !== 'working') return
-      // Reset the working→ready timer on every burst of output
-      if (workingTimers[paneId]) clearTimeout(workingTimers[paneId])
-      workingTimers[paneId] = setTimeout(() => {
-        const s = getClaudePaneState(paneId)
-        if (s.lifecycle === 'working') {
-          updateClaudePaneState(paneId, { lifecycle: 'ready' })
-        }
-        delete workingTimers[paneId]
-      }, 2000)
-    })
-    listeners.push(unPtyActive as unknown as () => void)
 
-    // claude-status: token/model updates from JSONL.
-    // Also drives the ready→working transition: when output_tokens increases,
-    // Claude is actively generating. This is immune to false positives from
-    // resize redraws (which produce PTY output but don't change token counts).
+      if (activity === 'thinking') {
+        // Suppress if resize happened recently (worktree switch, startup)
+        const lastResize = resizeTimestamps[paneId] ?? 0
+        if (lastResize > 0 && Date.now() - lastResize < 500) return
+
+        if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
+          updateClaudePaneState(paneId, { lifecycle: 'working' })
+        }
+      }
+      // Keep idle timer alive on any activity while working
+      if (state.lifecycle === 'working' || getClaudePaneState(paneId).lifecycle === 'working') {
+        resetIdleTimer()
+      }
+    })
+    listeners.push(unActivity as unknown as () => void)
+
+    // ── claude-status: token/model/cost updates from JSONL ────────────────
+    // ── claude-status: token/model/cost updates from JSONL ────────────────
+    // Also a secondary gate for ready → working via output_tokens increase
+    // (backup for when spinner detection is suppressed by resize).
     const unStatus = await listen<ClaudeStatusPayload>(`claude-status-${sid}`, (event) => {
-      console.warn(`[claude-events] STATUS pane=${paneId}`, event.payload)
       const p = event.payload
       const state = getClaudePaneState(paneId)
       const update: Partial<ClaudePaneState> = {}
 
-      // Detect working: output_tokens increased → Claude is generating
-      if (p?.output_tokens != null && p.output_tokens > (state.outputTokens ?? 0)) {
+      // Capture baseline on first status after adoption (sentinel = -1)
+      if (p?.output_tokens != null && turnBaselines[paneId] === -1) {
+        turnBaselines[paneId] = p.output_tokens
+      }
+      // Backup gate: output_tokens exceeds turn baseline → working
+      if (p?.output_tokens != null && p.output_tokens > (turnBaselines[paneId] ?? 0)) {
         if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
           update.lifecycle = 'working'
         }
-        // Reset working→ready timer
-        if (workingTimers[paneId]) clearTimeout(workingTimers[paneId])
-        workingTimers[paneId] = setTimeout(() => {
-          const s = getClaudePaneState(paneId)
-          if (s.lifecycle === 'working') {
-            updateClaudePaneState(paneId, { lifecycle: 'ready' })
-          }
-          delete workingTimers[paneId]
-        }, 2000)
+        resetIdleTimer()
       }
 
       if (p?.session_id) update.sessionId = p.session_id
@@ -460,62 +501,80 @@ export const usePaneStore = defineStore('pane', () => {
         const total = (p.input_tokens ?? 0) + (p.output_tokens ?? 0)
           + (p.cache_creation_input_tokens ?? 0) + (p.cache_read_input_tokens ?? 0)
         update.contextPercent = Math.min(100, (total / 200_000) * 100)
+        const model = update.model ?? state.model
+        update.cost = computeCost(
+          model,
+          p.input_tokens ?? state.inputTokens,
+          p.output_tokens ?? state.outputTokens,
+          p.cache_read_input_tokens ?? state.cacheReadTokens,
+          p.cache_creation_input_tokens ?? state.cacheWriteTokens,
+        )
+      }
+      // Keep idle timer alive while JSONL writes continue during active turn
+      if (state.lifecycle === 'working') {
+        resetIdleTimer()
       }
       updateClaudePaneState(paneId, update)
     })
     listeners.push(unStatus as unknown as () => void)
 
-    // claude-exited: process died → closed
+    // ── claude-exited: process died → closed ──────────────────────────────
     const unExited = await listen(`claude-exited-${sid}`, () => {
       console.warn(`[claude-events] EXITED pane=${paneId}`)
-      if (workingTimers[paneId]) { clearTimeout(workingTimers[paneId]); delete workingTimers[paneId] }
+      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
       delete launchTimestamps[paneId]
+      delete turnBaselines[paneId]
       updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
     })
     listeners.push(unExited as unknown as () => void)
 
-    // shell-activity: exit fallback — shell idle while Claude active → exited.
-    // Also handles the launching state: if the shell goes idle more than 5s
-    // after launch, Claude exited without creating a JSONL.
-    const unActivity = await listen<boolean>(`shell-activity-${sid}`, (event) => {
+    // ── shell-activity: exit fallback (OSC 133) ───────────────────────────
+    const unShellActivity = await listen<boolean>(`shell-activity-${sid}`, (event) => {
       const idle = event.payload
       const state = getClaudePaneState(paneId)
-      console.warn(`[claude-events] SHELL-ACTIVITY idle=${idle} lifecycle=${state.lifecycle} pane=${paneId}`)
 
       if (idle && (state.lifecycle === 'ready' || state.lifecycle === 'working' || state.lifecycle === 'attention')) {
-        // Shell went idle while Claude was active → Claude exited
-        console.warn(`[claude-events] shell-idle → CLOSED pane=${paneId}`)
-        if (workingTimers[paneId]) { clearTimeout(workingTimers[paneId]); delete workingTimers[paneId] }
+        if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
         delete launchTimestamps[paneId]
         updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
         invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
       } else if (idle && state.lifecycle === 'launching') {
-        // Shell idle during launch — Claude might have exited before JSONL creation.
         const launchedAt = launchTimestamps[paneId] ?? 0
         if (launchedAt > 0 && Date.now() - launchedAt > 5000) {
-          console.warn(`[claude-events] launch-idle → CLOSED pane=${paneId}`)
           delete launchTimestamps[paneId]
           updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
           invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
         }
       }
 
-      // Update terminal status for non-Claude shell state
       if (state.lifecycle === 'closed') {
         setTerminalStatus(paneId, idle ? 'idle' : 'running')
       }
     })
-    listeners.push(unActivity as unknown as () => void)
+    listeners.push(unShellActivity as unknown as () => void)
 
-    // claude-bell: BEL byte → attention (permission prompts, etc.)
+    // ── claude-bell: BEL → end of turn or attention ─────────────────────
+    // Claude sends BEL when waiting for user input. If working, Claude
+    // finished → ready. If already ready, permission prompt → attention.
     const unBell = await listen(`claude-bell-${sid}`, () => {
-      console.warn(`[claude-events] BELL pane=${paneId}`)
       const state = getClaudePaneState(paneId)
-      if (state.lifecycle !== 'closed' && state.lifecycle !== 'launching') {
+      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
+      if (state.lifecycle === 'working') {
+        // End of turn — instant ready, reset baseline
+        turnBaselines[paneId] = state.outputTokens
+        updateClaudePaneState(paneId, { lifecycle: 'ready' })
+      } else if (state.lifecycle === 'ready') {
+        // Already idle — this is a permission/attention prompt
         updateClaudePaneState(paneId, { lifecycle: 'attention' })
       }
     })
     listeners.push(unBell as unknown as () => void)
+
+    // ── claude-context: backend-parsed context % ──────────────────────────
+    const unContext = await listen<number>(`claude-context-${sid}`, (event) => {
+      updateClaudePaneState(paneId, { contextPercent: event.payload })
+    })
+    listeners.push(unContext as unknown as () => void)
 
     claudeEventListeners.value[paneId] = listeners
   }
@@ -526,11 +585,13 @@ export const usePaneStore = defineStore('pane', () => {
       for (const fn of listeners) fn()
       delete claudeEventListeners.value[paneId]
     }
-    if (workingTimers[paneId]) {
-      clearTimeout(workingTimers[paneId])
-      delete workingTimers[paneId]
+    if (idleTimers[paneId]) {
+      clearTimeout(idleTimers[paneId])
+      delete idleTimers[paneId]
     }
     delete launchTimestamps[paneId]
+    delete turnBaselines[paneId]
+    delete resizeTimestamps[paneId]
   }
 
   /** Ensure persistent Claude event listeners are active for a pane.
@@ -1094,7 +1155,7 @@ export const usePaneStore = defineStore('pane', () => {
     terminalShells, getTerminalShell, setTerminalShell,
     // Claude lifecycle state (centralized)
     claudePaneStates, getClaudePaneState, updateClaudePaneState, clearClaudePaneState,
-    isClaudeActive, getClaudeSessionForSave,
+    isClaudeActive, getClaudeSessionForSave, markResize,
     subscribeClaudeEvents, unsubscribeClaudeEvents, armClaudeListeners,
     // Terminal status
     terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,

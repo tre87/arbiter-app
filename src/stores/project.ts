@@ -27,6 +27,7 @@ export interface WorktreeClaudeStatus {
   cacheReadTokens: number
   cacheWriteTokens: number
   contextPercent: number
+  cost: number
   status: 'ready' | 'working' | 'attention' | 'exited'
   sessionId: string | null
 }
@@ -72,6 +73,7 @@ export const useProjectStore = defineStore('project', () => {
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       contextPercent: 0,
+      cost: 0,
       status: 'exited',
       sessionId: null,
     }
@@ -96,7 +98,7 @@ export const useProjectStore = defineStore('project', () => {
   watch(
     () => {
       const paneStore = getPaneStore()
-      const snap: Record<string, { lifecycle: string; model: string | null; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; contextPercent: number; sessionId: string | null } | null> = {}
+      const snap: Record<string, { lifecycle: string; model: string | null; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; contextPercent: number; cost: number; sessionId: string | null } | null> = {}
       for (const [paneId, wtId] of Object.entries(paneToWorktree.value)) {
         const state = paneStore.getClaudePaneState(paneId)
         snap[wtId] = state
@@ -108,7 +110,8 @@ export const useProjectStore = defineStore('project', () => {
         if (!state || state.lifecycle === 'closed') {
           updateClaudeStatus(wtId, { status: 'exited' })
         } else {
-          const status = state.lifecycle === 'launching' ? 'ready' : state.lifecycle as WorktreeClaudeStatus['status']
+          const lc = state.lifecycle
+          const status: WorktreeClaudeStatus['status'] = lc === 'launching' ? 'ready' : lc === 'closed' ? 'exited' : lc as WorktreeClaudeStatus['status']
           const update: Partial<WorktreeClaudeStatus> = {
             status,
             inputTokens: state.inputTokens,
@@ -116,6 +119,7 @@ export const useProjectStore = defineStore('project', () => {
             cacheReadTokens: state.cacheReadTokens,
             cacheWriteTokens: state.cacheWriteTokens,
             contextPercent: state.contextPercent,
+            cost: state.cost,
           }
           if (state.model) update.model = state.model
           if (state.sessionId) update.sessionId = state.sessionId
