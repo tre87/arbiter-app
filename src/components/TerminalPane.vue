@@ -8,7 +8,6 @@ import { readText as clipboardRead, writeText as clipboardWrite } from '@tauri-a
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
-import { useProjectStore } from '../stores/project'
 import { useDevSettingsStore } from '../stores/devSettings'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
@@ -17,31 +16,9 @@ import TerminalFooter from './TerminalFooter.vue'
 
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
-const projectStore = useProjectStore()
 const devSettings = useDevSettingsStore()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
-function syncProjectStatus(status: typeof claudeStatus.value, state?: 'ready' | 'working' | 'attention' | 'exited') {
-  const wtId = projectStore.getWorktreeIdForPane(props.paneId)
-  if (!wtId) return
-  const update: Record<string, any> = {}
-  if (status) {
-    if (status.model_id) update.model = status.model_id
-    if (status.input_tokens != null) update.inputTokens = status.input_tokens
-    if (status.output_tokens != null) update.outputTokens = status.output_tokens
-    if (status.cache_read_input_tokens != null) update.cacheReadTokens = status.cache_read_input_tokens
-    if (status.cache_creation_input_tokens != null) update.cacheWriteTokens = status.cache_creation_input_tokens
-    if (status.session_id) update.sessionId = status.session_id
-    const total = (status.input_tokens ?? 0)
-      + (status.output_tokens ?? 0)
-      + (status.cache_creation_input_tokens ?? 0)
-      + (status.cache_read_input_tokens ?? 0)
-    update.contextPercent = Math.min(100, (total / 200_000) * 100)
-  }
-  if (state) update.status = state
-  projectStore.updateClaudeStatus(wtId, update)
-}
-
 let term: Terminal
 let fitAddon: FitAddon
 let webglAddon: WebglAddon | null = null
@@ -51,27 +28,14 @@ let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
 let focusHandler: (() => void) | null = null
 let workspaceActivatedHandler: (() => void) | null = null
-// True once we've actually sent `claude` or `claude --resume` to the PTY.
-// Prevents the initial shell-idle event (which fires before the 500ms launch
-// timeout) from being misinterpreted as "Claude exited without JSONL".
-let claudeCommandSent = false
 
 // ── Claude detection state ───────────────────────────────────────────────────
 // All Claude lifecycle state is centralized in the pane store (claudePaneStates).
-// TerminalPane reads it reactively and forwards events to the store.
+// Persistent event listeners in pane.ts handle claude-started/status/exited/bell.
+// TerminalPane only reads state reactively for rendering.
 const claudeState = computed(() => store.getClaudePaneState(props.paneId))
 const claudeActive = computed(() => store.isClaudeActive(props.paneId))
 const footerVisible = ref(true)
-const claudeStatus = ref<{
-  session_id: string
-  model_id?: string | null
-  input_tokens?: number | null
-  output_tokens?: number | null
-  cache_creation_input_tokens?: number | null
-  cache_read_input_tokens?: number | null
-  folder?: string | null
-  branch?: string | null
-} | null>(null)
 
 const sessionCwd = ref<string | null>(null)
 const folderName = ref<string | null>(null)
@@ -87,12 +51,6 @@ const inProjectWorkspace = computed(() => store.isPaneInProjectWorkspace(props.p
 
 // Derived booleans for template usage
 const claudeWorking = computed(() => claudeState.value.lifecycle === 'working')
-
-function pushClaudeState() {
-  const s = claudeState.value.lifecycle === 'closed' ? 'idle' as const : claudeState.value.lifecycle === 'launching' ? 'ready' as const : claudeState.value.lifecycle
-  store.setTerminalStatus(props.paneId, s === 'idle' ? 'idle' : s)
-  syncProjectStatus(null, s === 'idle' ? 'exited' : s)
-}
 
 const infoPanelOpen = ref(false)
 
@@ -134,11 +92,6 @@ function cancelEditName() {
   isEditingName.value = false
 }
 
-// Unlisten callbacks for Rust-emitted Claude lifecycle events
-let unlistenStarted: (() => void) | null = null
-let unlistenStatus:  (() => void) | null = null
-let unlistenExited:  (() => void) | null = null
-let unlistenActivity: (() => void) | null = null
 
 // ── Toolbar actions ───────────────────────────────────────────────────────────
 
@@ -201,10 +154,9 @@ watch(claudeActive, (active) => {
 
 function launchClaude() {
   if (sessionId) {
-    claudeCommandSent = true
     store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false, sessionId: null })
+    store.armClaudeListeners(props.paneId)
     footerVisible.value = true
-    syncProjectStatus(null, 'ready')
     invoke('write_to_session', { sessionId, data: 'claude\r' })
     term?.focus()
   }
@@ -212,16 +164,18 @@ function launchClaude() {
 
 function continueClaude() {
   if (sessionId) {
-    claudeCommandSent = true
     store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false, sessionId: null })
+    store.armClaudeListeners(props.paneId)
     footerVisible.value = true
-    syncProjectStatus(null, 'ready')
     invoke('write_to_session', { sessionId, data: 'claude --continue\r' })
     term?.focus()
   }
 }
 
 // ── Event subscription helper ────────────────────────────────────────────────
+// Claude lifecycle events (started/status/exited/bell/shell-activity) are
+// handled by persistent listeners in pane.ts — they survive component
+// unmount/remount. This function only subscribes to CWD changes.
 async function subscribeToSession(sid: string) {
   unlistenCwd = await listen(`cwd-changed-${sid}`, (event) => {
     const data = event.payload as { cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }
@@ -229,80 +183,8 @@ async function subscribeToSession(sid: string) {
     folderName.value = data.folder
     gitInfo.value = data.git
   }) as unknown as (() => void)
-  unlistenStarted = await listen(`claude-started-${sid}`, (event) => {
-    const payload = event.payload as typeof claudeStatus.value
-    claudeStatus.value = payload
-    footerVisible.value = true
-    const update: Partial<import('../types/pane').ClaudePaneState> = {
-      lifecycle: 'ready',
-      confirmed: true,
-    }
-    if (payload?.session_id) update.sessionId = payload.session_id
-    if (payload?.model_id) update.model = payload.model_id
-    if (payload?.input_tokens != null) update.inputTokens = payload.input_tokens
-    if (payload?.output_tokens != null) update.outputTokens = payload.output_tokens
-    if (payload?.cache_creation_input_tokens != null) update.cacheWriteTokens = payload.cache_creation_input_tokens
-    if (payload?.cache_read_input_tokens != null) update.cacheReadTokens = payload.cache_read_input_tokens
-    store.updateClaudePaneState(props.paneId, update)
-    syncProjectStatus(payload, 'ready')
-  })
-  unlistenStatus = await listen(`claude-status-${sid}`, (event) => {
-    const payload = event.payload as typeof claudeStatus.value
-    claudeStatus.value = payload
-    const update: Partial<import('../types/pane').ClaudePaneState> = {}
-    if (payload?.session_id) update.sessionId = payload.session_id
-    if (payload?.model_id) update.model = payload.model_id
-    if (payload?.input_tokens != null) update.inputTokens = payload.input_tokens
-    if (payload?.output_tokens != null) update.outputTokens = payload.output_tokens
-    if (payload?.cache_creation_input_tokens != null) update.cacheWriteTokens = payload.cache_creation_input_tokens
-    if (payload?.cache_read_input_tokens != null) update.cacheReadTokens = payload.cache_read_input_tokens
-    if (payload) {
-      const total = (payload.input_tokens ?? 0) + (payload.output_tokens ?? 0)
-        + (payload.cache_creation_input_tokens ?? 0) + (payload.cache_read_input_tokens ?? 0)
-      update.contextPercent = Math.min(100, (total / 200_000) * 100)
-    }
-    store.updateClaudePaneState(props.paneId, update)
-    syncProjectStatus(payload)
-  })
-  unlistenExited = await listen(`claude-exited-${sid}`, () => {
-    infoPanelOpen.value = false
-    claudeCommandSent = false
-    store.updateClaudePaneState(props.paneId, {
-      lifecycle: 'closed', confirmed: false,
-    })
-    store.setTerminalStatus(props.paneId, 'idle')
-    syncProjectStatus(null, 'exited')
-  })
-  unlistenActivity = await listen(`shell-activity-${sid}`, (event) => {
-    const idle = event.payload as boolean
-    if (claudeActive.value) {
-      // Shell went idle while we think Claude is running. If the backend
-      // never confirmed Claude via JSONL detection (confirmed is false),
-      // Claude exited before creating a session file — e.g. the user typed
-      // /exit with no conversation, or Claude crashed on startup.
-      // Guard: only apply this after we've actually sent the claude command
-      // (claudeCommandSent). Without this, the initial shell-idle event
-      // that fires when the PTY first starts (before the 500ms launch
-      // timeout) would be misinterpreted as an exit.
-      if (idle && !claudeState.value.confirmed && claudeCommandSent) {
-        infoPanelOpen.value = false
-        claudeCommandSent = false
-        store.updateClaudePaneState(props.paneId, {
-          lifecycle: 'closed', confirmed: false,
-        })
-        store.setTerminalStatus(props.paneId, 'idle')
-        syncProjectStatus(null, 'exited')
-        if (isWindows && gitBashPath.value) shellIdle.value = true
-      }
-    } else {
-      store.setTerminalStatus(props.paneId, idle ? 'idle' : 'running')
-      if (isWindows && gitBashPath.value) shellIdle.value = idle
-    }
-  }) as unknown as (() => void)
 
-  // Recover state that may have been emitted before these listeners were
-  // attached — both OSC 7 (cwd) and OSC 133;A (idle) typically fire at the
-  // shell's very first prompt, and the backend only re-emits on transitions.
+  // Recover CWD that may have been emitted before this listener was attached
   const currentCwd = await invoke<string | null>('get_session_cwd', { sessionId: sid }).catch(() => null)
   if (currentCwd && !sessionCwd.value) {
     sessionCwd.value = currentCwd
@@ -321,10 +203,6 @@ async function subscribeToSession(sid: string) {
 function unsubscribeAll() {
   unlisten?.(); unlisten = null
   unlistenCwd?.(); unlistenCwd = null
-  unlistenStarted?.(); unlistenStarted = null
-  unlistenStatus?.(); unlistenStatus = null
-  unlistenExited?.(); unlistenExited = null
-  unlistenActivity?.(); unlistenActivity = null
 }
 
 // ── Shell switching ──────────────────────────────────────────────────────────
@@ -414,39 +292,17 @@ onMounted(async () => {
   term.loadAddon(new WebLinksAddon())
   term.open(terminalEl.value!)
 
-  // Detect Claude working via OSC 0 title changes.
+  // Store OSC 0 title for display in toolbar (no Claude detection — that's
+  // handled by persistent listeners in pane.ts via JSONL/process monitoring).
   term.parser.registerOscHandler(0, (data) => {
     terminalTitle.value = data
-    if (claudeActive.value) {
-      const hasSpinner = /[\u2800-\u28FF]/.test(data)
-      const isIdle = /✳/.test(data)
-      const wasWorking = claudeState.value.lifecycle === 'working'
-      const nowWorking = hasSpinner && !isIdle
-      if (nowWorking) {
-        store.updateClaudePaneState(props.paneId, { lifecycle: 'working' })
-      } else if (wasWorking) {
-        // Brief idle after work — leave as 'ready'; BEL will upgrade to 'attention'
-        store.updateClaudePaneState(props.paneId, { lifecycle: 'ready' })
-      }
-      pushClaudeState()
-    }
     return false
-  })
-
-  // BEL (\x07) is Claude Code's "waiting for user input" signal (permission
-  // prompts, option menus). Surface it as 'needs attention'.
-  term.onBell(() => {
-    if (claudeActive.value && claudeState.value.lifecycle !== 'working') {
-      store.updateClaudePaneState(props.paneId, { lifecycle: 'attention' })
-      pushClaudeState()
-    }
   })
 
   // Any user input clears the attention flag for this terminal.
   term.onData(() => {
     if (claudeState.value.lifecycle === 'attention') {
       store.updateClaudePaneState(props.paneId, { lifecycle: 'ready' })
-      pushClaudeState()
     }
   })
 
@@ -505,45 +361,17 @@ onMounted(async () => {
       term.write(event.payload)
     })
 
-    // Fetch the last OSC 0 title the shell emitted while this terminal wasn't mounted
-    const savedTitle = await invoke<string | null>('get_session_title', { sessionId })
-    if (savedTitle) {
-      terminalTitle.value = savedTitle
-    }
-
     // Resize the PTY to match the new container — the shell gets notified and redraws.
     // We intentionally skip replaying the raw buffer here: it was captured at the old
     // terminal width, so escape sequences (cursor positioning, line wraps) would render
     // as garbled text at the new width. The running process redraws after the resize.
     invoke('resize_session', { sessionId, cols: term.cols, rows: term.rows })
 
-    // Restore footer if Claude was running before the remount
-    const status = await invoke('get_active_claude_status', { sessionId }).catch(() => null) as typeof claudeStatus.value
-    if (status) {
-      claudeStatus.value = status
+    // Claude state was maintained by persistent listeners in pane.ts while this
+    // component was unmounted — just read it and ensure listeners are armed.
+    if (claudeActive.value) {
       footerVisible.value = true
-      // Derive working state from the restored title
-      let lifecycle: 'ready' | 'working' = 'ready'
-      if (savedTitle) {
-        const hasSpinner = /[\u2800-\u28FF]/.test(savedTitle)
-        const isIdle = /✳/.test(savedTitle)
-        if (hasSpinner && !isIdle) lifecycle = 'working'
-      }
-      store.updateClaudePaneState(props.paneId, {
-        lifecycle,
-        confirmed: true,
-        sessionId: status.session_id ?? null,
-        model: status.model_id ?? null,
-        inputTokens: status.input_tokens ?? 0,
-        outputTokens: status.output_tokens ?? 0,
-        cacheWriteTokens: status.cache_creation_input_tokens ?? 0,
-        cacheReadTokens: status.cache_read_input_tokens ?? 0,
-      })
-      pushClaudeState()
-    } else {
-      // Claude not running — clear any stale working status from before unmount
-      store.updateClaudePaneState(props.paneId, { lifecycle: 'closed', confirmed: false })
-      store.setTerminalStatus(props.paneId, 'idle')
+      store.armClaudeListeners(props.paneId)
     }
   } else {
     const savedCwd = store.consumeSavedCwd(props.paneId)
@@ -587,9 +415,8 @@ onMounted(async () => {
         store.updateClaudePaneState(props.paneId, {
           lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
         })
-        syncProjectStatus(null, 'ready')
+        store.armClaudeListeners(props.paneId)
         setTimeout(() => {
-          claudeCommandSent = true
           invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
         }, 500)
       } else if (claudeRestore.wasOpen) {
@@ -597,9 +424,8 @@ onMounted(async () => {
         store.updateClaudePaneState(props.paneId, {
           lifecycle: 'launching', confirmed: false,
         })
-        syncProjectStatus(null, 'ready')
+        store.armClaudeListeners(props.paneId)
         setTimeout(() => {
-          claudeCommandSent = true
           invoke('write_to_session', { sessionId, data: 'claude\r' })
         }, 500)
       }
@@ -642,7 +468,7 @@ onMounted(async () => {
 
   // Initial focus is handled by App.vue polling for the textarea.
 
-  // Subscribe to cwd/Claude lifecycle events (also drives shellIdle via shell-activity)
+  // Subscribe to CWD changes (Claude lifecycle handled by persistent listeners in pane.ts)
   await subscribeToSession(sessionId!)
 
   // Focus this terminal if it's the focused pane — must happen after full setup
@@ -733,38 +559,30 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- Info panel overlay -->
-    <div v-if="infoPanelOpen && claudeStatus" class="info-panel">
+    <div v-if="infoPanelOpen && claudeActive" class="info-panel">
       <div class="info-row">
         <span class="info-label">Session ID</span>
-        <span class="info-value id-value">{{ claudeStatus.session_id }}</span>
+        <span class="info-value id-value">{{ claudeState.sessionId ?? '—' }}</span>
       </div>
-      <div v-if="claudeStatus.model_id" class="info-row">
+      <div v-if="claudeState.model" class="info-row">
         <span class="info-label">Model</span>
-        <span class="info-value">{{ modelLabel(claudeStatus.model_id) }}</span>
-      </div>
-      <div v-if="claudeStatus.folder" class="info-row">
-        <span class="info-label">Folder</span>
-        <span class="info-value">{{ claudeStatus.folder }}</span>
-      </div>
-      <div v-if="claudeStatus.branch" class="info-row">
-        <span class="info-label">Branch</span>
-        <span class="info-value">{{ claudeStatus.branch }}</span>
+        <span class="info-value">{{ modelLabel(claudeState.model) }}</span>
       </div>
       <div class="info-row">
         <span class="info-label">Tokens in</span>
-        <span class="info-value">{{ claudeStatus.input_tokens?.toLocaleString() ?? '—' }}</span>
+        <span class="info-value">{{ claudeState.inputTokens.toLocaleString() }}</span>
       </div>
       <div class="info-row">
         <span class="info-label">Tokens out</span>
-        <span class="info-value">{{ claudeStatus.output_tokens?.toLocaleString() ?? '—' }}</span>
+        <span class="info-value">{{ claudeState.outputTokens.toLocaleString() }}</span>
       </div>
       <div class="info-row">
         <span class="info-label">Cache write</span>
-        <span class="info-value">{{ claudeStatus.cache_creation_input_tokens?.toLocaleString() ?? '—' }}</span>
+        <span class="info-value">{{ claudeState.cacheWriteTokens.toLocaleString() }}</span>
       </div>
       <div class="info-row">
         <span class="info-label">Cache read</span>
-        <span class="info-value">{{ claudeStatus.cache_read_input_tokens?.toLocaleString() ?? '—' }}</span>
+        <span class="info-value">{{ claudeState.cacheReadTokens.toLocaleString() }}</span>
       </div>
     </div>
 
@@ -777,7 +595,14 @@ onBeforeUnmount(() => {
         ? (claudeActive && footerVisible)
         : ((claudeActive && footerVisible) || gitInfo?.is_repo || (devSettings.alwaysShowFooter && sessionCwd))"
       :claude-running="claudeActive"
-      :status="claudeStatus"
+      :status="claudeActive ? {
+        session_id: claudeState.sessionId ?? '',
+        model_id: claudeState.model,
+        input_tokens: claudeState.inputTokens,
+        output_tokens: claudeState.outputTokens,
+        cache_creation_input_tokens: claudeState.cacheWriteTokens,
+        cache_read_input_tokens: claudeState.cacheReadTokens,
+      } : null"
       :folder-name="folderName"
       :git-info="gitInfo"
       :session-id="sessionId"

@@ -42,7 +42,7 @@ struct ClaudeMonitor(Arc<Mutex<HashMap<String, ClaudeEntry>>>);
 struct ExpectedClaudeSessions(Arc<Mutex<HashMap<String, String>>>);
 
 #[tauri::command]
-fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, rows: Option<u16>, cwd: Option<String>, shell: Option<String>) -> Result<String, String> {
+fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<ClaudeMonitor>, cols: Option<u16>, rows: Option<u16>, cwd: Option<String>, shell: Option<String>) -> Result<String, String> {
     let session_id = Uuid::new_v4().to_string();
     let sid = session_id.clone();
 
@@ -92,11 +92,16 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
 
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
+    let monitor_arc = monitor.0.clone();
     let event_name = format!("pty-output-{}", sid);
     let cwd_event_name = format!("cwd-changed-{}", sid);
     let activity_event_name = format!("shell-activity-{}", sid);
     let title_event_name = format!("title-changed-{}", sid);
+    let bell_event_name = format!("claude-bell-{}", sid);
+    let pty_active_event_name = format!("claude-pty-active-{}", sid);
+    let reader_sid = sid.clone();
     std::thread::spawn(move || {
+        let sid = reader_sid;
         const MAX_BUF: usize = 102_400; // 100 KB rolling buffer
         let mut buf = [0u8; 4096];
         // Holds trailing bytes from an incomplete UTF-8 sequence at chunk boundary
@@ -109,6 +114,9 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
         // None until the shell first reports; we only emit on transitions.
         let mut prev_idle: Option<bool> = None;
         let mut prev_title: Option<String> = None;
+        // Debounced PTY-output activity signal for instant working detection.
+        // Only emitted when Claude is tracked for this session (monitor entry exists).
+        let mut last_pty_active_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -217,8 +225,27 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
                         } else if osc_buf == "\x1b" && ch == ']' {
                             osc_buf.clear();
                             in_osc = true;
+                        } else if ch == '\x07' {
+                            // BEL outside of an OSC sequence — Claude Code uses
+                            // this to signal "waiting for user input" (permission
+                            // prompts, option menus).
+                            app_handle.emit(&bell_event_name, ()).ok();
+                            osc_buf.clear();
                         } else {
                             osc_buf.clear();
+                        }
+                    }
+
+                    // Emit debounced PTY activity signal when Claude is tracked.
+                    // This provides instant "working" detection — the frontend
+                    // sees output within milliseconds of Claude generating text.
+                    if valid_chunk.len() > 1 {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_pty_active_emit).as_millis() >= 300 {
+                            if monitor_arc.lock().unwrap().contains_key(&sid) {
+                                app_handle.emit(&pty_active_event_name, ()).ok();
+                                last_pty_active_emit = now;
+                            }
                         }
                     }
 
@@ -249,9 +276,18 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, cols: Option<u16>, 
         },
     );
 
-    // Claude detection, adoption, and exit tracking are driven entirely by the
-    // global filesystem watcher on ~/.claude/projects/ (see start_claude_watcher).
-    // No per-pane polling thread.
+    // Per-PTY process monitor: polls every 1s for Claude descendants.
+    // Handles lifecycle detection (start/exit/relaunch) independently from
+    // the JSONL file watcher. The file watcher only provides supplementary
+    // token/model data via claude-status events.
+    {
+        let app3 = app.clone();
+        let sessions3 = sessions.0.clone();
+        let monitor3 = monitor.0.clone();
+        let expected3: Arc<Mutex<HashMap<String, String>>> = app.state::<ExpectedClaudeSessions>().0.clone();
+        let sid3 = session_id.clone();
+        spawn_pane_monitor(app3, sessions3, monitor3, expected3, sid3);
+    }
 
     Ok(session_id)
 }
@@ -314,6 +350,15 @@ fn set_expected_claude_session(
     expected: State<ExpectedClaudeSessions>,
 ) {
     expected.0.lock().unwrap().insert(session_id, claude_session_id);
+}
+
+/// Frontend detected Claude exit via shell-activity (OSC 133 idle) before
+/// the backend's PID-based exit watcher could fire.  Clear the monitor entry
+/// so the pane is no longer considered "tracked" and future JSONL files can
+/// be adopted into it.
+#[tauri::command]
+fn clear_claude_monitor(session_id: String, monitor: State<ClaudeMonitor>) {
+    monitor.0.lock().unwrap().remove(&session_id);
 }
 
 /// Return the buffered PTY output for a session as a UTF-8 string (lossy).
@@ -557,6 +602,191 @@ fn spawn_exit_watcher(
     });
 }
 
+/// Fallback exit watcher: when `find_claude_pid_for_shell_bounded` can't find
+/// Claude's PID, poll every 2s to check whether a Claude descendant still exists
+/// under the shell. If not found on two consecutive checks, Claude has exited.
+fn spawn_polling_exit_watcher(
+    app:      AppHandle,
+    monitor:  Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    pane_id:  String,
+    shell_pid: u32,
+) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Monitor entry was cleared externally (e.g. clear_claude_monitor)
+            if !monitor.lock().unwrap().contains_key(&pane_id) { return; }
+
+            if let Some((claude_pid, _)) = find_claude_for_shell(shell_pid) {
+                // Found Claude — switch to efficient blocking wait
+                wait_for_pid_exit(claude_pid);
+                monitor.lock().unwrap().remove(&pane_id);
+                app.emit(&format!("claude-exited-{}", pane_id), ()).ok();
+                return;
+            }
+
+            // No Claude descendant — confirm with a second check after 2s
+            // to avoid racing with process startup.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !monitor.lock().unwrap().contains_key(&pane_id) { return; }
+            if find_claude_for_shell(shell_pid).is_none() {
+                // Confirmed: Claude is gone.
+                monitor.lock().unwrap().remove(&pane_id);
+                app.emit(&format!("claude-exited-{}", pane_id), ()).ok();
+                return;
+            }
+        }
+    });
+}
+
+/// Per-PTY process monitor: polls every 1s for Claude descendants under the
+/// shell PID. When Claude appears, emits `claude-started`, scans for JSONL,
+/// and spawns a blocking exit watcher. When Claude disappears, emits
+/// `claude-exited`. Continues running to detect re-launches.
+///
+/// This is the primary lifecycle detection mechanism — simple, reliable, and
+/// covers all cases: button launch, manual `claude` typing, relaunch after
+/// exit, Ctrl+C exit. Every major terminal emulator (tmux, kitty, etc.) uses
+/// the same approach for foreground process detection.
+fn spawn_pane_monitor(
+    app:      AppHandle,
+    sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    monitor:  Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    expected: Arc<Mutex<HashMap<String, String>>>,
+    session_id: String,
+) {
+    std::thread::spawn(move || {
+        // Wait a moment for the shell to start up before polling
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+
+            // Check if the PTY session still exists; if not, the pane was closed.
+            let shell_pid = {
+                let s = sessions.lock().unwrap();
+                match s.get(&session_id) {
+                    Some(sess) => sess.shell_pid,
+                    None => return, // session closed, stop monitoring
+                }
+            };
+            let Some(shell_pid) = shell_pid else { continue };
+
+            // Already tracked (adopted via file watcher or previous cycle)?
+            // Let the exit watcher handle it — don't interfere.
+            if monitor.lock().unwrap().contains_key(&session_id) {
+                continue;
+            }
+
+            // Check if a Claude process exists under this shell.
+            let claude = find_claude_for_shell(shell_pid);
+            if claude.is_none() { continue; }
+            let (claude_pid, _) = claude.unwrap();
+
+            // Claude just appeared! Try to find and adopt a matching JSONL
+            // for session details (model, tokens, session_id).
+            let cwd = {
+                let s = sessions.lock().unwrap();
+                s.get(&session_id).and_then(|sess| sess.cwd.lock().unwrap().clone())
+            };
+
+            let mut adopted = false;
+            if let Some(ref cwd) = cwd {
+                let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+                let encoded = encode_project_dir(cwd);
+                let project_dir = PathBuf::from(&home).join(".claude").join("projects").join(&encoded);
+                if project_dir.is_dir() {
+                    // Find most recent .jsonl files
+                    let mut jsonl_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&project_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                                if let Ok(meta) = path.metadata() {
+                                    if let Ok(modified) = meta.modified() {
+                                        jsonl_files.push((path, modified));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    jsonl_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+                    // Try to adopt the most recent JSONL
+                    for (path, _) in jsonl_files.iter().take(5) {
+                        // Skip if already tracked by another pane
+                        let already_tracked = monitor.lock().unwrap().iter()
+                            .any(|(_, e)| e.jsonl == *path);
+                        if already_tracked { continue; }
+
+                        // Adopt it
+                        {
+                            let mut mon = monitor.lock().unwrap();
+                            mon.insert(session_id.clone(), ClaudeEntry { jsonl: path.to_path_buf() });
+                        }
+                        expected.lock().unwrap().remove(&session_id);
+                        adopted = true;
+
+                        // Emit started with JSONL info
+                        let started_status = ClaudeSessionStatus {
+                            session_id: path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| session_id.clone()),
+                            model_id: None, input_tokens: None, output_tokens: None,
+                            cache_creation_input_tokens: None, cache_read_input_tokens: None,
+                            folder: None, branch: None,
+                        };
+                        app.emit(&format!("claude-started-{}", session_id), &started_status).ok();
+                        if let Some(status) = parse_jsonl_status(path) {
+                            app.emit(&format!("claude-status-{}", session_id), &status).ok();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if !adopted {
+                // No JSONL found (yet) — emit started so the frontend
+                // transitions out of 'closed'. The JSONL file watcher will
+                // adopt and emit claude-status when the file appears.
+                // Don't insert a monitor entry — let the file watcher handle
+                // JSONL tracking. We'll still detect exit via the PID watcher below.
+                let started_status = ClaudeSessionStatus {
+                    session_id: String::new(),
+                    model_id: None, input_tokens: None, output_tokens: None,
+                    cache_creation_input_tokens: None, cache_read_input_tokens: None,
+                    folder: None, branch: None,
+                };
+                app.emit(&format!("claude-started-{}", session_id), &started_status).ok();
+            }
+
+            // Spawn a blocking exit watcher. When it completes, clean up
+            // the monitor entry. The outer loop continues and will detect
+            // a re-launch on the next poll cycle.
+            {
+                let app2 = app.clone();
+                let monitor2 = monitor.clone();
+                let sid2 = session_id.clone();
+                // Block this monitor thread until Claude exits, then loop back
+                // to detect re-launches. Use a child thread for the actual
+                // WaitForSingleObject so we can do cleanup in this thread.
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
+                    wait_for_pid_exit(claude_pid);
+                    monitor2.lock().unwrap().remove(&sid2);
+                    app2.emit(&format!("claude-exited-{}", sid2), ()).ok();
+                    tx.send(()).ok();
+                });
+                // Block until Claude exits, then continue the outer loop
+                // to detect re-launch. Timeout after 1 hour to avoid zombie
+                // threads if something goes wrong.
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(3600));
+            }
+        }
+    });
+}
+
 /// Find the most recently started Claude process under `shell_pid`, looking up
 /// to `attempts` times with a 150ms delay between tries. Returns the PID only;
 /// the start-time disambiguation used by the old polling monitor is gone.
@@ -586,14 +816,13 @@ fn pane_shell_pid(
 
 /// Adopt a JSONL into the matching pane and emit the appropriate event.
 /// Used by the file-system watcher on Create/Modify of an untracked JSONL.
-/// Returns true if the JSONL was adopted into some pane (or already tracked).
 fn try_adopt_jsonl(
     app:      &AppHandle,
     sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
     monitor:  &Arc<Mutex<HashMap<String, ClaudeEntry>>>,
     expected: &Arc<Mutex<HashMap<String, String>>>,
     jsonl_path: &std::path::Path,
-) -> bool {
+) -> MatchResult {
     // Already tracked? Just emit a status update.
     let already = monitor.lock().unwrap().iter()
         .find(|(_, e)| e.jsonl == jsonl_path)
@@ -602,11 +831,12 @@ fn try_adopt_jsonl(
         if let Some(status) = parse_jsonl_status(jsonl_path) {
             app.emit(&format!("claude-status-{}", pane_id), &status).ok();
         }
-        return true;
+        return MatchResult::Matched(pane_id);
     }
 
-    let Some(pane_id) = match_jsonl_to_pane(jsonl_path, sessions, monitor, expected) else {
-        return false;
+    let pane_id = match match_jsonl_to_pane(jsonl_path, sessions, monitor, expected) {
+        MatchResult::Matched(id) => id,
+        other => return other,
     };
 
     // Adopt: write the JSONL into the pane's monitor entry, clear any expected entry.
@@ -635,27 +865,35 @@ fn try_adopt_jsonl(
 
     // Find the Claude PID under this pane's shell and spawn a blocking exit
     // watcher so we get a `claude-exited` event the instant the process dies.
-    // Runs on a background thread so the file-watcher loop isn't blocked.
     if let Some(shell_pid) = pane_shell_pid(sessions, &pane_id) {
         let app2      = app.clone();
         let monitor2  = monitor.clone();
         let pane_id2  = pane_id.clone();
         std::thread::spawn(move || {
-            if let Some(claude_pid) = find_claude_pid_for_shell_bounded(shell_pid, 6) {
+            if let Some(claude_pid) = find_claude_pid_for_shell_bounded(shell_pid, 12) {
                 spawn_exit_watcher(app2, monitor2, pane_id2, claude_pid);
+            } else {
+                spawn_polling_exit_watcher(app2, monitor2, pane_id2, shell_pid);
             }
-            // If no PID is ever found (e.g. Claude exited before we could scan),
-            // the JSONL entry stays registered; the frontend gets no exit event,
-            // but manual interaction (a new JSONL or a fresh start) will recover.
         });
     }
 
-    true
+    MatchResult::Matched(pane_id)
+}
+
+/// Result of JSONL-to-pane matching / adoption.
+enum MatchResult {
+    /// No CWD-matching candidates at all — nothing to retry.
+    NoMatch,
+    /// CWD candidates exist but PID check failed (process not visible yet).
+    /// The caller should schedule a bounded retry.
+    RetryNeeded,
+    /// Single unambiguous match (or already-tracked pane).
+    Matched(String),
 }
 
 /// Single source of truth for "which pane should this JSONL belong to?".
 /// Called by the global file-system watcher when an untracked JSONL appears.
-/// Returns Some(pane_id) only when there is a single, unambiguous match.
 ///
 /// Match priority:
 /// 1. **Expected**: a pane registered this JSONL's filename stem via
@@ -663,14 +901,16 @@ fn try_adopt_jsonl(
 /// 2. **Fresh detection**: among panes whose cwd's encoded form matches the
 ///    JSONL's parent directory AND which aren't already tracked, find those
 ///    whose shell has a Claude descendant *right now*. If exactly one matches,
-///    adopt it. If multiple (or none) match, refuse to guess.
+///    adopt it.
 fn match_jsonl_to_pane(
     jsonl_path: &std::path::Path,
     sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
     monitor:  &Arc<Mutex<HashMap<String, ClaudeEntry>>>,
     expected: &Arc<Mutex<HashMap<String, String>>>,
-) -> Option<String> {
-    let stem = jsonl_path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())?;
+) -> MatchResult {
+    let Some(stem) = jsonl_path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+        return MatchResult::NoMatch;
+    };
 
     // 1) Expected match (resumed sessions).
     {
@@ -680,14 +920,11 @@ fn match_jsonl_to_pane(
             if let Some(p_cwd) = pane_cwd(sessions, pane_id) {
                 if !jsonl_parent_matches_cwd(jsonl_path, &p_cwd) { continue; }
             }
-            return Some(pane_id.clone());
+            return MatchResult::Matched(pane_id.clone());
         }
     }
 
     // 2) Fresh-session match by parent-dir encoding.
-    //    The parent directory of every Claude JSONL is the encoded form of
-    //    its cwd, so parent-dir alone filters down to panes in that exact
-    //    directory — no need to read the JSONL contents.
     let tracked: std::collections::HashSet<String> =
         monitor.lock().unwrap().keys().cloned().collect();
     let exp_panes: std::collections::HashSet<String> =
@@ -708,13 +945,9 @@ fn match_jsonl_to_pane(
             .collect()
     };
 
-    if candidates.is_empty() { return None; }
-    if candidates.len() == 1 {
-        return Some(candidates.into_iter().next().unwrap().0);
-    }
+    if candidates.is_empty() { return MatchResult::NoMatch; }
 
-    // Multiple panes share this cwd — disambiguate by which one actually has
-    // Claude running right now. One sysinfo scan, shared across all candidates.
+    // Always verify via PID scan which candidate actually has Claude running.
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
@@ -729,11 +962,13 @@ fn match_jsonl_to_pane(
         }
     }
     if matches.len() == 1 {
-        Some(matches.into_iter().next().unwrap())
+        MatchResult::Matched(matches.into_iter().next().unwrap())
+    } else if matches.is_empty() {
+        // CWD candidates exist but Claude process not visible in sysinfo yet.
+        MatchResult::RetryNeeded
     } else {
-        // Zero matches (Claude hasn't appeared in sysinfo yet) or multiple
-        // (ambiguous) — refuse to adopt; a subsequent Modify event will retry.
-        None
+        // Multiple matches — ambiguous, refuse to guess.
+        MatchResult::NoMatch
     }
 }
 
@@ -753,6 +988,86 @@ fn has_claude_descendant(sys: &System, shell_pid: u32) -> bool {
         }
     }
     false
+}
+
+/// Proactively scan for a JSONL file matching the given pane's CWD.
+/// Called by the frontend when a pane transitions to 'launching' state AFTER
+/// the PTY session exists. This handles the timing gap where the JSONL file
+/// was created before the pane's session appeared in the sessions map, so the
+/// file-system watcher couldn't match it.
+#[tauri::command]
+fn scan_for_claude_session(
+    session_id: String,
+    sessions:   State<Sessions>,
+    monitor:    State<ClaudeMonitor>,
+    expected:   State<ExpectedClaudeSessions>,
+    app:        AppHandle,
+) {
+    let sessions_arc = sessions.0.clone();
+    let monitor_arc  = monitor.0.clone();
+    let expected_arc = expected.0.clone();
+
+    // Get the pane's CWD
+    let cwd = {
+        let s = sessions_arc.lock().unwrap();
+        match s.get(&session_id) {
+            Some(sess) => sess.cwd.lock().unwrap().clone(),
+            None => return,
+        }
+    };
+    let Some(cwd) = cwd else { return };
+
+    // Already tracked? Nothing to do.
+    if monitor_arc.lock().unwrap().contains_key(&session_id) { return; }
+
+    let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let encoded = encode_project_dir(&cwd);
+    let project_dir = PathBuf::from(home).join(".claude").join("projects").join(&encoded);
+    if !project_dir.is_dir() { return; }
+
+    // Find the most recent .jsonl file in this project dir
+    let mut jsonl_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&project_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        jsonl_files.push((path, modified));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by modification time, most recent first
+    jsonl_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Try to adopt the most recent JSONL files (first match wins)
+    for (path, _) in jsonl_files.iter().take(5) {
+        match try_adopt_jsonl(&app, &sessions_arc, &monitor_arc, &expected_arc, path) {
+            MatchResult::Matched(_) => break,
+            MatchResult::RetryNeeded => {
+                let app2 = app.clone();
+                let s2 = sessions_arc.clone();
+                let m2 = monitor_arc.clone();
+                let e2 = expected_arc.clone();
+                let p2 = path.clone();
+                std::thread::spawn(move || {
+                    for delay_ms in [500, 1500] {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        if m2.lock().unwrap().iter().any(|(_, e)| e.jsonl == p2) { return; }
+                        if matches!(try_adopt_jsonl(&app2, &s2, &m2, &e2, &p2), MatchResult::Matched(_)) { return; }
+                    }
+                });
+                break;
+            }
+            MatchResult::NoMatch => continue,
+        }
+    }
 }
 
 /// Start the file-system watcher on `~/.claude/projects/`.
@@ -791,16 +1106,29 @@ fn start_claude_watcher(
                 .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
                 .collect();
             if paths.is_empty() { continue; }
-            // Both Create and Modify drive the same path: try_adopt_jsonl is
-            // idempotent for already-tracked files (it just re-emits the
-            // status) and will repeatedly re-attempt matching on untracked
-            // ones as Claude writes the file's initial contents. No retry
-            // backoff needed — the next Modify event is the retry.
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_)
                 | EventKind::Other | EventKind::Any => {
                     for path in paths {
-                        try_adopt_jsonl(&app, &sessions, &monitor, &expected, &path);
+                        let result = try_adopt_jsonl(&app, &sessions, &monitor, &expected, &path);
+                        if matches!(result, MatchResult::RetryNeeded) {
+                            // CWD candidates exist but Claude process not visible yet.
+                            // Schedule bounded retries on a background thread.
+                            let app2 = app.clone();
+                            let s2 = sessions.clone();
+                            let m2 = monitor.clone();
+                            let e2 = expected.clone();
+                            let p2 = path.clone();
+                            std::thread::spawn(move || {
+                                for delay_ms in [500, 1500] {
+                                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                                    if m2.lock().unwrap().iter().any(|(_, e)| e.jsonl == p2) { return; }
+                                    if matches!(try_adopt_jsonl(&app2, &s2, &m2, &e2, &p2), MatchResult::Matched(_)) {
+                                        return;
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -1412,6 +1740,11 @@ fn exit_app(app: AppHandle) {
 }
 
 #[tauri::command]
+fn open_devtools(webview_window: tauri::WebviewWindow) {
+    webview_window.open_devtools();
+}
+
+#[tauri::command]
 fn focus_webview(webview_window: tauri::WebviewWindow) {
     #[cfg(windows)]
     {
@@ -1992,9 +2325,14 @@ fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
         } else {
             let mut cmd = CommandBuilder::new("powershell.exe");
             // -NoExit keeps the shell interactive after running the setup command.
-            // The prompt override emits OSC 7 with cwd plus OSC 133 A (prompt
-            // start → idle). OSC 133 C (command start → busy) is emitted via a
-            // PSReadLine Enter handler so busy transitions are detected too.
+            // The prompt override emits OSC 133 C (busy), then OSC 7 (cwd),
+            // then OSC 133 A (idle). The C→A pair guarantees a busy→idle
+            // transition on every prompt render, which is critical because
+            // PSReadLine's Enter key handler does NOT fire for programmatic
+            // `\r` input — without the leading C, the backend's transition-
+            // based dedup suppresses the idle event when prev_idle is already
+            // true, breaking exit detection for programmatically-launched
+            // Claude sessions.
             cmd.args([
                 "-NoExit",
                 "-Command",
@@ -2004,7 +2342,7 @@ fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                         "$loc = (Get-Location).Path; ",
                         "$uri = 'file:///' + ($loc -replace '\\\\','/'); ",
                         "$e = [char]27; $bel = [char]7; ",
-                        "[Console]::Write(\"${e}]7;${uri}${bel}${e}]133;A${bel}\"); ",
+                        "[Console]::Write(\"${e}]133;C${bel}${e}]7;${uri}${bel}${e}]133;A${bel}\"); ",
                         "& $__arbiter_orig_prompt ",
                     "}; ",
                     "if (Get-Module PSReadLine -ErrorAction SilentlyContinue) { ",
@@ -2115,6 +2453,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_session,
             set_expected_claude_session,
+            clear_claude_monitor,
             write_to_session,
             resize_session,
             close_session,
@@ -2154,6 +2493,8 @@ pub fn run() {
             watch_directory,
             unwatch_directory,
             get_project_model,
+            open_devtools,
+            scan_for_claude_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

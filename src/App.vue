@@ -13,7 +13,7 @@ import StatsBar from './components/StatsBar.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import { useConfirm } from './composables/useConfirm'
 import MdiIcon from './components/MdiIcon.vue'
-import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline } from '@mdi/js'
+import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline, mdiBugOutline } from '@mdi/js'
 import ShortcutsDialog from './components/ShortcutsDialog.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
@@ -294,6 +294,7 @@ async function bootstrapBackgroundSessions() {
             store.updateClaudePaneState(paneId, {
               lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
             })
+            store.armClaudeListeners(paneId)
             setTimeout(() => {
               invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
             }, 500)
@@ -301,6 +302,7 @@ async function bootstrapBackgroundSessions() {
             store.updateClaudePaneState(paneId, {
               lifecycle: 'launching', confirmed: false,
             })
+            store.armClaudeListeners(paneId)
             setTimeout(() => {
               invoke('write_to_session', { sessionId, data: 'claude\r' })
             }, 500)
@@ -318,8 +320,15 @@ async function bootstrapBackgroundSessions() {
 async function setupCloseHandler() {
   const win = getCurrentWindow()
   await win.onCloseRequested(async (_event) => {
-    // Autosave runs on every state change, so by the time the user clicks close
-    // the disk is already up to date. No final flush needed.
+    // Force a final save to ensure the latest state is on disk.
+    // The autosave watcher may not have flushed yet if a state change just
+    // happened (Vue batches watcher callbacks), or the in-flight save may
+    // not have completed.
+    try {
+      saveInFlight = false  // bypass the guard — we MUST save now
+      savePending = false
+      await performAutoSave()
+    } catch { /* best-effort */ }
     await invoke('exit_app')
   })
 }
@@ -576,6 +585,9 @@ onBeforeUnmount(() => {
         </button>
         <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
           <MdiIcon :path="mdiKeyboardOutline" :size="16" />
+        </button>
+        <button class="settings-btn" title="DevTools" @click="invoke('open_devtools')">
+          <MdiIcon :path="mdiBugOutline" :size="16" />
         </button>
         <button class="settings-btn" title="Settings" @click="settingsOpen = true">
           <MdiIcon :path="mdiCogOutline" :size="16" />

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { emit } from '@tauri-apps/api/event'
+import { emit, listen } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree, ClaudePaneState } from '../types/pane'
 import type { SavedPaneNode, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace, LegacySavedWorkspace } from '../types/config'
 
@@ -123,6 +124,11 @@ export const usePaneStore = defineStore('pane', () => {
 
   function setPtySession(paneId: string, sessionId: string) {
     ptySessionIds.value[paneId] = sessionId
+    // Always subscribe Claude event listeners so manually-typed `claude`
+    // commands are detected, not just button-launched ones.
+    // The backend's per-PTY process monitor (spawn_pane_monitor) handles
+    // lifecycle detection by polling for Claude descendants every 1s.
+    subscribeClaudeEvents(paneId, sessionId)
   }
 
   function getPtySession(paneId: string): string | undefined {
@@ -159,6 +165,7 @@ export const usePaneStore = defineStore('pane', () => {
 
   function removePtySession(paneId: string) {
     delete ptySessionIds.value[paneId]
+    unsubscribeClaudeEvents(paneId)
   }
 
   function splitFocused(direction: 'vertical' | 'horizontal') {
@@ -331,6 +338,10 @@ export const usePaneStore = defineStore('pane', () => {
   function updateClaudePaneState(paneId: string, update: Partial<ClaudePaneState>) {
     const current = getClaudePaneState(paneId)
     claudePaneStates.value[paneId] = { ...current, ...update }
+    // Track launch timestamp for shell-activity grace period
+    if (update.lifecycle === 'launching') {
+      launchTimestamps[paneId] = Date.now()
+    }
   }
 
   function clearClaudePaneState(paneId: string) {
@@ -348,6 +359,169 @@ export const usePaneStore = defineStore('pane', () => {
     return {
       sessionId: s.confirmed && s.sessionId ? s.sessionId : null,
       wasOpen: true,
+    }
+  }
+
+  // ── Persistent Claude event listeners ────────────────────────────────────
+  // These live in the store (not in TerminalPane) so they survive component
+  // unmount/remount cycles (e.g. worktree switching in project workspaces).
+  const claudeEventListeners = ref<Record<string, Array<() => void>>>({})
+  const workingTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+  // Tracks when lifecycle entered 'launching' for shell-activity grace period
+  const launchTimestamps: Record<string, number> = {}
+
+  interface ClaudeStatusPayload {
+    session_id: string
+    model_id?: string | null
+    input_tokens?: number | null
+    output_tokens?: number | null
+    cache_creation_input_tokens?: number | null
+    cache_read_input_tokens?: number | null
+    folder?: string | null
+    branch?: string | null
+  }
+
+  async function subscribeClaudeEvents(paneId: string, sid: string) {
+    // Tear down existing listeners (idempotent)
+    unsubscribeClaudeEvents(paneId)
+    console.warn(`[claude-events] subscribed pane=${paneId} sid=${sid}`)
+
+    const listeners: Array<() => void> = []
+
+    // claude-started: JSONL adopted → Claude confirmed running
+    const unStarted = await listen<ClaudeStatusPayload>(`claude-started-${sid}`, (event) => {
+      console.warn(`[claude-events] STARTED pane=${paneId}`, event.payload)
+      const p = event.payload
+      const update: Partial<ClaudePaneState> = { lifecycle: 'ready', confirmed: true }
+      if (p?.session_id) update.sessionId = p.session_id
+      if (p?.model_id) update.model = p.model_id
+      if (p?.input_tokens != null) update.inputTokens = p.input_tokens
+      if (p?.output_tokens != null) update.outputTokens = p.output_tokens
+      if (p?.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
+      if (p?.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
+      delete launchTimestamps[paneId]
+      updateClaudePaneState(paneId, update)
+    })
+    listeners.push(unStarted as unknown as () => void)
+
+    // claude-pty-active: PTY output while Claude is tracked → instant working detection.
+    // The backend emits this every 300ms when there's terminal output and a monitor
+    // entry exists. Much faster than JSONL token deltas.
+    const unPtyActive = await listen(`claude-pty-active-${sid}`, () => {
+      const state = getClaudePaneState(paneId)
+      if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
+        console.warn(`[claude-events] PTY-ACTIVE → working pane=${paneId}`)
+        updateClaudePaneState(paneId, { lifecycle: 'working' })
+      }
+      // Reset the working→ready timer on every burst of output
+      if (workingTimers[paneId]) clearTimeout(workingTimers[paneId])
+      workingTimers[paneId] = setTimeout(() => {
+        const s = getClaudePaneState(paneId)
+        if (s.lifecycle === 'working') {
+          console.warn(`[claude-events] working timeout → ready pane=${paneId}`)
+          updateClaudePaneState(paneId, { lifecycle: 'ready' })
+        }
+        delete workingTimers[paneId]
+      }, 2000)
+    })
+    listeners.push(unPtyActive as unknown as () => void)
+
+    // claude-status: token/model updates from JSONL
+    const unStatus = await listen<ClaudeStatusPayload>(`claude-status-${sid}`, (event) => {
+      console.warn(`[claude-events] STATUS pane=${paneId}`, event.payload)
+      const p = event.payload
+      const update: Partial<ClaudePaneState> = {}
+
+      if (p?.session_id) update.sessionId = p.session_id
+      if (p?.model_id) update.model = p.model_id
+      if (p?.input_tokens != null) update.inputTokens = p.input_tokens
+      if (p?.output_tokens != null) update.outputTokens = p.output_tokens
+      if (p?.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
+      if (p?.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
+      if (p) {
+        const total = (p.input_tokens ?? 0) + (p.output_tokens ?? 0)
+          + (p.cache_creation_input_tokens ?? 0) + (p.cache_read_input_tokens ?? 0)
+        update.contextPercent = Math.min(100, (total / 200_000) * 100)
+      }
+      updateClaudePaneState(paneId, update)
+    })
+    listeners.push(unStatus as unknown as () => void)
+
+    // claude-exited: process died → closed
+    const unExited = await listen(`claude-exited-${sid}`, () => {
+      console.warn(`[claude-events] EXITED pane=${paneId}`)
+      if (workingTimers[paneId]) { clearTimeout(workingTimers[paneId]); delete workingTimers[paneId] }
+      delete launchTimestamps[paneId]
+      updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
+    })
+    listeners.push(unExited as unknown as () => void)
+
+    // shell-activity: exit fallback — shell idle while Claude active → exited.
+    // Also handles the launching state: if the shell goes idle more than 5s
+    // after launch, Claude exited without creating a JSONL.
+    const unActivity = await listen<boolean>(`shell-activity-${sid}`, (event) => {
+      const idle = event.payload
+      const state = getClaudePaneState(paneId)
+      console.warn(`[claude-events] SHELL-ACTIVITY idle=${idle} lifecycle=${state.lifecycle} pane=${paneId}`)
+
+      if (idle && (state.lifecycle === 'ready' || state.lifecycle === 'working' || state.lifecycle === 'attention')) {
+        // Shell went idle while Claude was active → Claude exited
+        console.warn(`[claude-events] shell-idle → CLOSED pane=${paneId}`)
+        if (workingTimers[paneId]) { clearTimeout(workingTimers[paneId]); delete workingTimers[paneId] }
+        delete launchTimestamps[paneId]
+        updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
+        invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
+      } else if (idle && state.lifecycle === 'launching') {
+        // Shell idle during launch — Claude might have exited before JSONL creation.
+        const launchedAt = launchTimestamps[paneId] ?? 0
+        if (launchedAt > 0 && Date.now() - launchedAt > 5000) {
+          console.warn(`[claude-events] launch-idle → CLOSED pane=${paneId}`)
+          delete launchTimestamps[paneId]
+          updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
+          invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
+        }
+      }
+
+      // Update terminal status for non-Claude shell state
+      if (state.lifecycle === 'closed') {
+        setTerminalStatus(paneId, idle ? 'idle' : 'running')
+      }
+    })
+    listeners.push(unActivity as unknown as () => void)
+
+    // claude-bell: BEL byte → attention (permission prompts, etc.)
+    const unBell = await listen(`claude-bell-${sid}`, () => {
+      console.warn(`[claude-events] BELL pane=${paneId}`)
+      const state = getClaudePaneState(paneId)
+      if (state.lifecycle !== 'closed' && state.lifecycle !== 'launching') {
+        updateClaudePaneState(paneId, { lifecycle: 'attention' })
+      }
+    })
+    listeners.push(unBell as unknown as () => void)
+
+    claudeEventListeners.value[paneId] = listeners
+  }
+
+  function unsubscribeClaudeEvents(paneId: string) {
+    const listeners = claudeEventListeners.value[paneId]
+    if (listeners) {
+      for (const fn of listeners) fn()
+      delete claudeEventListeners.value[paneId]
+    }
+    if (workingTimers[paneId]) {
+      clearTimeout(workingTimers[paneId])
+      delete workingTimers[paneId]
+    }
+    delete launchTimestamps[paneId]
+  }
+
+  /** Ensure persistent Claude event listeners are active for a pane.
+   *  Called when Claude is launched or when a session is created with
+   *  pending Claude state. Idempotent — skips if already subscribed. */
+  function armClaudeListeners(paneId: string) {
+    const sid = ptySessionIds.value[paneId]
+    if (sid && !claudeEventListeners.value[paneId]) {
+      subscribeClaudeEvents(paneId, sid)
     }
   }
 
@@ -896,13 +1070,14 @@ export const usePaneStore = defineStore('pane', () => {
     splitFocused, closeFocused, setFocus,
     updateSplitSizes, adjustSplitSize,
     // PTY session mapping
-    setPtySession, getPtySession, hasPaneId, isPaneInProjectWorkspace, removePtySession,
+    ptySessionIds, setPtySession, getPtySession, hasPaneId, isPaneInProjectWorkspace, removePtySession,
     // Terminal names
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
     terminalShells, getTerminalShell, setTerminalShell,
     // Claude lifecycle state (centralized)
     claudePaneStates, getClaudePaneState, updateClaudePaneState, clearClaudePaneState,
     isClaudeActive, getClaudeSessionForSave,
+    subscribeClaudeEvents, unsubscribeClaudeEvents, armClaudeListeners,
     // Terminal status
     terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,
     // Saved state for restoration
