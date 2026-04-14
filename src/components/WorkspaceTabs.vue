@@ -306,14 +306,14 @@ function onPointerDown(e: PointerEvent, index: number) {
 <style scoped>
 .workspace-tabs {
   display: flex;
-  align-items: stretch;
-  gap: 1px;
+  align-items: center;
+  gap: 3px;
   height: 100%;
   min-width: 0;
+  padding: 0 4px;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
-  -webkit-app-region: no-drag;
 }
 
 .workspace-tabs::-webkit-scrollbar {
@@ -325,7 +325,7 @@ function onPointerDown(e: PointerEvent, index: number) {
   align-items: center;
   gap: 4px;
   padding: 0 8px;
-  height: 24px;
+  height: 26px;
   margin: auto 0;
   min-width: 60px;
   max-width: 180px;
@@ -335,22 +335,24 @@ function onPointerDown(e: PointerEvent, index: number) {
   font-size: 12px;
   font-weight: 400;
   white-space: nowrap;
-  border-radius: 4px;
-  transition: color 0.15s, background 0.15s;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
   position: relative;
   overflow: hidden;
-  -webkit-app-region: no-drag;
   touch-action: none;
 }
 
 .tab:hover {
   color: var(--color-text-secondary);
   background: var(--color-bg-elevated);
+  border-color: var(--color-card-border);
 }
 
 .tab.active {
   color: var(--color-text-primary);
   background: var(--color-bg-elevated);
+  border-color: var(--color-card-border-hover);
 }
 
 .tab.dragging {
@@ -390,11 +392,11 @@ function onPointerDown(e: PointerEvent, index: number) {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   background: none;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--color-text-muted);
   font-size: 14px;
   line-height: 1;
@@ -417,23 +419,25 @@ function onPointerDown(e: PointerEvent, index: number) {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  min-width: 28px;
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  margin: auto 0;
   flex-shrink: 0;
-  height: 100%;
   background: none;
-  border: none;
-  -webkit-app-region: no-drag;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
   color: var(--color-text-muted);
-  font-size: 18px;
+  font-size: 16px;
   cursor: pointer;
-  transition: color 0.15s, background 0.15s;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
   padding: 0;
 }
 
 .tab-add:hover {
   color: var(--color-text-primary);
   background: var(--color-bg-elevated);
+  border-color: var(--color-card-border);
 }
 
 .tab-type-icon {
@@ -477,7 +481,6 @@ function onPointerDown(e: PointerEvent, index: number) {
   flex: 1 1 auto;
   min-width: 0;
   height: 100%;
-  -webkit-app-region: drag;
 }
 
 /* Context menu */

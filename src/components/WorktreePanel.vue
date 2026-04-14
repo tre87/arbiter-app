@@ -578,8 +578,7 @@ async function ctxDismissMerged() {
   min-width: 200px;
   display: flex;
   flex-direction: column;
-  background: var(--color-bg);
-  border-left: 1px solid var(--color-card-border);
+  background: var(--color-bg-subtle);
   overflow: hidden;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
 }
@@ -606,7 +605,7 @@ async function ctxDismissMerged() {
   color: var(--color-text-secondary);
   cursor: pointer;
   padding: 2px;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 .add-btn:hover {
   color: var(--color-text-primary);
@@ -670,7 +669,7 @@ async function ctxDismissMerged() {
   padding: 6px 8px;
   background: var(--color-bg);
   border: 1px solid var(--color-card-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: var(--color-text-primary);
   font-size: 13px;
   outline: none;
@@ -700,7 +699,7 @@ async function ctxDismissMerged() {
   height: 22px;
   background: none;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: var(--color-text-muted);
   cursor: pointer;
   padding: 0;
@@ -725,7 +724,7 @@ async function ctxDismissMerged() {
   padding: 6px 8px;
   background: var(--color-bg);
   border: 1px solid var(--color-card-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: var(--color-text-primary);
   font-size: 13px;
   font-family: inherit;
@@ -801,7 +800,7 @@ async function ctxDismissMerged() {
   margin-bottom: 10px;
   padding: 6px 8px;
   background: rgba(239, 68, 68, 0.1);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 
 .dialog-actions {
@@ -825,7 +824,7 @@ async function ctxDismissMerged() {
 
 .btn-primary, .btn-secondary, .btn-action {
   padding: 6px 14px;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   font-size: 13px;
   cursor: pointer;
   border: 1px solid var(--color-card-border);

@@ -149,8 +149,7 @@ watch(() => props.worktree.id, async () => {
   min-width: 160px;
   display: flex;
   flex-direction: column;
-  background: var(--color-bg);
-  border-right: 1px solid var(--color-card-border);
+  background: var(--color-bg-subtle);
   overflow: hidden;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
 }

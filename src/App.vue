@@ -28,6 +28,14 @@ const devStore = useDevSettingsStore()
 const ready = ref(false)
 const overviewOpen = ref(false)
 
+const isMac = typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac')
+const isWindows = typeof navigator !== 'undefined' && navigator.platform.startsWith('Win')
+if (typeof document !== 'undefined') {
+  if (isMac) document.body.classList.add('is-macos')
+  else if (isWindows) document.body.classList.add('is-windows')
+  else document.body.classList.add('is-linux')
+}
+
 // ── Auto-save (crash-safe persistence) ──────────────────────────────────────
 // Purely event-driven: every reactive state change runs the watcher below,
 // which calls performAutoSave once per Vue tick (mutations are batched). A
@@ -495,6 +503,26 @@ function resetOverviewWindow(e: MouseEvent) {
   overviewOpen.value = true
 }
 
+// ── Titlebar drag ────────────────────────────────────────────────────────────
+// Explicit drag handling (more reliable than data-tauri-drag-region under custom
+// chrome). Any mousedown in the titlebar that isn't on an interactive element
+// starts a native window drag. Double-click toggles maximize.
+function onTitlebarMouseDown(e: MouseEvent) {
+  if (e.button !== 0) return
+  const target = e.target as HTMLElement | null
+  if (!target) return
+  if (target.closest('button, input, textarea, select, a, .tab')) return
+  e.preventDefault()
+  getCurrentWindow().startDragging()
+}
+
+async function onTitlebarDblClick(e: MouseEvent) {
+  const target = e.target as HTMLElement | null
+  if (!target) return
+  if (target.closest('button, input, textarea, select, a, .tab')) return
+  await getCurrentWindow().toggleMaximize()
+}
+
 // ── Drag and drop ────────────────────────────────────────────────────────────
 
 let unlistenDragDrop: (() => void) | null = null
@@ -595,7 +623,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app">
-    <div class="titlebar">
+    <div class="titlebar" @mousedown="onTitlebarMouseDown" @dblclick="onTitlebarDblClick">
       <div class="titlebar-brand">
         <img :src="logoUrl" class="titlebar-logo" alt="Arbiter" />
         <span class="titlebar-title">Arbiter</span>
@@ -603,20 +631,20 @@ onBeforeUnmount(() => {
       <WorkspaceTabs v-if="ready" />
       <div class="titlebar-right">
         <StatsBar v-if="!devStore.hideUsageBar" />
-        <button class="settings-btn" :class="{ active: overviewOpen }" title="Workspace overview (Ctrl+Shift+O)" @click="toggleOverviewWindow()" @contextmenu="resetOverviewWindow">
+        <button class="btn-icon" :class="{ 'is-active': overviewOpen }" title="Workspace overview (Ctrl+Shift+O)" @click="toggleOverviewWindow()" @contextmenu="resetOverviewWindow">
           <MdiIcon :path="mdiViewDashboardOutline" :size="16" />
         </button>
-        <button class="settings-btn" title="Keyboard shortcuts" @click="shortcutsOpen = true">
+        <button class="btn-icon" title="Keyboard shortcuts" @click="shortcutsOpen = true">
           <MdiIcon :path="mdiKeyboardOutline" :size="16" />
         </button>
-        <button class="settings-btn" title="DevTools" @click="invoke('open_devtools')">
+        <button class="btn-icon" title="DevTools" @click="invoke('open_devtools')">
           <MdiIcon :path="mdiBugOutline" :size="16" />
         </button>
-        <button class="settings-btn" title="Settings" @click="settingsOpen = true">
+        <button class="btn-icon" title="Settings" @click="settingsOpen = true">
           <MdiIcon :path="mdiCogOutline" :size="16" />
         </button>
       </div>
-      <WindowControls />
+      <WindowControls v-if="!isMac" />
     </div>
     <template v-if="ready">
       <div
@@ -629,10 +657,11 @@ onBeforeUnmount(() => {
           v-if="ws.type === 'project'"
           :workspace="ws as any"
         />
-        <SplitView
-          v-else
-          :node="(ws as any).root"
-        />
+        <div v-else class="terminal-workspace">
+          <div class="panel-card terminal-workspace-card">
+            <SplitView :node="(ws as any).root" />
+          </div>
+        </div>
       </div>
     </template>
 
@@ -645,22 +674,42 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .app {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
   width: 100vw;
+  background: var(--color-bg);
+}
+
+.app::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse 900px 560px at calc(var(--titlebar-pad-left) + 14px) 0,
+    rgba(51, 153, 255, 0.32) 0%,
+    rgba(51, 153, 255, 0.16) 25%,
+    rgba(51, 153, 255, 0.06) 55%,
+    transparent 85%
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app > * {
+  position: relative;
+  z-index: 1;
 }
 
 .titlebar {
-  height: 44px;
-  background: var(--color-bg-subtle);
-  border-bottom: 1px solid var(--color-card-border);
+  height: var(--titlebar-height);
+  background: transparent;
   display: grid;
   grid-template-columns: auto 1fr auto auto;
   align-items: center;
-  padding: 0 0 0 6px;
+  padding: 0 var(--titlebar-pad-right) 0 var(--titlebar-pad-left);
   user-select: none;
-  -webkit-app-region: drag;
   flex-shrink: 0;
 }
 
@@ -705,44 +754,41 @@ onBeforeUnmount(() => {
 .titlebar-right {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   padding: 0 8px;
-  -webkit-app-region: no-drag;
-}
-
-.settings-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: none;
-  border: 1px solid var(--color-card-border);
-  border-radius: 4px;
-  color: var(--color-text-muted);
-  cursor: pointer;
-  padding: 4px;
-  line-height: 1;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-}
-
-.settings-btn:hover {
-  color: var(--color-accent);
-  border-color: var(--color-accent);
-  background: var(--color-bg-elevated);
-}
-
-.settings-btn.active {
-  color: var(--color-accent);
-  border-color: var(--color-accent);
 }
 
 .workspace {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  background: var(--color-bg);
+  background: transparent;
   position: relative;
 }
 .workspace > * {
   height: 100%;
+}
+
+.terminal-workspace {
+  display: flex;
+  padding: 0 var(--workspace-padding) var(--workspace-padding);
+  background: transparent;
+}
+
+.terminal-workspace-card {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--panel-shadow);
+  display: flex;
+  flex-direction: column;
+}
+.terminal-workspace-card > * {
+  flex: 1;
+  min-height: 0;
 }
 </style>

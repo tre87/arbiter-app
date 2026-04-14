@@ -636,24 +636,6 @@ onBeforeUnmount(() => {
   background: var(--color-bg);
 }
 
-.terminal-pane::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: transparent;
-  pointer-events: none;
-  transition: background-color 0.12s;
-  z-index: 10;
-}
-
-.terminal-pane.focused::after {
-  background: linear-gradient(90deg, transparent 0%, var(--color-accent) 50%, transparent 100%);
-}
-
-
 .pane-toolbar {
   position: relative;
   display: flex;
@@ -664,6 +646,11 @@ onBeforeUnmount(() => {
   background: var(--color-bg-subtle);
   border-bottom: 1px solid var(--color-card-border);
   flex-shrink: 0;
+  transition: background 0.12s;
+}
+
+.terminal-pane.focused .pane-toolbar {
+  background: var(--color-bg-elevated);
 }
 
 .toolbar-spacer { flex: 1; }

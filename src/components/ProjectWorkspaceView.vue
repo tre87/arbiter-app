@@ -23,15 +23,16 @@ const centerRoot = computed(() => activeWorktree.value?.root ?? null)
       :key="activeWorktree.id"
       :worktree="activeWorktree"
       :workspace-repo-root="workspace.repoRoot"
+      class="panel-card"
     />
-    <div class="center-content">
+    <div class="center-content panel-card">
       <SplitView
         v-if="centerRoot"
         :node="centerRoot"
         :key="workspace.activeWorktreeId"
       />
     </div>
-    <WorktreePanel :workspace="workspace" />
+    <WorktreePanel :workspace="workspace" class="panel-card" />
   </div>
 </template>
 
@@ -42,6 +43,9 @@ const centerRoot = computed(() => activeWorktree.value?.root ?? null)
   height: 100%;
   min-height: 0;
   overflow: hidden;
+  padding: 0 var(--workspace-padding) var(--workspace-padding);
+  gap: var(--panel-gap);
+  background: transparent;
 }
 
 .center-content {
@@ -49,5 +53,13 @@ const centerRoot = computed(() => activeWorktree.value?.root ?? null)
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+
+.project-workspace > :deep(.panel-card) {
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--panel-shadow);
 }
 </style>

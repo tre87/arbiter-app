@@ -58,8 +58,7 @@ function close() {
 .window-controls {
   display: flex;
   align-items: stretch;
-  height: 100%;
-  -webkit-app-region: no-drag;
+  height: var(--titlebar-height);
 }
 
 .win-btn {
@@ -78,11 +77,11 @@ function close() {
 
 .win-btn:hover {
   background: var(--color-bg-elevated);
-  color: var(--color-text);
+  color: var(--color-text-primary);
 }
 
 .win-btn.close:hover {
-  background: #e81123;
+  background: var(--color-danger);
   color: #fff;
 }
 </style>

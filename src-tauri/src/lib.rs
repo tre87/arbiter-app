@@ -2507,7 +2507,12 @@ pub fn run() {
 
             // Show the main window after the window-state plugin has restored
             // its position/size so there's no visible jump.
+            // On Windows/Linux, strip OS decorations — we ship custom chrome.
+            // On macOS, decorations stay on so the native traffic lights render
+            // on top of our overlay-style titlebar.
             if let Some(w) = app.get_webview_window("main") {
+                #[cfg(not(target_os = "macos"))]
+                { let _ = w.set_decorations(false); }
                 w.show().unwrap_or_default();
             }
 

@@ -193,7 +193,7 @@ onBeforeUnmount(() => {
   width: 72px;
   height: 18px;
   background: var(--color-card-border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
@@ -236,7 +236,7 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   line-height: 1;
   border: 1px solid var(--color-card-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 5px 7px;
   height: 26px;
   box-sizing: border-box;
@@ -252,7 +252,7 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   line-height: 1;
   border: 1px solid var(--color-warning, #e8a735);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 5px 7px;
   height: 26px;
   box-sizing: border-box;
@@ -272,7 +272,7 @@ onBeforeUnmount(() => {
   gap: 4px;
   background: none;
   border: 1px solid var(--color-card-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 5px 7px;
   height: 26px;
   box-sizing: border-box;
