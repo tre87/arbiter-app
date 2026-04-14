@@ -2456,11 +2456,12 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
+            // We save position/size ourselves in arbiter.json; the plugin only
+            // tracks maximized/fullscreen so it doesn't fight our custom restore
+            // (which runs after the decoration flip on Windows).
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::SIZE
-                        | tauri_plugin_window_state::StateFlags::POSITION
-                        | tauri_plugin_window_state::StateFlags::MAXIMIZED
+                    tauri_plugin_window_state::StateFlags::MAXIMIZED
                         | tauri_plugin_window_state::StateFlags::FULLSCREEN,
                 )
                 .with_denylist(&[AUTH_WINDOW_LABEL, OVERVIEW_WINDOW_LABEL])
