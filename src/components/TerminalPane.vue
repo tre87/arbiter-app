@@ -362,12 +362,19 @@ onMounted(async () => {
       term.write(event.payload)
     })
 
-    // Resize the PTY to match the new container — the shell gets notified and redraws.
-    // We intentionally skip replaying the raw buffer here: it was captured at the old
-    // terminal width, so escape sequences (cursor positioning, line wraps) would render
-    // as garbled text at the new width. The running process redraws after the resize.
+    // Tell the PTY our current dimensions. The backend skips the actual resize
+    // (and SIGWINCH) when dimensions are unchanged — this avoids Claude's Ink
+    // TUI redrawing and producing ghost cursor artefacts on worktree switch.
+    // When dimensions *did* change (e.g. after a split), SIGWINCH fires and
+    // the running process redraws at the new size.
     store.markResize(props.paneId)
-    invoke('resize_session', { sessionId, cols: term.cols, rows: term.rows })
+    const resized = await invoke<boolean>('resize_session', { sessionId, cols: term.cols, rows: term.rows })
+    if (!resized) {
+      // Dimensions unchanged (worktree switch) — replay the output buffer to
+      // restore terminal content without triggering a TUI redraw.
+      const replay = await invoke<string>('get_session_replay', { sessionId })
+      if (replay) term.write(replay)
+    }
 
     // Claude state was maintained by persistent listeners in pane.ts while this
     // component was unmounted — just read it and ensure listeners are armed.
@@ -388,6 +395,11 @@ onMounted(async () => {
       gitInfo.value = git
       if (claudeRestore?.wasOpen) {
         footerVisible.value = true
+        // Set lifecycle early so claudeActive=true and the footer actually
+        // renders before safeFit — otherwise the terminal is sized to the
+        // full container, then the footer appears later causing a resize
+        // that sends SIGWINCH and triggers Claude's ghost cursor artefact.
+        store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false })
       }
       // Let Vue re-render the footer, then refit terminal to the new smaller area
       await nextTick()

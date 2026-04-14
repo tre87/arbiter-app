@@ -21,6 +21,10 @@ struct PtySession {
     // Queried by the frontend on (re)mount so a subscription that races
     // past the first idle transition can still show the shell-switch button.
     shell_idle: Arc<Mutex<Option<bool>>>,
+    // Last resize dimensions — resize_session skips the PTY resize (and thus
+    // SIGWINCH) when the requested size matches, avoiding unnecessary TUI
+    // redraws that cause ghost cursor artefacts in Claude's Ink renderer.
+    last_size: Mutex<(u16, u16)>,
 }
 
 // Arc so the watcher background thread can share ownership
@@ -310,6 +314,8 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
         }
     });
 
+    let initial_cols = cols.unwrap_or(80);
+    let initial_rows = rows.unwrap_or(24);
     sessions.0.lock().unwrap().insert(
         session_id.clone(),
         PtySession {
@@ -320,6 +326,7 @@ fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<Clau
             cwd: session_cwd,
             title: session_title,
             shell_idle: session_shell_idle,
+            last_size: Mutex::new((initial_cols, initial_rows)),
         },
     );
 
@@ -361,9 +368,16 @@ fn resize_session(
     cols: u16,
     rows: u16,
     sessions: State<Sessions>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let map = sessions.0.lock().unwrap();
     if let Some(session) = map.get(&session_id) {
+        // Skip if dimensions unchanged — avoids SIGWINCH which triggers TUI
+        // redraws in Claude's Ink renderer, causing ghost cursor artefacts.
+        let mut last = session.last_size.lock().unwrap();
+        if last.0 == cols && last.1 == rows {
+            return Ok(false);
+        }
+        *last = (cols, rows);
         session
             ._master
             .resize(PtySize {
@@ -373,8 +387,10 @@ fn resize_session(
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -406,6 +422,15 @@ fn set_expected_claude_session(
 #[tauri::command]
 fn clear_claude_monitor(session_id: String, monitor: State<ClaudeMonitor>) {
     monitor.0.lock().unwrap().remove(&session_id);
+}
+
+/// Return the current terminal dimensions (cols, rows) for a session.
+/// Used by bootstrapBackgroundSessions to create background PTY sessions at
+/// the correct size instead of the default 80×24.
+#[tauri::command]
+fn get_session_size(session_id: String, sessions: State<Sessions>) -> Option<(u16, u16)> {
+    let map = sessions.0.lock().unwrap();
+    map.get(&session_id).map(|s| *s.last_size.lock().unwrap())
 }
 
 /// Return the buffered PTY output for a session as a UTF-8 string (lossy).
@@ -2505,6 +2530,7 @@ pub fn run() {
             resize_session,
             close_session,
             get_session_replay,
+            get_session_size,
             get_usage,
             report_usage,
             report_auth_error,

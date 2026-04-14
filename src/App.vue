@@ -265,6 +265,29 @@ async function bootstrapBackgroundSessions() {
     // until the user switches to them, so Claude wouldn't auto-launch
     // without this bootstrap path.
     if (ws.type !== 'project') continue
+
+    // Wait for the active worktree's panes to create their PTY sessions so we
+    // can read the correct terminal dimensions.  Background sessions created at
+    // the wrong size (e.g. 80×24) cause a large SIGWINCH when the user switches
+    // worktrees, which triggers Claude's Ink TUI to redraw with a ghost cursor.
+    const activeWt = ws.worktrees.find(wt => wt.id === ws.activeWorktreeId)
+    const refPaneId = activeWt?.claudePaneId || (activeWt ? collectLeafIds(activeWt.root)[0] : null)
+    let refCols = 80, refRows = 24
+    if (refPaneId) {
+      // Wait reactively for the active worktree's TerminalPane to create its session
+      const refSid = await new Promise<string>((resolve) => {
+        const existing = store.getPtySession(refPaneId)
+        if (existing) { resolve(existing); return }
+        const unwatch = watch(() => store.getPtySession(refPaneId), (sid) => {
+          if (sid) { unwatch(); resolve(sid) }
+        })
+      })
+      // Give TerminalPane a moment to resize the session to the container
+      await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+      const size = await invoke<[number, number] | null>('get_session_size', { sessionId: refSid })
+      if (size) { refCols = size[0]; refRows = size[1] }
+    }
+
     const paneIds = ws.worktrees
       .filter(wt => wt.id !== ws.activeWorktreeId)
       .flatMap(wt => collectLeafIds(wt.root))
@@ -280,7 +303,7 @@ async function bootstrapBackgroundSessions() {
       store.setTerminalShell(paneId, shellPath ? 'gitbash' : 'powershell')
 
       try {
-        const sessionId = await invoke<string>('create_session', { cols: 80, rows: 24, cwd: cwd ?? null, shell: shellPath })
+        const sessionId = await invoke<string>('create_session', { cols: refCols, rows: refRows, cwd: cwd ?? null, shell: shellPath })
         store.setPtySession(paneId, sessionId)
 
         if (claudeRestore) {
