@@ -82,6 +82,7 @@ watch(() => store.loading, (loading, was) => {
 
 onMounted(async () => {
   store.startPolling()
+  // Wall-clock countdown display — must tick each second; no event source.
   cdTimer = setInterval(() => {
     countdown.value = countdown.value > 0 ? countdown.value - 1 : 120
   }, 1000)

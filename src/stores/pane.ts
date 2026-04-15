@@ -1,66 +1,18 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { emit, listen } from '@tauri-apps/api/event'
-import { invoke } from '@tauri-apps/api/core'
+import { emit } from '@tauri-apps/api/event'
 import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree, ClaudePaneState } from '../types/pane'
 import type { SavedPaneNode, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace, LegacySavedWorkspace } from '../types/config'
+import {
+  nextAvailableNumber, getWorkspaceRoot, setWorkspaceRoot,
+  getWorkspaceFocusedId, setWorkspaceFocusedId,
+  collectPaneIdsFromNode, collectAllPaneIds, nodeContainsId,
+  firstLeaf, lastLeaf,
+} from '../utils/paneTree'
+import { wireClaudeEventListeners } from './paneClaudeEvents'
 
 let nextId = 1
 const genId = () => String(nextId++)
-
-function nextAvailableNumber(prefix: string, usedNames: Iterable<string>): number {
-  const used = new Set<number>()
-  for (const name of usedNames) {
-    const match = name.match(new RegExp(`^${prefix} (\\d+)$`))
-    if (match) used.add(parseInt(match[1], 10))
-  }
-  let n = 1
-  while (used.has(n)) n++
-  return n
-}
-
-// ── Helpers for workspace-type-aware tree access ────────────────────────────
-
-function getWorkspaceRoot(ws: Workspace): PaneNode {
-  if (ws.type === 'project') {
-    const wt = ws.worktrees.find(w => w.id === ws.activeWorktreeId)
-    return wt ? wt.root : ws.worktrees[0].root
-  }
-  return ws.root
-}
-
-function setWorkspaceRoot(ws: Workspace, val: PaneNode) {
-  if (ws.type === 'project') {
-    const wt = ws.worktrees.find(w => w.id === ws.activeWorktreeId)
-    if (wt) wt.root = val
-  } else {
-    ws.root = val
-  }
-}
-
-function getWorkspaceFocusedId(ws: Workspace): string {
-  return ws.type === 'project' ? ws.focusedPaneId : ws.focusedId
-}
-
-function setWorkspaceFocusedId(ws: Workspace, val: string) {
-  if (ws.type === 'project') {
-    ws.focusedPaneId = val
-  } else {
-    ws.focusedId = val
-  }
-}
-
-function collectPaneIdsFromNode(node: PaneNode): string[] {
-  if (node.type === 'terminal') return [node.id]
-  return [...collectPaneIdsFromNode(node.first), ...collectPaneIdsFromNode(node.second)]
-}
-
-function collectAllPaneIds(ws: Workspace): string[] {
-  if (ws.type === 'project') {
-    return ws.worktrees.flatMap(wt => collectPaneIdsFromNode(wt.root))
-  }
-  return collectPaneIdsFromNode(ws.root)
-}
 
 export const usePaneStore = defineStore('pane', () => {
   // ── Multi-workspace state ─────────────────────────────────────────────────
@@ -87,7 +39,6 @@ export const usePaneStore = defineStore('pane', () => {
   // Maps paneId → PTY sessionId so sessions survive Vue remounts (e.g. splits)
   const ptySessionIds = ref<Record<string, string>>({})
 
-  // Terminal display names
   const terminalNames = ref<Record<string, string>>({})
 
   function assignTerminalName(id: string) {
@@ -103,7 +54,6 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value[id] = name
   }
 
-  // Terminal shell types (for persistence across restarts)
   const terminalShells = ref<Record<string, 'powershell' | 'gitbash'>>({})
 
   function setTerminalShell(id: string, shell: 'powershell' | 'gitbash') {
@@ -119,15 +69,12 @@ export const usePaneStore = defineStore('pane', () => {
     return `Workspace ${n}`
   }
 
-  // Assign name to the initial leaf
   assignTerminalName(initialLeaf.id)
 
   function setPtySession(paneId: string, sessionId: string) {
     ptySessionIds.value[paneId] = sessionId
     // Always subscribe Claude event listeners so manually-typed `claude`
     // commands are detected, not just button-launched ones.
-    // The backend's per-PTY process monitor (spawn_pane_monitor) handles
-    // lifecycle detection by polling for Claude descendants every 1s.
     subscribeClaudeEvents(paneId, sessionId)
   }
 
@@ -136,16 +83,11 @@ export const usePaneStore = defineStore('pane', () => {
   }
 
   function hasPaneId(id: string): boolean {
-    function check(node: PaneNode): boolean {
-      if (node.type === 'terminal') return node.id === id
-      return check(node.first) || check(node.second)
-    }
-    // Check all workspaces — pane may be in a background tab
     return workspaces.value.some(ws => {
       if (ws.type === 'project') {
-        return ws.worktrees.some(wt => check(wt.root))
+        return ws.worktrees.some(wt => nodeContainsId(wt.root, id))
       }
-      return check(ws.root)
+      return nodeContainsId(ws.root, id)
     })
   }
 
@@ -153,13 +95,9 @@ export const usePaneStore = defineStore('pane', () => {
   // Used by TerminalPane to hide its footer (git/cwd info is shown in the
   // worktree sidebar instead).
   function isPaneInProjectWorkspace(id: string): boolean {
-    function check(node: PaneNode): boolean {
-      if (node.type === 'terminal') return node.id === id
-      return check(node.first) || check(node.second)
-    }
     return workspaces.value.some(ws => {
       if (ws.type !== 'project') return false
-      return ws.worktrees.some(wt => check(wt.root))
+      return ws.worktrees.some(wt => nodeContainsId(wt.root, id))
     })
   }
 
@@ -203,14 +141,12 @@ export const usePaneStore = defineStore('pane', () => {
       if (activeWt && focusedId.value === activeWt.claudePaneId) return
     }
 
-    // Can't close the last pane
     if (root.value.type === 'terminal') return
 
     const target = focusedId.value
     let sibling: PaneNode | null = null
     let targetWasSecond = false
 
-    // Replace the parent split of the target with its sibling
     function remove(node: PaneNode): PaneNode {
       if (node.type !== 'split') return node
       if (node.first.type === 'terminal' && node.first.id === target) {
@@ -228,16 +164,6 @@ export const usePaneStore = defineStore('pane', () => {
 
     root.value = remove(root.value)
     delete terminalStatuses.value[target]
-
-    // Focus the leaf in the sibling closest to where the closed pane was
-    function firstLeaf(node: PaneNode): string {
-      if (node.type === 'terminal') return node.id
-      return firstLeaf(node.first)
-    }
-    function lastLeaf(node: PaneNode): string {
-      if (node.type === 'terminal') return node.id
-      return lastLeaf(node.second)
-    }
 
     if (sibling) {
       focusedId.value = targetWasSecond ? lastLeaf(sibling) : firstLeaf(sibling)
@@ -331,21 +257,6 @@ export const usePaneStore = defineStore('pane', () => {
     cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0, cost: 0,
   }
 
-  // Per-model pricing (USD per million tokens)
-  const MODEL_PRICING: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
-    'opus':   { input: 15.00, output: 75.00, cacheRead: 1.50,  cacheWrite: 18.75 },
-    'sonnet': { input: 3.00,  output: 15.00, cacheRead: 0.30,  cacheWrite: 3.75  },
-    'haiku':  { input: 0.80,  output: 4.00,  cacheRead: 0.08,  cacheWrite: 1.00  },
-  }
-
-  function computeCost(model: string | null, input: number, output: number, cacheRead: number, cacheWrite: number): number {
-    if (!model) return 0
-    const key = Object.keys(MODEL_PRICING).find(k => model.includes(k))
-    if (!key) return 0
-    const p = MODEL_PRICING[key]
-    return (input * p.input + output * p.output + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite) / 1_000_000
-  }
-
   function getClaudePaneState(paneId: string): ClaudePaneState {
     return claudePaneStates.value[paneId] ?? { ...defaultClaudePaneState }
   }
@@ -353,7 +264,6 @@ export const usePaneStore = defineStore('pane', () => {
   function updateClaudePaneState(paneId: string, update: Partial<ClaudePaneState>) {
     const current = getClaudePaneState(paneId)
     claudePaneStates.value[paneId] = { ...current, ...update }
-    // Track launch timestamp for shell-activity grace period
     if (update.lifecycle === 'launching') {
       launchTimestamps[paneId] = Date.now()
     }
@@ -384,12 +294,9 @@ export const usePaneStore = defineStore('pane', () => {
   const idleTimers: Record<string, ReturnType<typeof setTimeout>> = {}
   // Tracks when lifecycle entered 'launching' for shell-activity grace period
   const launchTimestamps: Record<string, number> = {}
-  // Turn baseline: output_tokens at adoption time. Only enter thinking when
-  // tokens exceed this value (prevents false positives on startup/resume).
-  // -1 = sentinel meaning "capture from next claude-status".
+  // Turn baseline: output_tokens at adoption time (-1 = capture from next status).
   const turnBaselines: Record<string, number> = {}
   // Suppress spinner-based working detection for 500ms after resize
-  // (resize redraws can contain Braille chars from Claude's status bar)
   const resizeTimestamps: Record<string, number> = {}
 
   /** Called by TerminalPane on resize to suppress false activity detection */
@@ -397,185 +304,14 @@ export const usePaneStore = defineStore('pane', () => {
     resizeTimestamps[paneId] = Date.now()
   }
 
-  interface ClaudeStatusPayload {
-    session_id: string
-    model_id?: string | null
-    input_tokens?: number | null
-    output_tokens?: number | null
-    cache_creation_input_tokens?: number | null
-    cache_read_input_tokens?: number | null
-    folder?: string | null
-    branch?: string | null
-  }
-
   async function subscribeClaudeEvents(paneId: string, sid: string) {
-    // Tear down existing listeners (idempotent)
     unsubscribeClaudeEvents(paneId)
-    console.warn(`[claude-events] subscribed pane=${paneId} sid=${sid}`)
-
-    const listeners: Array<() => void> = []
-
-    // Helper: reset idle timer — when no activity event arrives within 800ms,
-    // revert to 'ready'. Called by both claude-activity and claude-status.
-    function resetIdleTimer() {
-      if (idleTimers[paneId]) clearTimeout(idleTimers[paneId])
-      idleTimers[paneId] = setTimeout(() => {
-        const s = getClaudePaneState(paneId)
-        if (s.lifecycle === 'working') {
-          turnBaselines[paneId] = s.outputTokens
-          updateClaudePaneState(paneId, { lifecycle: 'ready' })
-        }
-        delete idleTimers[paneId]
-      }, 300)
-    }
-
-    // ── claude-started: JSONL adopted → Claude confirmed running ──────────
-    const unStarted = await listen<ClaudeStatusPayload>(`claude-started-${sid}`, (event) => {
-      console.warn(`[claude-events] STARTED pane=${paneId}`, event.payload)
-      const p = event.payload
-      const update: Partial<ClaudePaneState> = { lifecycle: 'ready', confirmed: true }
-      if (p?.session_id) update.sessionId = p.session_id
-      if (p?.model_id) update.model = p.model_id
-      if (p?.input_tokens != null) update.inputTokens = p.input_tokens
-      if (p?.output_tokens != null) update.outputTokens = p.output_tokens
-      if (p?.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
-      if (p?.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
-      delete launchTimestamps[paneId]
-      // Set baseline from started payload, or -1 sentinel to capture from next status
-      turnBaselines[paneId] = p?.output_tokens ?? -1
-      updateClaudePaneState(paneId, update)
-    })
-    listeners.push(unStarted as unknown as () => void)
-
-    // ── claude-activity: spinner detection from backend PTY reader ──────────
-    // Spinners (Braille chars) gate ready → working. Suppressed for 500ms
-    // after resize to avoid false positives from TUI redraws.
-    const unActivity = await listen<string>(`claude-activity-${sid}`, (event) => {
-      const activity = event.payload as 'thinking' | 'generating'
-      const state = getClaudePaneState(paneId)
-
-      if (activity === 'thinking') {
-        // Suppress if resize happened recently (worktree switch, startup)
-        const lastResize = resizeTimestamps[paneId] ?? 0
-        if (lastResize > 0 && Date.now() - lastResize < 500) return
-
-        if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
-          updateClaudePaneState(paneId, { lifecycle: 'working' })
-        }
-      }
-      // Keep idle timer alive on any activity while working
-      if (state.lifecycle === 'working' || getClaudePaneState(paneId).lifecycle === 'working') {
-        resetIdleTimer()
-      }
-    })
-    listeners.push(unActivity as unknown as () => void)
-
-    // ── claude-status: token/model/cost updates from JSONL ────────────────
-    // ── claude-status: token/model/cost updates from JSONL ────────────────
-    // Also a secondary gate for ready → working via output_tokens increase
-    // (backup for when spinner detection is suppressed by resize).
-    const unStatus = await listen<ClaudeStatusPayload>(`claude-status-${sid}`, (event) => {
-      const p = event.payload
-      const state = getClaudePaneState(paneId)
-      const update: Partial<ClaudePaneState> = {}
-
-      // Capture baseline on first status after adoption (sentinel = -1)
-      if (p?.output_tokens != null && turnBaselines[paneId] === -1) {
-        turnBaselines[paneId] = p.output_tokens
-      }
-      // Backup gate: output_tokens exceeds turn baseline → working
-      if (p?.output_tokens != null && p.output_tokens > (turnBaselines[paneId] ?? 0)) {
-        if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
-          update.lifecycle = 'working'
-        }
-        resetIdleTimer()
-      }
-
-      if (p?.session_id) update.sessionId = p.session_id
-      if (p?.model_id) update.model = p.model_id
-      if (p?.input_tokens != null) update.inputTokens = p.input_tokens
-      if (p?.output_tokens != null) update.outputTokens = p.output_tokens
-      if (p?.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
-      if (p?.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
-      if (p) {
-        const total = (p.input_tokens ?? 0) + (p.output_tokens ?? 0)
-          + (p.cache_creation_input_tokens ?? 0) + (p.cache_read_input_tokens ?? 0)
-        update.contextPercent = Math.min(100, (total / 200_000) * 100)
-        const model = update.model ?? state.model
-        update.cost = computeCost(
-          model,
-          p.input_tokens ?? state.inputTokens,
-          p.output_tokens ?? state.outputTokens,
-          p.cache_read_input_tokens ?? state.cacheReadTokens,
-          p.cache_creation_input_tokens ?? state.cacheWriteTokens,
-        )
-      }
-      // Keep idle timer alive while JSONL writes continue during active turn
-      if (state.lifecycle === 'working') {
-        resetIdleTimer()
-      }
-      updateClaudePaneState(paneId, update)
-    })
-    listeners.push(unStatus as unknown as () => void)
-
-    // ── claude-exited: process died → closed ──────────────────────────────
-    const unExited = await listen(`claude-exited-${sid}`, () => {
-      console.warn(`[claude-events] EXITED pane=${paneId}`)
-      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
-      delete launchTimestamps[paneId]
-      delete turnBaselines[paneId]
-      updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
-    })
-    listeners.push(unExited as unknown as () => void)
-
-    // ── shell-activity: exit fallback (OSC 133) ───────────────────────────
-    const unShellActivity = await listen<boolean>(`shell-activity-${sid}`, (event) => {
-      const idle = event.payload
-      const state = getClaudePaneState(paneId)
-
-      if (idle && (state.lifecycle === 'ready' || state.lifecycle === 'working' || state.lifecycle === 'attention')) {
-        if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
-        delete launchTimestamps[paneId]
-        updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
-        invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
-      } else if (idle && state.lifecycle === 'launching') {
-        const launchedAt = launchTimestamps[paneId] ?? 0
-        if (launchedAt > 0 && Date.now() - launchedAt > 5000) {
-          delete launchTimestamps[paneId]
-          updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
-          invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
-        }
-      }
-
-      if (state.lifecycle === 'closed') {
-        setTerminalStatus(paneId, idle ? 'idle' : 'running')
-      }
-    })
-    listeners.push(unShellActivity as unknown as () => void)
-
-    // ── claude-bell: BEL → end of turn or attention ─────────────────────
-    // Claude sends BEL when waiting for user input. If working, Claude
-    // finished → ready. If already ready, permission prompt → attention.
-    const unBell = await listen(`claude-bell-${sid}`, () => {
-      const state = getClaudePaneState(paneId)
-      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
-      if (state.lifecycle === 'working') {
-        // End of turn — instant ready, reset baseline
-        turnBaselines[paneId] = state.outputTokens
-        updateClaudePaneState(paneId, { lifecycle: 'ready' })
-      } else if (state.lifecycle === 'ready') {
-        // Already idle — this is a permission/attention prompt
-        updateClaudePaneState(paneId, { lifecycle: 'attention' })
-      }
-    })
-    listeners.push(unBell as unknown as () => void)
-
-    // ── claude-context: backend-parsed context % ──────────────────────────
-    const unContext = await listen<number>(`claude-context-${sid}`, (event) => {
-      updateClaudePaneState(paneId, { contextPercent: event.payload })
-    })
-    listeners.push(unContext as unknown as () => void)
-
+    const listeners = await wireClaudeEventListeners(
+      paneId,
+      sid,
+      { getClaudePaneState, updateClaudePaneState, setTerminalStatus },
+      { idleTimers, launchTimestamps, turnBaselines, resizeTimestamps },
+    )
     claudeEventListeners.value[paneId] = listeners
   }
 
@@ -594,9 +330,7 @@ export const usePaneStore = defineStore('pane', () => {
     delete resizeTimestamps[paneId]
   }
 
-  /** Ensure persistent Claude event listeners are active for a pane.
-   *  Called when Claude is launched or when a session is created with
-   *  pending Claude state. Idempotent — skips if already subscribed. */
+  /** Ensure persistent Claude event listeners are active. Idempotent. */
   function armClaudeListeners(paneId: string) {
     const sid = ptySessionIds.value[paneId]
     if (sid && !claudeEventListeners.value[paneId]) {
@@ -632,7 +366,6 @@ export const usePaneStore = defineStore('pane', () => {
     return savedShells.value[paneId]
   }
 
-  // ── Focus trigger ────────────────────────────────────────────────────────
   // Bumped by App.vue after layout restore so TerminalPane watchers can
   // pick up the initial focusedId (which was set before they mounted).
   const focusTrigger = ref(0)
@@ -697,7 +430,6 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value[termLeaf.id] = 'Terminal'
     savedCwds.value[claudeLeaf.id] = mainWorktreePath
     savedCwds.value[termLeaf.id] = mainWorktreePath
-    // Auto-launch claude in the main worktree's Claude pane on first mount.
     savedClaudeRestore.value[claudeLeaf.id] = { sessionId: null, wasOpen: true }
     claudePaneStates.value[claudeLeaf.id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
 
@@ -742,9 +474,6 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames.value[termLeaf.id] = 'Terminal'
     savedCwds.value[claudeLeaf.id] = worktreePath
     savedCwds.value[termLeaf.id] = worktreePath
-    // Auto-launch claude in the worktree's main (Claude) pane on first mount.
-    // Also pre-mark it as "claude running" so the autosave persists the intent
-    // even if the app exits before claude actually starts (~500ms after PTY).
     savedClaudeRestore.value[claudeLeaf.id] = { sessionId: null, wasOpen: true }
     claudePaneStates.value[claudeLeaf.id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
 
@@ -767,13 +496,11 @@ export const usePaneStore = defineStore('pane', () => {
 
     ws.worktrees.splice(idx, 1)
 
-    // If we removed the active worktree, switch to another
     if (ws.activeWorktreeId === worktreeId && ws.worktrees.length > 0) {
       ws.activeWorktreeId = ws.worktrees[0].id
       ws.focusedPaneId = ws.worktrees[0].claudePaneId
     }
 
-    // Clean up statuses
     for (const id of paneIds) delete terminalStatuses.value[id]
 
     return paneIds
@@ -799,7 +526,6 @@ export const usePaneStore = defineStore('pane', () => {
     return ws?.type === 'project' ? ws : undefined
   }
 
-
   function removeWorkspace(index: number) {
     if (workspaces.value.length <= 1) return
 
@@ -809,14 +535,13 @@ export const usePaneStore = defineStore('pane', () => {
 
     workspaces.value.splice(index, 1)
 
-    // Adjust active index
     if (activeWorkspaceIndex.value >= workspaces.value.length) {
       activeWorkspaceIndex.value = workspaces.value.length - 1
     } else if (activeWorkspaceIndex.value > index) {
       activeWorkspaceIndex.value--
     }
 
-    return paneIds // Caller can use these to close PTY sessions
+    return paneIds
   }
 
   function switchWorkspace(index: number) {
@@ -830,7 +555,6 @@ export const usePaneStore = defineStore('pane', () => {
     const active = activeWorkspaceIndex.value
     const ws = workspaces.value.splice(from, 1)[0]
     workspaces.value.splice(to, 0, ws)
-    // Adjust active index to follow the previously active workspace
     if (active === from) {
       activeWorkspaceIndex.value = to
     } else if (from < active && to >= active) {
@@ -895,27 +619,6 @@ export const usePaneStore = defineStore('pane', () => {
     return { layout, terminals, claudePaneIndex, defaultTerminalIndex }
   }
 
-  // Legacy single-workspace serialization (delegates to active workspace)
-  function serializeLayout() {
-    const ws = workspaces.value[activeWorkspaceIndex.value]
-    if (ws.type === 'project') {
-      // Fallback: serialize the active worktree's root as if it were a terminal workspace
-      const wt = ws.worktrees.find(w => w.id === ws.activeWorktreeId)!
-      const terminals: { id: string; name: string }[] = []
-      function walk(node: PaneNode): SavedPaneNode {
-        if (node.type === 'terminal') {
-          const idx = terminals.length
-          terminals.push({ id: node.id, name: getTerminalName(node.id) })
-          return { type: 'terminal', index: idx }
-        }
-        return { type: 'split', direction: node.direction, sizes: [...node.sizes] as [number, number], first: walk(node.first), second: walk(node.second) }
-      }
-      const layout = walk(wt.root)
-      return { layout, terminals, focusedTerminalIndex: 0 }
-    }
-    return serializeTerminalWorkspace(ws)
-  }
-
   // Enrichable format — includes live pane IDs so App.vue can fill in CWD/Claude/shell
   interface EnrichableTerminal { id: string; name: string }
   interface EnrichableWorktree {
@@ -967,7 +670,10 @@ export const usePaneStore = defineStore('pane', () => {
     return { workspaces: result, activeWorkspaceIndex: activeWorkspaceIndex.value }
   }
 
-  function buildTerminalWorkspace(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number, wsName?: string): TerminalWorkspace {
+  /** Build a PaneNode tree from saved layout, seeding saved cwd/claude/shell
+   *  state for each restored terminal leaf. Returns the terminal IDs mapped
+   *  by their saved index so the caller can resolve claude/default pane refs. */
+  function buildPaneTree(saved: SavedPaneNode, terminals: SavedTerminal[]): { root: PaneNode; terminalIdsByIndex: string[] } {
     const terminalIdsByIndex: string[] = []
 
     function build(node: SavedPaneNode): PaneNode {
@@ -1005,13 +711,12 @@ export const usePaneStore = defineStore('pane', () => {
       }
     }
 
-    const newRoot = build(saved)
-    const restoredFocusId = focusedTerminalIndex != null ? terminalIdsByIndex[focusedTerminalIndex] : undefined
+    return { root: build(saved), terminalIdsByIndex }
+  }
 
-    function firstLeaf(node: PaneNode): string {
-      if (node.type === 'terminal') return node.id
-      return firstLeaf(node.first)
-    }
+  function buildTerminalWorkspace(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number, wsName?: string): TerminalWorkspace {
+    const { root: newRoot, terminalIdsByIndex } = buildPaneTree(saved, terminals)
+    const restoredFocusId = focusedTerminalIndex != null ? terminalIdsByIndex[focusedTerminalIndex] : undefined
 
     return {
       type: 'terminal',
@@ -1024,45 +729,10 @@ export const usePaneStore = defineStore('pane', () => {
 
   function buildProjectWorkspace(saved: SavedProjectWorkspace): ProjectWorkspace {
     const worktrees: Worktree[] = saved.worktrees.map(sw => {
-      const terminalIdsByIndex: string[] = []
-
-      function build(node: SavedPaneNode): PaneNode {
-        if (node.type === 'terminal') {
-          const id = genId()
-          const t = sw.terminals[node.index]
-          terminalIdsByIndex[node.index] = id
-          if (t) {
-            terminalNames.value[id] = t.name
-            if (t.cwd) savedCwds.value[id] = t.cwd
-            if (t.claudeSessionId || t.claudeWasRunning) {
-              savedClaudeRestore.value[id] = {
-                sessionId: t.claudeSessionId ?? null,
-                wasOpen: t.claudeWasRunning ?? !!t.claudeSessionId,
-              }
-              claudePaneStates.value[id] = { ...defaultClaudePaneState, lifecycle: 'launching' }
-            }
-            if (t.shell) savedShells.value[id] = t.shell
-          } else {
-            assignTerminalName(id)
-          }
-          return { type: 'terminal', id }
-        }
-        const id = genId()
-        return {
-          type: 'split',
-          id,
-          direction: node.direction,
-          sizes: [...node.sizes] as [number, number],
-          first: build(node.first),
-          second: build(node.second),
-        }
-      }
-
-      const wtRoot = build(sw.layout)
-      const worktreeId = genId()
+      const { root: wtRoot, terminalIdsByIndex } = buildPaneTree(sw.layout, sw.terminals)
 
       return {
-        id: worktreeId,
+        id: genId(),
         branchName: sw.branchName,
         path: sw.path,
         isMain: sw.isMain,
@@ -1086,8 +756,7 @@ export const usePaneStore = defineStore('pane', () => {
     }
   }
 
-  // Legacy single-workspace restore
-  function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number) {
+  function resetRestoreState() {
     nextId = 1
     terminalNames.value = {}
     ptySessionIds.value = {}
@@ -1095,23 +764,20 @@ export const usePaneStore = defineStore('pane', () => {
     savedClaudeRestore.value = {}
     claudePaneStates.value = {}
     savedShells.value = {}
+  }
 
+  // Legacy single-workspace restore
+  function restoreFromSaved(saved: SavedPaneNode, terminals: SavedTerminal[], focusedTerminalIndex?: number) {
+    resetRestoreState()
     const ws = buildTerminalWorkspace(saved, terminals, focusedTerminalIndex, 'Workspace 1')
     workspaces.value = [ws]
     activeWorkspaceIndex.value = 0
   }
 
   function restoreAllWorkspaces(savedWorkspaces: (SavedWorkspace | LegacySavedWorkspace)[], savedActiveIndex?: number) {
-    nextId = 1
-    terminalNames.value = {}
-    ptySessionIds.value = {}
-    savedCwds.value = {}
-    savedClaudeRestore.value = {}
-    claudePaneStates.value = {}
-    savedShells.value = {}
+    resetRestoreState()
 
     const restored: Workspace[] = savedWorkspaces.map(sw => {
-      // Handle typed workspaces
       if ('type' in sw && sw.type === 'project') {
         return buildProjectWorkspace(sw as SavedProjectWorkspace)
       }
@@ -1165,7 +831,7 @@ export const usePaneStore = defineStore('pane', () => {
     // Focus trigger
     focusTrigger, triggerFocus,
     // Serialization
-    serializeLayout, serializeAll,
+    serializeAll,
     restoreFromSaved, restoreAllWorkspaces,
   }
 })

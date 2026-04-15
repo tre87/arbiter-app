@@ -46,13 +46,7 @@ function modelLabel(id: string | null | undefined): { name: string; cls: string 
   return { name: id.replace('claude-', ''), cls: '' }
 }
 
-function contextWindow(id: string | null | undefined): number {
-  if (!id) return 200_000
-  if (id.includes('haiku')) return 200_000
-  if (id.includes('opus')) return 200_000
-  if (id.includes('sonnet')) return 200_000
-  return 200_000
-}
+const CONTEXT_WINDOW = 200_000
 
 const totalTokens = computed(() => {
   if (!props.status) return 0
@@ -62,16 +56,11 @@ const totalTokens = computed(() => {
     + (props.status.cache_read_input_tokens ?? 0)
 })
 
-const contextPct = computed(() => {
-  const max = contextWindow(props.status?.model_id)
-  if (max === 0) return 0
-  return Math.min(100, Math.round((totalTokens.value / max) * 100))
-})
+const contextPct = computed(() =>
+  Math.min(100, Math.round((totalTokens.value / CONTEXT_WINDOW) * 100))
+)
 
-const contextMax = computed(() => {
-  const max = contextWindow(props.status?.model_id)
-  return (max / 1000) + 'k'
-})
+const contextMax = `${CONTEXT_WINDOW / 1000}k`
 
 function fmtK(n: number | null | undefined): string {
   if (n == null) return '0'

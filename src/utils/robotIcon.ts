@@ -3,7 +3,6 @@
 
 import { createAvatar } from '@dicebear/core'
 import { bottts } from '@dicebear/collection'
-import type { Options as BotttsOptions } from '@dicebear/bottts'
 
 // Animation eye cycle — keeps the robot's identity intact, only swaps eyes per frame
 // Frame 0,1: default (seeded) eyes — open and neutral
@@ -40,13 +39,8 @@ function getSeed(branchName: string): string {
 
 function render(branchName: string, size: number, eyeOverride?: BotttsEye): string {
   const seed = getSeed(branchName)
-  const options: BotttsOptions & { seed: string; size: number } = {
-    seed,
-    size,
-  }
-  if (eyeOverride) {
-    options.eyes = [eyeOverride]
-  }
+  const options: { seed: string; size: number; eyes?: [BotttsEye] } = { seed, size }
+  if (eyeOverride) options.eyes = [eyeOverride]
   return createAvatar(bottts, options).toDataUri()
 }
 
