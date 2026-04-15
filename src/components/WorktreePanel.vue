@@ -8,7 +8,7 @@ import MdiIcon from './MdiIcon.vue'
 import WorktreeNewDialog from './WorktreeNewDialog.vue'
 import WorktreeEndDialog from './WorktreeEndDialog.vue'
 import WorktreeContextMenu from './WorktreeContextMenu.vue'
-import { mdiPlus } from '@mdi/js'
+import { mdiPlus, mdiChevronRight, mdiChevronDown, mdiRestore, mdiBroom } from '@mdi/js'
 import type { ProjectWorkspace, Worktree } from '../types/pane'
 import { useConfirm } from '../composables/useConfirm'
 
@@ -168,6 +168,58 @@ async function ctxDismissMerged() {
     console.error('Dismiss merged worktree failed:', e)
   }
 }
+
+// ── Stale worktrees ─────────────────────────────────────────────────────────
+
+const staleEntries = computed(() => projectStore.getStaleWorktrees(props.workspace.id))
+const staleExpanded = ref(false)
+
+function folderName(path: string): string {
+  return path.split(/[/\\]/).filter(Boolean).pop() ?? path
+}
+
+const restoreError = ref<string | null>(null)
+async function restoreStale(path: string, branch: string | null) {
+  if (!branch) return
+  try {
+    await projectStore.restoreStale(props.workspace.id, path, branch)
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    restoreError.value = `Could not restore "${branch}": ${msg}`
+    console.error('Restore stale worktree failed:', e)
+  }
+}
+
+async function pruneStaleEntry(path: string, branch: string | null) {
+  const label = branch ?? folderName(path)
+  const ok = await confirm({
+    title: `Prune stale worktree "${label}"?`,
+    message: 'Removes the leftover .git/worktrees bookkeeping entry. The branch is kept; only the worktree registration is cleared.',
+    confirmText: 'Prune',
+  })
+  if (!ok) return
+  try {
+    await projectStore.pruneStale(props.workspace.id, path)
+  } catch (e) {
+    console.error('Prune stale worktree failed:', e)
+  }
+}
+
+async function pruneAllStale() {
+  const n = staleEntries.value.length
+  if (n === 0) return
+  const ok = await confirm({
+    title: `Clean up ${n} stale worktree${n === 1 ? '' : 's'}?`,
+    message: 'Clears all .git/worktrees bookkeeping entries whose folders are gone. Branches are untouched.',
+    confirmText: 'Clean up',
+  })
+  if (!ok) return
+  try {
+    await projectStore.pruneAllStale(props.workspace.id)
+  } catch (e) {
+    console.error('Prune all stale failed:', e)
+  }
+}
 </script>
 
 <template>
@@ -193,6 +245,49 @@ async function ctxDismissMerged() {
         @remove="removeMerged(wt.id)"
         @contextmenu="(e) => openContextMenu(e, wt)"
       />
+
+      <div v-if="staleEntries.length > 0" class="stale-section">
+        <div class="stale-header">
+          <button
+            class="stale-toggle"
+            :title="staleExpanded ? 'Collapse' : 'Expand'"
+            @click="staleExpanded = !staleExpanded"
+          >
+            <MdiIcon :path="staleExpanded ? mdiChevronDown : mdiChevronRight" :size="14" />
+            <span>Stale ({{ staleEntries.length }})</span>
+          </button>
+          <button class="stale-cleanup-all" title="Clean up all stale entries" @click="pruneAllStale">
+            Clean up all
+          </button>
+        </div>
+        <div v-if="staleExpanded" class="stale-list">
+          <div v-for="entry in staleEntries" :key="entry.path" class="stale-row">
+            <div class="stale-info">
+              <div class="stale-branch">{{ entry.branch ?? '(detached)' }}</div>
+              <div class="stale-path" :title="entry.path">{{ folderName(entry.path) }}</div>
+            </div>
+            <button
+              class="stale-action"
+              :disabled="!entry.branch"
+              :title="entry.branch ? 'Restore worktree' : 'Cannot restore detached HEAD'"
+              @click="restoreStale(entry.path, entry.branch)"
+            >
+              <MdiIcon :path="mdiRestore" :size="14" />
+            </button>
+            <button
+              class="stale-action"
+              title="Prune this stale entry"
+              @click="pruneStaleEntry(entry.path, entry.branch)"
+            >
+              <MdiIcon :path="mdiBroom" :size="14" />
+            </button>
+          </div>
+          <div v-if="restoreError" class="stale-error">
+            {{ restoreError }}
+            <button class="stale-error-dismiss" @click="restoreError = null">×</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Git actions menu for the active worktree. Commands run in the
@@ -294,5 +389,137 @@ async function ctxDismissMerged() {
   border-top: 1px solid var(--color-card-border);
   background: var(--color-bg-subtle);
   flex-shrink: 0;
+}
+
+.stale-section {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-card-border);
+}
+
+.stale-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 2px 2px 2px 0;
+}
+
+.stale-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.stale-toggle:hover {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-elevated);
+}
+
+.stale-cleanup-all {
+  background: none;
+  border: 1px solid var(--color-card-border);
+  color: var(--color-text-muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.stale-cleanup-all:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-card-border-hover);
+  background: var(--color-bg-elevated);
+}
+
+.stale-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.stale-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  opacity: 0.75;
+}
+.stale-row:hover {
+  background: var(--color-bg-elevated);
+  opacity: 1;
+}
+
+.stale-info {
+  flex: 1;
+  min-width: 0;
+}
+.stale-branch {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stale-path {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stale-action {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+.stale-action:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: var(--color-bg-elevated);
+}
+.stale-action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.stale-error {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: rgba(229, 83, 75, 0.12);
+  border: 1px solid rgba(229, 83, 75, 0.4);
+  border-radius: 4px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+.stale-error-dismiss {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.stale-error-dismiss:hover {
+  color: var(--color-text-primary);
 }
 </style>

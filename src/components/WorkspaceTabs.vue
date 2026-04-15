@@ -52,23 +52,37 @@ function newTerminalWorkspace() {
   store.addWorkspace()
 }
 
+async function openProjectAt(repoRoot: string) {
+  const result = await projectStore.createProjectWorkspace(repoRoot)
+  if (result.kind === 'ok' || result.kind === 'error') return
+
+  // not-main: the user picked a linked worktree. Warn and offer to open the
+  // main repo instead (Arbiter's model requires the workspace to be anchored
+  // at the main worktree).
+  const branchNote = result.pickedBranch ? ` ("${result.pickedBranch}")` : ''
+  const ok = await confirmDialog({
+    title: `"${result.repoName}" is a worktree, not the main repo`,
+    message:
+      `The folder you selected${branchNote} is a linked Git worktree. ` +
+      `Arbiter project workspaces must be opened at the main repository, ` +
+      `which is at "${result.mainPath}". Open the main repo instead?`,
+    confirmText: 'Open main repo',
+    cancelText: 'Cancel',
+  })
+  if (ok) await projectStore.createProjectWorkspace(result.mainPath)
+}
+
 async function newProjectWorkspace() {
   closeNewMenu()
   try {
-    // Use Tauri dialog plugin to pick folder
     const { open } = await import('@tauri-apps/plugin-dialog')
     const selected = await open({ directory: true, title: 'Select Project Folder' })
     if (!selected || typeof selected !== 'string') return
 
-    // Verify it's a git repo
     const repoRoot = await invoke<string | null>('git_repo_root', { path: selected })
-    if (!repoRoot) {
-      // Not a git repo — could show error, for now just use the selected path
-      // and let the worktree commands fail gracefully
-      return
-    }
+    if (!repoRoot) return
 
-    await projectStore.createProjectWorkspace(repoRoot)
+    await openProjectAt(repoRoot)
   } catch (e) {
     console.error('Failed to create project workspace:', e)
   }

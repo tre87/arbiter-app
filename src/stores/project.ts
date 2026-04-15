@@ -11,6 +11,9 @@ export interface WorktreeInfo {
   branch: string | null
   head: string | null
   is_main: boolean
+  // Git retains .git/worktrees/ entries after the folder is deleted manually.
+  // false for those stale entries; backend determines this by stat'ing the path.
+  exists: boolean
 }
 
 export interface DirEntry {
@@ -18,6 +21,16 @@ export interface DirEntry {
   path: string
   is_dir: boolean
   is_symlink: boolean
+}
+
+export type CreateProjectResult =
+  | { kind: 'ok'; workspaceId: string }
+  | { kind: 'not-main'; mainPath: string; repoName: string; pickedBranch: string | null }
+  | { kind: 'error'; message: string }
+
+export interface StaleWorktreeEntry {
+  path: string
+  branch: string | null
 }
 
 export interface WorktreeClaudeStatus {
@@ -46,6 +59,16 @@ export const useProjectStore = defineStore('project', () => {
   const gitStatusCache = ref<Record<string, Record<string, string>>>({})
   // worktreeId → watcher IDs
   const activeWatchers = ref<Record<string, string[]>>({})
+
+  // ── Stale worktree tracking (workspaceId → entries) ──────────────────────
+  // Populated during workspace creation/restore from `git worktree list` —
+  // entries whose on-disk folder was deleted outside Arbiter. Drives the
+  // "Stale" UI section and its Restore / Prune actions.
+  const staleWorktrees = ref<Record<string, StaleWorktreeEntry[]>>({})
+
+  function getStaleWorktrees(workspaceId: string): StaleWorktreeEntry[] {
+    return staleWorktrees.value[workspaceId] ?? []
+  }
 
   // ── Merged-state tracking (worktreeId → true) ────────────────────────────
   // Set by the refs watcher when a non-main worktree's branch becomes
@@ -391,35 +414,105 @@ export const useProjectStore = defineStore('project', () => {
     return isWindows ? p.replace(/\//g, '\\') : p
   }
 
-  async function createProjectWorkspace(repoRoot: string): Promise<string | null> {
+  // Paths from git use forward slashes on Windows; user selection may use
+  // either. Normalize both sides before comparing identity.
+  function pathsEqual(a: string, b: string): boolean {
+    const na = normalizePath(a).replace(/[/\\]+$/, '')
+    const nb = normalizePath(b).replace(/[/\\]+$/, '')
+    return isWindows ? na.toLowerCase() === nb.toLowerCase() : na === nb
+  }
+
+  async function createProjectWorkspace(repoRoot: string): Promise<CreateProjectResult> {
     try {
       const normalizedRoot = normalizePath(repoRoot)
-      // Detect main branch
       const worktrees = await invoke<WorktreeInfo[]>('git_worktree_list', { repoRoot: normalizedRoot })
       const mainWt = worktrees.find(wt => wt.is_main) ?? worktrees[0]
-      if (!mainWt) return null
+      if (!mainWt) return { kind: 'error', message: 'No worktrees found for this repository.' }
 
       const mainPath = normalizePath(mainWt.path)
-      const branchName = mainWt.branch ?? 'main'
-      const repoName = normalizedRoot.split(/[/\\]/).pop() ?? 'Project'
+      const repoName = mainPath.split(/[/\\]/).pop() ?? 'Project'
 
+      // Reject opening a linked worktree as the project root — the user almost
+      // certainly wants the main repo, and the rest of the store assumes the
+      // workspace is anchored at the main worktree.
+      if (!pathsEqual(normalizedRoot, mainPath)) {
+        const picked = worktrees.find(wt => pathsEqual(wt.path, normalizedRoot))
+        return {
+          kind: 'not-main',
+          mainPath,
+          repoName,
+          pickedBranch: picked?.branch ?? null,
+        }
+      }
+
+      const branchName = mainWt.branch ?? 'main'
       const result = getPaneStore().addProjectWorkspace(repoName, normalizedRoot, branchName, mainPath)
       registerPaneWorktree(result.claudePaneId, result.worktreeId)
       updateClaudeStatus(result.worktreeId, { status: 'ready' })
 
-      // Pre-populate model from project settings if available
       try {
         const model = await invoke<string | null>('get_project_model', { projectPath: mainPath })
         if (model) updateClaudeStatus(result.worktreeId, { model })
       } catch { /* no settings file */ }
 
-      // Start watching .git/refs/heads for merge detection
+      // Adopt any linked worktrees that already exist on disk. Git doesn't
+      // record parent-branch metadata, so we default to the main branch.
+      //
+      // Timing detail: addWorktreeToProject flips `ws.activeWorktreeId` to
+      // each adopted worktree. If we then `await` anything before resetting
+      // it, Vue flushes with the new key on <ProjectWorkspaceView>, which
+      // unmounts the main's TerminalPane mid-PTY-creation. When main
+      // remounts, consumeSavedCwd has already fired, so the new shell
+      // spawns at $HOME instead of the repo. Reset activeWorktreeId back
+      // to main synchronously inside the same tick so Vue never sees the
+      // flip.
+      const mainBranch = branchName
+      const adoptedList: { paneId: string; worktreeId: string; path: string }[] = []
+      const stale: StaleWorktreeEntry[] = []
+      for (const wt of worktrees) {
+        if (wt.is_main) continue
+        if (!wt.branch) continue // detached HEAD — skip adoption
+        if (!wt.exists) {
+          stale.push({ path: normalizePath(wt.path), branch: wt.branch })
+          continue
+        }
+        const wtPath = normalizePath(wt.path)
+        const adopted = getPaneStore().addWorktreeToProject(
+          result.workspaceId, wt.branch, wtPath, mainBranch,
+        )
+        if (!adopted) continue
+        getPaneStore().switchWorktree(result.workspaceId, result.worktreeId)
+        registerPaneWorktree(adopted.claudePaneId, adopted.worktreeId)
+        updateClaudeStatus(adopted.worktreeId, { status: 'ready' })
+        adoptedList.push({ paneId: adopted.claudePaneId, worktreeId: adopted.worktreeId, path: wtPath })
+      }
+
+      // Model pre-population — safe to await now that the active worktree
+      // is back on main and Vue's key is stable.
+      for (const a of adoptedList) {
+        try {
+          const model = await invoke<string | null>('get_project_model', { projectPath: a.path })
+          if (model) updateClaudeStatus(a.worktreeId, { model })
+        } catch { /* ignore */ }
+      }
+
+      staleWorktrees.value[result.workspaceId] = stale
+
       setupRefsWatcher(result.workspaceId)
 
-      return result.workspaceId
+      // Kick off background PTY/Claude launch for the adopted worktrees so
+      // they're ready before the user clicks them. Dynamic import avoids a
+      // circular dependency (useStartupRestore imports this store).
+      if (adoptedList.length) {
+        import('../composables/useStartupRestore').then(m => {
+          m.bootstrapWorkspaceSessions(result.workspaceId)
+        })
+      }
+
+      return { kind: 'ok', workspaceId: result.workspaceId }
     } catch (e) {
       console.error('Failed to create project workspace:', e)
-      return null
+      return { kind: 'error', message: String(e) }
     }
   }
 
@@ -572,6 +665,134 @@ export const useProjectStore = defineStore('project', () => {
     getPaneStore().switchWorktree(workspaceId, worktreeId)
   }
 
+  // ── Stale worktree actions ───────────────────────────────────────────────
+
+  // Re-scan `git worktree list` and sync workspace state with disk:
+  //   • Evict live worktrees whose folders are missing (they'd otherwise
+  //     spawn PTYs that fall back to $HOME — the user's bug).
+  //   • Rebuild the stale-entries list from git's view.
+  // Returns the number of live worktrees that got evicted, so callers can
+  // decide whether to re-bootstrap sessions.
+  async function reconcileWorktrees(workspaceId: string): Promise<number> {
+    const paneStore = getPaneStore()
+    const ws = paneStore.getProjectWorkspace(workspaceId)
+    if (!ws) return 0
+
+    let worktrees: WorktreeInfo[]
+    try {
+      worktrees = await invoke<WorktreeInfo[]>('git_worktree_list', { repoRoot: ws.repoRoot })
+    } catch (e) {
+      console.error('Failed to list worktrees for reconcile:', e)
+      return 0
+    }
+
+    // Evict restored worktrees whose folders are gone. The main worktree is
+    // exempt — losing it means the workspace is broken and the user should
+    // see it rather than silently having their project disappear.
+    const evicted: { path: string; branch: string }[] = []
+    for (const wt of [...ws.worktrees]) {
+      if (wt.isMain) continue
+      const gitEntry = worktrees.find(e => pathsEqual(e.path, wt.path))
+      const missing = gitEntry ? !gitEntry.exists : false
+      if (!missing) continue
+
+      const paneIds = paneStore.removeWorktreeFromProject(workspaceId, wt.id)
+      for (const id of paneIds) {
+        // Drain pane-level saved state so bootstrapBackgroundSessions
+        // doesn't try to cd into the now-missing folder.
+        paneStore.consumeSavedCwd(id)
+        paneStore.consumeSavedClaudeRestore(id)
+        const sid = paneStore.getPtySession(id)
+        if (sid) {
+          invoke('close_session', { sessionId: sid }).catch(() => { /* ignore */ })
+          paneStore.removePtySession(id)
+        }
+      }
+      delete claudeStatuses.value[wt.id]
+      delete directoryCache.value[wt.id]
+      delete gitStatusCache.value[wt.id]
+      delete mergedWorktrees.value[wt.id]
+      delete paneToWorktree.value[wt.claudePaneId]
+
+      if (wt.branchName) evicted.push({ path: wt.path, branch: wt.branchName })
+    }
+
+    // Rebuild the stale list from git's view. This includes both the entries
+    // we just evicted (git still remembers them) and any pre-existing stale
+    // entries that were never live in this session.
+    const stale: StaleWorktreeEntry[] = []
+    for (const wt of worktrees) {
+      if (wt.is_main) continue
+      if (!wt.branch) continue
+      if (wt.exists) continue
+      stale.push({ path: normalizePath(wt.path), branch: wt.branch })
+    }
+    staleWorktrees.value[workspaceId] = stale
+
+    return evicted.length
+  }
+
+  // Convenience alias kept for the prune/restore flows that only need a
+  // stale-list refresh — same implementation, different intent.
+  async function refreshStaleWorktrees(workspaceId: string): Promise<void> {
+    await reconcileWorktrees(workspaceId)
+  }
+
+  // Clear all stale .git/worktrees/ entries for the workspace.
+  // Non-destructive — branches are untouched.
+  async function pruneAllStale(workspaceId: string): Promise<void> {
+    const ws = getPaneStore().getProjectWorkspace(workspaceId)
+    if (!ws) return
+    await invoke('git_worktree_prune', { repoRoot: ws.repoRoot })
+    await refreshStaleWorktrees(workspaceId)
+  }
+
+  // Remove a single stale entry. Git doesn't offer per-entry prune, so we
+  // force-remove by path — `git worktree remove --force <path>` succeeds even
+  // when the folder is missing, which is exactly our case.
+  async function pruneStale(workspaceId: string, path: string): Promise<void> {
+    const ws = getPaneStore().getProjectWorkspace(workspaceId)
+    if (!ws) return
+    try {
+      await invoke('git_worktree_remove', { repoRoot: ws.repoRoot, worktreePath: path, force: true })
+    } catch (e) {
+      // Fall back to full prune — covers git versions that refuse `remove`
+      // on already-missing paths.
+      console.warn('git_worktree_remove failed on stale entry, falling back to prune:', e)
+      await invoke('git_worktree_prune', { repoRoot: ws.repoRoot })
+    }
+    await refreshStaleWorktrees(workspaceId)
+  }
+
+  // Re-check out a stale worktree. On success, adopts it as a live worktree
+  // card (new pane tree, registered Claude mapping, etc.).
+  async function restoreStale(workspaceId: string, path: string, branch: string): Promise<void> {
+    const ws = getPaneStore().getProjectWorkspace(workspaceId)
+    if (!ws) return
+
+    const info = await invoke<WorktreeInfo>('git_worktree_restore', {
+      repoRoot: ws.repoRoot,
+      worktreePath: path,
+      branchName: branch,
+    })
+
+    const infoPath = normalizePath(info.path)
+    const mainBranch = ws.worktrees.find(w => w.isMain)?.branchName ?? null
+    const adopted = getPaneStore().addWorktreeToProject(workspaceId, branch, infoPath, mainBranch)
+    if (adopted) {
+      registerPaneWorktree(adopted.claudePaneId, adopted.worktreeId)
+      updateClaudeStatus(adopted.worktreeId, { status: 'ready' })
+      try {
+        const model = await invoke<string | null>('get_project_model', { projectPath: infoPath })
+        if (model) updateClaudeStatus(adopted.worktreeId, { model })
+      } catch { /* ignore */ }
+    }
+
+    // Drop the restored entry from the stale list.
+    const list = staleWorktrees.value[workspaceId] ?? []
+    staleWorktrees.value[workspaceId] = list.filter(e => !pathsEqual(e.path, infoPath))
+  }
+
   // ── Init (called after restore) ───────────────────────────────────────────
 
   // Synchronously register every project worktree's claudePane → worktreeId
@@ -619,6 +840,9 @@ export const useProjectStore = defineStore('project', () => {
         } catch { /* ignore */ }
       }
       setupRefsWatcher(ws.id)
+      // Populate the stale list for restored workspaces. Non-blocking —
+      // the sidebar simply picks it up reactively when it arrives.
+      refreshStaleWorktrees(ws.id)
     }
   }
 
@@ -638,6 +862,7 @@ export const useProjectStore = defineStore('project', () => {
       delete mergedWorktrees.value[wt.id]
       delete paneToWorktree.value[wt.claudePaneId]
     }
+    delete staleWorktrees.value[workspaceId]
   }
 
   return {
@@ -673,6 +898,14 @@ export const useProjectStore = defineStore('project', () => {
     manualMergeToParent,
     askClaudeToMerge,
     canAskClaudeToMerge,
+    // Stale worktrees
+    staleWorktrees,
+    getStaleWorktrees,
+    reconcileWorktrees,
+    refreshStaleWorktrees,
+    pruneAllStale,
+    pruneStale,
+    restoreStale,
     // Cleanup
     cleanupWorkspace,
   }

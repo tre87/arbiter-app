@@ -51,6 +51,10 @@ pub struct WorktreeInfo {
     branch: Option<String>,
     head: Option<String>,
     is_main: bool,
+    // Git keeps entries under .git/worktrees/ even after a user deletes the
+    // worktree folder manually. We surface this so the frontend can skip
+    // adopting stale entries (and, later, offer a prune action).
+    exists: bool,
 }
 
 #[tauri::command]
@@ -77,11 +81,13 @@ pub fn git_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfo>, String>
             // Flush previous entry
             if let Some(path) = current_path.take() {
                 if !is_bare {
+                    let exists = std::path::Path::new(&path).is_dir();
                     worktrees.push(WorktreeInfo {
                         path: path.clone(),
                         branch: current_branch.take(),
                         head: current_head.take(),
                         is_main: false, // set below
+                        exists,
                     });
                 }
             }
@@ -102,11 +108,13 @@ pub fn git_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfo>, String>
     // Flush last entry
     if let Some(path) = current_path {
         if !is_bare {
+            let exists = std::path::Path::new(&path).is_dir();
             worktrees.push(WorktreeInfo {
                 path,
                 branch: current_branch,
                 head: current_head,
                 is_main: false,
+                exists,
             });
         }
     }
@@ -172,6 +180,56 @@ pub fn git_worktree_add(repo_root: String, branch_name: String, base_branch: Opt
         branch: Some(branch_name),
         head,
         is_main: false,
+        exists: true,
+    })
+}
+
+// Clear `.git/worktrees/<name>/` entries whose folders no longer exist.
+// Non-destructive to branches — only touches stale bookkeeping.
+#[tauri::command]
+pub fn git_worktree_prune(repo_root: String) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|e| format!("Failed to run git worktree prune: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+// Re-check out a worktree whose folder was deleted manually. `-f` is required
+// because the stale `.git/worktrees/<name>/` entry from the previous checkout
+// still registers the path; without --force, git refuses the add.
+#[tauri::command]
+pub fn git_worktree_restore(repo_root: String, worktree_path: String, branch_name: String) -> Result<WorktreeInfo, String> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "-f", &worktree_path, &branch_name])
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree_path)
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else { None });
+
+    Ok(WorktreeInfo {
+        path: worktree_path,
+        branch: Some(branch_name),
+        head,
+        is_main: false,
+        exists: true,
     })
 }
 

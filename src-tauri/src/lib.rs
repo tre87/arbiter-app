@@ -181,6 +181,8 @@ pub fn run() {
             git::git_worktree_add,
             git::git_is_branch_merged,
             git::git_worktree_remove,
+            git::git_worktree_prune,
+            git::git_worktree_restore,
             git::git_merge_branch,
             git::git_push_and_create_pr,
             git::git_repo_root,
