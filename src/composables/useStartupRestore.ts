@@ -1,6 +1,5 @@
 import { watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { getCurrentWindow } from '@tauri-apps/api/window'
 import { usePaneStore } from '../stores/pane'
 import { useProjectStore } from '../stores/project'
 import { useDevSettingsStore } from '../stores/devSettings'
@@ -101,18 +100,8 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
     const config = await invoke<ArbiterConfig | null>('load_config')
     if (!config) return
 
-    if (config.window) {
-      const { width, height, x, y } = config.window
-      // Reject bogus geometry: too small, or wildly off-screen
-      if (width > 200 && height > 200 && x > -10000 && y > -10000 && x < 10000 && y < 10000) {
-        const win = getCurrentWindow()
-        try {
-          await win.setSize(new (await import('@tauri-apps/api/dpi')).PhysicalSize(width, height))
-          await win.setPosition(new (await import('@tauri-apps/api/dpi')).PhysicalPosition(x, y))
-          await new Promise(r => setTimeout(r, 150))
-        } catch { /* ignore if position is off-screen */ }
-      }
-    }
+    // Window size/position are applied in Rust during setup (before show())
+    // so the window appears at its saved geometry without a visible snap.
 
     if (config.workspaces?.length) {
       store.restoreAllWorkspaces(config.workspaces, config.activeWorkspaceIndex)

@@ -135,6 +135,27 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 #[cfg(not(target_os = "macos"))]
                 { let _ = w.set_decorations(false); }
+
+                // Apply saved size/position BEFORE show() so the user doesn't
+                // see the window flash at default geometry and then snap.
+                if let Ok(Some(cfg)) = config::load_config(app.handle().clone()) {
+                    if let Some(win_cfg) = cfg.get("window") {
+                        let width = win_cfg.get("width").and_then(|v| v.as_f64());
+                        let height = win_cfg.get("height").and_then(|v| v.as_f64());
+                        let x = win_cfg.get("x").and_then(|v| v.as_f64());
+                        let y = win_cfg.get("y").and_then(|v| v.as_f64());
+                        if let (Some(width), Some(height), Some(x), Some(y)) = (width, height, x, y) {
+                            if width > 200.0 && height > 200.0
+                                && x > -10000.0 && y > -10000.0
+                                && x < 10000.0 && y < 10000.0
+                            {
+                                let _ = w.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
+                                let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+                            }
+                        }
+                    }
+                }
+
                 w.show().unwrap_or_default();
             }
 
