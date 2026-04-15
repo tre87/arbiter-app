@@ -3,7 +3,6 @@ import { createPinia } from 'pinia'
 import './style.css'
 
 const label = (window as any).__TAURI_INTERNALS__?.metadata?.currentWindow?.label ?? 'main'
-console.log('[main.ts] window label:', label)
 
 if (label === 'overview') {
   import('./OverviewApp.vue').then(({ default: OverviewApp }) => {
