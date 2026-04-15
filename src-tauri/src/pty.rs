@@ -94,7 +94,10 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let reader_sid = sid.clone();
     std::thread::spawn(move || {
         let _sid = reader_sid;
-        const MAX_BUF: usize = 102_400; // 100 KB rolling buffer
+        // 256 KB ≈ ~16 screens @ 200×80 — comfortably covers a typical Claude
+        // turn's worth of streamed output for replay after a split remount.
+        // Memory cost scales per-pane; at 20 concurrent panes this is 5 MB total.
+        const MAX_BUF: usize = 262_144;
         const MAX_UTF8_REMAINDER: usize = 8;
         let mut buf = [0u8; 4096];
         // Holds trailing bytes from an incomplete UTF-8 sequence at chunk boundary

@@ -49,6 +49,19 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
 
   let saveInFlight = false
   let savePending = false
+  // Debounce coalesces rapid-fire reactive changes (e.g. each token update in
+  // claudePaneStates) into a single disk write. The in-flight/pending pair
+  // below still serializes overlapping saves; the timer avoids spamming them.
+  const DEBOUNCE_MS = 500
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+  function scheduleAutoSave() {
+    if (debounceTimer) clearTimeout(debounceTimer)
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null
+      performAutoSave()
+    }, DEBOUNCE_MS)
+  }
 
   async function performAutoSave() {
     if (!ready.value) return
@@ -130,9 +143,9 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
     }
   }
 
-  // Every reactive state change runs this watcher, which calls performAutoSave
-  // once per Vue tick (mutations are batched). saveInFlight/savePending
-  // serialize overlapping saves so we never race on the file.
+  // Every reactive state change runs this watcher, which schedules a
+  // debounced save. saveInFlight/savePending still serialize overlapping
+  // saves so we never race on the file if a save outruns the debounce.
   watch(
     () => [
       store.workspaces,
@@ -140,12 +153,14 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       store.terminalStatuses,
       store.claudePaneStates,
     ],
-    performAutoSave,
+    scheduleAutoSave,
     { deep: true },
   )
 
-  /** Force a final save, bypassing the in-flight guard. Call on window close. */
+  /** Force a final save, bypassing the in-flight guard and debounce timer.
+   *  Call on window close. */
   async function flush() {
+    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null }
     saveInFlight = false
     savePending = false
     await performAutoSave()

@@ -187,7 +187,16 @@ fn parse_jsonl_status(path: &std::path::Path) -> Option<ClaudeSessionStatus> {
 
     for line in content.lines() {
         if line.is_empty() { continue; }
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let entry = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v,
+            Err(e) => {
+                // Partial/corrupt lines happen at the trailing edge when Claude
+                // is mid-write. Log at debug level so they're not silent but
+                // don't spam on every parse.
+                eprintln!("parse_jsonl_status: skipping malformed line in {}: {e}", path.display());
+                continue;
+            }
+        };
 
         if let Some(c) = entry.get("cwd").and_then(|v| v.as_str()) {
             cwd = Some(c.to_string());
@@ -283,6 +292,7 @@ fn spawn_exit_watcher(
     app:      AppHandle,
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     monitor:  Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    expected: Arc<Mutex<HashMap<String, String>>>,
     pane_id:  String,
     claude_pid: u32,
 ) {
@@ -290,6 +300,7 @@ fn spawn_exit_watcher(
         wait_for_pid_exit(claude_pid);
         clear_tracked(&sessions, &pane_id);
         monitor.lock().unwrap().remove(&pane_id);
+        expected.lock().unwrap().remove(&pane_id);
         app.emit(&format!("claude-exited-{}", pane_id), ()).ok();
     });
 }
@@ -301,6 +312,7 @@ fn spawn_polling_exit_watcher(
     app:      AppHandle,
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     monitor:  Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    expected: Arc<Mutex<HashMap<String, String>>>,
     pane_id:  String,
     shell_pid: u32,
 ) {
@@ -317,6 +329,7 @@ fn spawn_polling_exit_watcher(
                 wait_for_pid_exit(claude_pid);
                 clear_tracked(&sessions, &pane_id);
                 monitor.lock().unwrap().remove(&pane_id);
+                expected.lock().unwrap().remove(&pane_id);
                 app.emit(&format!("claude-exited-{}", pane_id), ()).ok();
                 return;
             }
@@ -332,6 +345,7 @@ fn spawn_polling_exit_watcher(
             if still_gone {
                 clear_tracked(&sessions, &pane_id);
                 monitor.lock().unwrap().remove(&pane_id);
+                expected.lock().unwrap().remove(&pane_id);
                 app.emit(&format!("claude-exited-{}", pane_id), ()).ok();
                 return;
             }
@@ -467,6 +481,10 @@ pub fn spawn_pane_monitor(
             wait_for_pid_exit(claude_pid);
             clear_tracked(&sessions, &session_id);
             monitor.lock().unwrap().remove(&session_id);
+            // Clear any stale `expected` entry: if a `claude --resume` died
+            // before its JSONL was written, the resume id would otherwise
+            // linger and skew future adoption matching.
+            expected.lock().unwrap().remove(&session_id);
             app.emit(&format!("claude-exited-{}", session_id), ()).ok();
         }
     });
@@ -544,12 +562,13 @@ fn try_adopt_jsonl(
         let app2      = app.clone();
         let sessions2 = sessions.clone();
         let monitor2  = monitor.clone();
+        let expected2 = expected.clone();
         let pane_id2  = pane_id.clone();
         std::thread::spawn(move || {
             if let Some(claude_pid) = find_claude_pid_for_shell_bounded(shell_pid, 12) {
-                spawn_exit_watcher(app2, sessions2, monitor2, pane_id2, claude_pid);
+                spawn_exit_watcher(app2, sessions2, monitor2, expected2, pane_id2, claude_pid);
             } else {
-                spawn_polling_exit_watcher(app2, sessions2, monitor2, pane_id2, shell_pid);
+                spawn_polling_exit_watcher(app2, sessions2, monitor2, expected2, pane_id2, shell_pid);
             }
         });
     }

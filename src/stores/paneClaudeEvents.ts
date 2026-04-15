@@ -153,13 +153,15 @@ export async function wireClaudeEventListeners(
       if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
       delete launchTimestamps[paneId]
       updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
-      invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
+      invoke('clear_claude_monitor', { sessionId: sid })
+        .catch(e => console.error(`clear_claude_monitor failed for ${sid}:`, e))
     } else if (idle && state.lifecycle === 'launching') {
       const launchedAt = launchTimestamps[paneId] ?? 0
       if (launchedAt > 0 && Date.now() - launchedAt > 5000) {
         delete launchTimestamps[paneId]
         updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
-        invoke('clear_claude_monitor', { sessionId: sid }).catch(() => {})
+        invoke('clear_claude_monitor', { sessionId: sid })
+          .catch(e => console.error(`clear_claude_monitor failed for ${sid}:`, e))
       }
     }
 

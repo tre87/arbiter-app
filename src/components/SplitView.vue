@@ -6,8 +6,17 @@ import { usePaneStore } from '../stores/pane'
 
 defineOptions({ name: 'SplitView' })
 
-const props = defineProps<{ node: PaneNode }>()
+// Cap recursion at a sane ceiling so a corrupt saved layout (or a runaway
+// split storm) can't blow the Vue component stack. 20 nested splits = 2^20
+// theoretical leaves, far past anything a user could resolve on screen.
+const MAX_DEPTH = 20
+
+const props = withDefaults(defineProps<{ node: PaneNode; depth?: number }>(), { depth: 0 })
 const store = usePaneStore()
+
+if (props.depth > MAX_DEPTH) {
+  console.error(`SplitView depth exceeded ${MAX_DEPTH}; refusing to render deeper.`)
+}
 const containerRef = ref<HTMLDivElement>()
 const isDragging = ref(false)
 
@@ -45,6 +54,9 @@ function startDrag(e: MouseEvent) {
   <!-- Terminal leaf -->
   <TerminalPane v-if="node.type === 'terminal'" :pane-id="node.id" />
 
+  <!-- Depth ceiling reached — render nothing rather than recurse further. -->
+  <template v-else-if="depth > MAX_DEPTH" />
+
   <!-- Split node -->
   <div
     v-else
@@ -56,7 +68,7 @@ function startDrag(e: MouseEvent) {
     <div v-if="isDragging" class="drag-overlay" />
 
     <div class="split-child" :style="{ flex: node.sizes[0] }">
-      <SplitView :node="node.first" />
+      <SplitView :node="node.first" :depth="depth + 1" />
     </div>
 
     <div
@@ -66,7 +78,7 @@ function startDrag(e: MouseEvent) {
     />
 
     <div class="split-child" :style="{ flex: node.sizes[1] }">
-      <SplitView :node="node.second" />
+      <SplitView :node="node.second" :depth="depth + 1" />
     </div>
   </div>
 </template>
