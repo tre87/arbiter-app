@@ -25,24 +25,26 @@ watch(pending, (v) => {
 </script>
 
 <template>
-  <div v-if="pending" class="dialog-overlay" @mousedown.self="resolve(false)">
-    <div class="dialog confirm-dialog">
-      <h3 class="dialog-title">{{ pending.title }}</h3>
-      <p v-if="pending.message" class="dialog-message">{{ pending.message }}</p>
-      <div class="dialog-actions">
-        <button class="btn btn-secondary" @click="resolve(false)">
-          {{ pending.cancelText ?? 'Cancel' }}
-        </button>
-        <button
-          class="btn btn-primary"
-          :class="{ danger: pending.danger }"
-          @click="resolve(true)"
-        >
-          {{ pending.confirmText ?? 'Confirm' }}
-        </button>
+  <Teleport to="body">
+    <div v-if="pending" class="dialog-overlay" @mousedown.self="resolve(false)">
+      <div class="dialog confirm-dialog">
+        <h3 class="dialog-title">{{ pending.title }}</h3>
+        <p v-if="pending.message" class="dialog-message">{{ pending.message }}</p>
+        <div class="dialog-actions">
+          <button class="btn btn-secondary" @click="resolve(false)">
+            {{ pending.cancelText ?? 'Cancel' }}
+          </button>
+          <button
+            class="btn btn-primary"
+            :class="{ danger: pending.danger }"
+            @click="resolve(true)"
+          >
+            {{ pending.confirmText ?? 'Confirm' }}
+          </button>
+        </div>
       </div>
     </div>
-  </div>
+  </Teleport>
 </template>
 
 <style scoped>

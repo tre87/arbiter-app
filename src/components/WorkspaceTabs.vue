@@ -258,11 +258,11 @@ function onPointerDown(e: PointerEvent, index: number) {
         @keydown="onRenameKeydown"
         @click.stop
       />
-      <span v-else class="tab-label">
+      <template v-else>
         <MdiIcon v-if="ws.type === 'project'" :path="mdiFolder" :size="12" class="tab-type-icon" />
         <MdiIcon v-else :path="mdiConsole" :size="12" class="tab-type-icon" />
-        {{ ws.name.length > 40 ? ws.name.slice(0, 40) + '…' : ws.name }}
-      </span>
+        <span class="tab-label">{{ ws.name }}</span>
+      </template>
       <button
         v-if="store.workspaces.length > 1 && editingIndex !== i"
         class="tab-close"
@@ -338,15 +338,16 @@ function onPointerDown(e: PointerEvent, index: number) {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 0 8px;
+  padding: 0 28px 0 8px;
   height: 26px;
   margin: auto 0;
-  min-width: 60px;
-  max-width: 180px;
+  min-width: 54px;
+  max-width: 240px;
   flex-shrink: 1;
   cursor: pointer;
   color: var(--color-text-muted);
   font-size: 12px;
+  line-height: 1;
   font-weight: 400;
   white-space: nowrap;
   border: 1px solid transparent;
@@ -385,6 +386,8 @@ function onPointerDown(e: PointerEvent, index: number) {
 }
 
 .tab-label {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   pointer-events: none;
@@ -403,6 +406,10 @@ function onPointerDown(e: PointerEvent, index: number) {
 }
 
 .tab-close {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -417,16 +424,19 @@ function onPointerDown(e: PointerEvent, index: number) {
   cursor: pointer;
   padding: 0;
   flex-shrink: 0;
-  display: none;
+  opacity: 0.55;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
 }
 
-.tab:hover .tab-close {
-  display: flex;
+.tab:hover .tab-close,
+.tab.active .tab-close {
+  opacity: 1;
 }
 
 .tab-close:hover {
   background: rgba(255, 255, 255, 0.1);
   color: var(--color-text-primary);
+  opacity: 1;
 }
 
 .tab-add {
@@ -455,6 +465,8 @@ function onPointerDown(e: PointerEvent, index: number) {
 }
 
 .tab-type-icon {
+  flex-shrink: 0;
+  display: block;
   opacity: 0.5;
   margin-right: 2px;
 }
