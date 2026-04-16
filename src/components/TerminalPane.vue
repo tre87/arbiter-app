@@ -16,6 +16,7 @@ import {
   getTerminalSession, setTerminalSession, disposeTerminalSession,
   type TerminalSession,
 } from '../composables/terminalSessionCache'
+import { gitBashPath, ensureGitBashProbed } from '../composables/gitBashPath'
 
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
@@ -48,8 +49,8 @@ let unlistenCwd: (() => void) | null = null
 // Reactive state that must survive Vue remounts lives on the persistent
 // TerminalSession in the cache. On a remount we adopt the cached refs directly
 // so OSC 0 titles and the active shell never reset.
-const _cachedAtSetup = getTerminalSession(props.paneId)
-const terminalTitle = _cachedAtSetup?.title ?? ref('')
+const cachedAtSetup = getTerminalSession(props.paneId)
+const terminalTitle = cachedAtSetup?.title ?? ref('')
 
 // Project workspaces render git actions in the worktree sidebar, so the
 // terminal footer should only appear when Claude is running.
@@ -61,9 +62,8 @@ const infoPanelOpen = ref(false)
 function toggleInfoPanel() { infoPanelOpen.value = !infoPanelOpen.value }
 
 const isWindows = navigator.platform.startsWith('Win')
-const gitBashPath = ref<string | null>(null)
 const shellIdle = ref(false)
-const currentShell = _cachedAtSetup?.shell ?? ref<'powershell' | 'gitbash'>('powershell')
+const currentShell = cachedAtSetup?.shell ?? ref<'powershell' | 'gitbash'>('powershell')
 
 const isEditingName = ref(false)
 const editNameValue = ref('')
@@ -131,12 +131,14 @@ function continueClaude() {
 // handled by persistent listeners in pane.ts — they survive component
 // unmount/remount. This function only subscribes to CWD changes.
 async function subscribeToSession(sid: string) {
-  unlistenCwd = await listen(`cwd-changed-${sid}`, (event) => {
-    const data = event.payload as { cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }
-    sessionCwd.value = data.cwd
-    folderName.value = data.folder
-    gitInfo.value = data.git
-  }) as unknown as (() => void)
+  unlistenCwd = await listen<{ cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }>(
+    `cwd-changed-${sid}`,
+    (event) => {
+      sessionCwd.value = event.payload.cwd
+      folderName.value = event.payload.folder
+      gitInfo.value = event.payload.git
+    },
+  )
 
   // Recover CWD that may have been emitted before this listener was attached
   const currentCwd = await invoke<string | null>('get_session_cwd', { sessionId: sid }).catch(() => null)
@@ -225,9 +227,7 @@ onMounted(async () => {
     // initial callback and refit via scheduleFit once dimensions stabilize.
     term.refresh(0, term.rows - 1)
 
-    if (isWindows && gitBashPath.value === null) {
-      gitBashPath.value = await invoke<string | null>('check_git_bash')
-    }
+    if (isWindows) await ensureGitBashProbed()
 
     if (claudeActive.value) footerVisible.value = true
   } else {
@@ -269,11 +269,12 @@ onMounted(async () => {
       if (sid) invoke('resize_session', { sessionId: sid, cols, rows })
     })
 
-    if (isWindows) {
-      gitBashPath.value = await invoke<string | null>('check_git_bash')
-    }
+    if (isWindows) await ensureGitBashProbed()
 
-    // Reuse existing PTY session if the pane survived a split/remount; otherwise create fresh
+    // Fallback: a PTY is registered in the store but no xterm cache entry
+    // exists. In normal flow the cache and store are populated together, so
+    // this only fires if a previous fresh-create threw before `setTerminalSession`.
+    // Rather than lose the live PTY, adopt it and replay its buffer.
     const existingSession = store.getPtySession(props.paneId)
     if (existingSession) {
       sessionId = existingSession

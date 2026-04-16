@@ -1,18 +1,17 @@
 import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 
 export interface XtermInstance {
   term: Terminal
-  fitAddon: FitAddon
   safeFit: () => void
   loadWebgl: () => void
   dispose: () => void
 }
 
-/** Create a configured xterm Terminal with FitAddon, WebLinksAddon, and a
- *  safeFit() that avoids FitAddon's circular css.cell.width issue. */
+/** Create a configured xterm Terminal with WebLinksAddon and a safeFit() that
+ *  computes cols/rows directly — FitAddon's circular css.cell.width derivation
+ *  misfires on detach/reattach, so we don't use it. */
 export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
   const term = new Terminal({
     theme: {
@@ -42,8 +41,6 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     allowTransparency: true,
   })
 
-  const fitAddon = new FitAddon()
-  term.loadAddon(fitAddon)
   term.loadAddon(new WebLinksAddon())
   term.open(mountEl)
 
@@ -73,10 +70,9 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     const dh: number | undefined = core?._renderService?.dimensions?.device?.cell?.height
     if (!dw || !dh) {
       // Render service hasn't measured yet (e.g. right after a DOM
-      // detach/reattach cycle). FitAddon.fit()'s circular css.cell.width
-      // computation misfires here and resizes to absurdly small cols, which
-      // then propagates to the PTY via onResize. Skip and let the next
-      // ResizeObserver tick retry once dimensions are available.
+      // detach/reattach cycle). Skip and let the next ResizeObserver tick
+      // retry once dimensions are available — otherwise we'd resize to
+      // absurdly small cols and SIGWINCH the PTY into narrow wrapping.
       return
     }
 
@@ -122,5 +118,5 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     term.dispose()
   }
 
-  return { term, fitAddon, safeFit, loadWebgl, dispose }
+  return { term, safeFit, loadWebgl, dispose }
 }
