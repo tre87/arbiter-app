@@ -50,6 +50,10 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
   let webglAddon: WebglAddon | null = null
 
   function loadWebgl() {
+    // Idempotent: already-loaded contexts stay loaded; contexts lost via
+    // onContextLoss (webglAddon set to null there) get reloaded on the next
+    // call. Lets callers safely invoke after a detach/reattach cycle.
+    if (webglAddon) return
     try {
       webglAddon = new WebglAddon()
       term.loadAddon(webglAddon)
@@ -68,7 +72,11 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     const dw: number | undefined = core?._renderService?.dimensions?.device?.cell?.width
     const dh: number | undefined = core?._renderService?.dimensions?.device?.cell?.height
     if (!dw || !dh) {
-      fitAddon.fit()
+      // Render service hasn't measured yet (e.g. right after a DOM
+      // detach/reattach cycle). FitAddon.fit()'s circular css.cell.width
+      // computation misfires here and resizes to absurdly small cols, which
+      // then propagates to the PTY via onResize. Skip and let the next
+      // ResizeObserver tick retry once dimensions are available.
       return
     }
 
@@ -94,6 +102,14 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     while (cols > 2 && Math.round(dw * cols / dpr) > available) {
       cols--
     }
+
+    // Sanity clamp: if we would shrink dramatically, we're almost certainly
+    // measuring during an unstable layout (workspace just unhidden, element
+    // just reattached, transition in flight). Dropping a terminal from a
+    // normal size down to a handful of columns would cause the PTY to emit
+    // narrow-wrapped content that stays baked into scrollback forever, so
+    // skip and wait for the next tick's measurement to stabilize.
+    if (cols < 20 || rows < 5) return
 
     if (term.cols !== cols || term.rows !== rows) {
       term.resize(cols, rows)

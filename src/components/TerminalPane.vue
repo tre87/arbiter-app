@@ -12,6 +12,10 @@ import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline, mdiBash
 import TerminalFooter from './TerminalFooter.vue'
 import TerminalInfoPanel from './TerminalInfoPanel.vue'
 import { createXtermInstance, type XtermInstance } from '../composables/useXtermInstance'
+import {
+  getTerminalSession, setTerminalSession, disposeTerminalSession,
+  type TerminalSession,
+} from '../composables/terminalSessionCache'
 
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
@@ -22,6 +26,8 @@ let xterm: XtermInstance | null = null
 let term: Terminal
 let unlisten: UnlistenFn | null = null
 let sessionId: string | null = null
+let session: TerminalSession | null = null
+let wrapperEl: HTMLDivElement | null = null
 let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
 let focusHandler: (() => void) | null = null
@@ -39,7 +45,11 @@ const folderName = ref<string | null>(null)
 const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
 let unlistenCwd: (() => void) | null = null
 
-const terminalTitle = ref('')
+// Reactive state that must survive Vue remounts lives on the persistent
+// TerminalSession in the cache. On a remount we adopt the cached refs directly
+// so OSC 0 titles and the active shell never reset.
+const _cachedAtSetup = getTerminalSession(props.paneId)
+const terminalTitle = _cachedAtSetup?.title ?? ref('')
 
 // Project workspaces render git actions in the worktree sidebar, so the
 // terminal footer should only appear when Claude is running.
@@ -53,7 +63,7 @@ function toggleInfoPanel() { infoPanelOpen.value = !infoPanelOpen.value }
 const isWindows = navigator.platform.startsWith('Win')
 const gitBashPath = ref<string | null>(null)
 const shellIdle = ref(false)
-const currentShell = ref<'powershell' | 'gitbash'>('powershell')
+const currentShell = _cachedAtSetup?.shell ?? ref<'powershell' | 'gitbash'>('powershell')
 
 const isEditingName = ref(false)
 const editNameValue = ref('')
@@ -144,8 +154,11 @@ async function subscribeToSession(sid: string) {
   }
 }
 
-function unsubscribeAll() {
-  unlisten?.(); unlisten = null
+// Tears down component-local subscriptions only. The session-level PTY
+// listener lives on the cached TerminalSession and is managed separately —
+// kept alive across remounts, and only replaced/disposed by switchShell or
+// disposeTerminalSession.
+function unsubscribeComponentLocal() {
   unlistenCwd?.(); unlistenCwd = null
 }
 
@@ -153,7 +166,9 @@ async function switchShell() {
   if (!sessionId) return
   const cwd = sessionCwd.value
 
-  unsubscribeAll()
+  unsubscribeComponentLocal()
+  unlisten?.(); unlisten = null
+  if (session) session.ptyUnlisten = null
   await invoke('close_session', { sessionId })
   store.removePtySession(props.paneId)
 
@@ -171,10 +186,12 @@ async function switchShell() {
     shell: newShell,
   })
   store.setPtySession(props.paneId, sessionId)
+  if (session) session.sessionId = sessionId
 
   unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
     term.write(event.payload)
   })
+  if (session) session.ptyUnlisten = unlisten
   await subscribeToSession(sessionId)
 
   shellIdle.value = false
@@ -182,23 +199,203 @@ async function switchShell() {
 }
 
 onMounted(async () => {
-  xterm = createXtermInstance(terminalEl.value!)
-  term = xterm.term
+  const cached = getTerminalSession(props.paneId)
 
-  // Store OSC 0 title for display in toolbar (Claude detection is handled
-  // by persistent listeners in pane.ts via JSONL/process monitoring).
-  term.parser.registerOscHandler(0, (data) => {
-    terminalTitle.value = data
-    return false
-  })
+  if (cached) {
+    // ── Reattach path: xterm + PTY listener survived the unmount ─────────
+    // VS Code-style: the Terminal instance, its scrollback, and its event
+    // handlers are preserved. We just reparent the wrapper element into the
+    // new TerminalPane's container. No replay, no handler re-registration.
+    session = cached
+    xterm = cached.xterm
+    term = xterm.term
+    sessionId = cached.sessionId
+    unlisten = cached.ptyUnlisten
+    wrapperEl = cached.wrapperEl
 
-  // Any user input clears the attention flag for this terminal.
-  term.onData(() => {
-    if (claudeState.value.lifecycle === 'attention') {
-      store.updateClaudePaneState(props.paneId, { lifecycle: 'ready' })
+    terminalEl.value!.appendChild(cached.wrapperEl)
+
+    await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+    xterm.loadWebgl()
+    // Don't call safeFit here: the WebGL addon hasn't rendered a frame yet, so
+    // _renderService.dimensions is stale. A wrong cell-width measurement would
+    // resize xterm (and SIGWINCH the PTY) to narrow cols, baking Claude's
+    // narrow wrap into scrollback forever. The Terminal's existing cols/rows
+    // survived the detach; the ResizeObserver attached below will fire an
+    // initial callback and refit via scheduleFit once dimensions stabilize.
+    term.refresh(0, term.rows - 1)
+
+    if (isWindows && gitBashPath.value === null) {
+      gitBashPath.value = await invoke<string | null>('check_git_bash')
     }
-  })
 
+    if (claudeActive.value) footerVisible.value = true
+  } else {
+    // ── Fresh-create path ────────────────────────────────────────────────
+    wrapperEl = document.createElement('div')
+    wrapperEl.style.width = '100%'
+    wrapperEl.style.height = '100%'
+    terminalEl.value!.appendChild(wrapperEl)
+
+    xterm = createXtermInstance(wrapperEl)
+    term = xterm.term
+
+    // Store OSC 0 title for display in toolbar (Claude detection is handled
+    // by persistent listeners in pane.ts via JSONL/process monitoring).
+    term.parser.registerOscHandler(0, (data) => {
+      terminalTitle.value = data
+      return false
+    })
+
+    // Any user input clears the attention flag for this terminal.
+    term.onData(() => {
+      if (claudeState.value.lifecycle === 'attention') {
+        store.updateClaudePaneState(props.paneId, { lifecycle: 'ready' })
+      }
+    })
+
+    await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+
+    xterm.loadWebgl()
+    xterm.safeFit()
+
+    term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
+
+    // Persistent handlers read the current session id through the cache so
+    // shell-switch updates reach them even though they were registered once.
+    term.onResize(({ cols, rows }) => {
+      store.markResize(props.paneId)
+      const sid = getTerminalSession(props.paneId)?.sessionId
+      if (sid) invoke('resize_session', { sessionId: sid, cols, rows })
+    })
+
+    if (isWindows) {
+      gitBashPath.value = await invoke<string | null>('check_git_bash')
+    }
+
+    // Reuse existing PTY session if the pane survived a split/remount; otherwise create fresh
+    const existingSession = store.getPtySession(props.paneId)
+    if (existingSession) {
+      sessionId = existingSession
+      currentShell.value = store.getTerminalShell(props.paneId)
+
+      unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
+        term.write(event.payload)
+      })
+
+      // Backend skips the actual resize (and SIGWINCH) when dimensions are
+      // unchanged — avoids Claude's Ink TUI redrawing on worktree switch.
+      store.markResize(props.paneId)
+      const resized = await invoke<boolean>('resize_session', { sessionId, cols: term.cols, rows: term.rows })
+      if (!resized) {
+        const replay = await invoke<string>('get_session_replay', { sessionId })
+        if (replay) term.write(replay)
+      }
+
+      if (claudeActive.value) {
+        footerVisible.value = true
+        store.armClaudeListeners(props.paneId)
+      }
+    } else {
+      const savedCwd = store.consumeSavedCwd(props.paneId)
+      const claudeRestore = store.consumeSavedClaudeRestore(props.paneId)
+
+      // Pre-populate footer state BEFORE creating the session so the terminal
+      // has its final height (with footer visible) when we measure rows/cols.
+      if (savedCwd) {
+        sessionCwd.value = savedCwd
+        folderName.value = savedCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
+        const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
+        gitInfo.value = git
+        if (claudeRestore?.wasOpen) {
+          footerVisible.value = true
+          // Set lifecycle early so footer renders before safeFit — otherwise a
+          // later resize sends SIGWINCH and triggers Claude's ghost cursor.
+          store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false })
+        }
+        await nextTick()
+        await new Promise<void>(r => requestAnimationFrame(() => r()))
+        xterm.safeFit()
+      }
+
+      const savedShell = store.consumeSavedShell(props.paneId)
+      const shellType = savedShell ?? (isWindows && devSettings.defaultShell === 'gitbash' ? 'gitbash' : 'powershell')
+      const shellPath = (shellType === 'gitbash' && gitBashPath.value) ? gitBashPath.value : null
+      currentShell.value = shellPath ? 'gitbash' : 'powershell'
+      store.setTerminalShell(props.paneId, currentShell.value)
+
+      sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null, shell: shellPath })
+      store.setPtySession(props.paneId, sessionId)
+
+      unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
+        term.write(event.payload)
+      })
+
+      if (claudeRestore && sessionId) {
+        if (claudeRestore.sessionId) {
+          // Resume conversation — pre-register expected session so JSONL watcher
+          // adopts the resumed file into *this* pane.
+          invoke('set_expected_claude_session', { sessionId, claudeSessionId: claudeRestore.sessionId }).catch(() => {})
+          store.updateClaudePaneState(props.paneId, {
+            lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
+          })
+          store.armClaudeListeners(props.paneId)
+          setTimeout(() => {
+            invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
+          }, 500)
+        } else if (claudeRestore.wasOpen) {
+          store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false })
+          store.armClaudeListeners(props.paneId)
+          setTimeout(() => {
+            invoke('write_to_session', { sessionId, data: 'claude\r' })
+          }, 500)
+        }
+      }
+    }
+
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true
+      if (e.ctrlKey && e.code === 'KeyC' && (e.shiftKey || term.hasSelection())) {
+        if (term.hasSelection()) {
+          clipboardWrite(term.getSelection())
+          term.clearSelection()
+        }
+        return false
+      }
+      if (e.ctrlKey && e.code === 'KeyV') {
+        e.preventDefault()
+        clipboardRead().then(text => {
+          const sid = getTerminalSession(props.paneId)?.sessionId
+          if (text && sid) invoke('write_to_session', { sessionId: sid, data: text })
+        })
+        return false
+      }
+      // Ctrl+Enter → newline (for Claude multi-line input)
+      if (e.ctrlKey && e.code === 'Enter') {
+        const sid = getTerminalSession(props.paneId)?.sessionId
+        if (sid) invoke('write_to_session', { sessionId: sid, data: '\n' })
+        return false
+      }
+      return true
+    })
+
+    term.onData((data) => {
+      const sid = getTerminalSession(props.paneId)?.sessionId
+      if (sid) invoke('write_to_session', { sessionId: sid, data })
+    })
+
+    session = {
+      xterm,
+      wrapperEl,
+      sessionId,
+      ptyUnlisten: unlisten,
+      title: terminalTitle,
+      shell: currentShell,
+    }
+    setTerminalSession(props.paneId, session)
+  }
+
+  // ── Component-local setup (recreated every mount) ───────────────────────
   focusHandler = () => { if (isFocused.value) term?.focus() }
   window.addEventListener('arbiter:request-focus', focusHandler)
 
@@ -211,134 +408,10 @@ onMounted(async () => {
   }
   window.addEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
 
-  await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
-
-  xterm.loadWebgl()
-  xterm.safeFit()
-
-  term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
-
-  term.onResize(({ cols, rows }) => {
-    store.markResize(props.paneId)
-    if (sessionId) invoke('resize_session', { sessionId, cols, rows })
-  })
-
-  if (isWindows) {
-    gitBashPath.value = await invoke<string | null>('check_git_bash')
-  }
-
-  // Reuse existing PTY session if the pane survived a split/remount; otherwise create fresh
-  const existingSession = store.getPtySession(props.paneId)
-  if (existingSession) {
-    sessionId = existingSession
-    currentShell.value = store.getTerminalShell(props.paneId)
-
-    unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
-      term.write(event.payload)
-    })
-
-    // Backend skips the actual resize (and SIGWINCH) when dimensions are
-    // unchanged — avoids Claude's Ink TUI redrawing on worktree switch.
-    store.markResize(props.paneId)
-    const resized = await invoke<boolean>('resize_session', { sessionId, cols: term.cols, rows: term.rows })
-    if (!resized) {
-      const replay = await invoke<string>('get_session_replay', { sessionId })
-      if (replay) term.write(replay)
-    }
-
-    if (claudeActive.value) {
-      footerVisible.value = true
-      store.armClaudeListeners(props.paneId)
-    }
-  } else {
-    const savedCwd = store.consumeSavedCwd(props.paneId)
-    const claudeRestore = store.consumeSavedClaudeRestore(props.paneId)
-
-    // Pre-populate footer state BEFORE creating the session so the terminal
-    // has its final height (with footer visible) when we measure rows/cols.
-    if (savedCwd) {
-      sessionCwd.value = savedCwd
-      folderName.value = savedCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
-      const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
-      gitInfo.value = git
-      if (claudeRestore?.wasOpen) {
-        footerVisible.value = true
-        // Set lifecycle early so footer renders before safeFit — otherwise a
-        // later resize sends SIGWINCH and triggers Claude's ghost cursor.
-        store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false })
-      }
-      await nextTick()
-      await new Promise<void>(r => requestAnimationFrame(() => r()))
-      xterm.safeFit()
-    }
-
-    const savedShell = store.consumeSavedShell(props.paneId)
-    const shellType = savedShell ?? (isWindows && devSettings.defaultShell === 'gitbash' ? 'gitbash' : 'powershell')
-    const shellPath = (shellType === 'gitbash' && gitBashPath.value) ? gitBashPath.value : null
-    currentShell.value = shellPath ? 'gitbash' : 'powershell'
-    store.setTerminalShell(props.paneId, currentShell.value)
-
-    sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null, shell: shellPath })
-    store.setPtySession(props.paneId, sessionId)
-
-    unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
-      term.write(event.payload)
-    })
-
-    if (claudeRestore && sessionId) {
-      if (claudeRestore.sessionId) {
-        // Resume conversation — pre-register expected session so JSONL watcher
-        // adopts the resumed file into *this* pane.
-        invoke('set_expected_claude_session', { sessionId, claudeSessionId: claudeRestore.sessionId }).catch(() => {})
-        store.updateClaudePaneState(props.paneId, {
-          lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
-        })
-        store.armClaudeListeners(props.paneId)
-        setTimeout(() => {
-          invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
-        }, 500)
-      } else if (claudeRestore.wasOpen) {
-        store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false })
-        store.armClaudeListeners(props.paneId)
-        setTimeout(() => {
-          invoke('write_to_session', { sessionId, data: 'claude\r' })
-        }, 500)
-      }
-    }
-  }
-
-  term.attachCustomKeyEventHandler((e) => {
-    if (e.type !== 'keydown') return true
-    if (e.ctrlKey && e.code === 'KeyC' && (e.shiftKey || term.hasSelection())) {
-      if (term.hasSelection()) {
-        clipboardWrite(term.getSelection())
-        term.clearSelection()
-      }
-      return false
-    }
-    if (e.ctrlKey && e.code === 'KeyV') {
-      e.preventDefault()
-      clipboardRead().then(text => {
-        if (text && sessionId) invoke('write_to_session', { sessionId, data: text })
-      })
-      return false
-    }
-    // Ctrl+Enter → newline (for Claude multi-line input)
-    if (e.ctrlKey && e.code === 'Enter') {
-      if (sessionId) invoke('write_to_session', { sessionId, data: '\n' })
-      return false
-    }
-    return true
-  })
-
-  term.onData((data) => {
-    if (sessionId) invoke('write_to_session', { sessionId, data })
-  })
-
   resizeObserver = new ResizeObserver(scheduleFit)
   resizeObserver.observe(terminalEl.value!)
 
-  await subscribeToSession(sessionId!)
+  if (sessionId) await subscribeToSession(sessionId)
 
   if (isFocused.value) {
     await nextTick()
@@ -349,17 +422,23 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
   if (workspaceActivatedHandler) window.removeEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
-  unsubscribeAll()
   if (fitTimer) clearTimeout(fitTimer)
-  unlisten?.()
   resizeObserver?.disconnect()
-  // Only close the PTY session if this pane has been removed from the layout tree.
-  // During a split the pane node survives, so we keep the session alive for reconnection.
-  if (sessionId && !store.hasPaneId(props.paneId)) {
-    invoke('close_session', { sessionId })
-    store.removePtySession(props.paneId)
+  unsubscribeComponentLocal()
+
+  if (!store.hasPaneId(props.paneId)) {
+    // Pane truly removed from layout — tear down everything.
+    disposeTerminalSession(props.paneId)
+    if (sessionId) {
+      invoke('close_session', { sessionId })
+      store.removePtySession(props.paneId)
+    }
+  } else {
+    // Pane survives (split, worktree switch, workspace switch). Detach the
+    // wrapper from the current DOM container; xterm + PTY listener stay
+    // alive in the cache for the next mount to adopt.
+    wrapperEl?.remove()
   }
-  xterm?.dispose()
 })
 </script>
 
