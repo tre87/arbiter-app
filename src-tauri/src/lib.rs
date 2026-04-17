@@ -213,6 +213,10 @@ pub fn run() {
             fs::watch_directory,
             fs::unwatch_directory,
             fs::get_project_model,
+            fs::open_path,
+            fs::reveal_path,
+            fs::rename_path,
+            fs::trash_path,
             open_devtools,
         ])
         .run(tauri::generate_context!())

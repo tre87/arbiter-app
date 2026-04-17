@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
-import { generateRobotIcon, generateRobotFrame, regenerateRobot } from '../utils/robotIcon'
+import { computed } from 'vue'
+import { generateRobotIcon, generateRobotFrame, robotVersion } from '../utils/robotIcon'
 
 const props = withDefaults(defineProps<{
   branchName: string
@@ -8,27 +8,15 @@ const props = withDefaults(defineProps<{
   animated?: boolean
 }>(), { size: 32, animated: false })
 
-const emit = defineEmits<{ regenerated: [] }>()
-
-// Regeneration counter to force recompute
-const regenKey = ref(0)
-
 const staticSrc = computed(() => {
-  void regenKey.value
+  void robotVersion.value
   return generateRobotIcon(props.branchName, props.size)
 })
 
 const frames = computed(() => {
-  void regenKey.value
+  void robotVersion.value
   return [0, 1, 2, 3].map(i => generateRobotFrame(props.branchName, props.size, i))
 })
-
-function handleContextMenu(e: MouseEvent) {
-  e.preventDefault()
-  regenerateRobot(props.branchName)
-  regenKey.value++
-  emit('regenerated')
-}
 </script>
 
 <template>
@@ -39,13 +27,11 @@ function handleContextMenu(e: MouseEvent) {
     :height="size"
     class="robot-icon"
     :alt="branchName"
-    @contextmenu="handleContextMenu"
   />
   <span
     v-else
     class="robot-icon robot-anim"
     :style="{ width: size + 'px', height: size + 'px' }"
-    @contextmenu="handleContextMenu"
   >
     <img
       v-for="(src, i) in frames"
@@ -64,7 +50,6 @@ function handleContextMenu(e: MouseEvent) {
 .robot-icon {
   border-radius: 4px;
   flex-shrink: 0;
-  cursor: context-menu;
 }
 .robot-anim {
   display: inline-block;

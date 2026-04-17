@@ -1,24 +1,29 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, nextTick, ref, watch } from 'vue'
 import MdiIcon from './MdiIcon.vue'
-import { mdiSourceMerge, mdiRobotOutline, mdiClose, mdiDeleteOutline, mdiDeleteAlertOutline } from '@mdi/js'
+import { mdiSourceMerge, mdiRobotOutline, mdiClose, mdiDeleteOutline, mdiDeleteAlertOutline, mdiSourcePull, mdiRefresh } from '@mdi/js'
 import type { Worktree } from '../types/pane'
 
 const props = defineProps<{
   worktree: Worktree
   clickX: number
   clickY: number
+  isMain: boolean
   isMerged: boolean
   canAskClaude: boolean
+  mainBranch: string
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'manualMerge'): void
   (e: 'claudeMerge'): void
+  (e: 'mergeAndDelete'): void
+  (e: 'createPr'): void
   (e: 'delete'): void
   (e: 'discard'): void
   (e: 'dismissMerged'): void
+  (e: 'regenerateRobot'): void
 }>()
 
 const pos = ref({ x: props.clickX, y: props.clickY })
@@ -68,11 +73,23 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onWindowMouseDow
       class="worktree-context-menu"
       :style="{ left: pos.x + 'px', top: pos.y + 'px' }"
     >
-      <template v-if="isMerged">
+      <template v-if="isMain">
+        <div class="ctx-section">
+          <button class="ctx-item" @click="emit('regenerateRobot')">
+            <MdiIcon :path="mdiRefresh" :size="14" />
+            <span>Regenerate robot</span>
+          </button>
+        </div>
+      </template>
+      <template v-else-if="isMerged">
         <div class="ctx-section">
           <button class="ctx-item" @click="emit('dismissMerged')">
             <MdiIcon :path="mdiClose" :size="14" />
             <span>Dismiss merged worktree</span>
+          </button>
+          <button class="ctx-item" @click="emit('regenerateRobot')">
+            <MdiIcon :path="mdiRefresh" :size="14" />
+            <span>Regenerate robot</span>
           </button>
         </div>
       </template>
@@ -97,6 +114,22 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onWindowMouseDow
           </button>
         </div>
         <div v-else class="ctx-empty">No parent branch recorded</div>
+        <div class="ctx-section">
+          <button class="ctx-item" @click="emit('mergeAndDelete')">
+            <MdiIcon :path="mdiSourceMerge" :size="14" />
+            <span>Merge into <b>{{ mainBranch }}</b> &amp; delete</span>
+          </button>
+          <button class="ctx-item" @click="emit('createPr')">
+            <MdiIcon :path="mdiSourcePull" :size="14" />
+            <span>Push, create PR &amp; delete</span>
+          </button>
+        </div>
+        <div class="ctx-section">
+          <button class="ctx-item" @click="emit('regenerateRobot')">
+            <MdiIcon :path="mdiRefresh" :size="14" />
+            <span>Regenerate robot</span>
+          </button>
+        </div>
         <div class="ctx-section">
           <button class="ctx-item" @click="emit('delete')">
             <MdiIcon :path="mdiDeleteOutline" :size="14" />

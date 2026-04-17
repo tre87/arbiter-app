@@ -1,6 +1,7 @@
 // DiceBear bottts-based robot icon generator
 // Deterministic: same branch name always produces the same robot (until regenerated)
 
+import { ref } from 'vue'
 import { createAvatar } from '@dicebear/core'
 import { bottts } from '@dicebear/collection'
 
@@ -24,12 +25,18 @@ const ANIM_EYES: Array<BotttsEye | undefined> = [
 const cache = new Map<string, string>()
 const seedOffsets = new Map<string, number>()
 
+// A reactive tick so `generateRobotIcon` / `generateRobotFrame` calls made
+// inside a computed rerun after a regeneration. Touch this inside the
+// computed (`void robotVersion.value`) to subscribe.
+export const robotVersion = ref(0)
+
 export function regenerateRobot(branchName: string) {
   const current = seedOffsets.get(branchName) ?? 0
   seedOffsets.set(branchName, current + 1)
   for (const key of Array.from(cache.keys())) {
     if (key.startsWith(branchName + ':')) cache.delete(key)
   }
+  robotVersion.value++
 }
 
 function getSeed(branchName: string): string {

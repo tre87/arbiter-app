@@ -6,11 +6,11 @@ import WorktreeCard from './WorktreeCard.vue'
 import GitMenu from './GitMenu.vue'
 import MdiIcon from './MdiIcon.vue'
 import WorktreeNewDialog from './WorktreeNewDialog.vue'
-import WorktreeEndDialog from './WorktreeEndDialog.vue'
 import WorktreeContextMenu from './WorktreeContextMenu.vue'
 import { mdiPlus, mdiChevronRight, mdiChevronDown, mdiRestore, mdiBroom } from '@mdi/js'
 import type { ProjectWorkspace, Worktree } from '../types/pane'
 import { useConfirm } from '../composables/useConfirm'
+import { regenerateRobot } from '../utils/robotIcon'
 
 const { confirm } = useConfirm()
 
@@ -47,42 +47,12 @@ const mainBranch = computed(() =>
   props.workspace.worktrees.find(w => w.isMain)?.branchName ?? 'main'
 )
 
-// Merge/PR actions ask Claude to do the work — only allowed when Claude
-// is alive in the main worktree's terminal.
-const mainClaudeRunning = computed(() => {
-  const main = props.workspace.worktrees.find(w => w.isMain)
-  if (!main) return false
-  const s = projectStore.getClaudeStatus(main.id).status
-  return s === 'ready' || s === 'working' || s === 'attention'
-})
-
 // ── New worktree dialog ─────────────────────────────────────────────────────
 
 const showNewDialog = ref(false)
 
 async function handleCreate(branchName: string, baseBranch: string | undefined) {
   await projectStore.addWorktree(props.workspace.id, branchName, baseBranch)
-}
-
-// ── End worktree dialog ─────────────────────────────────────────────────────
-
-const endingWorktree = ref<{ id: string; branchName: string } | null>(null)
-
-function openEndDialog(worktreeId: string, branchName: string) {
-  endingWorktree.value = { id: worktreeId, branchName }
-}
-
-async function handleEnd(mode: 'delete' | 'merge' | 'discard' | 'pr') {
-  if (!endingWorktree.value) return
-  await projectStore.removeWorktree(props.workspace.id, endingWorktree.value.id, mode)
-}
-
-async function removeMerged(worktreeId: string) {
-  try {
-    await projectStore.removeMergedWorktree(props.workspace.id, worktreeId)
-  } catch (e) {
-    console.error(e)
-  }
 }
 
 // ── Right-click context menu ────────────────────────────────────────────────
@@ -120,6 +90,40 @@ async function ctxClaudeMerge() {
     await projectStore.askClaudeToMerge(props.workspace.id, wt.id)
   } catch (e) {
     console.error('Ask Claude to merge failed:', e)
+  }
+}
+
+async function ctxMergeAndDelete() {
+  if (!ctxMenu.value) return
+  const wt = ctxMenu.value.worktree
+  closeContextMenu()
+  const ok = await confirm({
+    title: `Merge "${wt.branchName}" into ${mainBranch.value} and delete?`,
+    message: 'Merges the branch into the main worktree and then removes the worktree.',
+    confirmText: 'Merge & delete',
+  })
+  if (!ok) return
+  try {
+    await projectStore.removeWorktree(props.workspace.id, wt.id, 'merge')
+  } catch (e) {
+    console.error('Merge & delete failed:', e)
+  }
+}
+
+async function ctxCreatePr() {
+  if (!ctxMenu.value) return
+  const wt = ctxMenu.value.worktree
+  closeContextMenu()
+  const ok = await confirm({
+    title: `Push "${wt.branchName}" and open a PR?`,
+    message: 'Pushes the branch, creates a pull request via `gh`, and removes the worktree afterwards.',
+    confirmText: 'Create PR',
+  })
+  if (!ok) return
+  try {
+    await projectStore.removeWorktree(props.workspace.id, wt.id, 'pr')
+  } catch (e) {
+    console.error('Create PR failed:', e)
   }
 }
 
@@ -167,6 +171,12 @@ async function ctxDismissMerged() {
   } catch (e) {
     console.error('Dismiss merged worktree failed:', e)
   }
+}
+
+function ctxRegenerateRobot() {
+  if (!ctxMenu.value) return
+  regenerateRobot(ctxMenu.value.worktree.branchName)
+  closeContextMenu()
 }
 
 // ── Stale worktrees ─────────────────────────────────────────────────────────
@@ -241,8 +251,6 @@ async function pruneAllStale() {
         :is-merged="projectStore.isMerged(wt.id)"
         :status="projectStore.getClaudeStatus(wt.id)"
         @click="projectStore.switchWorktree(workspace.id, wt.id)"
-        @end="openEndDialog(wt.id, wt.branchName)"
-        @remove="removeMerged(wt.id)"
         @contextmenu="(e) => openContextMenu(e, wt)"
       />
 
@@ -306,14 +314,19 @@ async function pruneAllStale() {
       :worktree="ctxMenu.worktree"
       :click-x="ctxMenu.x"
       :click-y="ctxMenu.y"
+      :is-main="ctxMenu.worktree.isMain"
       :is-merged="projectStore.isMerged(ctxMenu.worktree.id)"
       :can-ask-claude="canAskClaude(ctxMenu.worktree)"
+      :main-branch="mainBranch"
       @close="closeContextMenu"
       @manual-merge="ctxManualMerge"
       @claude-merge="ctxClaudeMerge"
+      @merge-and-delete="ctxMergeAndDelete"
+      @create-pr="ctxCreatePr"
       @delete="ctxDeleteWorktree"
       @discard="ctxDiscardWorktree"
       @dismiss-merged="ctxDismissMerged"
+      @regenerate-robot="ctxRegenerateRobot"
     />
 
     <WorktreeNewDialog
@@ -322,15 +335,6 @@ async function pruneAllStale() {
       :main-branch="mainBranch"
       :on-create="handleCreate"
       @close="showNewDialog = false"
-    />
-
-    <WorktreeEndDialog
-      v-if="endingWorktree"
-      :branch-name="endingWorktree.branchName"
-      :main-branch="mainBranch"
-      :main-claude-running="mainClaudeRunning"
-      :on-end="handleEnd"
-      @close="endingWorktree = null"
     />
   </div>
 </template>

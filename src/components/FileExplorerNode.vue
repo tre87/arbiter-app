@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, nextTick, ref, watch } from 'vue'
 import { useProjectStore, type DirEntry } from '../stores/project'
 import MdiIcon from './MdiIcon.vue'
 import { mdiChevronRight, mdiChevronDown } from '@mdi/js'
@@ -9,14 +10,49 @@ const props = defineProps<{
   worktreeId: string
   worktreePath: string
   expandedPaths: Set<string>
+  selection: Set<string>
+  renamingPath: string | null
   depth: number
 }>()
 
 const emit = defineEmits<{
-  toggle: [path: string]
+  select: [event: MouseEvent, entry: DirEntry]
+  open: [entry: DirEntry]
+  contextmenu: [event: MouseEvent, entry: DirEntry]
+  'rename-commit': [path: string, newName: string]
+  'rename-cancel': []
 }>()
 
+const isSelected = computed(() => props.selection.has(props.entry.path))
+
 const projectStore = useProjectStore()
+
+const isRenaming = computed(() => props.renamingPath === props.entry.path)
+const renameValue = ref('')
+const renameInputEl = ref<HTMLInputElement | null>(null)
+
+watch(isRenaming, (active) => {
+  if (active) {
+    renameValue.value = props.entry.name
+    nextTick(() => {
+      const el = renameInputEl.value
+      if (!el) return
+      el.focus()
+      const dot = props.entry.is_dir ? -1 : props.entry.name.lastIndexOf('.')
+      if (dot > 0) el.setSelectionRange(0, dot)
+      else el.select()
+    })
+  }
+})
+
+function commitRename() {
+  const trimmed = renameValue.value.trim()
+  if (!trimmed || trimmed === props.entry.name) {
+    emit('rename-cancel')
+    return
+  }
+  emit('rename-commit', props.entry.path, trimmed)
+}
 
 function getStatusColor(entry: DirEntry): string | undefined {
   const relativePath = entry.path.replace(props.worktreePath, '').replace(/^[/\\]/, '').replace(/\\/g, '/')
@@ -35,19 +71,23 @@ function getStatusColor(entry: DirEntry): string | undefined {
   }
 }
 
-const isExpanded = props.expandedPaths.has(props.entry.path)
-const children = props.entry.is_dir && isExpanded
-  ? (projectStore.getCachedDirectory(props.worktreeId, props.entry.path) ?? [])
-  : []
+const isExpanded = computed(() => props.expandedPaths.has(props.entry.path))
+const children = computed(() =>
+  props.entry.is_dir && isExpanded.value
+    ? (projectStore.getCachedDirectory(props.worktreeId, props.entry.path) ?? [])
+    : [],
+)
 const indent = `${props.depth * 16}px`
 </script>
 
 <template>
   <div
     class="tree-item"
-    :class="{ dir: entry.is_dir }"
+    :class="{ dir: entry.is_dir, selected: isSelected }"
     :style="{ paddingLeft: `calc(8px + ${indent})` }"
-    @click="entry.is_dir && emit('toggle', entry.path)"
+    @click="!isRenaming && emit('select', $event, entry)"
+    @dblclick="!isRenaming && !entry.is_dir && emit('open', entry)"
+    @contextmenu.prevent.stop="emit('contextmenu', $event, entry)"
   >
     <span v-if="entry.is_dir" class="tree-chevron">
       <MdiIcon v-if="isExpanded" :path="mdiChevronDown" :size="16" />
@@ -56,7 +96,18 @@ const indent = `${props.depth * 16}px`
     <span v-else class="tree-file-icon">
       <MdiIcon :path="getFileIcon(entry.name).icon" :size="16" :style="{ color: getFileIcon(entry.name).color }" />
     </span>
-    <span class="tree-name" :style="{ color: getStatusColor(entry) }">{{ entry.name }}</span>
+    <input
+      v-if="isRenaming"
+      ref="renameInputEl"
+      v-model="renameValue"
+      class="tree-rename-input"
+      @click.stop
+      @contextmenu.stop
+      @keydown.enter.prevent="commitRename"
+      @keydown.escape.prevent="emit('rename-cancel')"
+      @blur="commitRename"
+    />
+    <span v-else class="tree-name" :style="{ color: getStatusColor(entry) }">{{ entry.name }}</span>
   </div>
   <template v-if="entry.is_dir && isExpanded">
     <FileExplorerNode
@@ -66,8 +117,14 @@ const indent = `${props.depth * 16}px`
       :worktree-id="worktreeId"
       :worktree-path="worktreePath"
       :expanded-paths="expandedPaths"
+      :selection="selection"
+      :renaming-path="renamingPath"
       :depth="depth + 1"
-      @toggle="(path: string) => emit('toggle', path)"
+      @select="(e, c) => emit('select', e, c)"
+      @open="(c) => emit('open', c)"
+      @contextmenu="(e, c) => emit('contextmenu', e, c)"
+      @rename-commit="(p, n) => emit('rename-commit', p, n)"
+      @rename-cancel="emit('rename-cancel')"
     />
   </template>
 </template>
@@ -90,6 +147,12 @@ const indent = `${props.depth * 16}px`
 }
 .tree-item:hover {
   background: var(--color-bg-subtle);
+}
+.tree-item.selected {
+  background: var(--color-accent-subtle, rgba(51, 153, 255, 0.18));
+}
+.tree-item.selected:hover {
+  background: var(--color-accent-subtle, rgba(51, 153, 255, 0.24));
 }
 
 .tree-chevron {
@@ -117,5 +180,17 @@ const indent = `${props.depth * 16}px`
 .tree-name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tree-rename-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--color-text-primary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-accent);
+  border-radius: 3px;
+  padding: 0 4px;
+  outline: none;
 }
 </style>

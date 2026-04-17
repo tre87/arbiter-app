@@ -104,3 +104,101 @@ pub fn watch_directory(app: AppHandle, watchers: State<FileWatchers>, path: Stri
 pub fn unwatch_directory(watcher_id: String, watchers: State<FileWatchers>) {
     watchers.0.lock().unwrap().remove(&watcher_id);
 }
+
+#[tauri::command]
+pub fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        // `cmd /C start "" "path"` honours file associations without opening a
+        // visible shell window. The empty quoted string is the window title
+        // argument that `start` requires when the target is quoted.
+        Command::new("cmd")
+            .args(["/C", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open").arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {}", e))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::process::Command;
+        Command::new("xdg-open").arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        // `explorer /select,path` requires no space after the comma and
+        // exits with code 1 on success, which isn't an error for us.
+        Command::new("explorer")
+            .arg(format!("/select,{}", path))
+            .spawn()
+            .map_err(|e| format!("Failed to reveal path: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open").args(["-R", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal path: {}", e))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No cross-DE way to select a specific file on Linux; fall back to
+        // opening the parent directory.
+        use std::process::Command;
+        let parent = p.parent().ok_or_else(|| "Path has no parent".to_string())?;
+        Command::new("xdg-open").arg(parent)
+            .spawn()
+            .map_err(|e| format!("Failed to reveal path: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn rename_path(old_path: String, new_name: String) -> Result<String, String> {
+    let old = std::path::Path::new(&old_path);
+    if !old.exists() {
+        return Err(format!("Path does not exist: {}", old_path));
+    }
+    if new_name.is_empty() || new_name.contains('/') || new_name.contains('\\') {
+        return Err("Invalid name".to_string());
+    }
+    let parent = old.parent().ok_or_else(|| "Path has no parent".to_string())?;
+    let new_path = parent.join(&new_name);
+    if new_path.exists() {
+        return Err(format!("{} already exists", new_name));
+    }
+    std::fs::rename(&old, &new_path).map_err(|e| format!("Failed to rename: {}", e))?;
+    Ok(new_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn trash_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    trash::delete(p).map_err(|e| format!("Failed to move to trash: {}", e))?;
+    Ok(())
+}

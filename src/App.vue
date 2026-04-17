@@ -80,6 +80,7 @@ async function setupCloseHandler() {
 let unlistenOverviewRequest: (() => void) | null = null
 let unlistenOverviewNavigate: (() => void) | null = null
 let unlistenOverviewClosed: (() => void) | null = null
+let unlistenOverviewReorder: (() => void) | null = null
 
 onMounted(async () => {
   // Set up overview listeners before loadAndRestore, which may show the overview window
@@ -91,6 +92,10 @@ onMounted(async () => {
     store.setFocus(event.payload.paneId)
     store.triggerFocus()
     getCurrentWindow().setFocus()
+  }) as unknown as (() => void)
+  unlistenOverviewReorder = await listen<{ from: number; to: number }>('overview-reorder-workspace', (event) => {
+    store.moveWorkspace(event.payload.from, event.payload.to)
+    store.emitOverviewUpdate()
   }) as unknown as (() => void)
   unlistenOverviewClosed = await listen('overview-closed', () => {
     overviewOpen.value = false
@@ -123,6 +128,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   unlistenOverviewRequest?.()
   unlistenOverviewNavigate?.()
+  unlistenOverviewReorder?.()
   unlistenOverviewClosed?.()
 })
 </script>
@@ -135,8 +141,10 @@ onBeforeUnmount(() => {
         <span class="titlebar-title">Arbiter</span>
       </div>
       <WorkspaceTabs v-if="ready" />
-      <div class="titlebar-right">
-        <StatsBar v-if="!devStore.hideUsageBar" />
+      <div v-if="!devStore.hideUsageBar" class="titlebar-stats">
+        <StatsBar />
+      </div>
+      <div class="titlebar-actions">
         <button class="btn-icon" :class="{ 'is-active': overviewOpen }" title="Workspace overview (Ctrl+Shift+O)" @click="toggleOverviewWindow()" @contextmenu="resetOverviewWindow">
           <MdiIcon :path="mdiViewDashboardOutline" :size="16" />
         </button>
@@ -211,12 +219,12 @@ onBeforeUnmount(() => {
 .titlebar {
   height: var(--titlebar-height);
   background: transparent;
-  display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  display: flex;
   align-items: center;
   padding: 0 var(--titlebar-pad-right) 0 var(--titlebar-pad-left);
   user-select: none;
   flex-shrink: 0;
+  min-width: 0;
 }
 
 .titlebar-brand {
@@ -224,6 +232,22 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 5px;
   padding-right: 8px;
+  flex: 0 0 auto;
+}
+
+.titlebar :deep(.workspace-tabs) {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.titlebar-stats {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .titlebar-logo {
@@ -257,11 +281,12 @@ onBeforeUnmount(() => {
   to   { background-position: 100% center; }
 }
 
-.titlebar-right {
+.titlebar-actions {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 0 8px;
+  padding: 0 8px 0 0;
+  flex: 0 0 auto;
 }
 
 .workspace {

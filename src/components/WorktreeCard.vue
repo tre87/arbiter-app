@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import RobotIcon from './RobotIcon.vue'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
-import { mdiBellRing, mdiCogPlay, mdiSourceMerge, mdiClose, mdiConsole } from '@mdi/js'
+import { mdiBellRing, mdiCogPlay, mdiSourceMerge, mdiConsole } from '@mdi/js'
 import type { WorktreeClaudeStatus } from '../stores/project'
 
 const props = defineProps<{
@@ -16,19 +16,22 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   click: []
-  end: []
-  remove: []
   contextmenu: [event: MouseEvent]
 }>()
 
-function onClick() {
+function onClick(e: MouseEvent) {
+  // Paranoia: never switch on anything but a left click. Right-click must
+  // only open the context menu — it should never also activate the card.
+  if (e.button !== 0) return
   if (props.isMerged) return
   emit('click')
 }
 
 function onContextMenu(e: MouseEvent) {
-  if (props.isMain) return
+  // Main is allowed to open the menu too (for regenerate-robot); the menu
+  // itself decides which destructive actions to expose.
   e.preventDefault()
+  e.stopPropagation()
   emit('contextmenu', e)
 }
 
@@ -77,13 +80,6 @@ const tokenDisplay = computed(() => {
   return String(total)
 })
 
-const costDisplay = computed(() => {
-  const c = props.status.cost
-  if (c <= 0) return ''
-  if (c < 0.01) return '<$0.01'
-  return `$${c.toFixed(2)}`
-})
-
 const contextPercent = computed(() => Math.min(100, Math.max(0, props.status.contextPercent)))
 const progressColor = computed(() => {
   if (contextPercent.value > 80) return 'var(--color-danger)'
@@ -122,7 +118,6 @@ const progressColor = computed(() => {
             {{ statusLabel }}
           </span>
           <span v-if="!isMerged && claudeActive && tokenDisplay" class="token-count">{{ tokenDisplay }}</span>
-          <span v-if="!isMerged && claudeActive && costDisplay" class="cost-label">{{ costDisplay }}</span>
           <span class="spacer" />
           <span v-if="!isMerged && claudeActive" class="context-pct">
             {{ Math.round(contextPercent) }}%<span class="context-max">/{{ contextMaxLabel }}</span>
@@ -133,17 +128,6 @@ const progressColor = computed(() => {
         </div>
       </div>
     </div>
-    <button
-      v-if="isMerged"
-      class="end-btn merged-remove"
-      title="Remove merged worktree"
-      @click.stop="emit('remove')"
-    >
-      <MdiIcon :path="mdiClose" :size="14" />
-    </button>
-    <button v-else-if="!isMain" class="end-btn" title="End worktree session" @click.stop="emit('end')">
-      &times;
-    </button>
   </div>
 </template>
 
@@ -297,39 +281,6 @@ const progressColor = computed(() => {
 .token-count {
   font-size: 11px;
   color: var(--color-text-muted);
-}
-.cost-label {
-  font-size: 11px;
-  color: #4ec9b0;
-  font-weight: 600;
-}
-
-.end-btn {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  background: none;
-  border: none;
-  color: var(--color-text-muted);
-  font-size: 14px;
-  cursor: pointer;
-  padding: 0 4px;
-  line-height: 1;
-  opacity: 0;
-  transition: opacity 0.1s;
-}
-.worktree-card:hover .end-btn {
-  opacity: 1;
-}
-.end-btn:hover {
-  color: var(--color-danger);
-}
-.end-btn.merged-remove {
-  opacity: 1;
-  color: var(--color-text-muted);
-}
-.end-btn.merged-remove:hover {
-  color: var(--color-danger);
 }
 
 @keyframes spin {

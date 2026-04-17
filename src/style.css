@@ -18,6 +18,14 @@ html, body, #app {
   background: var(--color-bg);
   color: var(--color-text-primary);
   font-family: system-ui, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Text selection stays enabled inside terminals and any editable field. */
+.xterm, .xterm *, input, textarea, [contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 ::-webkit-scrollbar {

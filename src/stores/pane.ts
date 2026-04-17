@@ -212,6 +212,7 @@ export const usePaneStore = defineStore('pane', () => {
   function emitOverviewUpdate() {
     const terminals = getAllTerminals().map(t => ({
       paneId: t.paneId,
+      workspaceId: t.workspaceId,
       workspaceIndex: t.workspaceIndex,
       workspaceName: t.workspaceName,
       workspaceType: t.workspaceType,
@@ -225,13 +226,13 @@ export const usePaneStore = defineStore('pane', () => {
     return terminalStatuses.value[paneId] ?? 'idle'
   }
 
-  function getAllTerminals(): Array<{ paneId: string; workspaceIndex: number; workspaceName: string; workspaceType: 'terminal' | 'project' }> {
-    const result: Array<{ paneId: string; workspaceIndex: number; workspaceName: string; workspaceType: 'terminal' | 'project' }> = []
+  function getAllTerminals(): Array<{ paneId: string; workspaceId: string; workspaceIndex: number; workspaceName: string; workspaceType: 'terminal' | 'project' }> {
+    const result: Array<{ paneId: string; workspaceId: string; workspaceIndex: number; workspaceName: string; workspaceType: 'terminal' | 'project' }> = []
     for (let i = 0; i < workspaces.value.length; i++) {
       const ws = workspaces.value[i]
       function collect(node: PaneNode) {
         if (node.type === 'terminal') {
-          result.push({ paneId: node.id, workspaceIndex: i, workspaceName: ws.name, workspaceType: ws.type })
+          result.push({ paneId: node.id, workspaceId: ws.id, workspaceIndex: i, workspaceName: ws.name, workspaceType: ws.type })
         } else {
           collect(node.first)
           collect(node.second)

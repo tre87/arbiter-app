@@ -345,12 +345,13 @@ function onPointerDown(e: PointerEvent, index: number) {
   max-width: 240px;
   flex-shrink: 1;
   cursor: pointer;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   font-size: 12px;
-  line-height: 1;
+  line-height: 1.2;
   font-weight: 400;
   white-space: nowrap;
-  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: var(--radius-md);
   transition: color 0.12s, background 0.12s, border-color 0.12s;
   position: relative;
@@ -359,9 +360,9 @@ function onPointerDown(e: PointerEvent, index: number) {
 }
 
 .tab:hover {
-  color: var(--color-text-secondary);
-  background: var(--color-bg-elevated);
-  border-color: var(--color-card-border);
+  color: var(--color-text-primary);
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.12);
 }
 
 .tab.active {
