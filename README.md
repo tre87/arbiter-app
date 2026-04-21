@@ -6,6 +6,8 @@ Arbiter lets you split your workspace into as many terminal panes as you need, e
 
 The name comes from the idea of a single commanding authority overseeing multiple agents beneath it. You are the arbiter.
 
+This project is still a work in progress.
+
 ## Stack
 
 - [Tauri](https://tauri.app) — native shell
