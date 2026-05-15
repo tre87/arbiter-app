@@ -69,18 +69,20 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
       <div class="dialog-content">
         <!-- General -->
         <div v-if="activeTab === 'general'" class="tab-panel">
-          <h4 class="panel-title">Saved Data</h4>
-          <div class="panel-body">
-            <div class="btn-row">
-              <button class="btn btn-secondary" @click="clearSaved('sessions')">Clear saved sessions</button>
-              <button class="btn btn-secondary" @click="clearSaved('paths')">Clear saved paths</button>
-              <button class="btn btn-secondary" @click="clearSaved('layout')">Clear saved layout</button>
-              <button class="btn btn-danger" @click="clearSaved('all')">Clear all saved data</button>
+          <div class="panel-section">
+            <h4 class="panel-title">Saved Data</h4>
+            <div class="panel-body">
+              <div class="btn-row">
+                <button class="btn btn-secondary" @click="clearSaved('sessions')">Clear saved sessions</button>
+                <button class="btn btn-secondary" @click="clearSaved('paths')">Clear saved paths</button>
+                <button class="btn btn-secondary" @click="clearSaved('layout')">Clear saved layout</button>
+                <button class="btn btn-danger" @click="clearSaved('all')">Clear all saved data</button>
+              </div>
             </div>
           </div>
 
-          <template v-if="isWindows && gitBashAvailable">
-            <h4 class="panel-title" style="margin-top: 20px;">Shell</h4>
+          <div v-if="isWindows && gitBashAvailable" class="panel-section">
+            <h4 class="panel-title">Shell</h4>
             <div class="panel-body">
               <label class="toggle-row">
                 <span class="toggle-label">Default shell for new terminals</span>
@@ -90,61 +92,85 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                 </select>
               </label>
             </div>
-          </template>
+          </div>
 
-          <h4 class="panel-title" style="margin-top: 20px;">Developer</h4>
-          <div class="panel-body">
-            <label class="toggle-row">
-              <span class="toggle-label">Force peak hours indicator</span>
-              <input type="checkbox" v-model="devStore.forcePeakHours" class="toggle-input" />
-            </label>
+          <div class="panel-section">
+            <h4 class="panel-title">Developer</h4>
+            <div class="panel-body">
+              <label class="toggle-row">
+                <span class="toggle-label">Force peak hours indicator</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.forcePeakHours" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
+            </div>
           </div>
         </div>
 
         <!-- Claude Usage -->
         <div v-if="activeTab === 'usage'" class="tab-panel">
-          <h4 class="panel-title">Account</h4>
-          <div class="panel-body">
-            <template v-if="usageStore.data">
-              <div class="account-info">
-                <span class="account-detail" v-if="usageStore.data.account_name">{{ usageStore.data.account_name }}</span>
-                <span class="account-detail muted" v-if="usageStore.data.account_email">{{ usageStore.data.account_email }}</span>
-                <span class="account-detail" v-if="!usageStore.data.account_name && !usageStore.data.account_email">Signed in ({{ usageStore.data.plan }})</span>
-                <span class="account-detail muted" v-if="usageStore.data.org_name">Organization: {{ usageStore.data.org_name }}</span>
-              </div>
-              <div class="btn-row" style="margin-top: 4px;">
-                <button v-if="usageStore.data.has_multiple_orgs" class="btn btn-secondary" @click="usageStore.openOrgPicker()">Switch organization</button>
-                <button class="btn btn-danger" @click="usageStore.logout()">Sign out</button>
-              </div>
-            </template>
-            <template v-else-if="usageStore.needsLogin">
-              <span class="account-detail muted" style="padding: 7px 0;">Not signed in</span>
-              <div class="btn-row" style="margin-top: 4px;">
-                <button class="btn btn-secondary" @click="usageStore.openLogin()">Sign in</button>
-              </div>
-            </template>
-            <template v-else>
-              <span class="account-detail muted" style="padding: 7px 0;">Loading...</span>
-            </template>
+          <div class="panel-section">
+            <h4 class="panel-title">Account</h4>
+            <div class="panel-body">
+              <template v-if="usageStore.data">
+                <div class="account-info">
+                  <span v-if="usageStore.data.account_name" class="account-name">{{ usageStore.data.account_name }}</span>
+                  <span v-if="usageStore.data.account_email" class="account-email">{{ usageStore.data.account_email }}</span>
+                  <span v-if="!usageStore.data.account_name && !usageStore.data.account_email" class="account-name">Signed in</span>
+                  <div v-if="usageStore.data.plan" class="account-meta-row">
+                    <span class="meta-label">Plan</span>
+                    <span class="meta-value">{{ usageStore.data.plan }}</span>
+                  </div>
+                  <div v-if="usageStore.data.org_name" class="account-meta-row">
+                    <span class="meta-label">Organization</span>
+                    <span class="meta-value">{{ usageStore.data.org_name }}</span>
+                  </div>
+                </div>
+                <div class="btn-row">
+                  <button v-if="usageStore.data.has_multiple_orgs" class="btn btn-secondary" @click="usageStore.openOrgPicker()">Switch organization</button>
+                  <button class="btn btn-danger" @click="usageStore.logout()">Sign out</button>
+                </div>
+              </template>
+              <template v-else-if="usageStore.needsLogin">
+                <span class="account-empty">Not signed in</span>
+                <div class="btn-row">
+                  <button class="btn btn-secondary" @click="usageStore.openLogin()">Sign in</button>
+                </div>
+              </template>
+              <template v-else>
+                <span class="account-empty">Loading...</span>
+              </template>
+            </div>
           </div>
 
-          <h4 class="panel-title" style="margin-top: 20px;">Display</h4>
-          <div class="panel-body">
-            <label class="toggle-row">
-              <span class="toggle-label">Hide usage bar</span>
-              <input type="checkbox" v-model="devStore.hideUsageBar" class="toggle-input" />
-            </label>
+          <div class="panel-section">
+            <h4 class="panel-title">Display</h4>
+            <div class="panel-body">
+              <label class="toggle-row">
+                <span class="toggle-label">Hide usage bar</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.hideUsageBar" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
+            </div>
           </div>
         </div>
 
         <!-- Display -->
         <div v-if="activeTab === 'display'" class="tab-panel">
-          <h4 class="panel-title">Display</h4>
-          <div class="panel-body">
-            <label class="toggle-row">
-              <span class="toggle-label">Always show footer bar</span>
-              <input type="checkbox" v-model="devStore.alwaysShowFooter" class="toggle-input" />
-            </label>
+          <div class="panel-section">
+            <h4 class="panel-title">Display</h4>
+            <div class="panel-body">
+              <label class="toggle-row">
+                <span class="toggle-label">Always show footer bar</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.alwaysShowFooter" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
+            </div>
           </div>
         </div>
 
@@ -172,29 +198,31 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   border: 1px solid var(--color-card-border);
   border-radius: 8px;
   display: flex;
-  width: 560px;
-  height: 380px;
+  width: 640px;
+  height: 440px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   overflow: hidden;
 }
 
 .dialog-sidebar {
-  width: 160px;
+  width: 184px;
   flex-shrink: 0;
   background: var(--color-bg);
   border-right: 1px solid var(--color-card-border);
-  padding: 20px 12px;
+  padding: 24px 14px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
 .dialog-title {
-  margin: 0 0 16px;
-  padding: 0 8px;
-  font-size: 14px;
+  margin: 0 0 18px;
+  padding: 0 10px;
+  font-size: 11px;
   font-weight: 600;
-  color: var(--color-text-primary);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
 }
 
 .tab-nav {
@@ -206,16 +234,17 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 .tab-btn {
   display: block;
   width: 100%;
-  padding: 7px 8px;
+  padding: 9px 12px;
   background: none;
   border: none;
+  border-left: 3px solid transparent;
   color: var(--color-text-secondary);
-  font-size: 12px;
+  font-size: 13px;
   font-family: inherit;
   text-align: left;
   cursor: pointer;
-  border-radius: 4px;
-  transition: background 0.1s, color 0.1s;
+  border-radius: var(--radius-sm);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
 
 .tab-btn:hover {
@@ -227,42 +256,53 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   background: var(--color-bg-subtle);
   color: var(--color-text-primary);
   font-weight: 500;
+  border-left-color: var(--color-accent);
 }
 
 .dialog-content {
   flex: 1;
-  padding: 20px 24px;
+  padding: 24px 28px;
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 
 .tab-panel {
   flex: 1;
+  overflow-y: auto;
+}
+
+.panel-section + .panel-section {
+  margin-top: 22px;
 }
 
 .panel-title {
-  margin: 0 0 12px;
-  font-size: 13px;
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-card-border);
+  font-size: 11px;
   font-weight: 600;
-  color: var(--color-text-primary);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
 }
 
 .panel-body {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
 }
 
 .btn-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
 }
 
 .btn {
-  padding: 6px 14px;
-  border-radius: 4px;
-  font-size: 12px;
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
   font-weight: 500;
   font-family: inherit;
   cursor: pointer;
@@ -278,7 +318,7 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 .btn-secondary:hover {
   background: var(--color-bg);
   color: var(--color-text-primary);
-  border-color: var(--color-text-muted);
+  border-color: var(--color-card-border-hover);
 }
 
 .btn-danger {
@@ -305,30 +345,55 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 }
 
 .account-info {
-  padding: 7px 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
+  padding: 4px 0 8px;
 }
 
-.account-detail {
-  font-size: 12px;
+.account-name {
+  font-size: 13px;
+  font-weight: 500;
   color: var(--color-text-primary);
 }
 
-.account-detail.muted {
+.account-email {
+  font-size: 12px;
   color: var(--color-text-muted);
-  font-size: 11px;
+}
+
+.account-meta-row {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.meta-label {
+  color: var(--color-text-muted);
+  min-width: 92px;
+}
+
+.meta-value {
+  color: var(--color-text-secondary);
+}
+
+.account-empty {
+  font-size: 13px;
+  color: var(--color-text-muted);
+  padding: 4px 0;
 }
 
 .toggle-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 7px 10px;
-  border-radius: 4px;
+  gap: 12px;
+  padding: 10px 12px;
+  min-height: 36px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
-  transition: background 0.1s;
+  transition: background 0.12s;
 }
 
 .toggle-row:hover {
@@ -336,35 +401,102 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 }
 
 .toggle-label {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--color-text-secondary);
 }
 
-.toggle-input {
-  accent-color: var(--color-accent);
-  cursor: pointer;
+/* iOS-style toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
 }
 
+.switch input[type="checkbox"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.switch-track {
+  position: absolute;
+  inset: 0;
+  background: var(--color-card-border);
+  border-radius: 999px;
+  transition: background 0.18s, box-shadow 0.12s;
+}
+
+.switch-track::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  transition: transform 0.18s;
+}
+
+.switch input[type="checkbox"]:checked + .switch-track {
+  background: var(--color-accent);
+}
+
+.switch input[type="checkbox"]:checked + .switch-track::after {
+  transform: translateX(16px);
+}
+
+.switch input[type="checkbox"]:focus-visible + .switch-track {
+  box-shadow: 0 0 0 2px rgba(51, 153, 255, 0.35);
+}
+
+/* Custom select with chevron */
 .shell-select {
-  background: var(--color-bg);
+  background-color: var(--color-bg);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a0aab8' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
   border: 1px solid var(--color-card-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: var(--color-text-primary);
-  font-size: 12px;
+  font-size: 13px;
   font-family: inherit;
-  padding: 4px 8px;
+  padding: 7px 30px 7px 12px;
+  min-width: 140px;
   cursor: pointer;
   outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.shell-select:hover {
+  border-color: var(--color-card-border-hover);
 }
 
 .shell-select:focus {
   border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px rgba(51, 153, 255, 0.25);
+}
+
+.shell-select option {
+  background: var(--color-bg-elevated);
+  color: var(--color-text-primary);
 }
 
 .dialog-actions {
   display: flex;
   justify-content: flex-end;
   margin-top: auto;
-  padding-top: 16px;
+  padding-top: 18px;
+  border-top: 1px solid var(--color-card-border);
 }
 </style>
