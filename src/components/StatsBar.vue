@@ -112,6 +112,12 @@ onBeforeUnmount(() => {
     <button class="stats-btn accent" @click="store.openLogin()">Sign in</button>
   </template>
 
+  <!-- Multi-org account with no saved selection -->
+  <template v-else-if="store.needsOrgSelection">
+    <span class="muted-label">Choose organization</span>
+    <button class="stats-btn accent" @click="store.openOrgPicker()">Select</button>
+  </template>
+
   <!-- Stats -->
   <template v-else-if="store.data">
     <span class="plan-badge">{{ store.data.plan }}</span>

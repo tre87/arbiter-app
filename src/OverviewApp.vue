@@ -2,7 +2,7 @@
 import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import PulseLoader from './components/PulseLoader.vue'
+import HexPulse from './components/HexPulse.vue'
 import MdiIcon from './components/MdiIcon.vue'
 import { mdiConsole, mdiFolder, mdiChevronRight, mdiChevronDown } from '@mdi/js'
 
@@ -198,7 +198,7 @@ onBeforeUnmount(() => {
               <span v-else-if="t.status === 'running'" class="status-dot running" />
               <span v-else-if="t.status === 'ready'" class="status-dot ready" />
               <span v-else-if="t.status === 'attention'" class="status-dot attention" />
-              <PulseLoader v-else size="3px" gap="3px" />
+              <HexPulse v-else-if="t.status === 'working'" :size="12" />
             </span>
           </div>
         </div>

@@ -3,7 +3,8 @@ import { computed } from 'vue'
 import RobotIcon from './RobotIcon.vue'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
-import { mdiBellRing, mdiCogPlay, mdiSourceMerge, mdiConsole } from '@mdi/js'
+import HexPulse from './HexPulse.vue'
+import { mdiBellRing, mdiSourceMerge, mdiConsole } from '@mdi/js'
 import type { WorktreeClaudeStatus } from '../stores/project'
 
 const props = defineProps<{
@@ -111,7 +112,7 @@ const progressColor = computed(() => {
             Merged
           </span>
           <span v-else class="status-badge" :class="statusClass">
-            <MdiIcon v-if="status.status === 'working'" :path="mdiCogPlay" :size="12" class="icon-spin" />
+            <HexPulse v-if="status.status === 'working'" :size="12" />
             <MdiIcon v-else-if="status.status === 'attention'" :path="mdiBellRing" :size="12" class="icon-ring" />
             <ClaudeIcon v-else-if="status.status === 'ready'" :size="12" />
             <MdiIcon v-else :path="mdiConsole" :size="12" />
@@ -252,10 +253,6 @@ const progressColor = computed(() => {
 .status-exited    { color: var(--color-text-muted); opacity: 0.7; }
 .status-merged    { color: #a371f7; }
 
-.icon-spin {
-  animation: spin 1.6s linear infinite;
-  transform-origin: center;
-}
 .icon-ring {
   animation: ring 1.2s ease-in-out infinite;
   transform-origin: top center;
@@ -283,7 +280,4 @@ const progressColor = computed(() => {
   color: var(--color-text-muted);
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
 </style>

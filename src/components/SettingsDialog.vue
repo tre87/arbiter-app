@@ -110,8 +110,10 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                 <span class="account-detail" v-if="usageStore.data.account_name">{{ usageStore.data.account_name }}</span>
                 <span class="account-detail muted" v-if="usageStore.data.account_email">{{ usageStore.data.account_email }}</span>
                 <span class="account-detail" v-if="!usageStore.data.account_name && !usageStore.data.account_email">Signed in ({{ usageStore.data.plan }})</span>
+                <span class="account-detail muted" v-if="usageStore.data.org_name">Organization: {{ usageStore.data.org_name }}</span>
               </div>
               <div class="btn-row" style="margin-top: 4px;">
+                <button v-if="usageStore.data.has_multiple_orgs" class="btn btn-secondary" @click="usageStore.openOrgPicker()">Switch organization</button>
                 <button class="btn btn-danger" @click="usageStore.logout()">Sign out</button>
               </div>
             </template>

@@ -8,6 +8,11 @@ export interface UsagePeriod {
   resets_at: string | null
 }
 
+export interface OrgInfo {
+  uuid: string
+  name: string
+}
+
 export interface UsageData {
   five_hour: UsagePeriod | null
   seven_day: UsagePeriod | null
@@ -16,6 +21,8 @@ export interface UsageData {
   plan: string
   account_email: string | null
   account_name: string | null
+  org_name: string | null
+  has_multiple_orgs: boolean
 }
 
 export const useUsageStore = defineStore('usage', () => {
@@ -23,6 +30,9 @@ export const useUsageStore = defineStore('usage', () => {
   const loading = ref(false)
   const pending = ref(true)   // true until first WebView response arrives
   const needsLogin = ref(false)
+  const needsOrgSelection = ref(false)
+  const pickerOpen = ref(false)
+  const availableOrgs = ref<OrgInfo[]>([])
   const error = ref<string | null>(null)
 
   let unlisten: (() => void) | null = null
@@ -34,11 +44,19 @@ export const useUsageStore = defineStore('usage', () => {
       data.value = await invoke<UsageData>('get_usage')
       pending.value = false
       needsLogin.value = false
+      needsOrgSelection.value = false
     } catch (e: unknown) {
       const msg = String(e)
       if (msg.includes('needs_login')) {
         pending.value = false
         needsLogin.value = true
+        needsOrgSelection.value = false
+      } else if (msg.includes('needs_org_selection')) {
+        pending.value = false
+        needsLogin.value = false
+        needsOrgSelection.value = true
+        // Pull the list so the dialog can render immediately
+        try { availableOrgs.value = await invoke<OrgInfo[]>('get_available_orgs') } catch { /* ignore */ }
       } else if (msg.includes('pending')) {
         // WebView still loading — stay in pending state, keep polling
       } else if (!data.value) {
@@ -57,6 +75,27 @@ export const useUsageStore = defineStore('usage', () => {
     await invoke('logout_usage')
     data.value = null
     needsLogin.value = true
+    needsOrgSelection.value = false
+    availableOrgs.value = []
+  }
+
+  async function openOrgPicker() {
+    // Manual open from Settings — load the list of orgs the script saw last
+    try { availableOrgs.value = await invoke<OrgInfo[]>('get_available_orgs') } catch { /* ignore */ }
+    pickerOpen.value = true
+  }
+
+  function closeOrgPicker() {
+    pickerOpen.value = false
+  }
+
+  async function setSelectedOrg(org: OrgInfo) {
+    await invoke('set_selected_org', { org })
+    pickerOpen.value = false
+    needsOrgSelection.value = false
+    // Show the spinner until the WebView's refetch lands and emits usage-updated
+    pending.value = true
+    data.value = null
   }
 
   // Event-driven only. The backend's injected WebView script calls `report_usage`
@@ -84,9 +123,13 @@ export const useUsageStore = defineStore('usage', () => {
 
   const primaryReset = computed(() => formatReset(data.value?.five_hour ?? null))
 
+  // Dialog is visible whenever we are forced into selection OR the user opened it manually
+  const orgPickerVisible = computed(() => needsOrgSelection.value || pickerOpen.value)
+
   return {
-    data, loading, pending, needsLogin, error,
+    data, loading, pending, needsLogin, needsOrgSelection, availableOrgs, pickerOpen, orgPickerVisible, error,
     fetch, openLogin, logout, startPolling, stopPolling,
+    openOrgPicker, closeOrgPicker, setSelectedOrg,
     formatReset, primaryReset,
   }
 })

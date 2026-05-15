@@ -6,12 +6,13 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { usePaneStore } from './stores/pane'
 import { useProjectStore } from './stores/project'
 import { useDevSettingsStore } from './stores/devSettings'
+import { useUsageStore } from './stores/usage'
 import SplitView from './components/SplitView.vue'
 import ProjectWorkspaceView from './components/ProjectWorkspaceView.vue'
 import StatsBar from './components/StatsBar.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import MdiIcon from './components/MdiIcon.vue'
-import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline, mdiBugOutline } from '@mdi/js'
+import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline, mdiBugOutline, mdiLoading, mdiWrenchOutline } from '@mdi/js'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import WindowControls from './components/WindowControls.vue'
 import logoUrl from './assets/logo.svg'
@@ -24,21 +25,28 @@ import { useTitlebarDrag, useWindowChrome } from './composables/useWindowChrome'
 // so they don't belong in the initial bundle.
 const ShortcutsDialog = defineAsyncComponent(() => import('./components/ShortcutsDialog.vue'))
 const SettingsDialog = defineAsyncComponent(() => import('./components/SettingsDialog.vue'))
+const LoaderShowcaseDialog = defineAsyncComponent(() => import('./components/LoaderShowcaseDialog.vue'))
+const OrgSelectionDialog = defineAsyncComponent(() => import('./components/OrgSelectionDialog.vue'))
 
 const store = usePaneStore()
 const devStore = useDevSettingsStore()
+const usageStore = useUsageStore()
 const ready = ref(false)
 const overviewOpen = ref(false)
 const settingsOpen = ref(false)
 const shortcutsOpen = ref(false)
+const loaderShowcaseOpen = ref(false)
+const devMenuOpen = ref(false)
+const devMenuEl = ref<HTMLDivElement>()
+const isDev = import.meta.env.DEV
+
+function onDevMenuClickOutside(e: MouseEvent) {
+  if (devMenuEl.value && !devMenuEl.value.contains(e.target as Node)) {
+    devMenuOpen.value = false
+  }
+}
 
 const isMac = typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac')
-const isWindows = typeof navigator !== 'undefined' && navigator.platform.startsWith('Win')
-if (typeof document !== 'undefined') {
-  if (isMac) document.body.classList.add('is-macos')
-  else if (isWindows) document.body.classList.add('is-windows')
-  else document.body.classList.add('is-linux')
-}
 
 const { flush: flushAutosave } = useAutosave(ready, overviewOpen)
 
@@ -83,6 +91,7 @@ let unlistenOverviewClosed: (() => void) | null = null
 let unlistenOverviewReorder: (() => void) | null = null
 
 onMounted(async () => {
+  if (isDev) document.addEventListener('mousedown', onDevMenuClickOutside)
   // Set up overview listeners before loadAndRestore, which may show the overview window
   unlistenOverviewRequest = await listen('overview-request-update', () => {
     store.emitOverviewUpdate()
@@ -126,6 +135,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (isDev) document.removeEventListener('mousedown', onDevMenuClickOutside)
   unlistenOverviewRequest?.()
   unlistenOverviewNavigate?.()
   unlistenOverviewReorder?.()
@@ -141,6 +151,7 @@ onBeforeUnmount(() => {
         <span class="titlebar-title">Arbiter</span>
       </div>
       <WorkspaceTabs v-if="ready" />
+      <div v-else class="titlebar-tabs-placeholder" />
       <div v-if="!devStore.hideUsageBar" class="titlebar-stats">
         <StatsBar />
       </div>
@@ -151,9 +162,21 @@ onBeforeUnmount(() => {
         <button class="btn-icon" title="Keyboard shortcuts" @click="shortcutsOpen = true">
           <MdiIcon :path="mdiKeyboardOutline" :size="16" />
         </button>
-        <button class="btn-icon" title="DevTools" @click="invoke('open_devtools')">
-          <MdiIcon :path="mdiBugOutline" :size="16" />
-        </button>
+        <div v-if="isDev" ref="devMenuEl" class="dev-menu-wrap">
+          <button class="btn-icon" :class="{ 'is-active': devMenuOpen }" title="Dev" @click="devMenuOpen = !devMenuOpen">
+            <MdiIcon :path="mdiWrenchOutline" :size="16" />
+          </button>
+          <div v-if="devMenuOpen" class="dev-menu">
+            <button class="dev-menu-item" @click="devMenuOpen = false; loaderShowcaseOpen = true">
+              <MdiIcon :path="mdiLoading" :size="14" />
+              <span>Loader showcase</span>
+            </button>
+            <button class="dev-menu-item" @click="devMenuOpen = false; invoke('open_devtools')">
+              <MdiIcon :path="mdiBugOutline" :size="14" />
+              <span>DevTools</span>
+            </button>
+          </div>
+        </div>
         <button class="btn-icon" title="Settings" @click="settingsOpen = true">
           <MdiIcon :path="mdiCogOutline" :size="16" />
         </button>
@@ -181,6 +204,8 @@ onBeforeUnmount(() => {
 
     <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
     <SettingsDialog v-if="settingsOpen" @close="settingsOpen = false" />
+    <LoaderShowcaseDialog v-if="loaderShowcaseOpen" @close="loaderShowcaseOpen = false" />
+    <OrgSelectionDialog v-if="usageStore.orgPickerVisible" />
 
     <ConfirmDialog />
   </div>
@@ -225,6 +250,7 @@ onBeforeUnmount(() => {
   user-select: none;
   flex-shrink: 0;
   min-width: 0;
+  z-index: 2;
 }
 
 .titlebar-brand {
@@ -235,7 +261,8 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
 }
 
-.titlebar :deep(.workspace-tabs) {
+.titlebar :deep(.workspace-tabs),
+.titlebar-tabs-placeholder {
   flex: 1 1 0;
   min-width: 0;
 }
@@ -287,6 +314,44 @@ onBeforeUnmount(() => {
   gap: 4px;
   padding: 0 8px 0 0;
   flex: 0 0 auto;
+}
+
+.dev-menu-wrap {
+  position: relative;
+}
+
+.dev-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-card-border);
+  border-radius: 5px;
+  padding: 4px 0;
+  min-width: 160px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.dev-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  background: none;
+  border: none;
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s;
+  text-align: left;
+}
+
+.dev-menu-item:hover {
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .workspace {
