@@ -54,6 +54,6 @@
 }
 
 body.is-macos {
-  --titlebar-pad-left:  78px;
+  --titlebar-pad-left:  96px;
   --titlebar-pad-right: 8px;
 }

@@ -37,6 +37,7 @@ fn open_devtools(webview_window: tauri::WebviewWindow) {
 fn open_devtools(_webview_window: tauri::WebviewWindow) {}
 
 #[tauri::command]
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn focus_webview(webview_window: tauri::WebviewWindow) {
     #[cfg(windows)]
     {
