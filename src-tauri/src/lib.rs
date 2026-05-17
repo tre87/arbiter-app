@@ -19,6 +19,14 @@ use crate::overview::OVERVIEW_WINDOW_LABEL;
 
 #[tauri::command]
 fn exit_app(app: AppHandle) {
+    // Destroy every webview window before `app.exit` to avoid a Chromium
+    // `Failed to unregister class Chrome_WidgetWin_0` error on Windows.
+    // `destroy()` bypasses CloseRequested handlers (e.g. the overview window
+    // hides itself on close, which would otherwise keep it alive past exit).
+    // https://github.com/tauri-apps/tauri/issues/7606
+    for (_, window) in app.webview_windows() {
+        let _ = window.destroy();
+    }
     app.exit(0);
 }
 

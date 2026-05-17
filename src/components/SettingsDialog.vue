@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { getVersion } from '@tauri-apps/api/app'
 import { useDevSettingsStore } from '../stores/devSettings'
 import { useUsageStore } from '../stores/usage'
 
@@ -10,6 +11,7 @@ const usageStore = useUsageStore()
 
 const isWindows = navigator.platform.startsWith('Win')
 const gitBashAvailable = ref(false)
+const appVersion = ref('')
 
 type Tab = 'general' | 'usage' | 'display'
 const activeTab = ref<Tab>('general')
@@ -25,6 +27,9 @@ onMounted(async () => {
     const path = await invoke<string | null>('check_git_bash')
     gitBashAvailable.value = !!path
   }
+  try {
+    appVersion.value = await getVersion()
+  } catch { /* ignore */ }
 })
 
 async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
@@ -64,6 +69,7 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
             {{ tab.label }}
           </button>
         </nav>
+        <div v-if="appVersion" class="sidebar-version">v{{ appVersion }}</div>
       </div>
 
       <div class="dialog-content">
@@ -257,6 +263,14 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   color: var(--color-text-primary);
   font-weight: 500;
   border-left-color: var(--color-accent);
+}
+
+.sidebar-version {
+  margin-top: auto;
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  letter-spacing: 0.04em;
 }
 
 .dialog-content {
