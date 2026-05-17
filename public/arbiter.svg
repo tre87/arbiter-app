@@ -1,27 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" role="img" aria-label="Zyre gradient mark">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" role="img" aria-label="Arbiter mark">
   <defs>
-    <style>
-      :root {
-        --zyre-philippine-blue: #0039A9;
-        --zyre-azure-traditional: #027DFF;
-        --zyre-brilliant-azure: #3399FF;
-        --zyre-baby-blue: #88D1F1;
-        --zyre-tropical-blue: #41AADE;
-        --zyre-deep-aqua-blue: #1392D3;
-      }
-    </style>
-
-    <linearGradient id="zyre-left-gradient" x1="91" y1="641" x2="468" y2="96" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="var(--zyre-baby-blue, #88D1F1)"/>
-      <stop offset="0.18" stop-color="var(--zyre-tropical-blue, #41AADE)"/>
-      <stop offset="0.55" stop-color="var(--zyre-brilliant-azure, #3399FF)"/>
-      <stop offset="1" stop-color="var(--zyre-baby-blue, #88D1F1)"/>
+    <linearGradient id="left-gradient" x1="91" y1="641" x2="468" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#88D1F1"/>
+      <stop offset="0.18" stop-color="#41AADE"/>
+      <stop offset="0.55" stop-color="#3399FF"/>
+      <stop offset="1" stop-color="#88D1F1"/>
     </linearGradient>
 
-    <linearGradient id="zyre-right-gradient" x1="421" y1="378" x2="704" y2="640" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="var(--zyre-azure-traditional, #027DFF)"/>
-      <stop offset="0.38" stop-color="var(--zyre-deep-aqua-blue, #1392D3)"/>
-      <stop offset="1" stop-color="var(--zyre-philippine-blue, #0039A9)"/>
+    <linearGradient id="right-gradient" x1="421" y1="378" x2="704" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#027DFF"/>
+      <stop offset="0.38" stop-color="#1392D3"/>
+      <stop offset="1" stop-color="#0039A9"/>
     </linearGradient>
   </defs>
 
@@ -36,7 +25,7 @@
        C471.2 216.2 471.1 207.7 467.1 200.8
        L416.9 107.4
        C414.3 102.5 410.4 98.3 405.9 96.4 Z"
-    fill="url(#zyre-left-gradient)"/>
+    fill="url(#left-gradient)"/>
 
   <path
     d="M493.2 252.1
@@ -48,5 +37,5 @@
        C703.5 641.8 710.7 624.9 702.5 612.0
        L501.8 252.4
        C499.9 249.0 495.1 248.7 493.2 252.1 Z"
-    fill="url(#zyre-right-gradient)"/>
+    fill="url(#right-gradient)"/>
 </svg>
