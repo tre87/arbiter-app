@@ -78,14 +78,13 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
-            // We save position/size ourselves in arbiter.json; the plugin only
-            // tracks maximized/fullscreen so it doesn't fight our custom restore
-            // (which runs after the decoration flip on Windows).
+            // Size/position and maximize state are handled in arbiter.json and
+            // applied from our setup() before show() — owning maximize ourselves
+            // avoids the launch blink that the plugin's async restore causes.
+            // The plugin still handles fullscreen, which is rare and harder to
+            // apply synchronously cross-platform.
             tauri_plugin_window_state::Builder::new()
-                .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::MAXIMIZED
-                        | tauri_plugin_window_state::StateFlags::FULLSCREEN,
-                )
+                .with_state_flags(tauri_plugin_window_state::StateFlags::FULLSCREEN)
                 .with_denylist(&[AUTH_WINDOW_LABEL, OVERVIEW_WINDOW_LABEL])
                 .build(),
         )
@@ -137,26 +136,42 @@ pub fn run() {
                 #[cfg(not(target_os = "macos"))]
                 { let _ = w.set_decorations(false); }
 
-                // Apply saved size/position BEFORE show() so the user doesn't
-                // see the window flash at default geometry and then snap.
+                // First launch (no config) → windowed at the default 1200x800
+                // from tauri.conf.json. Otherwise apply saved geometry, or
+                // maximize when the user last quit while maximized.
+                let mut should_maximize = false;
                 if let Ok(Some(cfg)) = config::load_config(app.handle().clone()) {
                     if let Some(win_cfg) = cfg.get("window") {
-                        let width = win_cfg.get("width").and_then(|v| v.as_f64());
-                        let height = win_cfg.get("height").and_then(|v| v.as_f64());
-                        let x = win_cfg.get("x").and_then(|v| v.as_f64());
-                        let y = win_cfg.get("y").and_then(|v| v.as_f64());
-                        if let (Some(width), Some(height), Some(x), Some(y)) = (width, height, x, y) {
-                            if width > 200.0 && height > 200.0
-                                && x > -10000.0 && y > -10000.0
-                                && x < 10000.0 && y < 10000.0
-                            {
-                                let _ = w.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
-                                let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+                        should_maximize = win_cfg.get("maximized")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+
+                        if !should_maximize {
+                            let width = win_cfg.get("width").and_then(|v| v.as_f64());
+                            let height = win_cfg.get("height").and_then(|v| v.as_f64());
+                            let x = win_cfg.get("x").and_then(|v| v.as_f64());
+                            let y = win_cfg.get("y").and_then(|v| v.as_f64());
+                            if let (Some(width), Some(height), Some(x), Some(y)) = (width, height, x, y) {
+                                if width > 200.0 && height > 200.0
+                                    && x > -10000.0 && y > -10000.0
+                                    && x < 10000.0 && y < 10000.0
+                                {
+                                    let _ = w.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
+                                    let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+                                }
                             }
                         }
                     }
                 }
 
+                // On Windows, w.maximize() is ShowWindow(SW_MAXIMIZE) — it
+                // makes the hidden window visible at the maximized size in
+                // one atomic OS call, so there's no windowed-then-maximized
+                // size transition. The webview's pre-Vue paint is hidden by
+                // the matching dark backgroundColor (tauri.conf.json).
+                if should_maximize {
+                    let _ = w.maximize();
+                }
                 w.show().unwrap_or_default();
             }
 

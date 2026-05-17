@@ -64,6 +64,7 @@ export interface WindowGeometry {
   height: number
   x: number
   y: number
+  maximized?: boolean
 }
 
 export type SavedPaneNode =

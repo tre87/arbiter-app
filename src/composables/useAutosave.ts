@@ -75,10 +75,24 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
 
       const win = getCurrentWindow()
       try {
-        const size = await win.innerSize()
-        const pos = await win.outerPosition()
-        if (size.width > 200 && size.height > 200 && pos.x > -10000 && pos.y > -10000 && pos.x < 10000 && pos.y < 10000) {
-          config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y }
+        // We persist `maximized` and apply it from Rust before show() to avoid
+        // the launch blink that the plugin-driven async restore caused. When
+        // currently maximized (or in fullscreen, which the plugin handles),
+        // keep the previously-saved windowed geometry so un-maximizing returns
+        // to a sensible size.
+        const [maximized, fullscreen] = await Promise.all([win.isMaximized(), win.isFullscreen()])
+        if (maximized || fullscreen) {
+          try {
+            const existing = await invoke<Record<string, any> | null>('load_config')
+            const base = (existing?.window as Record<string, any> | undefined) ?? {}
+            config.window = { ...base, maximized } as ArbiterConfig['window']
+          } catch { /* ignore */ }
+        } else {
+          const size = await win.innerSize()
+          const pos = await win.outerPosition()
+          if (size.width > 200 && size.height > 200 && pos.x > -10000 && pos.y > -10000 && pos.x < 10000 && pos.y < 10000) {
+            config.window = { width: size.width, height: size.height, x: pos.x, y: pos.y, maximized: false }
+          }
         }
       } catch { /* ignore */ }
 
