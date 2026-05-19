@@ -121,8 +121,6 @@ export const useUsageStore = defineStore('usage', () => {
     return `${m}m`
   }
 
-  const primaryReset = computed(() => formatReset(data.value?.five_hour ?? null))
-
   // Dialog is visible whenever we are forced into selection OR the user opened it manually
   const orgPickerVisible = computed(() => needsOrgSelection.value || pickerOpen.value)
 
@@ -130,6 +128,6 @@ export const useUsageStore = defineStore('usage', () => {
     data, loading, pending, needsLogin, needsOrgSelection, availableOrgs, pickerOpen, orgPickerVisible, error,
     fetch, openLogin, logout, startPolling, stopPolling,
     openOrgPicker, closeOrgPicker, setSelectedOrg,
-    formatReset, primaryReset,
+    formatReset,
   }
 })

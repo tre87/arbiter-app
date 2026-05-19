@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
 import { useProjectStore } from '../stores/project'
 import { useDevSettingsStore } from '../stores/devSettings'
+import { waitForShellIdle } from '../utils/shellIdle'
 import type { ArbiterConfig } from '../types/config'
 import type { PaneNode } from '../types/pane'
 
@@ -73,18 +74,26 @@ export async function bootstrapWorkspaceSessions(workspaceId: string) {
             lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
           })
           store.armClaudeListeners(paneId)
-          setTimeout(() => {
+          // Wait for OSC 133 idle before typing — otherwise on a slow shell
+          // startup we'd send "claude --resume" before the prompt is ready.
+          waitForShellIdle(sessionId).then(() => {
             invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
-          }, 500)
+              .catch(e => console.error(`Arbiter: claude --resume write failed for pane ${paneId}:`, e))
+          })
         } else if (claudeRestore.wasOpen) {
           store.updateClaudePaneState(paneId, { lifecycle: 'launching', confirmed: false })
           store.armClaudeListeners(paneId)
-          setTimeout(() => {
+          waitForShellIdle(sessionId).then(() => {
             invoke('write_to_session', { sessionId, data: 'claude\r' })
-          }, 500)
+              .catch(e => console.error(`Arbiter: claude launch write failed for pane ${paneId}:`, e))
+          })
         }
       }
-    } catch { /* ignore failed session creation */ }
+    } catch (e) {
+      // Log so a failed background bootstrap doesn't silently leave a worktree
+      // with no PTY (clicking it would show an empty unresponsive terminal).
+      console.error(`Arbiter: bootstrap session creation failed for pane ${paneId}:`, e)
+    }
   }
 }
 
@@ -135,7 +144,11 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
     )
 
     bootstrapBackgroundSessions()
-  } catch {
-    // Config load failed — start fresh
+  } catch (e) {
+    // Config load failed. The Rust side quarantines a corrupt config.json to
+    // config.json.corrupt-<ts> before reporting the error, so the autosave
+    // that's about to start won't overwrite recoverable data — but log the
+    // cause loudly so the user (or a bug report) can find the quarantine.
+    console.error('Arbiter: config load failed, starting with fresh state. Cause:', e)
   }
 }

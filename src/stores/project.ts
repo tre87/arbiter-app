@@ -334,14 +334,6 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  async function teardownRefsWatcher(workspaceId: string): Promise<void> {
-    const w = refsWatchers.value[workspaceId]
-    if (!w) return
-    try { w.unlisten() } catch { /* ignore */ }
-    try { await invoke('unwatch_directory', { watcherId: w.watcherId }) } catch { /* ignore */ }
-    delete refsWatchers.value[workspaceId]
-  }
-
   // ── Merge actions ────────────────────────────────────────────────────────
 
   // Manually merge a worktree's branch into its parent branch.
@@ -846,25 +838,6 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  // ── Cleanup ───────────────────────────────────────────────────────────────
-
-  async function cleanupWorkspace(workspaceId: string) {
-    const ws = getPaneStore().getProjectWorkspace(workspaceId)
-    if (!ws) return
-
-    await teardownRefsWatcher(workspaceId)
-
-    for (const wt of ws.worktrees) {
-      await unwatchAll(wt.id)
-      delete claudeStatuses.value[wt.id]
-      delete directoryCache.value[wt.id]
-      delete gitStatusCache.value[wt.id]
-      delete mergedWorktrees.value[wt.id]
-      delete paneToWorktree.value[wt.claudePaneId]
-    }
-    delete staleWorktrees.value[workspaceId]
-  }
-
   return {
     // Explorer
     directoryCache,
@@ -906,7 +879,5 @@ export const useProjectStore = defineStore('project', () => {
     pruneAllStale,
     pruneStale,
     restoreStale,
-    // Cleanup
-    cleanupWorkspace,
   }
 })

@@ -194,11 +194,8 @@ onBeforeUnmount(() => {
           >
             <span class="overview-name">{{ t.name }}</span>
             <span class="overview-status">
-              <span v-if="t.status === 'idle'" class="status-dot idle" />
-              <span v-else-if="t.status === 'running'" class="status-dot running" />
-              <span v-else-if="t.status === 'ready'" class="status-dot ready" />
-              <span v-else-if="t.status === 'attention'" class="status-dot attention" />
-              <HexPulse v-else-if="t.status === 'working'" :size="12" />
+              <HexPulse v-if="t.status === 'working'" :size="12" />
+              <span v-else class="status-dot" :class="t.status" />
             </span>
           </div>
         </div>

@@ -50,6 +50,10 @@ const isMac = typeof navigator !== 'undefined' && navigator.platform.startsWith(
 
 const { flush: flushAutosave } = useAutosave(ready, overviewOpen)
 
+// Mirror overview-open state into the pane store so emitOverviewUpdate can
+// skip the cross-window IPC when nobody's listening.
+watch(overviewOpen, (open) => store.setOverviewOpen(open), { immediate: true })
+
 // Panes in newly-active workspaces need a chance to refit: ResizeObserver
 // doesn't fire while an ancestor is `display: none`, so a window resize
 // during backgrounding wouldn't have reached them. Each TerminalPane decides

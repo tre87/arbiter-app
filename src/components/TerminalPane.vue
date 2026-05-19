@@ -17,6 +17,7 @@ import {
   type TerminalSession,
 } from '../composables/terminalSessionCache'
 import { gitBashPath, ensureGitBashProbed } from '../composables/gitBashPath'
+import { waitForShellIdle } from '../utils/shellIdle'
 
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
@@ -33,6 +34,13 @@ let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
 let focusHandler: (() => void) | null = null
 let workspaceActivatedHandler: (() => void) | null = null
+
+// Three callers register byte-identical pty-output listeners; this helper
+// keeps the write callback in one place. `term` is captured by reference, so
+// it picks up reassignments (cached vs fresh-create mount paths).
+function attachPtyOutput(sid: string): Promise<UnlistenFn> {
+  return listen<string>(`pty-output-${sid}`, (event) => { term.write(event.payload) })
+}
 
 // All Claude lifecycle state is centralized in the pane store (claudePaneStates).
 // Persistent event listeners in pane.ts handle claude-started/status/exited/bell.
@@ -113,6 +121,7 @@ function launchClaude() {
     store.armClaudeListeners(props.paneId)
     footerVisible.value = true
     invoke('write_to_session', { sessionId, data: 'claude\r' })
+      .catch(e => console.error('Arbiter: claude launch failed:', e))
     term?.focus()
   }
 }
@@ -123,6 +132,7 @@ function continueClaude() {
     store.armClaudeListeners(props.paneId)
     footerVisible.value = true
     invoke('write_to_session', { sessionId, data: 'claude --continue\r' })
+      .catch(e => console.error('Arbiter: claude --continue failed:', e))
     term?.focus()
   }
 }
@@ -167,11 +177,16 @@ function unsubscribeComponentLocal() {
 async function switchShell() {
   if (!sessionId) return
   const cwd = sessionCwd.value
+  const oldSessionId = sessionId
 
   unsubscribeComponentLocal()
   unlisten?.(); unlisten = null
   if (session) session.ptyUnlisten = null
-  await invoke('close_session', { sessionId })
+  try {
+    await invoke('close_session', { sessionId: oldSessionId })
+  } catch (e) {
+    console.error('Arbiter: close_session failed during switchShell:', e)
+  }
   store.removePtySession(props.paneId)
 
   term.clear()
@@ -181,20 +196,30 @@ async function switchShell() {
   currentShell.value = newShell ? 'gitbash' : 'powershell'
   store.setTerminalShell(props.paneId, currentShell.value)
 
-  sessionId = await invoke<string>('create_session', {
-    cols: term.cols,
-    rows: term.rows,
-    cwd: cwd ?? null,
-    shell: newShell,
-  })
-  store.setPtySession(props.paneId, sessionId)
-  if (session) session.sessionId = sessionId
+  let newSessionId: string
+  try {
+    newSessionId = await invoke<string>('create_session', {
+      cols: term.cols,
+      rows: term.rows,
+      cwd: cwd ?? null,
+      shell: newShell,
+    })
+  } catch (e) {
+    // create_session failed: leave the terminal visibly idle rather than
+    // racing back to whatever cached sessionId was lingering on `session`.
+    console.error('Arbiter: create_session failed during switchShell, terminal will be inactive:', e)
+    sessionId = null
+    if (session) session.sessionId = ''
+    term.write('\r\n\x1b[31m[Arbiter] Shell switch failed — close and reopen this terminal.\x1b[0m\r\n')
+    return
+  }
+  sessionId = newSessionId
+  store.setPtySession(props.paneId, newSessionId)
+  if (session) session.sessionId = newSessionId
 
-  unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
-    term.write(event.payload)
-  })
+  unlisten = await attachPtyOutput(newSessionId)
   if (session) session.ptyUnlisten = unlisten
-  await subscribeToSession(sessionId)
+  await subscribeToSession(newSessionId)
 
   shellIdle.value = false
   term.focus()
@@ -266,7 +291,12 @@ onMounted(async () => {
     term.onResize(({ cols, rows }) => {
       store.markResize(props.paneId)
       const sid = getTerminalSession(props.paneId)?.sessionId
-      if (sid) invoke('resize_session', { sessionId: sid, cols, rows })
+      if (sid) {
+        // A silent resize failure desyncs xterm and the PTY for the rest of
+        // the session lifetime — Claude's TUI then misrenders forever.
+        invoke('resize_session', { sessionId: sid, cols, rows })
+          .catch(e => console.error('Arbiter: resize_session failed:', e))
+      }
     })
 
     if (isWindows) await ensureGitBashProbed()
@@ -280,17 +310,19 @@ onMounted(async () => {
       sessionId = existingSession
       currentShell.value = store.getTerminalShell(props.paneId)
 
-      unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
-        term.write(event.payload)
-      })
+      unlisten = await attachPtyOutput(sessionId)
 
       // Backend skips the actual resize (and SIGWINCH) when dimensions are
       // unchanged — avoids Claude's Ink TUI redrawing on worktree switch.
       store.markResize(props.paneId)
-      const resized = await invoke<boolean>('resize_session', { sessionId, cols: term.cols, rows: term.rows })
-      if (!resized) {
-        const replay = await invoke<string>('get_session_replay', { sessionId })
-        if (replay) term.write(replay)
+      try {
+        const resized = await invoke<boolean>('resize_session', { sessionId, cols: term.cols, rows: term.rows })
+        if (!resized) {
+          const replay = await invoke<string>('get_session_replay', { sessionId })
+          if (replay) term.write(replay)
+        }
+      } catch (e) {
+        console.error('Arbiter: resize/replay failed on adoption fallback:', e)
       }
 
       if (claudeActive.value) {
@@ -325,31 +357,42 @@ onMounted(async () => {
       currentShell.value = shellPath ? 'gitbash' : 'powershell'
       store.setTerminalShell(props.paneId, currentShell.value)
 
-      sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null, shell: shellPath })
+      try {
+        sessionId = await invoke<string>('create_session', { cols: term.cols, rows: term.rows, cwd: savedCwd ?? null, shell: shellPath })
+      } catch (e) {
+        // Fresh-create failed — surface in the terminal pane rather than
+        // leaving a zombie xterm wired to a non-existent PTY.
+        console.error('Arbiter: create_session failed during mount:', e)
+        term.write('\r\n\x1b[31m[Arbiter] Failed to start shell. Close and reopen this terminal.\x1b[0m\r\n')
+        return
+      }
       store.setPtySession(props.paneId, sessionId)
+      const newSessionId = sessionId
 
-      unlisten = await listen<string>(`pty-output-${sessionId}`, (event) => {
-        term.write(event.payload)
-      })
+      unlisten = await attachPtyOutput(newSessionId)
 
-      if (claudeRestore && sessionId) {
+      if (claudeRestore) {
         if (claudeRestore.sessionId) {
           // Resume conversation — pre-register expected session so JSONL watcher
-          // adopts the resumed file into *this* pane.
-          invoke('set_expected_claude_session', { sessionId, claudeSessionId: claudeRestore.sessionId }).catch(() => {})
+          // adopts the resumed file into *this* pane. Failure here lands the
+          // resumed Claude output in some other waiting pane, so surface it.
+          invoke('set_expected_claude_session', { sessionId: newSessionId, claudeSessionId: claudeRestore.sessionId })
+            .catch(e => console.error('Arbiter: set_expected_claude_session failed — resume may adopt into the wrong pane:', e))
           store.updateClaudePaneState(props.paneId, {
             lifecycle: 'launching', confirmed: false, sessionId: claudeRestore.sessionId,
           })
           store.armClaudeListeners(props.paneId)
-          setTimeout(() => {
-            invoke('write_to_session', { sessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
-          }, 500)
+          waitForShellIdle(newSessionId).then(() => {
+            invoke('write_to_session', { sessionId: newSessionId, data: `claude --resume ${claudeRestore.sessionId}\r` })
+              .catch(e => console.error('Arbiter: claude --resume write failed:', e))
+          })
         } else if (claudeRestore.wasOpen) {
           store.updateClaudePaneState(props.paneId, { lifecycle: 'launching', confirmed: false })
           store.armClaudeListeners(props.paneId)
-          setTimeout(() => {
-            invoke('write_to_session', { sessionId, data: 'claude\r' })
-          }, 500)
+          waitForShellIdle(newSessionId).then(() => {
+            invoke('write_to_session', { sessionId: newSessionId, data: 'claude\r' })
+              .catch(e => console.error('Arbiter: claude launch write failed:', e))
+          })
         }
       }
     }
@@ -432,6 +475,7 @@ onBeforeUnmount(() => {
     disposeTerminalSession(props.paneId)
     if (sessionId) {
       invoke('close_session', { sessionId })
+        .catch(e => console.error('Arbiter: close_session failed:', e))
       store.removePtySession(props.paneId)
     }
   } else {

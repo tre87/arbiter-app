@@ -27,6 +27,22 @@ pub fn load_config(app: AppHandle) -> Result<Option<serde_json::Value>, String> 
         return Ok(None);
     }
     let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let config: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
-    Ok(Some(config))
+    match serde_json::from_str::<serde_json::Value>(&data) {
+        Ok(config) => Ok(Some(config)),
+        Err(e) => {
+            // Quarantine the corrupt config so the autosave that runs after
+            // load failure can't overwrite recoverable state. Without this,
+            // a single bad write or a forward-incompatible field would wipe
+            // the user's workspace tree on the next save tick.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup = path.with_extension(format!("json.corrupt-{ts}"));
+            if let Err(rename_err) = std::fs::rename(&path, &backup) {
+                eprintln!("load_config: failed to quarantine corrupt {}: {rename_err}", path.display());
+            }
+            Err(format!("config parse error (corrupt file moved to {}): {e}", backup.display()))
+        }
+    }
 }

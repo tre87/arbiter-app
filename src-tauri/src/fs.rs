@@ -78,12 +78,21 @@ pub fn watch_directory(app: AppHandle, watchers: State<FileWatchers>, path: Stri
     let watcher_id_clone = watcher_id.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res {
-            match event.kind {
+        match res {
+            Ok(event) => match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                     let _ = app_handle.emit(&format!("fs-changed-{}", watcher_id_clone), ());
                 }
                 _ => {}
+            },
+            Err(e) => {
+                // Backend errors (handle exhaustion, path deleted out from
+                // under the watcher) silently stopping the tree refresh is the
+                // exact failure mode CLAUDE.md's "no polling" rule trades off
+                // against. Surface them so users see "auto-refresh stopped"
+                // instead of "directory listing feels stale."
+                eprintln!("watch_directory ({watcher_id_clone}): notify error: {e}");
+                let _ = app_handle.emit("backend-degraded", format!("fs_watcher: {e}"));
             }
         }
     }).map_err(|e| format!("Failed to create watcher: {}", e))?;

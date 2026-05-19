@@ -21,7 +21,12 @@ use crate::overview::OVERVIEW_WINDOW_LABEL;
 fn exit_app(app: AppHandle) {
     // Destroy every webview window before `app.exit` to avoid a Chromium
     // `Failed to unregister class Chrome_WidgetWin_0` error on Windows.
-    // `destroy()` bypasses CloseRequested handlers (e.g. the overview window
+    // Destroying main here is safe: the frontend awaits flushAutosave()
+    // (which awaits save_config — synchronous fs::write + fs::rename in
+    // Rust) before calling exit_app, so by the time we run, the save has
+    // already returned to the renderer. There is no concurrent save in
+    // flight that destroying main could interrupt.
+    // `destroy()` bypasses CloseRequested handlers (the overview window
     // hides itself on close, which would otherwise keep it alive past exit).
     // https://github.com/tauri-apps/tauri/issues/7606
     for (_, window) in app.webview_windows() {
@@ -210,7 +215,6 @@ pub fn run() {
             usage::get_selected_org_uuid,
             usage::get_available_orgs,
             usage::set_selected_org,
-            usage::clear_selected_org,
             usage::open_login_window,
             usage::logout_usage,
             config::save_config,

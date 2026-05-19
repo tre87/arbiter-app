@@ -172,59 +172,129 @@ fn pane_cwd(
     cwd
 }
 
-/// Parse the last assistant message from a JSONL file for model/token data.
+/// Per-JSONL incremental parse cache. Keyed by file path; persists across
+/// parse calls so we only read the bytes appended since the last call.
+/// JSONLs grow monotonically while Claude runs and are otherwise read-only,
+/// so a simple `(offset, accumulated_fields)` cache is sound. We hold a
+/// trailing byte buffer for partial lines (Claude's atomic-write of an entry
+/// can split mid-UTF-8 across read boundaries) and reset everything when the
+/// file shrinks (truncate/replace).
+struct JsonlCacheEntry {
+    offset: u64,
+    trailing: Vec<u8>,
+    cwd: Option<String>,
+    branch: Option<String>,
+    model_id: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+}
+
+static JSONL_CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, JsonlCacheEntry>>> = std::sync::OnceLock::new();
+fn jsonl_cache() -> &'static Mutex<HashMap<PathBuf, JsonlCacheEntry>> {
+    JSONL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Parse the latest model / token / cwd data from a JSONL file, reading only
+/// the bytes appended since the previous call for this path.
 fn parse_jsonl_status(path: &std::path::Path) -> Option<ClaudeSessionStatus> {
-    let content = std::fs::read_to_string(path).ok()?;
+    use std::io::{Read as IoRead, Seek, SeekFrom};
+
     let session_id = path.file_stem()?.to_str()?.to_string();
+    let file_len = std::fs::metadata(path).ok()?.len();
 
-    let mut cwd: Option<String>      = None;
-    let mut branch: Option<String>   = None;
-    let mut model_id: Option<String> = None;
-    let mut input_tokens: Option<u64>  = None;
-    let mut output_tokens: Option<u64> = None;
-    let mut cache_creation: Option<u64> = None;
-    let mut cache_read: Option<u64>     = None;
+    let mut cache = jsonl_cache().lock().unwrap();
+    let entry = cache.entry(path.to_path_buf()).or_insert_with(|| JsonlCacheEntry {
+        offset: 0,
+        trailing: Vec::new(),
+        cwd: None, branch: None, model_id: None,
+        input_tokens: None, output_tokens: None,
+        cache_creation_input_tokens: None, cache_read_input_tokens: None,
+    });
 
-    for line in content.lines() {
-        if line.is_empty() { continue; }
-        let entry = match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(v) => v,
-            Err(e) => {
-                // Partial/corrupt lines happen at the trailing edge when Claude
-                // is mid-write. Log at debug level so they're not silent but
-                // don't spam on every parse.
-                eprintln!("parse_jsonl_status: skipping malformed line in {}: {e}", path.display());
-                continue;
-            }
-        };
-
-        if let Some(c) = entry.get("cwd").and_then(|v| v.as_str()) {
-            cwd = Some(c.to_string());
-        }
-        if let Some(b) = entry.get("gitBranch").and_then(|v| v.as_str()) {
-            branch = Some(b.to_string());
-        }
-        if entry.pointer("/message/role").and_then(|v| v.as_str()) == Some("assistant") {
-            if let Some(m) = entry.pointer("/message/model").and_then(|v| v.as_str()) {
-                model_id = Some(m.to_string());
-            }
-            if let Some(u) = entry.pointer("/message/usage") {
-                input_tokens   = u.get("input_tokens").and_then(|v| v.as_u64()).or(input_tokens);
-                output_tokens  = u.get("output_tokens").and_then(|v| v.as_u64()).or(output_tokens);
-                cache_creation = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).or(cache_creation);
-                cache_read     = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).or(cache_read);
-            }
-        }
+    // File shrank (truncated / replaced) — discard cached offset and re-read
+    // from the start. Existing field state stays around as a fallback so
+    // mid-resume callers don't see momentary None values.
+    if file_len < entry.offset {
+        entry.offset = 0;
+        entry.trailing.clear();
     }
 
-    let folder = cwd.as_deref().map(|p| {
+    if file_len > entry.offset {
+        let mut file = std::fs::File::open(path).ok()?;
+        if entry.offset > 0 {
+            file.seek(SeekFrom::Start(entry.offset)).ok()?;
+        }
+        let mut new_bytes = Vec::new();
+        file.read_to_end(&mut new_bytes).ok()?;
+        // Best-effort offset advance; if the file grew further during the
+        // read, the next call sees the remainder via the same path.
+        entry.offset = entry.offset.saturating_add(new_bytes.len() as u64);
+
+        // Stitch carried-over partial line bytes from the previous call.
+        let mut buf = std::mem::take(&mut entry.trailing);
+        buf.extend_from_slice(&new_bytes);
+
+        // Split into complete lines (everything up to the last '\n') and the
+        // trailing partial. Byte-level split avoids breaking multi-byte UTF-8
+        // across reads.
+        let last_nl = buf.iter().rposition(|&b| b == b'\n');
+        let (complete, partial): (&[u8], &[u8]) = match last_nl {
+            Some(idx) => (&buf[..=idx], &buf[idx + 1..]),
+            None => (&[][..], &buf[..]),
+        };
+
+        for line in complete.split(|&b| b == b'\n') {
+            if line.is_empty() { continue; }
+            let line_str = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let value = match serde_json::from_str::<serde_json::Value>(line_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("parse_jsonl_status: skipping malformed line in {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if let Some(c) = value.get("cwd").and_then(|v| v.as_str()) {
+                entry.cwd = Some(c.to_string());
+            }
+            if let Some(b) = value.get("gitBranch").and_then(|v| v.as_str()) {
+                entry.branch = Some(b.to_string());
+            }
+            if value.pointer("/message/role").and_then(|v| v.as_str()) == Some("assistant") {
+                if let Some(m) = value.pointer("/message/model").and_then(|v| v.as_str()) {
+                    entry.model_id = Some(m.to_string());
+                }
+                if let Some(u) = value.pointer("/message/usage") {
+                    entry.input_tokens   = u.get("input_tokens").and_then(|v| v.as_u64()).or(entry.input_tokens);
+                    entry.output_tokens  = u.get("output_tokens").and_then(|v| v.as_u64()).or(entry.output_tokens);
+                    entry.cache_creation_input_tokens = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).or(entry.cache_creation_input_tokens);
+                    entry.cache_read_input_tokens     = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).or(entry.cache_read_input_tokens);
+                }
+            }
+        }
+
+        entry.trailing = partial.to_vec();
+    }
+
+    let folder = entry.cwd.as_deref().map(|p| {
         p.replace('\\', "/").split('/').filter(|s| !s.is_empty())
             .last().unwrap_or(p).to_string()
     });
 
-    Some(ClaudeSessionStatus { session_id, model_id, input_tokens, output_tokens,
-        cache_creation_input_tokens: cache_creation, cache_read_input_tokens: cache_read,
-        folder, branch })
+    Some(ClaudeSessionStatus {
+        session_id,
+        model_id: entry.model_id.clone(),
+        input_tokens: entry.input_tokens,
+        output_tokens: entry.output_tokens,
+        cache_creation_input_tokens: entry.cache_creation_input_tokens,
+        cache_read_input_tokens: entry.cache_read_input_tokens,
+        folder,
+        branch: entry.branch.clone(),
+    })
 }
 
 /// Block the current thread until the process with `pid` exits.
@@ -446,10 +516,14 @@ pub fn spawn_pane_monitor(
                 if let Some(project_dir) = claude_home().map(|h| h.join("projects").join(encode_project_dir(cwd))) {
                     if project_dir.is_dir() {
                         for path in list_recent_jsonl(&project_dir).into_iter().take(5) {
-                            let already = monitor.lock().unwrap().values().any(|e| e.jsonl == path);
-                            if already { continue; }
-                            monitor.lock().unwrap()
-                                .insert(session_id.clone(), ClaudeEntry { jsonl: path.clone() });
+                            // Hold a single guard across the check + insert so
+                            // the global JSONL watcher can't adopt the same
+                            // path into a different pane between the two ops.
+                            {
+                                let mut mguard = monitor.lock().unwrap();
+                                if mguard.values().any(|e| e.jsonl == path) { continue; }
+                                mguard.insert(session_id.clone(), ClaudeEntry { jsonl: path.clone() });
+                            }
                             expected.lock().unwrap().remove(&session_id);
                             set_tracked(&sessions, &session_id);
                             let stem = path.file_stem().and_then(|s| s.to_str())
@@ -539,9 +613,17 @@ fn try_adopt_jsonl(
         other => return other,
     };
 
-    // Adopt: write the JSONL into the pane's monitor entry, clear any expected entry.
-    monitor.lock().unwrap()
-        .insert(pane_id.clone(), ClaudeEntry { jsonl: jsonl_path.to_path_buf() });
+    // Adopt under a single monitor-lock acquisition: re-check that no other
+    // pane has claimed this JSONL between match_jsonl_to_pane returning and
+    // this insert (the per-pane monitor and the global watcher both adopt;
+    // dropping the lock between check and insert is a TOCTOU window).
+    {
+        let mut mguard = monitor.lock().unwrap();
+        if mguard.values().any(|e| e.jsonl == jsonl_path) {
+            return MatchResult::Matched(pane_id);
+        }
+        mguard.insert(pane_id.clone(), ClaudeEntry { jsonl: jsonl_path.to_path_buf() });
+    }
     expected.lock().unwrap().remove(&pane_id);
     set_tracked(sessions, &pane_id);
 

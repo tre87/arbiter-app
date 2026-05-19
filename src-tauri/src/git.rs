@@ -1,5 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Clone)]
 pub struct GitInfo {
@@ -7,8 +9,21 @@ pub struct GitInfo {
     pub branch: Option<String>,
 }
 
-/// Standalone git info lookup (usable from both Tauri commands and background threads)
-pub fn get_git_info(cwd: &str) -> GitInfo {
+// Cache get_git_info results for a short window to avoid spawning two `git`
+// processes per OSC 7 prompt (≈30 ms each on Windows). Hit by the PTY reader
+// on every cwd change and by TerminalPane mounts.
+struct GitInfoCacheEntry {
+    info: GitInfo,
+    at: Instant,
+}
+static GIT_INFO_CACHE: OnceLock<Mutex<HashMap<String, GitInfoCacheEntry>>> = OnceLock::new();
+const GIT_INFO_TTL: Duration = Duration::from_millis(1500);
+
+fn git_info_cache() -> &'static Mutex<HashMap<String, GitInfoCacheEntry>> {
+    GIT_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn compute_git_info(cwd: &str) -> GitInfo {
     let path = std::path::Path::new(cwd);
     if !path.is_dir() {
         return GitInfo { is_repo: false, branch: None };
@@ -38,6 +53,25 @@ pub fn get_git_info(cwd: &str) -> GitInfo {
         })
         .filter(|s| !s.is_empty());
     GitInfo { is_repo, branch }
+}
+
+/// Standalone git info lookup (usable from both Tauri commands and background
+/// threads). Results are cached per-cwd for ~1.5 s so back-to-back lookups
+/// (e.g. when the PTY reader emits cwd-changed and the frontend immediately
+/// invokes get_session_git_info) share a single git process pair.
+pub fn get_git_info(cwd: &str) -> GitInfo {
+    {
+        let cache = git_info_cache().lock().unwrap();
+        if let Some(entry) = cache.get(cwd) {
+            if entry.at.elapsed() < GIT_INFO_TTL {
+                return entry.info.clone();
+            }
+        }
+    }
+    let info = compute_git_info(cwd);
+    let mut cache = git_info_cache().lock().unwrap();
+    cache.insert(cwd.to_string(), GitInfoCacheEntry { info: info.clone(), at: Instant::now() });
+    info
 }
 
 #[tauri::command]
@@ -70,54 +104,47 @@ pub fn git_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfo>, String>
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut worktrees = Vec::new();
+    let mut worktrees: Vec<WorktreeInfo> = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_head: Option<String> = None;
     let mut current_branch: Option<String> = None;
     let mut is_bare = false;
 
-    for line in stdout.lines() {
-        if line.starts_with("worktree ") {
-            // Flush previous entry
-            if let Some(path) = current_path.take() {
-                if !is_bare {
-                    let exists = std::path::Path::new(&path).is_dir();
-                    worktrees.push(WorktreeInfo {
-                        path: path.clone(),
-                        branch: current_branch.take(),
-                        head: current_head.take(),
-                        is_main: false, // set below
-                        exists,
-                    });
-                }
+    let flush = |path: &mut Option<String>,
+                 head: &mut Option<String>,
+                 branch: &mut Option<String>,
+                 bare: &mut bool,
+                 out: &mut Vec<WorktreeInfo>| {
+        if let Some(p) = path.take() {
+            if !*bare {
+                let exists = std::path::Path::new(&p).is_dir();
+                out.push(WorktreeInfo {
+                    path: p,
+                    branch: branch.take(),
+                    head: head.take(),
+                    is_main: false,
+                    exists,
+                });
             }
-            current_path = Some(line[9..].to_string());
-            current_head = None;
-            current_branch = None;
-            is_bare = false;
-        } else if line.starts_with("HEAD ") {
-            current_head = Some(line[5..].to_string());
-        } else if line.starts_with("branch ") {
-            // "branch refs/heads/main" → "main"
-            let branch = line[7..].to_string();
-            current_branch = Some(branch.strip_prefix("refs/heads/").unwrap_or(&branch).to_string());
+        }
+        *head = None;
+        *branch = None;
+        *bare = false;
+    };
+
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            flush(&mut current_path, &mut current_head, &mut current_branch, &mut is_bare, &mut worktrees);
+            current_path = Some(path.to_string());
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            current_head = Some(head.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            current_branch = Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).to_string());
         } else if line == "bare" {
             is_bare = true;
         }
     }
-    // Flush last entry
-    if let Some(path) = current_path {
-        if !is_bare {
-            let exists = std::path::Path::new(&path).is_dir();
-            worktrees.push(WorktreeInfo {
-                path,
-                branch: current_branch,
-                head: current_head,
-                is_main: false,
-                exists,
-            });
-        }
-    }
+    flush(&mut current_path, &mut current_head, &mut current_branch, &mut is_bare, &mut worktrees);
 
     // The first worktree (at repo root) is the main one
     if let Some(first) = worktrees.first_mut() {

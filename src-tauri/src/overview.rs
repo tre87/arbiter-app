@@ -4,8 +4,8 @@ use crate::config::config_path;
 
 pub const OVERVIEW_WINDOW_LABEL: &str = "overview";
 
-pub const OVERVIEW_DEFAULT_WIDTH: f64 = 240.0;
-pub const OVERVIEW_DEFAULT_HEIGHT: f64 = 320.0;
+const OVERVIEW_DEFAULT_WIDTH: f64 = 240.0;
+const OVERVIEW_DEFAULT_HEIGHT: f64 = 320.0;
 
 /// Check if a point is visible on any monitor
 fn is_position_on_screen(app: &AppHandle, x: i32, y: i32, w: u32, h: u32) -> bool {

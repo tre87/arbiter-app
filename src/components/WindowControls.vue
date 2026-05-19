@@ -2,33 +2,26 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
+const win = getCurrentWindow()
 const isMaximized = ref(false)
 let unlisten: (() => void) | null = null
 
 async function syncMaximized() {
-  isMaximized.value = await getCurrentWindow().isMaximized()
+  isMaximized.value = await win.isMaximized()
 }
 
 onMounted(async () => {
   await syncMaximized()
-  unlisten = await getCurrentWindow().onResized(syncMaximized)
+  unlisten = await win.onResized(syncMaximized)
 })
 
 onBeforeUnmount(() => {
   unlisten?.()
 })
 
-function minimize() {
-  getCurrentWindow().minimize()
-}
-
-function toggleMaximize() {
-  getCurrentWindow().toggleMaximize()
-}
-
-function close() {
-  getCurrentWindow().close()
-}
+function minimize() { win.minimize() }
+function toggleMaximize() { win.toggleMaximize() }
+function close() { win.close() }
 </script>
 
 <template>

@@ -1,6 +1,7 @@
 use portable_pty::{NativePtySystem, PtySize, PtySystem};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -11,10 +12,17 @@ use crate::git::get_git_info;
 use crate::shell::build_shell_command;
 
 pub struct PtySession {
-    writer: Box<dyn Write + Send>,
+    // Per-session writer lock so `write_to_session` doesn't serialize through
+    // the global `Sessions` mutex — a slow write on one pane (e.g. a paused
+    // shell absorbing a paste) no longer blocks keystrokes to other panes.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
     pub(crate) shell_pid: Option<u32>,
-    output_buffer: Arc<Mutex<Vec<u8>>>,
+    // VecDeque so trimming from the front when the rolling buffer is full is
+    // O(excess) head-advance instead of an O(remaining) memmove. With a fully
+    // saturated 256KB buffer and 4KB reads, this drops per-read overhead from
+    // ~256KB shifts to a handful of pointer updates.
+    output_buffer: Arc<Mutex<VecDeque<u8>>>,
     pub(crate) cwd: Arc<Mutex<Option<String>>>,
     // Latest OSC 133 idle state — None before any prompt-marker seen.
     // Queried by the frontend on (re)mount so a subscription that races
@@ -71,9 +79,10 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     drop(child);
 
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let writer_inner: Box<dyn Write + Send> = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer_inner));
 
-    let output_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let output_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
     let buf_writer = output_buffer.clone();
     let session_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(cwd.clone()));
     let cwd_writer = session_cwd.clone();
@@ -92,7 +101,12 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let context_event_name = format!("claude-context-{}", sid);
     let error_event_name = format!("pty-error-{}", sid);
     let reader_sid = sid.clone();
+    // Cloned for the panic-recovery emit outside the inner closure that owns
+    // app_handle / error_event_name during the read loop.
+    let panic_app = app.clone();
+    let panic_event = error_event_name.clone();
     std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let _sid = reader_sid;
         // 256 KB ≈ ~16 screens @ 200×80 — comfortably covers a typical Claude
         // turn's worth of streamed output for replay after a split remount.
@@ -293,15 +307,21 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
 
                     {
                         let mut b = buf_writer.lock().unwrap();
-                        b.extend_from_slice(valid_chunk);
-                        if b.len() > MAX_BUF {
-                            let excess = b.len() - MAX_BUF;
-                            b.drain(..excess);
-                        }
+                        b.extend(valid_chunk.iter().copied());
+                        let excess = b.len().saturating_sub(MAX_BUF);
+                        if excess > 0 { b.drain(..excess); }
                     }
                     let _ = app_handle.emit(&event_name, text.to_string());
                 }
             }
+        }
+        }));
+        if let Err(panic) = result {
+            let msg = panic.downcast_ref::<String>().cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "PTY reader thread panicked".to_string());
+            eprintln!("pty reader panicked: {msg}");
+            let _ = panic_app.emit(&panic_event, format!("reader panic: {msg}"));
         }
     });
 
@@ -349,10 +369,18 @@ pub fn write_to_session(
     data: String,
     sessions: State<Sessions>,
 ) -> Result<(), String> {
-    let mut map = sessions.0.lock().unwrap();
-    let session = map.get_mut(&session_id)
-        .ok_or_else(|| format!("session not found: {}", session_id))?;
-    session.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    // Clone the Arc out under the global lock, then drop the global lock
+    // before doing the actual PTY write. Otherwise a blocking write on one
+    // pane (e.g. paste into a paused shell) would stall keystrokes to every
+    // other pane until the OS flushed.
+    let writer = {
+        let map = sessions.0.lock().unwrap();
+        let session = map.get(&session_id)
+            .ok_or_else(|| format!("session not found: {}", session_id))?;
+        session.writer.clone()
+    };
+    let mut w = writer.lock().unwrap();
+    w.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -412,8 +440,8 @@ pub fn get_session_size(session_id: String, sessions: State<Sessions>) -> Option
 pub fn get_session_replay(session_id: String, sessions: State<Sessions>) -> String {
     let map = sessions.0.lock().unwrap();
     if let Some(session) = map.get(&session_id) {
-        let buf = session.output_buffer.lock().unwrap();
-        String::from_utf8_lossy(&buf).to_string()
+        let mut buf = session.output_buffer.lock().unwrap();
+        String::from_utf8_lossy(buf.make_contiguous()).to_string()
     } else {
         String::new()
     }

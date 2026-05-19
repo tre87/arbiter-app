@@ -204,12 +204,20 @@ export const usePaneStore = defineStore('pane', () => {
   // ── Terminal status tracking (for workspace overview) ─────────────────────
   const terminalStatuses = ref<Record<string, 'idle' | 'running' | 'ready' | 'working' | 'attention'>>({})
 
+  // Tracked here so emitOverviewUpdate can skip the cross-window IPC when the
+  // overview window is hidden — setTerminalStatus runs on every shell-activity
+  // event (potentially several per second per pane), and emitting + serialising
+  // every terminal's status when no one's listening is pure waste.
+  const overviewWindowOpen = ref(false)
+  function setOverviewOpen(open: boolean) { overviewWindowOpen.value = open }
+
   function setTerminalStatus(paneId: string, status: 'idle' | 'running' | 'ready' | 'working' | 'attention') {
     terminalStatuses.value[paneId] = status
     emitOverviewUpdate()
   }
 
   function emitOverviewUpdate() {
+    if (!overviewWindowOpen.value) return
     const terminals = getAllTerminals().map(t => ({
       paneId: t.paneId,
       workspaceId: t.workspaceId,
@@ -270,10 +278,6 @@ export const usePaneStore = defineStore('pane', () => {
     }
   }
 
-  function clearClaudePaneState(paneId: string) {
-    delete claudePaneStates.value[paneId]
-  }
-
   function isClaudeActive(paneId: string): boolean {
     const s = claudePaneStates.value[paneId]
     return !!s && s.lifecycle !== 'closed'
@@ -305,18 +309,40 @@ export const usePaneStore = defineStore('pane', () => {
     resizeTimestamps[paneId] = Date.now()
   }
 
+  // Per-pane subscription generation counter. subscribeClaudeEvents is async
+  // (wireClaudeEventListeners awaits 7 Tauri listen() calls); two interleaved
+  // calls — e.g. rapid setPtySession after removePtySession on shell switch —
+  // would both pass the empty-check on entry, register their own 7 listeners,
+  // and the second assignment would orphan the first set without ever
+  // unlistening them, so every event fires twice forever afterward.
+  // The token captured before the await is compared after; the loser cleans
+  // up its own listeners instead of installing them.
+  const subscribeGen: Record<string, number> = {}
+
   async function subscribeClaudeEvents(paneId: string, sid: string) {
     unsubscribeClaudeEvents(paneId)
+    const gen = (subscribeGen[paneId] ?? 0) + 1
+    subscribeGen[paneId] = gen
     const listeners = await wireClaudeEventListeners(
       paneId,
       sid,
       { getClaudePaneState, updateClaudePaneState, setTerminalStatus },
       { idleTimers, launchTimestamps, turnBaselines, resizeTimestamps },
     )
+    if (subscribeGen[paneId] !== gen) {
+      // A newer subscribe (or an unsubscribe) ran while we were awaiting —
+      // tear down the listeners we just registered instead of stranding them.
+      for (const fn of listeners) fn()
+      return
+    }
     claudeEventListeners.value[paneId] = listeners
   }
 
   function unsubscribeClaudeEvents(paneId: string) {
+    // Bumping the generation invalidates any in-flight subscribeClaudeEvents
+    // call for this pane — it will tear down its own listeners after await
+    // instead of installing them.
+    subscribeGen[paneId] = (subscribeGen[paneId] ?? 0) + 1
     const listeners = claudeEventListeners.value[paneId]
     if (listeners) {
       for (const fn of listeners) fn()
@@ -573,9 +599,8 @@ export const usePaneStore = defineStore('pane', () => {
 
   // ── Serialization ────────────────────────────────────────────────────────
 
-  function serializeTerminalWorkspace(ws: TerminalWorkspace): { layout: SavedPaneNode; terminals: { id: string; name: string }[]; focusedTerminalIndex: number } {
+  function walkLayout(root: PaneNode): { layout: SavedPaneNode; terminals: { id: string; name: string }[] } {
     const terminals: { id: string; name: string }[] = []
-
     function walk(node: PaneNode): SavedPaneNode {
       if (node.type === 'terminal') {
         const idx = terminals.length
@@ -590,31 +615,17 @@ export const usePaneStore = defineStore('pane', () => {
         second: walk(node.second),
       }
     }
+    return { layout: walk(root), terminals }
+  }
 
-    const layout = walk(ws.root)
+  function serializeTerminalWorkspace(ws: TerminalWorkspace): { layout: SavedPaneNode; terminals: { id: string; name: string }[]; focusedTerminalIndex: number } {
+    const { layout, terminals } = walkLayout(ws.root)
     const focusedTerminalIndex = terminals.findIndex(t => t.id === ws.focusedId)
     return { layout, terminals, focusedTerminalIndex: focusedTerminalIndex >= 0 ? focusedTerminalIndex : 0 }
   }
 
   function serializeWorktree(wt: Worktree): { layout: SavedPaneNode; terminals: { id: string; name: string }[]; claudePaneIndex: number; defaultTerminalIndex: number } {
-    const terminals: { id: string; name: string }[] = []
-
-    function walk(node: PaneNode): SavedPaneNode {
-      if (node.type === 'terminal') {
-        const idx = terminals.length
-        terminals.push({ id: node.id, name: getTerminalName(node.id) })
-        return { type: 'terminal', index: idx }
-      }
-      return {
-        type: 'split',
-        direction: node.direction,
-        sizes: [...node.sizes] as [number, number],
-        first: walk(node.first),
-        second: walk(node.second),
-      }
-    }
-
-    const layout = walk(wt.root)
+    const { layout, terminals } = walkLayout(wt.root)
     const claudePaneIndex = terminals.findIndex(t => t.id === wt.claudePaneId)
     const defaultTerminalIndex = terminals.findIndex(t => t.id === wt.defaultTerminalPaneId)
     return { layout, terminals, claudePaneIndex, defaultTerminalIndex }
@@ -821,11 +832,12 @@ export const usePaneStore = defineStore('pane', () => {
     terminalNames, getTerminalName, setTerminalName, assignTerminalName,
     terminalShells, getTerminalShell, setTerminalShell,
     // Claude lifecycle state (centralized)
-    claudePaneStates, getClaudePaneState, updateClaudePaneState, clearClaudePaneState,
+    claudePaneStates, getClaudePaneState, updateClaudePaneState,
     isClaudeActive, getClaudeSessionForSave, markResize,
     subscribeClaudeEvents, unsubscribeClaudeEvents, armClaudeListeners,
     // Terminal status
     terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,
+    setOverviewOpen,
     // Saved state for restoration
     savedCwds, savedClaudeRestore,
     getSavedCwd, consumeSavedCwd, consumeSavedClaudeRestore, getSavedShell, consumeSavedShell,

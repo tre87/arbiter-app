@@ -35,22 +35,32 @@ onMounted(async () => {
 async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   try {
     const current = await invoke<Record<string, any> | null>('load_config')
-    const config: Record<string, any> = {}
-
-    if (what === 'all' || what === 'layout') {
-      // Drop everything
-    } else if (what === 'paths') {
-      config.layout = current?.layout
-      config.window = current?.window
-      config.terminals = current?.terminals?.map((t: any) => ({ name: t.name }))
-    } else if (what === 'sessions') {
-      config.layout = current?.layout
-      config.window = current?.window
-      config.terminals = current?.terminals?.map((t: any) => ({ name: t.name, cwd: t.cwd }))
+    let config: Record<string, any> = {}
+    switch (what) {
+      // Both 'all' and 'layout' wipe everything (layout-only retention would
+      // strip terminal identity, which the rest of restore depends on).
+      case 'all':
+      case 'layout':
+        break
+      case 'paths':
+        config = {
+          layout: current?.layout,
+          window: current?.window,
+          terminals: current?.terminals?.map((t: any) => ({ name: t.name })),
+        }
+        break
+      case 'sessions':
+        config = {
+          layout: current?.layout,
+          window: current?.window,
+          terminals: current?.terminals?.map((t: any) => ({ name: t.name, cwd: t.cwd })),
+        }
+        break
     }
-
     await invoke('save_config', { config })
-  } catch { /* ignore */ }
+  } catch (e) {
+    console.error('Arbiter: clearSaved failed:', e)
+  }
 }
 </script>
 

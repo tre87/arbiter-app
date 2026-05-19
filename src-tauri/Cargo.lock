@@ -49,7 +49,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arbiter"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "notify",
  "portable-pty",
@@ -2233,6 +2233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6205bd8bb1e454ad2e27422015fb5e4f2bcc7e08fa8f27058670d208324a4d2d"
 dependencies = [
  "bitflags 2.11.0",
+ "crossbeam-channel",
  "filetime",
  "fsevent-sys",
  "inotify",

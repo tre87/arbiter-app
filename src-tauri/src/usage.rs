@@ -291,11 +291,6 @@ pub fn set_selected_org(org: OrgInfo, app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn clear_selected_org(app: AppHandle) -> Result<(), String> {
-    clear_saved_org(&app)
-}
-
 // Logs out by invalidating the claude.ai session and resetting the cache.
 // We do the in-process state reset FIRST so the UI updates instantly, then
 // run the JS side-effects best-effort. Claude's HttpOnly session cookie
@@ -304,8 +299,10 @@ pub fn clear_selected_org(app: AppHandle) -> Result<(), String> {
 // IIFE so the response (and its Set-Cookie) lands before we navigate away.
 #[tauri::command]
 pub async fn logout_usage(cache: State<'_, Cache>, app: AppHandle) -> Result<(), String> {
-    // 1. Forget the saved org so a fresh sign-in re-prompts
-    clear_saved_org(&app).ok();
+    // 1. Forget the saved org so a fresh sign-in re-prompts. Propagate the
+    //    error: a silent failure here means the next sign-in lands on the
+    //    previous account's org, which is exactly the bug class to avoid.
+    clear_saved_org(&app)?;
 
     // 2. Reset cache to needs-login state and notify the UI
     {

@@ -165,7 +165,14 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       store.workspaces,
       store.activeWorkspaceIndex,
       store.terminalStatuses,
-      store.claudePaneStates,
+      // Narrow projection of claudePaneStates: only fields that actually get
+      // persisted (lifecycle, sessionId, confirmed). Deep-watching the full
+      // map would re-fire — and trigger O(N) get_session_cwd IPC roundtrips —
+      // on every per-token Claude status update, which can be several per
+      // second per pane during streaming.
+      Object.entries(store.claudePaneStates)
+        .map(([id, s]) => `${id}:${s.lifecycle}:${s.sessionId ?? ''}:${s.confirmed ? 1 : 0}`)
+        .join('|'),
     ],
     scheduleAutoSave,
     { deep: true },
