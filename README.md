@@ -18,46 +18,45 @@ One window. Many agents. You decide who works on what.
 
 ## About
 
-Arbiter is a cross-platform desktop app for running multiple [Claude Code](https://claude.com/claude-code) CLI sessions in parallel. Split your workspace into as many terminal panes as you need — each one an independent shell with its own agent. Spawn a session per feature, per repo, or per concern, and watch them work side by side.
+Arbiter is a desktop app that lets you run a bunch of [Claude Code](https://claude.com/claude-code) sessions at the same time, in the same window. Split your workspace into as many terminal panes as you want, and each one is its own independent shell with its own agent. Open a session per feature, per repo, per branch, whatever makes sense, then let them all work in parallel.
 
-The name comes from the idea of a single commanding authority overseeing many agents below it. You are the arbiter.
+The name comes from the idea of a single commanding authority overseeing a bunch of agents below it. You are the arbiter.
 
 ## Workspaces
 
-Arbiter has two kinds of workspaces, each in its own tab. Open as many as you like, switch between them with `Ctrl+Tab` or `Ctrl+1`–`Ctrl+9`.
+There are two kinds of workspaces in Arbiter, and each one lives in its own tab at the top. You can have as many open as you like, and flip between them with `Ctrl+Tab` or jump straight to one with `Ctrl+1` through `Ctrl+9`.
 
 ### Terminal Workspace
 
-A free-form tiling grid of shell panes. Split any pane vertically (`Ctrl+Shift+R`) or horizontally (`Ctrl+Shift+D`), resize boundaries with `Alt+Shift+Arrow`, and jump between panes with `Ctrl+Shift+Arrow`. Each pane is a real PTY running `bash`, `zsh`, or PowerShell — Claude Code is the obvious tenant, but anything goes.
+A free-form tiling grid of shell panes. Split any pane to the right with `Ctrl+Shift+R` or downwards with `Ctrl+Shift+D`, drag the boundaries with your mouse or resize them with `Alt+Shift+Arrow`, and hop between panes with `Ctrl+Shift+Arrow`. Every pane is a real PTY running `bash`, `zsh`, or PowerShell, so Claude Code is the obvious thing to put in there, but really anything works.
 
 ### Project Workspace
 
-Built around a Git repository. The center is a tiling split just like a terminal workspace, but flanked by two project-aware panels:
+Built around a Git repository. The middle of the workspace is a tiling split just like a terminal workspace, but it's wrapped with two project-aware panels.
 
-- **File explorer** on the left, with live filesystem watching, expand-state persistence, and per-file Git status indicators.
-- **Worktrees panel** on the right. Create a worktree from any branch and Arbiter spins up a dedicated Claude pane and shell for it. Switch between worktrees instantly — each keeps its own pane layout, file explorer state, and Claude session.
+On the left is a file explorer with live filesystem watching, persisted expand state, and per-file Git status. On the right is a worktrees panel. Create a worktree from any branch and Arbiter spins up a dedicated Claude pane and shell terminal for it. Switching between worktrees is instant, and each one keeps its own pane layout, file explorer state, and Claude session.
 
-Every worktree carries its own Claude lifecycle indicator (idle / working / needs-attention) and token meter, so a glance at the panel tells you which agents are busy and which are waiting on you.
+Every worktree carries its own Claude lifecycle indicator (idle, working, needs attention) and a token meter, so a glance at the panel tells you which agents are busy and which ones are waiting on you.
 
 ## Sessions stick around
 
-Arbiter remembers everything between launches:
+This is a big one. Arbiter remembers everything between launches, including:
 
 - The full pane tree of every workspace, with exact split percentages
-- Each terminal's working directory and Claude session ID (so `claude --resume` picks up right where you left off)
+- Each terminal's working directory and Claude session ID, so `claude --resume` picks up right where you left off
 - Window size, position, and which workspace was active
-- Worktree configuration, file-explorer expand state, and active worktree per project
+- Worktree configuration, file explorer expand state, and which worktree was active in each project
 - Workspace overview window position and bounds
 
-State is autosaved continuously to the Tauri app data directory, so unexpected exits don't cost you your layout.
+State is autosaved continuously to the Tauri app data directory, so even unexpected exits won't cost you your layout.
 
 ## Other features
 
-- **Claude-aware footer.** Each pane shows the active model, token usage, context %, and idle/working state, parsed straight from Claude's JSONL output.
-- **Usage at a glance.** 5-hour and 7-day Claude utilization in the title bar, refreshed automatically from your `claude.ai` session.
-- **Workspace overview window.** A second window that shows live thumbnails of every pane across every workspace — click one to jump there.
-- **Drag-and-drop attachments.** Drop files or images onto a Claude pane to attach them; `Ctrl+Shift+S` grabs a screenshot, `Ctrl+Shift+A` opens a file picker.
-- **Event-driven, not polled.** Filesystem watchers, OSC escape parsing, and Tauri events keep CPU idle when nothing is happening.
+- **Claude-aware footer.** Every pane shows the active model, token usage, context %, and idle/working state, parsed straight from Claude's JSONL output.
+- **Usage at a glance.** 5-hour and 7-day Claude utilization sits in the title bar and refreshes on its own from your `claude.ai` session.
+- **Workspace overview window.** A second window that shows live thumbnails of every pane across every workspace. Click one to jump there.
+- **Drag and drop attachments.** Drop files or images onto a Claude pane to attach them. `Ctrl+Shift+S` grabs a screenshot, and `Ctrl+Shift+A` opens a file picker.
+- **Event-driven, not polled.** Filesystem watchers, OSC escape parsing, and Tauri events keep CPU usage flat when nothing's happening.
 
 ## Keyboard shortcuts
 
@@ -66,8 +65,8 @@ State is autosaved continuously to the Tauri app data directory, so unexpected e
 | `Ctrl+Shift+T`       | New workspace                   |
 | `Ctrl+Tab`           | Next workspace                  |
 | `Ctrl+Shift+Tab`     | Previous workspace              |
-| `Ctrl+1`–`Ctrl+9`    | Switch to workspace 1–9         |
-| `Ctrl+Shift+W`       | Close pane / workspace          |
+| `Ctrl+1` to `Ctrl+9` | Switch to workspace 1 to 9      |
+| `Ctrl+Shift+W`       | Close pane or workspace         |
 | `Ctrl+Shift+R`       | Split right                     |
 | `Ctrl+Shift+D`       | Split down                      |
 | `Ctrl+Shift+Arrow`   | Navigate panes                  |
@@ -79,10 +78,10 @@ State is autosaved continuously to the Tauri app data directory, so unexpected e
 
 ## Stack
 
-- [Tauri 2](https://tauri.app) — native shell (Rust)
-- [Vue 3](https://vuejs.org) + TypeScript + [Pinia](https://pinia.vuejs.org)
-- [xterm.js](https://xtermjs.org) — terminal rendering with the WebGL renderer
-- [portable-pty](https://crates.io/crates/portable-pty) — real PTYs on Windows, macOS, and Linux
+- [Tauri 2](https://tauri.app) for the native shell (Rust)
+- [Vue 3](https://vuejs.org) with TypeScript and [Pinia](https://pinia.vuejs.org)
+- [xterm.js](https://xtermjs.org) for terminal rendering, using the WebGL renderer
+- [portable-pty](https://crates.io/crates/portable-pty) for real PTYs on Windows, macOS, and Linux
 
 ## Develop
 
@@ -97,7 +96,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-Bundles are written to `src-tauri/target/release/bundle/`.
+Bundles end up in `src-tauri/target/release/bundle/`.
 
 ## Downloads
 
