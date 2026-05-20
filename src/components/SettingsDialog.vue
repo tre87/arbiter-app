@@ -135,18 +135,6 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
             </div>
           </div>
 
-          <div class="panel-section">
-            <h4 class="panel-title">Developer</h4>
-            <div class="panel-body">
-              <label class="toggle-row">
-                <span class="toggle-label">Force peak hours indicator</span>
-                <span class="switch">
-                  <input type="checkbox" v-model="devStore.forcePeakHours" />
-                  <span class="switch-track"></span>
-                </span>
-              </label>
-            </div>
-          </div>
         </div>
 
         <!-- Files -->

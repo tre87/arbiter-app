@@ -1,67 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useUsageStore } from '../stores/usage'
-import { useDevSettingsStore } from '../stores/devSettings'
 import PulseLoader from './PulseLoader.vue'
 
 const store = useUsageStore()
-const devStore = useDevSettingsStore()
-const osLocale = ref('en-US')
-
-// Peak hours: weekdays 5am–11am PT (UTC-7 standard / UTC-8 daylight)
-// We use America/Los_Angeles to handle DST automatically
-const realPeakHours = ref(false)
-const isPeakHours = computed(() => devStore.forcePeakHours || realPeakHours.value)
-
-function checkPeakHours() {
-  const now = new Date()
-  const ptTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
-  const day = ptTime.getDay() // 0=Sun, 6=Sat
-  const hour = ptTime.getHours()
-  realPeakHours.value = day >= 1 && day <= 5 && hour >= 5 && hour < 11
-}
-
-// Schedule a one-shot wakeup at the next PT hour boundary (minute 00).
-// At each fire, recompute peak state and schedule the next one. No periodic polling.
-let peakTimeout: ReturnType<typeof setTimeout> | null = null
-function scheduleNextPeakCheck() {
-  const now = new Date()
-  const ptNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
-  const next = new Date(ptNow)
-  next.setMinutes(0, 0, 0)
-  next.setHours(ptNow.getHours() + 1)
-  // Convert the PT wall-clock target back to a local-time delay
-  const ptOffsetMs = now.getTime() - ptNow.getTime()
-  const fireAt = next.getTime() + ptOffsetMs
-  const delay = Math.max(1000, fireAt - now.getTime())
-  peakTimeout = setTimeout(() => {
-    checkPeakHours()
-    scheduleNextPeakCheck()
-  }, delay)
-}
-
-const peakTooltip = computed(() => {
-  // Convert 5am and 11am PT to the user's local timezone
-  // Use a fixed date (a Monday) to get the conversion right
-  const base = new Date()
-  const startPT = new Date(base.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
-  startPT.setHours(5, 0, 0, 0)
-  const endPT = new Date(base.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))
-  endPT.setHours(11, 0, 0, 0)
-
-  // Compute offset between local and PT
-  const localNow = base.getTime()
-  const ptNow = new Date(base.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })).getTime()
-  const offsetMs = localNow - ptNow
-
-  const localStart = new Date(startPT.getTime() + offsetMs)
-  const localEnd = new Date(endPT.getTime() + offsetMs)
-
-  const fmt = (d: Date) => d.toLocaleTimeString(osLocale.value, { hour: 'numeric', minute: '2-digit' })
-
-  return `Peak hours (weekdays ${fmt(localStart)}–${fmt(localEnd)}) — 5h session limits drain faster`
-})
 
 // Countdown to next auto-refresh
 const countdown = ref(120)
@@ -80,23 +22,17 @@ watch(() => store.loading, (loading, was) => {
   if (was && !loading) resetCountdown()
 })
 
-onMounted(async () => {
+onMounted(() => {
   store.startPolling()
   // Wall-clock countdown display — must tick each second; no event source.
   cdTimer = setInterval(() => {
     countdown.value = countdown.value > 0 ? countdown.value - 1 : 120
   }, 1000)
-  checkPeakHours()
-  scheduleNextPeakCheck()
-  try {
-    osLocale.value = await invoke<string>('get_locale')
-  } catch { /* fallback to en-US */ }
 })
 
 onBeforeUnmount(() => {
   store.stopPolling()
   if (cdTimer) clearInterval(cdTimer)
-  if (peakTimeout) { clearTimeout(peakTimeout); peakTimeout = null }
 })
 </script>
 
@@ -121,8 +57,6 @@ onBeforeUnmount(() => {
   <!-- Stats -->
   <template v-else-if="store.data">
     <span class="plan-badge">{{ store.data.plan }}</span>
-
-    <span v-if="isPeakHours" class="peak-badge" :title="peakTooltip"><span class="peak-icon">⚡</span> PEAK</span>
 
     <!-- 5h -->
     <div v-if="store.data.five_hour" class="stat">
@@ -249,28 +183,6 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   display: flex;
   align-items: center;
-}
-
-.peak-badge {
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--color-warning, #e8a735);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  line-height: 1;
-  border: 1px solid var(--color-warning, #e8a735);
-  border-radius: var(--radius-md);
-  padding: 5px 7px;
-  height: 26px;
-  box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  opacity: 0.9;
-}
-
-.peak-icon {
-  font-style: normal;
-  line-height: 0;
 }
 
 .refresh-btn {
