@@ -139,9 +139,8 @@ const progressColor = computed(() => {
   padding: 8px 10px;
   border-radius: 6px;
   background: var(--color-bg-subtle);
-  border: 1px solid var(--color-card-border);
   cursor: pointer;
-  transition: border-color 0.1s, background 0.1s;
+  transition: background 0.1s;
   position: relative;
 }
 .worktree-card:hover {
@@ -157,7 +156,6 @@ const progressColor = computed(() => {
   cursor: default;
   opacity: 0.6;
   background: var(--color-bg-subtle);
-  border-color: var(--color-card-border);
 }
 .worktree-card.merged:hover {
   background: var(--color-bg-subtle);

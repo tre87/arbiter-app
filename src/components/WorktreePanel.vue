@@ -355,7 +355,6 @@ async function pruneAllStale() {
   align-items: center;
   justify-content: space-between;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--color-card-border);
 }
 
 .panel-title {
@@ -390,8 +389,6 @@ async function pruneAllStale() {
 
 .panel-footer {
   padding: 8px 10px;
-  border-top: 1px solid var(--color-card-border);
-  background: var(--color-bg-subtle);
   flex-shrink: 0;
 }
 

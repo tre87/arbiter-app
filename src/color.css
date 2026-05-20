@@ -9,6 +9,8 @@
   --color-bg:              #121212;
   --color-bg-subtle:       #1c1c1c;
   --color-bg-elevated:     #252525;
+  --color-bg-chrome:       #222222;  /* Outer window chrome — sits behind panel cards */
+  --color-bg-titlebar:     #181818;  /* Pane title bar — a touch above terminal #121 */
 
   /* Cards */
   --color-card-bg:         #1c1c1c;

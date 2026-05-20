@@ -199,7 +199,7 @@ onBeforeUnmount(() => {
   position: relative;
   width: 72px;
   height: 18px;
-  background: var(--color-card-border);
+  background: var(--color-bg);
   border-radius: var(--radius-sm);
   overflow: hidden;
 }

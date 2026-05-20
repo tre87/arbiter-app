@@ -56,8 +56,7 @@ const centerRoot = computed(() => activeWorktree.value?.root ?? null)
 }
 
 .project-workspace > :deep(.panel-card) {
-  background: var(--color-bg-subtle);
-  border: 1px solid var(--color-card-border);
+  background: var(--color-bg);
   border-radius: var(--radius-lg);
   overflow: hidden;
   box-shadow: var(--panel-shadow);

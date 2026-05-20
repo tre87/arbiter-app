@@ -222,7 +222,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100vh;
   width: 100vw;
-  background: var(--color-bg);
+  background: var(--color-bg-chrome);
 }
 
 .app::before {

@@ -596,16 +596,11 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 4px;
-  height: 30px;
+  height: 34px;
   padding: 0 6px;
-  background: var(--color-bg-subtle);
+  background: var(--color-bg-titlebar);
   border-bottom: 1px solid var(--color-card-border);
   flex-shrink: 0;
-  transition: background 0.12s;
-}
-
-.terminal-pane.focused .pane-toolbar {
-  background: var(--color-bg-elevated);
 }
 
 .toolbar-spacer { flex: 1; }
@@ -634,7 +629,7 @@ onBeforeUnmount(() => {
 
 .name-label {
   font-size: 11px;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

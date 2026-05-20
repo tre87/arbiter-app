@@ -318,7 +318,6 @@ watch(() => props.worktree.id, async () => {
 
 .explorer-header {
   padding: 8px 10px;
-  border-bottom: 1px solid var(--color-card-border);
 }
 
 .explorer-title {

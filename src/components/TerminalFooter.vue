@@ -147,7 +147,7 @@ function fmtK(n: number | null | undefined): string {
   gap: 6px;
   height: 26px;
   padding: 0 8px;
-  background: var(--color-bg-subtle);
+  background: var(--color-bg);
   border-top: 1px solid var(--color-card-border);
   flex-shrink: 0;
   overflow: visible;

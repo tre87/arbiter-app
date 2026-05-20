@@ -225,6 +225,8 @@ function gitPush() {
   width: 100%;
   justify-content: center;
   padding: 6px 8px;
+  border: none;
+  border-radius: 4px;
 }
 
 .full .git-menu {
