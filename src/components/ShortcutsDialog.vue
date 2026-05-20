@@ -11,6 +11,7 @@ const shortcuts = [
   { action: 'Split down', keys: ['Ctrl', 'Shift', 'D'] },
   { action: 'Navigate panes', keys: ['Ctrl', 'Shift', 'Arrow'] },
   { action: 'Resize panes', keys: ['Alt', 'Shift', 'Arrow'] },
+  { action: 'Equalize pane sizes', keys: ['Ctrl', 'Shift', 'E'] },
   { action: 'Workspace overview', keys: ['Ctrl', 'Shift', 'O'] },
   { action: 'Attach screenshot', keys: ['Ctrl', 'Shift', 'S'] },
   { action: 'Attach files', keys: ['Ctrl', 'Shift', 'A'] },

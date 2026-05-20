@@ -201,6 +201,33 @@ export const usePaneStore = defineStore('pane', () => {
     root.value = update(root.value)
   }
 
+  /** Redistribute split sizes so every terminal ends up with the same
+   *  viewport area, regardless of how the tree is shaped. Each split's
+   *  children are weighted by the total number of leaves under them, so a
+   *  subtree holding twice as many terminals gets twice the space. For a
+   *  clean chain of N same-direction splits this still gives 1/N per leaf;
+   *  for irregular trees it picks the only assignment where every leaf
+   *  occupies the same fraction of the screen. */
+  function equalizeSplits() {
+    function leafCount(node: PaneNode): number {
+      if (node.type !== 'split') return 1
+      return leafCount(node.first) + leafCount(node.second)
+    }
+    function update(node: PaneNode): PaneNode {
+      if (node.type !== 'split') return node
+      const w1 = leafCount(node.first)
+      const w2 = leafCount(node.second)
+      const a = (w1 / (w1 + w2)) * 100
+      return {
+        ...node,
+        sizes: [a, 100 - a],
+        first: update(node.first),
+        second: update(node.second),
+      }
+    }
+    root.value = update(root.value)
+  }
+
   // ── Terminal status tracking (for workspace overview) ─────────────────────
   const terminalStatuses = ref<Record<string, 'idle' | 'running' | 'ready' | 'working' | 'attention'>>({})
 
@@ -825,7 +852,7 @@ export const usePaneStore = defineStore('pane', () => {
     switchWorktree, getActiveWorktree, getProjectWorkspace,
     // Pane operations
     splitFocused, closeFocused, setFocus,
-    updateSplitSizes, adjustSplitSize,
+    updateSplitSizes, adjustSplitSize, equalizeSplits,
     // PTY session mapping
     ptySessionIds, setPtySession, getPtySession, hasPaneId, isPaneInProjectWorkspace, removePtySession,
     // Terminal names

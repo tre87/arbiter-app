@@ -117,6 +117,14 @@ export function useKeyboardShortcuts(toggleOverview: () => void) {
       return
     }
 
+    // Ctrl+Shift+E → equalize all split sizes (even grid)
+    if (e.code === 'KeyE') {
+      e.preventDefault()
+      e.stopPropagation()
+      store.equalizeSplits()
+      return
+    }
+
     // Ctrl+Shift+S → attach files from screenshot folder
     if (e.code === 'KeyS') {
       e.preventDefault()
