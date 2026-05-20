@@ -25,7 +25,11 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes("node_modules/@xterm/")) return "vendor-xterm"
+          // Do NOT manualChunk `@xterm/*` — Rollup wraps `@xterm/xterm` in an
+          // IIFE whose internal `xterm_exports` symbol gets tree-shaken away
+          // when the package is split into its own chunk, breaking addon
+          // imports at runtime (`SyntaxError: Export 'xterm_exports' is not
+          // defined in module`). Default chunking keeps core + addons together.
           if (id.includes("node_modules/@dicebear/")) return "vendor-dicebear"
           if (id.includes("node_modules/vue/") || id.includes("node_modules/@vue/") || id.includes("node_modules/pinia/")) return "vendor-vue"
         },
