@@ -1,3 +1,4 @@
+use crate::util::hidden_command;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -28,7 +29,7 @@ fn compute_git_info(cwd: &str) -> GitInfo {
     if !path.is_dir() {
         return GitInfo { is_repo: false, branch: None };
     }
-    let is_repo = std::process::Command::new("git")
+    let is_repo = hidden_command("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
@@ -39,7 +40,7 @@ fn compute_git_info(cwd: &str) -> GitInfo {
     if !is_repo {
         return GitInfo { is_repo: false, branch: None };
     }
-    let branch = std::process::Command::new("git")
+    let branch = hidden_command("git")
         .args(["branch", "--show-current"])
         .current_dir(cwd)
         .output()
@@ -93,7 +94,7 @@ pub struct WorktreeInfo {
 
 #[tauri::command]
 pub fn git_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfo>, String> {
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(&repo_root)
         .output()
@@ -182,7 +183,7 @@ pub fn git_worktree_add(repo_root: String, branch_name: String, base_branch: Opt
         args.push(base.clone());
     }
 
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(&args)
         .current_dir(&repo_root)
         .output()
@@ -193,7 +194,7 @@ pub fn git_worktree_add(repo_root: String, branch_name: String, base_branch: Opt
     }
 
     // Get HEAD of the new worktree
-    let head = std::process::Command::new("git")
+    let head = hidden_command("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&worktree_path)
         .output()
@@ -215,7 +216,7 @@ pub fn git_worktree_add(repo_root: String, branch_name: String, base_branch: Opt
 // Non-destructive to branches — only touches stale bookkeeping.
 #[tauri::command]
 pub fn git_worktree_prune(repo_root: String) -> Result<(), String> {
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["worktree", "prune"])
         .current_dir(&repo_root)
         .output()
@@ -232,7 +233,7 @@ pub fn git_worktree_prune(repo_root: String) -> Result<(), String> {
 // still registers the path; without --force, git refuses the add.
 #[tauri::command]
 pub fn git_worktree_restore(repo_root: String, worktree_path: String, branch_name: String) -> Result<WorktreeInfo, String> {
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["worktree", "add", "-f", &worktree_path, &branch_name])
         .current_dir(&repo_root)
         .output()
@@ -242,7 +243,7 @@ pub fn git_worktree_restore(repo_root: String, worktree_path: String, branch_nam
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    let head = std::process::Command::new("git")
+    let head = hidden_command("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&worktree_path)
         .output()
@@ -268,7 +269,7 @@ pub fn git_worktree_remove(repo_root: String, worktree_path: String, force: bool
     }
     args.push(&worktree_path);
 
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(&args)
         .output()
         .map_err(|e| format!("Failed to run git worktree remove: {}", e))?;
@@ -295,7 +296,7 @@ pub fn git_worktree_remove(repo_root: String, worktree_path: String, force: bool
                 .map_err(|e| format!("Filesystem removal failed: {}", e))?;
         }
         // Clean up stale administrative entries in <repo>/.git/worktrees.
-        let _ = std::process::Command::new("git")
+        let _ = hidden_command("git")
             .args(["-C", &repo_root, "worktree", "prune"])
             .output();
         return Ok(());
@@ -311,7 +312,7 @@ pub fn git_merge_branch(repo_root: String, source_branch: String, target_branch:
     let target_wt = worktrees.iter().find(|wt| wt.branch.as_deref() == Some(&target_branch));
     let merge_dir = target_wt.map(|wt| wt.path.clone()).unwrap_or(repo_root);
 
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["merge", &source_branch])
         .current_dir(&merge_dir)
         .output()
@@ -328,7 +329,7 @@ pub fn git_merge_branch(repo_root: String, source_branch: String, target_branch:
 #[tauri::command]
 pub fn git_push_and_create_pr(worktree_path: String) -> Result<String, String> {
     // Push branch
-    let push_output = std::process::Command::new("git")
+    let push_output = hidden_command("git")
         .args(["push", "-u", "origin", "HEAD"])
         .current_dir(&worktree_path)
         .output()
@@ -339,7 +340,7 @@ pub fn git_push_and_create_pr(worktree_path: String) -> Result<String, String> {
     }
 
     // Create PR using gh CLI
-    let pr_output = std::process::Command::new("gh")
+    let pr_output = hidden_command("gh")
         .args(["pr", "create", "--fill"])
         .current_dir(&worktree_path)
         .output()
@@ -357,7 +358,7 @@ pub fn git_list_branches(repo_path: String) -> Result<Vec<String>, String> {
     // List local branches and remote branches that don't have a local counterpart.
     // Local branches are returned by their short name; remote-only branches keep the
     // remote prefix (e.g. "origin/foo") so the value is directly usable as a git ref.
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"])
         .current_dir(&repo_path)
         .output()
@@ -398,7 +399,7 @@ pub fn git_list_branches(repo_path: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub fn git_repo_root(path: String) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&path)
         .output()
@@ -415,7 +416,7 @@ pub fn git_repo_root(path: String) -> Option<String> {
 #[tauri::command]
 pub fn git_file_status(repo_root: String, worktree_path: Option<String>) -> Result<HashMap<String, String>, String> {
     let cwd = worktree_path.as_deref().unwrap_or(&repo_root);
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["status", "--porcelain=v1", "-uall"])
         .current_dir(cwd)
         .output()
@@ -475,7 +476,7 @@ pub fn git_is_branch_merged(repo_root: String, branch: String, into_branch: Stri
     // acceptable — that case self-corrects as soon as the parent advances.
 
     let rev = |refname: &str| -> Result<String, String> {
-        let out = std::process::Command::new("git")
+        let out = hidden_command("git")
             .args(["rev-parse", refname])
             .current_dir(&repo_root)
             .output()
@@ -496,7 +497,7 @@ pub fn git_is_branch_merged(repo_root: String, branch: String, into_branch: Stri
     // exit 0 → branch's tip is reachable from into_branch (fully merged)
     // exit 1 → not merged
     // any other → real error
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .args(["merge-base", "--is-ancestor", &branch, &into_branch])
         .current_dir(&repo_root)
         .output()

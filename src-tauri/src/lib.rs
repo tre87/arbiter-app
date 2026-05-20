@@ -6,6 +6,7 @@ mod overview;
 mod pty;
 mod shell;
 mod usage;
+mod util;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -63,8 +64,7 @@ fn get_locale() -> String {
     // regional format (e.g. da-DK). Read the regional format from the registry.
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        if let Ok(output) = Command::new("powershell")
+        if let Ok(output) = crate::util::hidden_command("powershell")
             .args(["-NoProfile", "-Command", "(Get-ItemProperty 'HKCU:\\Control Panel\\International').LocaleName"])
             .output()
         {

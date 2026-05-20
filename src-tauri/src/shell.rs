@@ -14,7 +14,7 @@ pub fn check_git_bash() -> Option<String> {
             }
         }
         // Fallback: check PATH via `where bash.exe`, filtering out WSL/System32
-        if let Ok(output) = std::process::Command::new("where").arg("bash.exe").output() {
+        if let Ok(output) = crate::util::hidden_command("where").arg("bash.exe").output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {

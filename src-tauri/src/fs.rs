@@ -122,11 +122,10 @@ pub fn open_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        // `cmd /C start "" "path"` honours file associations without opening a
-        // visible shell window. The empty quoted string is the window title
-        // argument that `start` requires when the target is quoted.
-        Command::new("cmd")
+        // `cmd /C start "" "path"` honours file associations. CREATE_NO_WINDOW
+        // (via hidden_command) keeps cmd itself from flashing; `start` then
+        // hands off to the file's registered handler.
+        crate::util::hidden_command("cmd")
             .args(["/C", "start", "", &path])
             .spawn()
             .map_err(|e| format!("Failed to open path: {}", e))?;
