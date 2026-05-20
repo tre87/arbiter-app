@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
 import { useProjectStore } from '../stores/project'
 import { useDevSettingsStore } from '../stores/devSettings'
+import { useFilesSettingsStore } from '../stores/filesSettings'
 import { waitForShellIdle } from '../utils/shellIdle'
 import type { ArbiterConfig } from '../types/config'
 import type { PaneNode } from '../types/pane'
@@ -116,6 +117,12 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
       store.restoreAllWorkspaces(config.workspaces, config.activeWorkspaceIndex)
     } else if (config.layout && config.terminals) {
       store.restoreFromSaved(config.layout, config.terminals, config.focusedTerminalIndex)
+    }
+
+    if (config.filesSettings) {
+      const fs = useFilesSettingsStore()
+      fs.setScreenshotFolder(config.filesSettings.screenshotFolder ?? null)
+      fs.setLastDocsFolder(config.filesSettings.lastDocsFolder ?? null)
     }
 
     if (config.overviewVisible && config.overview) {

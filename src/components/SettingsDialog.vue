@@ -2,22 +2,27 @@
 import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
+import { open } from '@tauri-apps/plugin-dialog'
 import { useDevSettingsStore } from '../stores/devSettings'
 import { useUsageStore } from '../stores/usage'
+import { useFilesSettingsStore } from '../stores/filesSettings'
 
 const emit = defineEmits<{ close: [] }>()
 const devStore = useDevSettingsStore()
 const usageStore = useUsageStore()
+const filesStore = useFilesSettingsStore()
 
 const isWindows = navigator.platform.startsWith('Win')
 const gitBashAvailable = ref(false)
 const appVersion = ref('')
+const screenshotDefaultPath = ref('')
 
-type Tab = 'general' | 'usage' | 'display'
+type Tab = 'general' | 'files' | 'usage' | 'display'
 const activeTab = ref<Tab>('general')
 
 const tabs: { id: Tab; label: string }[] = [
   { id: 'general', label: 'General' },
+  { id: 'files', label: 'Files' },
   { id: 'usage', label: 'Claude Usage' },
   { id: 'display', label: 'Display' },
 ]
@@ -30,7 +35,27 @@ onMounted(async () => {
   try {
     appVersion.value = await getVersion()
   } catch { /* ignore */ }
+  try {
+    screenshotDefaultPath.value = await filesStore.getScreenshotDefaultDir()
+  } catch { /* ignore — placeholder stays empty */ }
 })
+
+async function browseScreenshotFolder() {
+  try {
+    const selected = await open({
+      directory: true,
+      defaultPath: filesStore.screenshotFolder || screenshotDefaultPath.value || undefined,
+      title: 'Select Screenshot Folder',
+    })
+    if (typeof selected === 'string') filesStore.setScreenshotFolder(selected)
+  } catch (e) {
+    console.error('Arbiter: browseScreenshotFolder failed:', e)
+  }
+}
+
+function resetScreenshotFolder() {
+  filesStore.setScreenshotFolder(null)
+}
 
 async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   try {
@@ -120,6 +145,34 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                   <span class="switch-track"></span>
                 </span>
               </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Files -->
+        <div v-if="activeTab === 'files'" class="tab-panel">
+          <div class="panel-section">
+            <h4 class="panel-title">Screenshot Folder</h4>
+            <div class="panel-body">
+              <p class="panel-hint">
+                Folder opened by <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>. Leave blank to use the system default.
+              </p>
+              <div class="path-row">
+                <input
+                  type="text"
+                  class="path-input"
+                  :value="filesStore.screenshotFolder ?? ''"
+                  :placeholder="screenshotDefaultPath || 'System default'"
+                  @input="filesStore.setScreenshotFolder(($event.target as HTMLInputElement).value)"
+                />
+                <button class="btn btn-secondary" @click="browseScreenshotFolder">Browse…</button>
+                <button
+                  v-if="filesStore.screenshotFolder"
+                  class="btn btn-secondary"
+                  @click="resetScreenshotFolder"
+                  title="Reset to system default"
+                >Reset</button>
+              </div>
             </div>
           </div>
         </div>
@@ -321,6 +374,54 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.panel-hint {
+  margin: 0 0 10px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.panel-hint kbd {
+  display: inline-block;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 1px 5px;
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-card-border);
+  border-radius: 3px;
+  color: var(--color-text-secondary);
+}
+
+.path-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.path-input::placeholder {
+  color: var(--color-text-muted);
+}
+
+.path-input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px rgba(51, 153, 255, 0.25);
 }
 
 .btn {

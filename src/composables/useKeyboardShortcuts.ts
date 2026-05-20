@@ -1,7 +1,9 @@
 import { onMounted, onBeforeUnmount } from 'vue'
 import { usePaneStore } from '../stores/pane'
+import { useFilesSettingsStore } from '../stores/filesSettings'
 import { useConfirm } from './useConfirm'
 import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from '../utils/spatial'
+import { dirnameOf, pickAndAttach } from '../utils/attachFiles'
 
 const arrowToDirection: Record<string, Direction> = {
   ArrowLeft: 'left',
@@ -12,7 +14,27 @@ const arrowToDirection: Record<string, Direction> = {
 
 export function useKeyboardShortcuts(toggleOverview: () => void) {
   const store = usePaneStore()
+  const filesStore = useFilesSettingsStore()
   const { confirm: confirmDialog } = useConfirm()
+
+  async function attachFromScreenshots() {
+    try {
+      const dir = await filesStore.resolveScreenshotDir()
+      await pickAndAttach(dir)
+    } catch (e) {
+      console.error('Arbiter: attachFromScreenshots failed:', e)
+    }
+  }
+
+  async function attachFromDocs() {
+    try {
+      const dir = await filesStore.resolveDocsDir()
+      const picked = await pickAndAttach(dir)
+      if (picked.length) filesStore.setLastDocsFolder(dirnameOf(picked[0]))
+    } catch (e) {
+      console.error('Arbiter: attachFromDocs failed:', e)
+    }
+  }
 
   async function confirmCloseWorkspace(index: number) {
     const ws = store.workspaces[index]
@@ -92,6 +114,22 @@ export function useKeyboardShortcuts(toggleOverview: () => void) {
       e.preventDefault()
       e.stopPropagation()
       toggleOverview()
+      return
+    }
+
+    // Ctrl+Shift+S → attach files from screenshot folder
+    if (e.code === 'KeyS') {
+      e.preventDefault()
+      e.stopPropagation()
+      attachFromScreenshots()
+      return
+    }
+
+    // Ctrl+Shift+A → attach files from last-used folder (Documents on first run)
+    if (e.code === 'KeyA') {
+      e.preventDefault()
+      e.stopPropagation()
+      attachFromDocs()
       return
     }
 

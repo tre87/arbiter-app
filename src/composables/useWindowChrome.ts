@@ -1,8 +1,8 @@
 import { onMounted, onBeforeUnmount } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { usePaneStore } from '../stores/pane'
+import { writePathsToPane } from '../utils/attachFiles'
 
 /** Titlebar drag handlers. Explicit drag handling is more reliable than
  *  data-tauri-drag-region under custom chrome. */
@@ -54,11 +54,7 @@ export function useWindowChrome() {
       const paneId = paneEl.dataset.paneId
       if (!paneId) return
 
-      const ptySessionId = store.getPtySession(paneId)
-      if (!ptySessionId) return
-
-      const quoted = paths.map(p => p.includes(' ') ? `"${p}"` : p)
-      invoke('write_to_session', { sessionId: ptySessionId, data: quoted.join(' ') })
+      if (!writePathsToPane(paneId, paths)) return
       store.setFocus(paneId)
     })
   }

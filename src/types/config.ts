@@ -53,10 +53,18 @@ export interface ArbiterConfig {
   // Multi-workspace (new format)
   workspaces?: SavedWorkspace[]
   activeWorkspaceIndex?: number
+  filesSettings?: FilesSettings
   // Legacy single-workspace (backward compat)
   layout?: SavedPaneNode
   terminals?: SavedTerminal[]
   focusedTerminalIndex?: number
+}
+
+export interface FilesSettings {
+  // Overrides the OS-default screenshot folder when set. Blank/undefined = use default.
+  screenshotFolder?: string
+  // Last directory the "attach files" picker opened in. Remembered across sessions.
+  lastDocsFolder?: string
 }
 
 export interface WindowGeometry {

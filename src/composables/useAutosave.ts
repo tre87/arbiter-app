@@ -2,6 +2,7 @@ import { watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { usePaneStore } from '../stores/pane'
+import { useFilesSettingsStore } from '../stores/filesSettings'
 import type {
   ArbiterConfig, SavedTerminal, SavedWorkspace,
   SavedTerminalWorkspace, SavedProjectWorkspace,
@@ -46,6 +47,7 @@ async function enrichTerminal(store: ReturnType<typeof usePaneStore>, t: { id: s
 
 export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
   const store = usePaneStore()
+  const filesStore = useFilesSettingsStore()
 
   let saveInFlight = false
   let savePending = false
@@ -144,6 +146,13 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       config.workspaces = savedWorkspaces
       config.activeWorkspaceIndex = serialized.activeWorkspaceIndex
 
+      if (filesStore.screenshotFolder || filesStore.lastDocsFolder) {
+        config.filesSettings = {
+          screenshotFolder: filesStore.screenshotFolder ?? undefined,
+          lastDocsFolder: filesStore.lastDocsFolder ?? undefined,
+        }
+      }
+
       await invoke('save_config', { config })
     } catch (e) {
       console.error('Auto-save failed:', e)
@@ -165,6 +174,8 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       store.workspaces,
       store.activeWorkspaceIndex,
       store.terminalStatuses,
+      filesStore.screenshotFolder,
+      filesStore.lastDocsFolder,
       // Narrow projection of claudePaneStates: only fields that actually get
       // persisted (lifecycle, sessionId, confirmed). Deep-watching the full
       // map would re-fire — and trigger O(N) get_session_cwd IPC roundtrips —

@@ -12,6 +12,8 @@ const shortcuts = [
   { action: 'Navigate panes', keys: ['Ctrl', 'Shift', 'Arrow'] },
   { action: 'Resize panes', keys: ['Alt', 'Shift', 'Arrow'] },
   { action: 'Workspace overview', keys: ['Ctrl', 'Shift', 'O'] },
+  { action: 'Attach screenshot', keys: ['Ctrl', 'Shift', 'S'] },
+  { action: 'Attach files', keys: ['Ctrl', 'Shift', 'A'] },
 ]
 </script>
 
