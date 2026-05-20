@@ -35,19 +35,12 @@ fn exit_app(app: AppHandle) {
     app.exit(0);
 }
 
-// `open_devtools` is only available on debug builds — Tauri strips the method
-// from `WebviewWindow` in release unless the `devtools` Cargo feature is on.
-// We expose a no-op release shim so the frontend can keep invoking the same
-// command unconditionally.
-#[cfg(debug_assertions)]
+// Available in release builds because the `devtools` Cargo feature is enabled
+// on the `tauri` crate (see Cargo.toml).
 #[tauri::command]
 fn open_devtools(webview_window: tauri::WebviewWindow) {
     webview_window.open_devtools();
 }
-
-#[cfg(not(debug_assertions))]
-#[tauri::command]
-fn open_devtools(_webview_window: tauri::WebviewWindow) {}
 
 #[tauri::command]
 #[cfg_attr(not(windows), allow(unused_variables))]

@@ -15,6 +15,7 @@ const shortcuts = [
   { action: 'Workspace overview', keys: ['Ctrl', 'Shift', 'O'] },
   { action: 'Attach screenshot', keys: ['Ctrl', 'Shift', 'S'] },
   { action: 'Attach files', keys: ['Ctrl', 'Shift', 'A'] },
+  { action: 'Open DevTools', keys: ['Ctrl', 'Shift', 'I'] },
 ]
 </script>
 

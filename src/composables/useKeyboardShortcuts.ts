@@ -1,4 +1,5 @@
 import { onMounted, onBeforeUnmount } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
 import { useFilesSettingsStore } from '../stores/filesSettings'
 import { useConfirm } from './useConfirm'
@@ -67,6 +68,15 @@ export function useKeyboardShortcuts(toggleOverview: () => void) {
       e.preventDefault()
       e.stopPropagation()
       store.addWorkspace()
+      return
+    }
+
+    // Ctrl+Shift+I → open WebView2 DevTools (release builds include the
+    // `devtools` Tauri feature). Handled before the generic Ctrl+Shift gate.
+    if (e.ctrlKey && e.shiftKey && e.code === 'KeyI') {
+      e.preventDefault()
+      e.stopPropagation()
+      invoke('open_devtools').catch(err => console.error('Arbiter: open_devtools failed:', err))
       return
     }
 

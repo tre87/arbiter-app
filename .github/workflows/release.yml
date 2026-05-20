@@ -18,12 +18,15 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
+            mac_suffix: ''
           - platform: macos-latest
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
+            mac_suffix: '_intel'
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             args: ''
+            mac_suffix: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -49,14 +52,46 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build and release with tauri-action
+      - name: Build with tauri-action
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Arbiter ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download and install.'
-          releaseDraft: true
-          prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Stage release assets (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          APP_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Arbiter.app"
+          if [ ! -d "$APP_DIR" ]; then
+            echo "::error::Expected .app bundle not found at $APP_DIR"
+            ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/" || true
+            exit 1
+          fi
+          # ditto preserves resource forks, symlinks, and executable bits
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "staging/Arbiter${{ matrix.mac_suffix }}.app.zip"
+
+      - name: Stage release assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          $nsis = Get-ChildItem -Path src-tauri\target\release\bundle\nsis\*-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $nsis) {
+            Write-Error "NSIS installer not found under src-tauri\target\release\bundle\nsis"
+            Get-ChildItem -Path src-tauri\target\release\bundle\ -Recurse | Select-Object FullName
+            exit 1
+          }
+          Copy-Item $nsis.FullName "staging\Arbiter-setup.exe"
+          Copy-Item src-tauri\target\release\arbiter.exe "staging\Arbiter.exe"
+
+      - name: Publish to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: 'Arbiter ${{ github.ref_name }}'
+          draft: true
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: staging/*
