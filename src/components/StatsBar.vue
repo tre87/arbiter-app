@@ -121,11 +121,12 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 5px;
+  height: 26px;
 }
 
 .stat-label {
   font-size: 11px;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   white-space: nowrap;
 }
 
@@ -160,13 +161,14 @@ onBeforeUnmount(() => {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
   z-index: 1;
   pointer-events: none;
+  font-variant-numeric: tabular-nums;
 }
 
 .stat-reset {
-  font-size: 10px;
-  color: var(--color-text-muted);
+  font-size: 11px;
+  color: var(--color-text-secondary);
   white-space: nowrap;
-  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
 }
 
 .plan-badge {
@@ -227,7 +229,7 @@ onBeforeUnmount(() => {
 
 .refresh-cd {
   font-size: 11px;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
   line-height: 1;
   font-variant-numeric: tabular-nums;
   transition: color 0.15s;
