@@ -257,10 +257,20 @@ onBeforeUnmount(() => {
   z-index: 2;
 }
 
+/* macOS: let the traffic-light cluster receive native hover/click by
+   passing pointer events through the titlebar's empty padding area.
+   Interactive children re-enable events; drag mousedown still bubbles. */
+:global(body.is-macos) .titlebar {
+  pointer-events: none;
+}
+:global(body.is-macos) .titlebar > * {
+  pointer-events: auto;
+}
+
 .titlebar-brand {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 8px;
   padding-right: 8px;
   flex: 0 0 auto;
 }
@@ -274,7 +284,7 @@ onBeforeUnmount(() => {
 .titlebar-stats {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   padding: 0 8px;
   flex: 0 1 auto;
   min-width: 0;
