@@ -14,6 +14,12 @@ interface TerminalInfo {
   workspaceType: 'terminal' | 'project'
   name: string
   status: 'idle' | 'running' | 'ready' | 'working' | 'attention'
+  claudeActive: boolean
+}
+
+interface OverviewUpdate {
+  terminals: TerminalInfo[]
+  claudeOnly: boolean
 }
 
 interface WorkspaceGroup {
@@ -25,6 +31,7 @@ interface WorkspaceGroup {
 }
 
 const terminals = ref<TerminalInfo[]>([])
+const claudeOnly = ref(true)
 const error = ref('')
 const collapsed = ref<Set<string>>(new Set())
 let unlistenUpdate: UnlistenFn | null = null
@@ -33,6 +40,7 @@ const grouped = computed<WorkspaceGroup[]>(() => {
   const groups: WorkspaceGroup[] = []
   let currentGroup: WorkspaceGroup | null = null
   for (const t of terminals.value) {
+    if (claudeOnly.value && !t.claudeActive) continue
     if (!currentGroup || currentGroup.workspaceIndex !== t.workspaceIndex) {
       currentGroup = {
         workspaceId: t.workspaceId,
@@ -128,8 +136,9 @@ function onHeaderPointerDown(e: PointerEvent, index: number) {
 
 onMounted(async () => {
   try {
-    unlistenUpdate = await listen<TerminalInfo[]>('overview-update', (event) => {
-      terminals.value = event.payload
+    unlistenUpdate = await listen<OverviewUpdate>('overview-update', (event) => {
+      terminals.value = event.payload.terminals
+      claudeOnly.value = event.payload.claudeOnly
     })
 
     // Request initial state from main window
