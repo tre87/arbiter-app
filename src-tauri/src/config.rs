@@ -3,7 +3,10 @@ use tauri::{AppHandle, Manager};
 
 pub fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(dir.join("config.json"))
+    // Debug builds (cargo tauri dev) get their own config file so iterating
+    // on the app doesn't trample the installed release's saved workspaces.
+    let file = if cfg!(debug_assertions) { "config-dev.json" } else { "config.json" };
+    Ok(dir.join(file))
 }
 
 #[tauri::command]
