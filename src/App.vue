@@ -54,6 +54,11 @@ const { flush: flushAutosave } = useAutosave(ready, overviewOpen)
 // skip the cross-window IPC when nobody's listening.
 watch(overviewOpen, (open) => store.setOverviewOpen(open), { immediate: true })
 
+// Re-push the overview list when the Claude-only filter toggles, so the
+// open overview window updates immediately instead of waiting for the next
+// terminal-status or Claude-lifecycle event.
+watch(() => devStore.overviewClaudeOnly, () => store.emitOverviewUpdate())
+
 // Panes in newly-active workspaces need a chance to refit: ResizeObserver
 // doesn't fire while an ancestor is `display: none`, so a window resize
 // during backgrounding wouldn't have reached them. Each TerminalPane decides

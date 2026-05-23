@@ -227,6 +227,13 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                   <span class="switch-track"></span>
                 </span>
               </label>
+              <label class="toggle-row">
+                <span class="toggle-label">Overview: only show terminals running Claude</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.overviewClaudeOnly" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
             </div>
           </div>
         </div>

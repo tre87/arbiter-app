@@ -10,6 +10,7 @@ import {
   firstLeaf, lastLeaf,
 } from '../utils/paneTree'
 import { wireClaudeEventListeners } from './paneClaudeEvents'
+import { useDevSettingsStore } from './devSettings'
 
 let nextId = 1
 const genId = () => String(nextId++)
@@ -245,6 +246,12 @@ export const usePaneStore = defineStore('pane', () => {
 
   function emitOverviewUpdate() {
     if (!overviewWindowOpen.value) return
+    const devSettings = useDevSettingsStore()
+    // Send all terminals plus per-terminal `claudeActive` and the current
+    // filter setting. The overview window applies the filter locally so it
+    // stays correct even when this fires before Claude lifecycle states
+    // have been populated by mounting panes (the initial overview-request
+    // happens before TerminalPane.onMounted runs).
     const terminals = getAllTerminals().map(t => ({
       paneId: t.paneId,
       workspaceId: t.workspaceId,
@@ -253,8 +260,9 @@ export const usePaneStore = defineStore('pane', () => {
       workspaceType: t.workspaceType,
       name: getTerminalName(t.paneId),
       status: getTerminalStatus(t.paneId),
+      claudeActive: getClaudePaneState(t.paneId).lifecycle !== 'closed',
     }))
-    emit('overview-update', terminals)
+    emit('overview-update', { terminals, claudeOnly: devSettings.overviewClaudeOnly })
   }
 
   function getTerminalStatus(paneId: string): 'idle' | 'running' | 'ready' | 'working' | 'attention' {
@@ -299,9 +307,17 @@ export const usePaneStore = defineStore('pane', () => {
 
   function updateClaudePaneState(paneId: string, update: Partial<ClaudePaneState>) {
     const current = getClaudePaneState(paneId)
+    const lifecycleChanged = update.lifecycle !== undefined && update.lifecycle !== current.lifecycle
     claudePaneStates.value[paneId] = { ...current, ...update }
     if (update.lifecycle === 'launching') {
       launchTimestamps[paneId] = Date.now()
+    }
+    // When `overviewClaudeOnly` is on, a pane appearing/disappearing from the
+    // overview is driven by its Claude lifecycle, not by terminal-status
+    // shell-activity events. Re-emit so the list re-filters as soon as a
+    // Claude launch/exit transitions across the `closed` boundary.
+    if (lifecycleChanged && (update.lifecycle === 'closed' || current.lifecycle === 'closed')) {
+      emitOverviewUpdate()
     }
   }
 
