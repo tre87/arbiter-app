@@ -175,7 +175,10 @@ fn parse_usage_period(obj: &serde_json::Value) -> Option<UsagePeriod> {
 
 fn org_selection_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(dir.join("org-selection.json"))
+    // Same dev/release split as `config.rs` — keeps the dev build's org
+    // picker state separate from the installed release's.
+    let file = if cfg!(debug_assertions) { "org-selection-dev.json" } else { "org-selection.json" };
+    Ok(dir.join(file))
 }
 
 fn load_selected_org(app: &AppHandle) -> Option<OrgInfo> {
