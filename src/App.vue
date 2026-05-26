@@ -282,7 +282,12 @@ onBeforeUnmount(() => {
 
 .titlebar :deep(.workspace-tabs),
 .titlebar-tabs-placeholder {
-  flex: 1 1 0;
+  /* basis: auto so the container's natural size is its content. shrink: 1
+     paired with stats' shrink: 0.01 makes tabs absorb ~99% of overflow as
+     the window narrows. Each tab's own min-width: 86 keeps "Xxx…" readable.
+     Once tabs collectively can't fit at that floor, the rightmost one starts
+     to clip — accepted trade-off for visible compression. */
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -291,7 +296,11 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   padding: 0 8px;
-  flex: 0 1 auto;
+  /* shrink: 0.01 (paired with tabs' shrink: 1) makes the tabs absorb ~99% of
+     overflow as the window narrows. Once tabs hit their min-width: min-content
+     floor (so both tab labels stay at "Xxx..."), the remaining pressure flows
+     here and stats compresses down to 0. */
+  flex: 0 0.01 auto;
   min-width: 0;
   overflow: hidden;
 }

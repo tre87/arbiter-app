@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { computed, ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
 import { useProjectStore } from '../stores/project'
@@ -11,9 +11,25 @@ const store = usePaneStore()
 const projectStore = useProjectStore()
 const { confirm: confirmDialog } = useConfirm()
 
+// Floor the container at sum(tab min-widths) + + button + gaps + padding so
+// the parent flex (titlebar) shrinks the stats bar before chopping any tab or
+// hiding the + button. Tabs still compress inside this floor as the window
+// narrows — each tab's own min-width: 86px keeps "Xxx…" readable; once tabs
+// are all at that floor and the container is at this overall floor, further
+// pressure flows entirely into the stats bar.
+const TAB_MIN_PX = 86
+const TAB_GAP_PX = 3
+const ADD_BTN_PX = 26
+const CONTAINER_GAPS_AND_PAD_PX = 14 // 2 gaps between (scroll, +, spacer) + 8 padding
+const tabsContainerMinWidth = computed(() => {
+  const count = Math.max(1, store.workspaces.length)
+  const tabsRow = count * TAB_MIN_PX + (count - 1) * TAB_GAP_PX
+  return `${tabsRow + ADD_BTN_PX + CONTAINER_GAPS_AND_PAD_PX}px`
+})
+
 async function confirmAndCloseWorkspace(index: number) {
   const ws = store.workspaces[index]
-  if (!ws || store.workspaces.length <= 1) return
+  if (!ws) return
   const ok = await confirmDialog({
     title: `Close workspace "${ws.name}"?`,
     message: ws.type === 'project'
@@ -22,7 +38,12 @@ async function confirmAndCloseWorkspace(index: number) {
     confirmText: 'Close',
     danger: true,
   })
-  if (ok) store.removeWorkspace(index)
+  if (!ok) return
+  // Closing the only workspace would leave the app in an empty state, so add
+  // a fresh terminal workspace first; removeWorkspace's length-guard then
+  // accepts the removal because length is back to >1.
+  if (store.workspaces.length <= 1) store.addWorkspace()
+  store.removeWorkspace(index)
 }
 
 // ── New workspace dropdown ──────────────────────────────────────────────────
@@ -232,45 +253,47 @@ function onPointerDown(e: PointerEvent, index: number) {
 </script>
 
 <template>
-  <div ref="tabsContainer" class="workspace-tabs" @wheel="onWheel">
-    <div
-      v-for="(ws, i) in store.workspaces"
-      :key="ws.id"
-      class="tab"
-      :class="{
-        active: i === store.activeWorkspaceIndex,
-        'drag-over': dragOverIndex === i && dragIndex !== i,
-        dragging: dragIndex === i,
-      }"
-      :title="ws.name"
-      @click="onTabClick(i)"
-      @mousedown="onTabMouseDown($event, i)"
-      @pointerdown="onPointerDown($event, i)"
-      @contextmenu="onContextMenu($event, i)"
-    >
-      <input
-        v-if="editingIndex === i"
-        ref="editInput"
-        v-model="editValue"
-        class="tab-rename-input"
-        maxlength="40"
-        @blur="finishRename"
-        @keydown="onRenameKeydown"
-        @click.stop
-      />
-      <template v-else>
-        <MdiIcon v-if="ws.type === 'project'" :path="mdiFolder" :size="12" class="tab-type-icon" />
-        <MdiIcon v-else :path="mdiConsole" :size="12" class="tab-type-icon" />
-        <span class="tab-label">{{ ws.name }}</span>
-      </template>
-      <button
-        v-if="store.workspaces.length > 1 && editingIndex !== i"
-        class="tab-close"
-        title="Close workspace"
-        @click.stop="confirmAndCloseWorkspace(i)"
+  <div class="workspace-tabs" :style="{ minWidth: tabsContainerMinWidth }">
+    <div ref="tabsContainer" class="tabs-scroll" @wheel="onWheel">
+      <div
+        v-for="(ws, i) in store.workspaces"
+        :key="ws.id"
+        class="tab"
+        :class="{
+          active: i === store.activeWorkspaceIndex,
+          'drag-over': dragOverIndex === i && dragIndex !== i,
+          dragging: dragIndex === i,
+        }"
+        :title="ws.name"
+        @click="onTabClick(i)"
+        @mousedown="onTabMouseDown($event, i)"
+        @pointerdown="onPointerDown($event, i)"
+        @contextmenu="onContextMenu($event, i)"
       >
-        <MdiIcon :path="mdiClose" :size="12" />
-      </button>
+        <input
+          v-if="editingIndex === i"
+          ref="editInput"
+          v-model="editValue"
+          class="tab-rename-input"
+          maxlength="40"
+          @blur="finishRename"
+          @keydown="onRenameKeydown"
+          @click.stop
+        />
+        <template v-else>
+          <MdiIcon v-if="ws.type === 'project'" :path="mdiFolder" :size="12" class="tab-type-icon" />
+          <MdiIcon v-else :path="mdiConsole" :size="12" class="tab-type-icon" />
+          <span class="tab-label">{{ ws.name }}</span>
+        </template>
+        <button
+          v-if="editingIndex !== i"
+          class="tab-close"
+          title="Close workspace"
+          @click.stop="confirmAndCloseWorkspace(i)"
+        >
+          <MdiIcon :path="mdiClose" :size="12" />
+        </button>
+      </div>
     </div>
     <button ref="addBtnEl" class="tab-add" title="New workspace (Ctrl+Shift+T)" @click.stop="toggleNewMenu">
       +
@@ -307,7 +330,6 @@ function onPointerDown(e: PointerEvent, index: number) {
     >
       <button class="ctx-item" @click="onContextRename">Rename</button>
       <button
-        v-if="store.workspaces.length > 1"
         class="ctx-item danger"
         @click="onContextClose"
       >
@@ -325,12 +347,30 @@ function onPointerDown(e: PointerEvent, index: number) {
   height: 100%;
   min-width: 0;
   padding: 0 4px;
+}
+
+/* Inner scroll region: only the tab list scrolls/clips. The + button and the
+   drag spacer sit outside this so + is always visible at a deterministic spot
+   regardless of how many tabs there are or how narrow the window gets.
+   grow: 0 keeps it at content width when the window is wide (no gap between
+   the last tab and the + button); shrink: 1 lets it absorb overflow when
+   the window narrows. min-width: 0 lets it compress all the way down — the
+   per-tab min-width still acts as the floor for each individual tab. If the
+   container can't fit every tab at that floor, the rightmost one will start
+   to clip; that's the trade-off for actually getting visible compression. */
+.tabs-scroll {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 100%;
+  min-width: 0;
+  flex: 0 1 auto;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
 }
 
-.workspace-tabs::-webkit-scrollbar {
+.tabs-scroll::-webkit-scrollbar {
   display: none;
 }
 
@@ -341,7 +381,10 @@ function onPointerDown(e: PointerEvent, index: number) {
   padding: 0 28px 0 8px;
   height: 26px;
   margin: auto 0;
-  min-width: 54px;
+  /* 8 (pad-left) + 14 (icon + margin) + 4 (gap) + ~32 ("Xxx…") + 28 (pad-right
+     for absolutely-positioned close button) — enough to always show 3 label
+     chars followed by an ellipsis. */
+  min-width: 86px;
   max-width: 240px;
   flex-shrink: 1;
   cursor: pointer;
@@ -441,6 +484,7 @@ function onPointerDown(e: PointerEvent, index: number) {
   opacity: 1;
 }
 
+/* Mirrors .tab so the + button reads as part of the same control group. */
 .tab-add {
   display: flex;
   align-items: center;
@@ -450,20 +494,21 @@ function onPointerDown(e: PointerEvent, index: number) {
   height: 26px;
   margin: auto 0;
   flex-shrink: 0;
-  background: none;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  color: var(--color-text-muted);
-  font-size: 16px;
   cursor: pointer;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-md);
+  font-size: 16px;
+  line-height: 1;
   transition: color 0.12s, background 0.12s, border-color 0.12s;
   padding: 0;
 }
 
 .tab-add:hover {
   color: var(--color-text-primary);
-  background: var(--color-bg-elevated);
-  border-color: var(--color-card-border);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
 }
 
 .tab-type-icon {

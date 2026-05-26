@@ -211,6 +211,13 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                   <span class="switch-track"></span>
                 </span>
               </label>
+              <label class="toggle-row">
+                <span class="toggle-label">Hide Sonnet usage</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.hideSonnetUsage" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
             </div>
           </div>
         </div>
