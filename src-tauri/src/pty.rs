@@ -56,7 +56,7 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
         })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = build_shell_command(shell.as_deref());
+    let mut cmd = build_shell_command(&app, shell.as_deref());
     cmd.env("TERM", "xterm-256color");
     if let Some(ref dir) = cwd {
         let p = std::path::Path::new(dir);

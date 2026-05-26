@@ -1,4 +1,51 @@
 use portable_pty::CommandBuilder;
+#[cfg(not(target_os = "windows"))]
+use std::path::PathBuf;
+use tauri::{AppHandle, Manager};
+
+// zsh ignores PROMPT_COMMAND, so we install precmd/preexec hooks via ZDOTDIR
+// injection: point zsh at an Arbiter-managed dir whose .z* files source the
+// user's real startup files and then add OSC 7 / OSC 133 emitters.
+#[cfg(not(target_os = "windows"))]
+const ZSH_ZSHENV: &str = "[[ -f \"${ARBITER_USER_ZDOTDIR:-$HOME}/.zshenv\" ]] && source \"${ARBITER_USER_ZDOTDIR:-$HOME}/.zshenv\"\n";
+
+#[cfg(not(target_os = "windows"))]
+const ZSH_ZPROFILE: &str = "[[ -f \"${ARBITER_USER_ZDOTDIR:-$HOME}/.zprofile\" ]] && source \"${ARBITER_USER_ZDOTDIR:-$HOME}/.zprofile\"\n";
+
+#[cfg(not(target_os = "windows"))]
+const ZSH_ZLOGIN: &str = "[[ -f \"${ARBITER_USER_ZDOTDIR:-$HOME}/.zlogin\" ]] && source \"${ARBITER_USER_ZDOTDIR:-$HOME}/.zlogin\"\n";
+
+#[cfg(not(target_os = "windows"))]
+const ZSH_ZSHRC: &str = r#"_arbiter_user_zdotdir="${ARBITER_USER_ZDOTDIR:-$HOME}"
+ZDOTDIR="$_arbiter_user_zdotdir"
+[[ -f "$_arbiter_user_zdotdir/.zshrc" ]] && source "$_arbiter_user_zdotdir/.zshrc"
+unset _arbiter_user_zdotdir ARBITER_USER_ZDOTDIR
+
+_arbiter_precmd() {
+  local pwd_encoded="${PWD// /%20}"
+  printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$HOST" "$pwd_encoded"
+}
+_arbiter_preexec() {
+  printf '\e]133;C\a'
+}
+autoload -Uz add-zsh-hook 2>/dev/null
+if (( $+functions[add-zsh-hook] )); then
+  add-zsh-hook precmd _arbiter_precmd
+  add-zsh-hook preexec _arbiter_preexec
+fi
+"#;
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_zsh_integration_dir(app: &AppHandle) -> Option<PathBuf> {
+    let data_dir = app.path().app_data_dir().ok()?;
+    let dir = data_dir.join("shell-integration").join("zsh");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join(".zshenv"), ZSH_ZSHENV).ok()?;
+    std::fs::write(dir.join(".zprofile"), ZSH_ZPROFILE).ok()?;
+    std::fs::write(dir.join(".zshrc"), ZSH_ZSHRC).ok()?;
+    std::fs::write(dir.join(".zlogin"), ZSH_ZLOGIN).ok()?;
+    Some(dir)
+}
 
 #[tauri::command]
 pub fn check_git_bash() -> Option<String> {
@@ -31,7 +78,7 @@ pub fn check_git_bash() -> Option<String> {
     { None }
 }
 
-pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
+pub fn build_shell_command(app: &AppHandle, shell: Option<&str>) -> CommandBuilder {
     // OSC 133 (FinalTerm prompt markers) lets the PTY parser emit
     // `shell-activity-{sid}` events without polling sysinfo:
     //   133;A → prompt start (idle)
@@ -96,18 +143,34 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
     {
         let _ = shell; // unused on non-Windows
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let shell_name = std::path::Path::new(&sh)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
         let mut cmd = CommandBuilder::new(&sh);
         cmd.arg("-l");
-        // Bash PROMPT_COMMAND: emit OSC 133 D (command finished) + OSC 7 (cwd)
-        // + OSC 133 A (prompt start). Works for bash; zsh users typically have
-        // precmd hooks from their rc files instead.
-        cmd.env(
-            "PROMPT_COMMAND",
-            r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
-        );
-        // PS0 fires just before executing a command → OSC 133 C (busy). Literal
-        // bytes so bash doesn't re-interpret the escapes.
-        cmd.env("PS0", "\x1b]133;C\x07");
+
+        if shell_name.ends_with("zsh") {
+            // zsh ignores PROMPT_COMMAND. Point it at our ZDOTDIR so the
+            // wrapper .zshrc sources the user's real rc files and then installs
+            // precmd/preexec hooks emitting OSC 7 + OSC 133.
+            if let Some(zdotdir) = ensure_zsh_integration_dir(app) {
+                if let Ok(orig) = std::env::var("ZDOTDIR") {
+                    cmd.env("ARBITER_USER_ZDOTDIR", orig);
+                }
+                cmd.env("ZDOTDIR", zdotdir);
+            }
+        } else {
+            // bash PROMPT_COMMAND: emit OSC 133 D (command finished) + OSC 7
+            // (cwd) + OSC 133 A (prompt start).
+            cmd.env(
+                "PROMPT_COMMAND",
+                r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
+            );
+            // PS0 fires just before executing a command → OSC 133 C (busy). Literal
+            // bytes so bash doesn't re-interpret the escapes.
+            cmd.env("PS0", "\x1b]133;C\x07");
+        }
         cmd
     }
 }
