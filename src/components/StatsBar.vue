@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useUsageStore } from '../stores/usage'
+import { useDevSettingsStore } from '../stores/devSettings'
 import PulseLoader from './PulseLoader.vue'
 
 const store = useUsageStore()
+const devSettings = useDevSettingsStore()
 
 // Countdown to next auto-refresh
 const countdown = ref(120)
@@ -56,8 +58,6 @@ onBeforeUnmount(() => {
 
   <!-- Stats -->
   <template v-else-if="store.data">
-    <span class="plan-badge">{{ store.data.plan }}</span>
-
     <!-- 5h -->
     <div v-if="store.data.five_hour" class="stat">
       <span class="stat-label">5h</span>
@@ -89,7 +89,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- Sonnet (Max plan) -->
-    <div v-if="store.data.seven_day_sonnet" class="stat">
+    <div v-if="store.data.seven_day_sonnet && !devSettings.hideSonnetUsage" class="stat">
       <span class="stat-label">Sonnet</span>
       <div class="bar-track">
         <div class="bar-fill blue" :style="{ width: store.data.seven_day_sonnet.utilization + '%' }" />
@@ -122,6 +122,8 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 5px;
   height: 26px;
+  padding-right: 8px;
+  border-right: 1px solid rgba(255, 255, 255, 0.18);
 }
 
 .stat-label {
@@ -169,22 +171,6 @@ onBeforeUnmount(() => {
   color: var(--color-text-secondary);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
-}
-
-.plan-badge {
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--color-accent);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  line-height: 1;
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-md);
-  padding: 5px 7px;
-  height: 26px;
-  box-sizing: border-box;
-  display: flex;
-  align-items: center;
 }
 
 .refresh-btn {
