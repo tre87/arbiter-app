@@ -18,15 +18,18 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-            mac_suffix: ''
+            asset_os: mac
+            asset_arch: arm64
           - platform: macos-latest
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
-            mac_suffix: '_intel'
+            asset_os: mac
+            asset_arch: x64
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             args: ''
-            mac_suffix: ''
+            asset_os: win
+            asset_arch: x64
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -52,6 +55,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Read version
+        id: pkg
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Build with tauri-action
         uses: tauri-apps/tauri-action@v0
         with:
@@ -63,28 +71,32 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p staging
-          APP_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Arbiter.app"
-          if [ ! -d "$APP_DIR" ]; then
-            echo "::error::Expected .app bundle not found at $APP_DIR"
+          VERSION="${{ steps.pkg.outputs.version }}"
+          DMG_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          DMG=$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -n1 || true)
+          if [ -z "$DMG" ]; then
+            echo "::error::DMG not found under $DMG_DIR"
             ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/" || true
             exit 1
           fi
-          # ditto preserves resource forks, symlinks, and executable bits
-          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "staging/Arbiter${{ matrix.mac_suffix }}.app.zip"
+          cp "$DMG" "staging/Arbiter-${VERSION}-${{ matrix.asset_os }}-${{ matrix.asset_arch }}.dmg"
 
       - name: Stage release assets (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path staging | Out-Null
+          $version = "${{ steps.pkg.outputs.version }}"
+          $os = "${{ matrix.asset_os }}"
+          $arch = "${{ matrix.asset_arch }}"
           $nsis = Get-ChildItem -Path src-tauri\target\release\bundle\nsis\*-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $nsis) {
             Write-Error "NSIS installer not found under src-tauri\target\release\bundle\nsis"
             Get-ChildItem -Path src-tauri\target\release\bundle\ -Recurse | Select-Object FullName
             exit 1
           }
-          Copy-Item $nsis.FullName "staging\Arbiter-setup.exe"
-          Copy-Item src-tauri\target\release\arbiter.exe "staging\Arbiter.exe"
+          Copy-Item $nsis.FullName "staging\Arbiter-Setup-$version-$os-$arch.exe"
+          Copy-Item src-tauri\target\release\arbiter.exe "staging\Arbiter-$version-$os-$arch.exe"
 
       - name: Publish to draft release
         uses: softprops/action-gh-release@v2
