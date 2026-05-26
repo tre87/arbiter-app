@@ -189,6 +189,13 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
     { deep: true },
   )
 
+  // Window geometry isn't in the Vue store, so the reactive watcher above
+  // doesn't see resize/move. Without these listeners the user can move/resize
+  // and quit (especially via Cmd+Q on macOS, which bypasses the JS close
+  // handler) and nothing is saved.
+  getCurrentWindow().onResized(scheduleAutoSave).catch(() => { /* best-effort */ })
+  getCurrentWindow().onMoved(scheduleAutoSave).catch(() => { /* best-effort */ })
+
   /** Force a final save, bypassing the in-flight guard and debounce timer.
    *  Call on window close. */
   async function flush() {
