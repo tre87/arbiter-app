@@ -1,7 +1,9 @@
 use portable_pty::CommandBuilder;
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "windows"))]
+use tauri::Manager;
 
 // zsh ignores PROMPT_COMMAND, so we install precmd/preexec hooks via ZDOTDIR
 // injection: point zsh at an Arbiter-managed dir whose .z* files source the
@@ -78,6 +80,7 @@ pub fn check_git_bash() -> Option<String> {
     { None }
 }
 
+#[cfg_attr(target_os = "windows", allow(unused_variables))]
 pub fn build_shell_command(app: &AppHandle, shell: Option<&str>) -> CommandBuilder {
     // OSC 133 (FinalTerm prompt markers) lets the PTY parser emit
     // `shell-activity-{sid}` events without polling sysinfo:
