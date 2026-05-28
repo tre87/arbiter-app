@@ -414,8 +414,25 @@ onMounted(async () => {
         })
         return false
       }
-      // Ctrl+Enter → newline (for Claude multi-line input)
+      // Shift+Enter: when Claude is running in this pane, send the kitty
+      // keyboard protocol sequence for Shift+Return (CSI 13;2 u) — Ink's
+      // input parser (used by Claude Code) recognises it as a true
+      // shift+enter and inserts a newline in the prompt, matching iTerm2's
+      // behaviour. In a plain shell we send \r so Shift+Enter just behaves
+      // like Enter; sending the kitty bytes there would risk literal output.
+      if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.code === 'Enter') {
+        e.preventDefault()
+        const sid = getTerminalSession(props.paneId)?.sessionId
+        if (sid) {
+          const data = claudeState.value.lifecycle !== 'closed' ? '\x1b[13;2u' : '\r'
+          invoke('write_to_session', { sessionId: sid, data })
+        }
+        return false
+      }
+      // Ctrl+Enter → \n (existing convention that already works in Claude
+      // multi-line input on both platforms; leaving untouched).
       if (e.ctrlKey && e.code === 'Enter') {
+        e.preventDefault()
         const sid = getTerminalSession(props.paneId)?.sessionId
         if (sid) invoke('write_to_session', { sessionId: sid, data: '\n' })
         return false

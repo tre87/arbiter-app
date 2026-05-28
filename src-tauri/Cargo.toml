@@ -1,6 +1,6 @@
 [package]
 name = "arbiter"
-version = "1.0.2"
+version = "1.0.3"
 description = "Arbiter - parallel Claude Code session manager"
 authors = []
 edition = "2021"
