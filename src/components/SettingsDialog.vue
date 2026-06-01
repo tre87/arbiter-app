@@ -248,6 +248,20 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                   <span class="switch-track"></span>
                 </span>
               </label>
+              <label class="toggle-row">
+                <span class="toggle-label">Hide Claude buttons in terminal header</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.hideClaudeButtons" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
+              <label v-if="isWindows" class="toggle-row">
+                <span class="toggle-label">Hide Git Bash button in terminal header</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.hideShellButton" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
             </div>
           </div>
         </div>

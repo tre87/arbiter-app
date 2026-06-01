@@ -53,6 +53,7 @@ const sessionCwd = ref<string | null>(null)
 const folderName = ref<string | null>(null)
 const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
 let unlistenCwd: (() => void) | null = null
+let unlistenActivity: (() => void) | null = null
 
 // Reactive state that must survive Vue remounts lives on the persistent
 // TerminalSession in the cache. On a remount we adopt the cached refs directly
@@ -150,6 +151,20 @@ async function subscribeToSession(sid: string) {
     },
   )
 
+  // Live driver for the shell-switch button (gitBashPath && shellIdle). The
+  // status/Claude-lifecycle shell-activity listener in paneClaudeEvents.ts is
+  // only armed when Claude launches and never touches this ref, so a plain
+  // shell needs its own subscription. Without it, shellIdle relies solely on
+  // the one-shot get_session_shell_idle read below — which runs before the
+  // shell's first prompt (OSC 133;A) on a fresh PTY, latching false. (In dev,
+  // HMR remounts re-run this read after the prompt, masking the bug; release
+  // has no remount, so the Git Bash button never appears.)
+  unlistenActivity = await listen<boolean>(`shell-activity-${sid}`, (event) => {
+    if (isWindows && gitBashPath.value && !claudeActive.value) {
+      shellIdle.value = event.payload
+    }
+  })
+
   // Recover CWD that may have been emitted before this listener was attached
   const currentCwd = await invoke<string | null>('get_session_cwd', { sessionId: sid }).catch(() => null)
   if (currentCwd && !sessionCwd.value) {
@@ -172,6 +187,7 @@ async function subscribeToSession(sid: string) {
 // disposeTerminalSession.
 function unsubscribeComponentLocal() {
   unlistenCwd?.(); unlistenCwd = null
+  unlistenActivity?.(); unlistenActivity = null
 }
 
 async function switchShell() {
@@ -532,15 +548,17 @@ onBeforeUnmount(() => {
       <span class="toolbar-spacer" />
 
       <template v-if="!claudeActive">
-        <button class="toolbar-btn claude-btn" title="Launch claude" @click="launchClaude" @mousedown.stop>
-          <ClaudeIcon :size="14" />
-        </button>
-        <button class="toolbar-btn claude-btn" title="claude --continue" @click="continueClaude" @mousedown.stop>
-          <ClaudeIcon :size="14" />
-          <MdiIcon :path="mdiChevronDoubleRight" :size="14" class="continue-icon" />
-        </button>
+        <template v-if="!devSettings.hideClaudeButtons">
+          <button class="toolbar-btn claude-btn" title="Launch claude" @click="launchClaude" @mousedown.stop>
+            <ClaudeIcon :size="14" />
+          </button>
+          <button class="toolbar-btn claude-btn" title="claude --continue" @click="continueClaude" @mousedown.stop>
+            <ClaudeIcon :size="14" />
+            <MdiIcon :path="mdiChevronDoubleRight" :size="14" class="continue-icon" />
+          </button>
+        </template>
         <button
-          v-if="gitBashPath && shellIdle"
+          v-if="gitBashPath && shellIdle && !devSettings.hideShellButton"
           class="toolbar-btn shell-btn"
           :title="currentShell === 'powershell' ? 'Switch to Git Bash' : 'Switch to PowerShell'"
           @click="switchShell"
