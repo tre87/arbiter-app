@@ -58,6 +58,12 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
 
     let mut cmd = build_shell_command(&app, shell.as_deref());
     cmd.env("TERM", "xterm-256color");
+    // GUI launches (Finder/Dock) start with a minimal environment that lacks
+    // COLORTERM, so Claude Code and other TUIs downgrade to 256-color and render
+    // accent colors (e.g. Claude's #D97757) differently than in `tauri dev`,
+    // which inherits COLORTERM=truecolor from the launching shell. Set it
+    // explicitly so 24-bit color is consistent regardless of launch method.
+    cmd.env("COLORTERM", "truecolor");
     if let Some(ref dir) = cwd {
         let p = std::path::Path::new(dir);
         if p.is_dir() {
