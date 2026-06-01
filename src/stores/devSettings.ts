@@ -11,6 +11,9 @@ export const useDevSettingsStore = defineStore('devSettings', () => {
   // Workspace overview: when true, list only terminals where Claude is
   // currently launched (any non-`closed` lifecycle). Default on.
   const overviewClaudeOnly = ref(true)
+  // When true, override the platform terminal theme's background with
+  // Arbiter's signature dark color. Default on.
+  const useCustomTerminalBg = ref(true)
 
-  return { alwaysShowFooter, hideUsageBar, hideSonnetUsage, defaultShell, overviewClaudeOnly }
+  return { alwaysShowFooter, hideUsageBar, hideSonnetUsage, defaultShell, overviewClaudeOnly, useCustomTerminalBg }
 })
