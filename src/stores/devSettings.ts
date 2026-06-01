@@ -14,6 +14,11 @@ export const useDevSettingsStore = defineStore('devSettings', () => {
   // When true, override the platform terminal theme's background with
   // Arbiter's signature dark color. Default on.
   const useCustomTerminalBg = ref(true)
+  // Hide the launch/continue Claude buttons in each terminal header.
+  const hideClaudeButtons = ref(false)
+  // Hide the PowerShell↔Git Bash toggle button in the terminal header
+  // (Windows-only — there's no Git Bash to switch to elsewhere).
+  const hideShellButton = ref(false)
 
-  return { alwaysShowFooter, hideUsageBar, hideSonnetUsage, defaultShell, overviewClaudeOnly, useCustomTerminalBg }
+  return { alwaysShowFooter, hideUsageBar, hideSonnetUsage, defaultShell, overviewClaudeOnly, useCustomTerminalBg, hideClaudeButtons, hideShellButton }
 })

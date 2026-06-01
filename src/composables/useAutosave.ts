@@ -155,11 +155,13 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
         }
       }
 
-      // Only persist when it diverges from the default (true) — keeps configs
-      // from older builds untouched until the user actually toggles it.
-      if (!devStore.useCustomTerminalBg) {
-        config.devSettings = { useCustomTerminalBg: false }
-      }
+      // Only persist keys that diverge from their defaults — keeps configs from
+      // older builds untouched until the user actually toggles something.
+      const devSettings: NonNullable<typeof config.devSettings> = {}
+      if (!devStore.useCustomTerminalBg) devSettings.useCustomTerminalBg = false
+      if (devStore.hideClaudeButtons) devSettings.hideClaudeButtons = true
+      if (devStore.hideShellButton) devSettings.hideShellButton = true
+      if (Object.keys(devSettings).length > 0) config.devSettings = devSettings
 
       await invoke('save_config', { config })
     } catch (e) {
@@ -185,6 +187,8 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       filesStore.screenshotFolder,
       filesStore.lastDocsFolder,
       devStore.useCustomTerminalBg,
+      devStore.hideClaudeButtons,
+      devStore.hideShellButton,
       // Narrow projection of claudePaneStates: only fields that actually get
       // persisted (lifecycle, sessionId, confirmed). Deep-watching the full
       // map would re-fire — and trigger O(N) get_session_cwd IPC roundtrips —

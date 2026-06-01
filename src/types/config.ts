@@ -72,6 +72,10 @@ export interface DevSettings {
   // When true, override the platform terminal theme's background with Arbiter's
   // signature dark color (#121212). Undefined/missing is treated as true.
   useCustomTerminalBg?: boolean
+  // Hide the launch/continue Claude buttons in terminal headers. Default false.
+  hideClaudeButtons?: boolean
+  // Hide the PowerShell↔Git Bash toggle in terminal headers (Windows). Default false.
+  hideShellButton?: boolean
 }
 
 export interface WindowGeometry {

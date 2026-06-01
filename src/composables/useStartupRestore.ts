@@ -125,8 +125,11 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
       fs.setLastDocsFolder(config.filesSettings.lastDocsFolder ?? null)
     }
 
-    if (config.devSettings?.useCustomTerminalBg === false) {
-      useDevSettingsStore().useCustomTerminalBg = false
+    if (config.devSettings) {
+      const dev = useDevSettingsStore()
+      if (config.devSettings.useCustomTerminalBg === false) dev.useCustomTerminalBg = false
+      if (config.devSettings.hideClaudeButtons === true) dev.hideClaudeButtons = true
+      if (config.devSettings.hideShellButton === true) dev.hideShellButton = true
     }
 
     if (config.overviewVisible && config.overview) {
