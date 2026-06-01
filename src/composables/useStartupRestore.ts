@@ -125,6 +125,10 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
       fs.setLastDocsFolder(config.filesSettings.lastDocsFolder ?? null)
     }
 
+    if (config.devSettings?.useCustomTerminalBg === false) {
+      useDevSettingsStore().useCustomTerminalBg = false
+    }
+
     if (config.overviewVisible && config.overview) {
       overviewOpen.value = true
       invoke('restore_overview_window', {

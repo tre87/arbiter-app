@@ -241,6 +241,13 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                   <span class="switch-track"></span>
                 </span>
               </label>
+              <label class="toggle-row">
+                <span class="toggle-label">Use Arbiter terminal background (off = native theme bg)</span>
+                <span class="switch">
+                  <input type="checkbox" v-model="devStore.useCustomTerminalBg" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
             </div>
           </div>
         </div>

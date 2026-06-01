@@ -54,6 +54,7 @@ export interface ArbiterConfig {
   workspaces?: SavedWorkspace[]
   activeWorkspaceIndex?: number
   filesSettings?: FilesSettings
+  devSettings?: DevSettings
   // Legacy single-workspace (backward compat)
   layout?: SavedPaneNode
   terminals?: SavedTerminal[]
@@ -65,6 +66,12 @@ export interface FilesSettings {
   screenshotFolder?: string
   // Last directory the "attach files" picker opened in. Remembered across sessions.
   lastDocsFolder?: string
+}
+
+export interface DevSettings {
+  // When true, override the platform terminal theme's background with Arbiter's
+  // signature dark color (#121212). Undefined/missing is treated as true.
+  useCustomTerminalBg?: boolean
 }
 
 export interface WindowGeometry {

@@ -1,6 +1,9 @@
-import { Terminal } from '@xterm/xterm'
+import { watch } from 'vue'
+import { Terminal, type ITheme } from '@xterm/xterm'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
+import { pickPlatformTheme, CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
+import { useDevSettingsStore } from '../stores/devSettings'
 
 export interface XtermInstance {
   term: Terminal
@@ -9,27 +12,18 @@ export interface XtermInstance {
   dispose: () => void
 }
 
+function buildTheme(useCustomBg: boolean): ITheme {
+  const base = pickPlatformTheme()
+  return useCustomBg ? { ...base, background: CUSTOM_TERMINAL_BG } : base
+}
+
 /** Create a configured xterm Terminal with WebLinksAddon and a safeFit() that
  *  computes cols/rows directly — FitAddon's circular css.cell.width derivation
  *  misfires on detach/reattach, so we don't use it. */
 export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
+  const devStore = useDevSettingsStore()
   const term = new Terminal({
-    theme: {
-      background: '#121212',
-      foreground: '#e8eaed',
-      cursor: '#aeafad',
-      cursorAccent: '#000000',
-      selectionBackground: 'rgba(51,153,255,0.25)',
-      black: '#1e1e1e',
-      brightBlack: '#555',
-      red: '#f44747',     brightRed: '#f44747',
-      green: '#6a9955',   brightGreen: '#b5cea8',
-      yellow: '#d7ba7d',  brightYellow: '#d7ba7d',
-      blue: '#569cd6',    brightBlue: '#9cdcfe',
-      magenta: '#c678dd', brightMagenta: '#c678dd',
-      cyan: '#4ec9b0',    brightCyan: '#4ec9b0',
-      white: '#d4d4d4',   brightWhite: '#ffffff',
-    },
+    theme: buildTheme(devStore.useCustomTerminalBg),
     fontFamily: "Consolas, 'Cascadia Code', Menlo, 'SF Mono', monospace",
     fontSize: 12,
     lineHeight: 1.0,
@@ -40,6 +34,13 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     scrollback: 5000,
     allowTransparency: true,
   })
+
+  // Live-update background when the toggle flips, so open terminals respond
+  // immediately without needing a restart.
+  const stopThemeWatcher = watch(
+    () => devStore.useCustomTerminalBg,
+    (useCustomBg) => { term.options.theme = buildTheme(useCustomBg) },
+  )
 
   term.loadAddon(new WebLinksAddon())
   term.open(mountEl)
@@ -113,6 +114,7 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
   }
 
   function dispose() {
+    stopThemeWatcher()
     webglAddon?.dispose()
     webglAddon = null
     term.dispose()
