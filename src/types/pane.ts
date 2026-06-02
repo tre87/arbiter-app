@@ -65,6 +65,12 @@ export interface ClaudePaneState {
   cacheReadTokens: number
   cacheWriteTokens: number
   contextPercent: number
+  /** Real context window for the session (200k / 1M), from Claude's statusLine capture. Null until a capture arrives. */
+  contextWindowSize: number | null
+  /** Claude's own context used-% (input-side, output excluded). Null until a capture arrives. */
+  usedPercentage: number | null
+  /** True once a Tier-2 statusLine capture has been received for this session. */
+  hasContext: boolean
   /** Estimated session cost in USD, computed from token counts + model pricing */
   cost: number
 }

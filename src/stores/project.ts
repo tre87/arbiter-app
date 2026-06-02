@@ -40,6 +40,10 @@ export interface WorktreeClaudeStatus {
   cacheReadTokens: number
   cacheWriteTokens: number
   contextPercent: number
+  /** Real context window (200k / 1M) from Claude's statusLine capture; null until captured. */
+  contextWindowSize: number | null
+  /** True once a Tier-2 statusLine capture has arrived for the session. */
+  hasContext: boolean
   cost: number
   status: 'ready' | 'working' | 'attention' | 'exited'
   sessionId: string | null
@@ -96,6 +100,8 @@ export const useProjectStore = defineStore('project', () => {
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       contextPercent: 0,
+      contextWindowSize: null,
+      hasContext: false,
       cost: 0,
       status: 'exited',
       sessionId: null,
@@ -121,7 +127,7 @@ export const useProjectStore = defineStore('project', () => {
   watch(
     () => {
       const paneStore = getPaneStore()
-      const snap: Record<string, { lifecycle: string; model: string | null; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; contextPercent: number; cost: number; sessionId: string | null } | null> = {}
+      const snap: Record<string, { lifecycle: string; model: string | null; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; contextPercent: number; contextWindowSize: number | null; hasContext: boolean; cost: number; sessionId: string | null } | null> = {}
       for (const [paneId, wtId] of Object.entries(paneToWorktree.value)) {
         const state = paneStore.getClaudePaneState(paneId)
         snap[wtId] = state
@@ -142,6 +148,8 @@ export const useProjectStore = defineStore('project', () => {
             cacheReadTokens: state.cacheReadTokens,
             cacheWriteTokens: state.cacheWriteTokens,
             contextPercent: state.contextPercent,
+            contextWindowSize: state.contextWindowSize,
+            hasContext: state.hasContext,
             cost: state.cost,
           }
           if (state.model) update.model = state.model

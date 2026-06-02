@@ -1,4 +1,5 @@
 mod claude;
+pub mod claude_shim;
 mod config;
 mod fs;
 mod git;
@@ -133,6 +134,15 @@ pub fn run() {
             let sessions_arc = app.state::<Sessions>().0.clone();
             let monitor_arc  = app.state::<ClaudeMonitor>().0.clone();
             let expected_arc = app.state::<ExpectedClaudeSessions>().0.clone();
+            // Watch the Tier-2 statusLine capture dir and route Claude's exact
+            // context usage to the matching pane.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                claude::start_capture_watcher(
+                    app.handle().clone(),
+                    monitor_arc.clone(),
+                    data_dir.join(claude_shim::CAPTURE_SUBDIR),
+                );
+            }
             claude::start_claude_watcher(app.handle().clone(), sessions_arc, monitor_arc, expected_arc);
 
             // Show the main window after the window-state plugin has restored
