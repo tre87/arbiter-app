@@ -100,13 +100,20 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
       cols--
     }
 
-    // Sanity clamp: if we would shrink dramatically, we're almost certainly
-    // measuring during an unstable layout (workspace just unhidden, element
-    // just reattached, transition in flight). Dropping a terminal from a
-    // normal size down to a handful of columns would cause the PTY to emit
-    // narrow-wrapped content that stays baked into scrollback forever, so
-    // skip and wait for the next tick's measurement to stabilize.
-    if (cols < 20 || rows < 5) return
+    // Sanity clamp on COLS only: a dramatic column drop almost always means
+    // we're measuring during an unstable layout (workspace just unhidden,
+    // element just reattached, transition in flight). Dropping a terminal from
+    // a normal size down to a handful of columns makes the PTY emit
+    // narrow-wrapped content that stays baked into scrollback forever, so skip
+    // and wait for the next tick's measurement to stabilize.
+    //
+    // Rows are deliberately NOT clamped: shrinking rows only shortens the
+    // viewport (a SIGWINCH height change, no scrollback reflow). Clamping them
+    // used to make safeFit() bail on a genuinely short pane, leaving xterm with
+    // a stale larger row count so the bottom (cursor) line rendered below the
+    // visible viewport and disappeared. Letting rows fall to 1 keeps the
+    // cursor line in view.
+    if (cols < 20) return
 
     if (term.cols !== cols || term.rows !== rows) {
       term.resize(cols, rows)
