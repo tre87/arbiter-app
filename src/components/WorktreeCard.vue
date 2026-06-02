@@ -4,7 +4,7 @@ import RobotIcon from './RobotIcon.vue'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
 import HexPulse from './HexPulse.vue'
-import { mdiBellRing, mdiSourceMerge, mdiConsole } from '@mdi/js'
+import { mdiBellRing, mdiSourceMerge, mdiConsole, mdiAlertOutline } from '@mdi/js'
 import type { WorktreeClaudeStatus } from '../stores/project'
 
 const props = defineProps<{
@@ -66,11 +66,14 @@ const modelInfo = computed(() => {
   return { name: id.replace('claude-', ''), cls: '' }
 })
 
-function contextWindow(id: string | null): number {
-  if (!id) return 200_000
-  return 200_000
-}
-const contextMaxLabel = computed(() => (contextWindow(props.status.model) / 1000) + 'k')
+const contextMaxLabel = computed(() => {
+  const w = props.status.contextWindowSize || 200_000
+  return w >= 1_000_000 ? `${w / 1_000_000}M` : `${w / 1000}k`
+})
+
+const NO_STATS_REASON =
+  "Context stats unavailable — this Claude session wasn't launched through Arbiter's wrapper " +
+  "(e.g. a 'claude' alias pointing at an absolute path, or claude started outside Arbiter)."
 
 const tokenDisplay = computed(() => {
   const total = props.status.inputTokens + props.status.outputTokens +
@@ -118,13 +121,14 @@ const progressColor = computed(() => {
             <MdiIcon v-else :path="mdiConsole" :size="12" />
             {{ statusLabel }}
           </span>
-          <span v-if="!isMerged && claudeActive && tokenDisplay" class="token-count">{{ tokenDisplay }}</span>
+          <span v-if="!isMerged && claudeActive && status.hasContext && tokenDisplay" class="token-count">{{ tokenDisplay }}</span>
           <span class="spacer" />
-          <span v-if="!isMerged && claudeActive" class="context-pct">
+          <span v-if="!isMerged && claudeActive && status.hasContext" class="context-pct">
             {{ Math.round(contextPercent) }}%<span class="context-max">/{{ contextMaxLabel }}</span>
           </span>
+          <MdiIcon v-else-if="!isMerged && claudeActive" :path="mdiAlertOutline" :size="12" class="icon-warn" :title="NO_STATS_REASON" />
         </div>
-        <div v-if="!isMerged && claudeActive" class="usage-bar">
+        <div v-if="!isMerged && claudeActive && status.hasContext" class="usage-bar">
           <div class="usage-fill" :style="{ width: contextPercent + '%', background: progressColor }" />
         </div>
       </div>
@@ -229,6 +233,7 @@ const progressColor = computed(() => {
   opacity: 0.6;
   font-weight: 400;
 }
+.icon-warn { color: #e5a03c; }
 
 .card-status-row {
   display: flex;

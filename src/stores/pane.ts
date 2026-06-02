@@ -298,7 +298,8 @@ export const usePaneStore = defineStore('pane', () => {
   const defaultClaudePaneState: ClaudePaneState = {
     lifecycle: 'closed', sessionId: null, confirmed: false,
     model: null, inputTokens: 0, outputTokens: 0,
-    cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0, cost: 0,
+    cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0,
+    contextWindowSize: null, usedPercentage: null, hasContext: false, cost: 0,
   }
 
   function getClaudePaneState(paneId: string): ClaudePaneState {

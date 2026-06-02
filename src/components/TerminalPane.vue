@@ -606,6 +606,9 @@ onBeforeUnmount(() => {
         output_tokens: claudeState.outputTokens,
         cache_creation_input_tokens: claudeState.cacheWriteTokens,
         cache_read_input_tokens: claudeState.cacheReadTokens,
+        context_window_size: claudeState.contextWindowSize,
+        used_percentage: claudeState.usedPercentage,
+        has_context: claudeState.hasContext,
       } : null"
       :folder-name="folderName"
       :git-info="gitInfo"

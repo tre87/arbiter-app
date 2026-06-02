@@ -766,6 +766,103 @@ fn schedule_adoption_retry(
     });
 }
 
+/// Authoritative context usage parsed from a captured statusLine payload
+/// (written by `arbiter claude-statusline`). Emitted as `claude-context-<pane>`.
+#[derive(Serialize, Clone)]
+pub struct ClaudeContextStatus {
+    session_id: String,
+    model_id: Option<String>,
+    context_window_size: Option<u64>,
+    used_percentage: Option<f64>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+}
+
+/// Parse a `<session_id>.json` capture (Claude's exact statusLine payload).
+fn parse_capture(path: &std::path::Path) -> Option<ClaudeContextStatus> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let session_id = v.get("session_id")?.as_str()?.to_string();
+    let cw = v.get("context_window");
+    let cu = cw.and_then(|c| c.get("current_usage"));
+    let get_u64 = |obj: Option<&serde_json::Value>, key: &str| {
+        obj.and_then(|o| o.get(key)).and_then(|x| x.as_u64())
+    };
+    Some(ClaudeContextStatus {
+        session_id,
+        model_id: v.pointer("/model/id").and_then(|x| x.as_str()).map(str::to_string),
+        context_window_size: get_u64(cw, "context_window_size"),
+        used_percentage: cw.and_then(|c| c.get("used_percentage")).and_then(|x| x.as_f64()),
+        input_tokens: get_u64(cu, "input_tokens"),
+        output_tokens: get_u64(cu, "output_tokens"),
+        cache_creation_input_tokens: get_u64(cu, "cache_creation_input_tokens"),
+        cache_read_input_tokens: get_u64(cu, "cache_read_input_tokens"),
+    })
+}
+
+/// Find the pane tracking the Claude session whose JSONL stem == `session_id`.
+/// Returns None until our JSONL watcher has adopted the session into a pane —
+/// the next statusLine render (Claude renders frequently) re-routes it.
+fn pane_for_session(
+    monitor: &Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    session_id: &str,
+) -> Option<String> {
+    monitor.lock().unwrap().iter()
+        .find(|(_, e)| e.jsonl.file_stem().and_then(|s| s.to_str()) == Some(session_id))
+        .map(|(id, _)| id.clone())
+}
+
+/// Watch the Tier-2 capture dir for `<session_id>.json` files written by the
+/// injected statusLine, and emit authoritative context usage to the matching
+/// pane. This is the source of truth for the footer's context/token display;
+/// the JSONL transcript does not contain context-window size or used %.
+pub fn start_capture_watcher(
+    app: AppHandle,
+    monitor: Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    capture_dir: PathBuf,
+) {
+    std::thread::spawn(move || {
+        if let Err(e) = std::fs::create_dir_all(&capture_dir) {
+            eprintln!("start_capture_watcher: cannot create {}: {e}", capture_dir.display());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(tx, NotifyConfig::default()) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("start_capture_watcher: watcher init failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(&capture_dir, RecursiveMode::NonRecursive) {
+            eprintln!("start_capture_watcher: cannot watch {}: {e}", capture_dir.display());
+            return;
+        }
+        let _watcher = watcher; // keep alive
+
+        for result in &rx {
+            let Ok(event) = result else { continue };
+            if !matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Other | EventKind::Any
+            ) {
+                continue;
+            }
+            for path in event.paths {
+                // Only completed captures (the staging file is `<id>.json.tmp`).
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(status) = parse_capture(&path) else { continue };
+                if let Some(pane_id) = pane_for_session(&monitor, &status.session_id) {
+                    app.emit(&format!("claude-context-{}", pane_id), &status).ok();
+                }
+            }
+        }
+    });
+}
+
 /// Start the file-system watcher on `~/.claude/projects/`.
 /// Fires OS-level events (inotify / FSEvents / ReadDirectoryChangesW) — no polling.
 pub fn start_claude_watcher(

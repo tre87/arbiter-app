@@ -104,7 +104,6 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let activity_event_name = format!("shell-activity-{}", sid);
     let bell_event_name = format!("claude-bell-{}", sid);
     let claude_activity_event_name = format!("claude-activity-{}", sid);
-    let context_event_name = format!("claude-context-{}", sid);
     let error_event_name = format!("pty-error-{}", sid);
     let reader_sid = sid.clone();
     // Cloned for the panic-recovery emit outside the inner closure that owns
@@ -291,24 +290,9 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                             }
                         }
 
-                        // Context window % detection from Claude's status bar.
-                        // Pattern: "context left until auto-compact: NN%"
-                        if let Some(idx) = text.find("context left until auto-compact") {
-                            let after = &text[idx..];
-                            // Find the digits before '%'
-                            if let Some(pct_end) = after.find('%') {
-                                let before_pct = &after[..pct_end];
-                                // Extract trailing digits
-                                let digits: String = before_pct.chars().rev()
-                                    .take_while(|c| c.is_ascii_digit())
-                                    .collect::<String>().chars().rev().collect();
-                                if let Ok(pct) = digits.parse::<u32>() {
-                                    // pct is "% left", convert to "% used"
-                                    let used = 100u32.saturating_sub(pct);
-                                    app_handle.emit(&context_event_name, used).ok();
-                                }
-                            }
-                        }
+                        // Context-window usage is sourced authoritatively from
+                        // Claude's statusLine capture (claude.rs::start_capture_watcher),
+                        // not scraped from terminal text.
                     }
 
                     {

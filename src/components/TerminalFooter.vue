@@ -11,6 +11,7 @@ import {
   mdiArrowUp,
   mdiCached,
   mdiBookOpenPageVariant,
+  mdiAlertOutline,
 } from '@mdi/js'
 
 interface ClaudeSessionStatus {
@@ -20,6 +21,9 @@ interface ClaudeSessionStatus {
   output_tokens?: number | null
   cache_creation_input_tokens?: number | null
   cache_read_input_tokens?: number | null
+  context_window_size?: number | null
+  used_percentage?: number | null
+  has_context?: boolean
   folder?: string | null
   branch?: string | null
 }
@@ -46,25 +50,28 @@ function modelLabel(id: string | null | undefined): { name: string; cls: string 
   return { name: id.replace('claude-', ''), cls: '' }
 }
 
-const CONTEXT_WINDOW = 200_000
+// Context usage comes straight from Claude's statusLine capture (exact): used %
+// (input-side) and the real window size (200k / 1M). Null until a capture lands.
+const contextPct = computed(() => Math.min(100, Math.round(props.status?.used_percentage ?? 0)))
 
-const totalTokens = computed(() => {
-  if (!props.status) return 0
-  return (props.status.input_tokens ?? 0)
-    + (props.status.output_tokens ?? 0)
-    + (props.status.cache_creation_input_tokens ?? 0)
-    + (props.status.cache_read_input_tokens ?? 0)
+const contextMax = computed(() => {
+  const w = props.status?.context_window_size ?? 0
+  if (!w) return ''
+  return w >= 1_000_000 ? `${w / 1_000_000}M` : `${w / 1000}k`
 })
 
-const contextPct = computed(() =>
-  Math.min(100, Math.round((totalTokens.value / CONTEXT_WINDOW) * 100))
-)
-
-const contextMax = `${CONTEXT_WINDOW / 1000}k`
+// Why a session might lack stats — shown on the warning icon for the punted
+// edge cases (alias to an absolute claude path, claude started before this
+// Arbiter version / outside Arbiter, or a login shell that wiped PATH).
+const NO_STATS_REASON =
+  "Context stats unavailable — this Claude session wasn't launched through Arbiter's wrapper " +
+  "(e.g. a 'claude' alias pointing at an absolute path, or claude started outside Arbiter)."
 
 function fmtK(n: number | null | undefined): string {
   if (n == null) return '0'
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
+  // Truncate to one decimal (not round) so we match Claude's status line, which
+  // formats via `bc scale=1` (e.g. 24450 → "24.4K", not "24.5K").
+  if (n >= 1000) return (Math.floor(n / 100) / 10).toFixed(1) + 'K'
   return String(n)
 }
 </script>
@@ -78,25 +85,36 @@ function fmtK(n: number | null | undefined): string {
         <span :class="['model', 'model-' + modelLabel(status.model_id).cls]">{{ modelLabel(status.model_id).name }}</span>
       </span>
 
-      <span class="divider">|</span>
+      <!-- Exact context + tokens from Claude's statusLine capture -->
+      <template v-if="status.has_context">
+        <span class="divider">|</span>
 
-      <span class="seg" title="Context">
-        <MdiIcon :path="mdiDatabase" :size="12" class="icon-context" />
-        <span class="context-val">{{ contextPct }}%<span class="context-max">/{{ contextMax }}</span></span>
-      </span>
+        <span class="seg" title="Context">
+          <MdiIcon :path="mdiDatabase" :size="12" class="icon-context" />
+          <span class="context-val">{{ contextPct }}%<span class="context-max">/{{ contextMax }}</span></span>
+        </span>
 
-      <span class="divider">|</span>
+        <span class="divider">|</span>
 
-      <span class="seg tok-seg">
-        <MdiIcon :path="mdiArrowDown" :size="11" class="tok-in" title="Input tokens" />
-        <span class="tok-in">{{ fmtK(status.input_tokens) }}</span>
-        <MdiIcon :path="mdiArrowUp" :size="11" class="tok-out" title="Output tokens" />
-        <span class="tok-out">{{ fmtK(status.output_tokens) }}</span>
-        <MdiIcon :path="mdiCached" :size="11" class="tok-cw" title="Cache write tokens" />
-        <span class="tok-cw">{{ fmtK(status.cache_creation_input_tokens) }}</span>
-        <MdiIcon :path="mdiBookOpenPageVariant" :size="11" class="tok-cr" title="Cache read tokens" />
-        <span class="tok-cr">{{ fmtK(status.cache_read_input_tokens) }}</span>
-      </span>
+        <span class="seg tok-seg">
+          <MdiIcon :path="mdiArrowDown" :size="11" class="tok-in" title="Input tokens" />
+          <span class="tok-in">{{ fmtK(status.input_tokens) }}</span>
+          <MdiIcon :path="mdiArrowUp" :size="11" class="tok-out" title="Output tokens" />
+          <span class="tok-out">{{ fmtK(status.output_tokens) }}</span>
+          <MdiIcon :path="mdiCached" :size="11" class="tok-cw" title="Cache write tokens" />
+          <span class="tok-cw">{{ fmtK(status.cache_creation_input_tokens) }}</span>
+          <MdiIcon :path="mdiBookOpenPageVariant" :size="11" class="tok-cr" title="Cache read tokens" />
+          <span class="tok-cr">{{ fmtK(status.cache_read_input_tokens) }}</span>
+        </span>
+      </template>
+
+      <!-- No capture yet / non-intercepted session: warning icon only -->
+      <template v-else>
+        <span class="divider">|</span>
+        <span class="seg" :title="NO_STATS_REASON">
+          <MdiIcon :path="mdiAlertOutline" :size="12" class="icon-warn" />
+        </span>
+      </template>
 
       <span class="spacer" />
 
@@ -188,6 +206,7 @@ function fmtK(n: number | null | undefined): string {
 .icon-flash  { color: #c678dd; }
 
 .icon-context { color: #569cd6; }
+.icon-warn { color: #e5a03c; }
 .context-val  { color: #569cd6; font-weight: 600; }
 .context-max  { color: var(--color-text-muted); opacity: 0.6; font-weight: 400; }
 

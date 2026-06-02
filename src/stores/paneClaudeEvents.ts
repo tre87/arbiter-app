@@ -14,6 +14,18 @@ interface ClaudeStatusPayload {
   branch?: string | null
 }
 
+// Authoritative context usage from Claude's statusLine capture (Tier 2).
+interface ClaudeContextPayload {
+  session_id: string
+  model_id?: string | null
+  context_window_size?: number | null
+  used_percentage?: number | null
+  input_tokens?: number | null
+  output_tokens?: number | null
+  cache_creation_input_tokens?: number | null
+  cache_read_input_tokens?: number | null
+}
+
 export interface ClaudeEventDeps {
   getClaudePaneState: (paneId: string) => ClaudePaneState
   updateClaudePaneState: (paneId: string, update: Partial<ClaudePaneState>) => void
@@ -140,7 +152,7 @@ export async function wireClaudeEventListeners(
     if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
     delete launchTimestamps[paneId]
     delete turnBaselines[paneId]
-    updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
+    updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false, hasContext: false })
   })
   listeners.push(unExited as unknown as () => void)
 
@@ -159,7 +171,7 @@ export async function wireClaudeEventListeners(
       const launchedAt = launchTimestamps[paneId] ?? 0
       if (launchedAt > 0 && Date.now() - launchedAt > 5000) {
         delete launchTimestamps[paneId]
-        updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
+        updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false, hasContext: false })
         invoke('clear_claude_monitor', { sessionId: sid })
           .catch(e => console.error(`clear_claude_monitor failed for ${sid}:`, e))
       }
@@ -184,9 +196,32 @@ export async function wireClaudeEventListeners(
   })
   listeners.push(unBell as unknown as () => void)
 
-  // claude-context: backend-parsed context %
-  const unContext = await listen<number>(`claude-context-${sid}`, (event) => {
-    updateClaudePaneState(paneId, { contextPercent: event.payload })
+  // claude-context: authoritative context usage captured from Claude's own
+  // statusLine payload (model + window size + used % + per-component tokens).
+  // This is the source of truth for the footer — the JSONL transcript lacks
+  // the window size and used %.
+  const unContext = await listen<ClaudeContextPayload>(`claude-context-${sid}`, (event) => {
+    const p = event.payload
+    const update: Partial<ClaudePaneState> = { hasContext: true }
+    if (p.model_id) update.model = p.model_id
+    if (p.context_window_size != null) update.contextWindowSize = p.context_window_size
+    if (p.used_percentage != null) {
+      update.usedPercentage = p.used_percentage
+      update.contextPercent = Math.min(100, p.used_percentage)
+    }
+    if (p.input_tokens != null) update.inputTokens = p.input_tokens
+    if (p.output_tokens != null) update.outputTokens = p.output_tokens
+    if (p.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
+    if (p.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
+    const state = getClaudePaneState(paneId)
+    update.cost = computeCost(
+      update.model ?? state.model,
+      update.inputTokens ?? state.inputTokens,
+      update.outputTokens ?? state.outputTokens,
+      update.cacheReadTokens ?? state.cacheReadTokens,
+      update.cacheWriteTokens ?? state.cacheWriteTokens,
+    )
+    updateClaudePaneState(paneId, update)
   })
   listeners.push(unContext as unknown as () => void)
 

@@ -2,7 +2,6 @@ use portable_pty::CommandBuilder;
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use tauri::AppHandle;
-#[cfg(not(target_os = "windows"))]
 use tauri::Manager;
 
 // zsh ignores PROMPT_COMMAND, so we install precmd/preexec hooks via ZDOTDIR
@@ -35,6 +34,10 @@ if (( $+functions[add-zsh-hook] )); then
   add-zsh-hook precmd _arbiter_precmd
   add-zsh-hook preexec _arbiter_preexec
 fi
+
+# Re-prepend Arbiter's claude-shim dir LAST (after the user's rc and macOS
+# path_helper have run), so `claude`/`cc` resolve to our launcher.
+[[ -n "$ARBITER_SHIM_BIN" ]] && export PATH="$ARBITER_SHIM_BIN:$PATH"
 "#;
 
 #[cfg(not(target_os = "windows"))]
@@ -80,8 +83,39 @@ pub fn check_git_bash() -> Option<String> {
     { None }
 }
 
-#[cfg_attr(target_os = "windows", allow(unused_variables))]
+/// Build the shell command, then wire Claude-shim interception (PATH prepend +
+/// env) so `claude`/`cc` launched in this shell report context usage to Arbiter.
 pub fn build_shell_command(app: &AppHandle, shell: Option<&str>) -> CommandBuilder {
+    let mut cmd = build_base_shell_command(app, shell);
+    apply_claude_shim(app, &mut cmd);
+    cmd
+}
+
+/// Prepend the Arbiter claude-shim `bin/` dir to the shell's PATH and export the
+/// vars its launcher + Claude's injected statusLine need. No-op (shell behaves
+/// normally) if `claude` can't be resolved or setup fails.
+fn apply_claude_shim(app: &AppHandle, cmd: &mut CommandBuilder) {
+    use crate::claude_shim;
+    let Ok(data_dir) = app.path().app_data_dir() else { return };
+    let Ok(arbiter_bin) = std::env::current_exe() else { return };
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+
+    let Some(s) = claude_shim::setup(&data_dir, &orig_path, &arbiter_bin) else { return };
+
+    let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+    cmd.env("PATH", format!("{}{}{}", s.bin_dir.display(), sep, orig_path));
+    // zsh re-prepends this after path_helper; harmless elsewhere.
+    cmd.env("ARBITER_SHIM_BIN", &s.bin_dir);
+    cmd.env(claude_shim::REAL_CLAUDE_ENV, &s.real_claude);
+    cmd.env(claude_shim::SETTINGS_ENV, &s.settings_file);
+    cmd.env(claude_shim::CAPTURE_DIR_ENV, &s.capture_dir);
+    if let Some(orig) = s.orig_statusline {
+        cmd.env(claude_shim::ORIG_STATUSLINE_ENV, orig);
+    }
+}
+
+#[cfg_attr(target_os = "windows", allow(unused_variables))]
+fn build_base_shell_command(app: &AppHandle, shell: Option<&str>) -> CommandBuilder {
     // OSC 133 (FinalTerm prompt markers) lets the PTY parser emit
     // `shell-activity-{sid}` events without polling sysinfo:
     //   133;A → prompt start (idle)
