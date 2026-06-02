@@ -128,9 +128,8 @@ export async function wireClaudeEventListeners(
     if (p?.cache_creation_input_tokens != null) update.cacheWriteTokens = p.cache_creation_input_tokens
     if (p?.cache_read_input_tokens != null) update.cacheReadTokens = p.cache_read_input_tokens
     if (p) {
-      const total = (p.input_tokens ?? 0) + (p.output_tokens ?? 0)
-        + (p.cache_creation_input_tokens ?? 0) + (p.cache_read_input_tokens ?? 0)
-      update.contextPercent = Math.min(100, (total / 200_000) * 100)
+      // contextPercent is owned by the Tier-2 statusLine capture (claude-context);
+      // don't derive an approximate /200k value here that would fight it.
       const model = update.model ?? state.model
       update.cost = computeCost(
         model,
