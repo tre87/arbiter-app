@@ -1,6 +1,6 @@
 [package]
 name = "arbiter"
-version = "1.0.6"
+version = "1.0.7"
 description = "Arbiter - parallel Claude Code session manager"
 authors = []
 edition = "2021"
@@ -36,6 +36,15 @@ trash = "5"
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Used to re-apply the custom traffic-light inset after geometry restores —
+# Tauri only exposes `trafficLightPosition` on the builder. Versions already
+# resolved transitively via tao, so this adds nothing to Cargo.lock.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+  "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow",
+] }
 
 [profile.dev]
 codegen-units = 1

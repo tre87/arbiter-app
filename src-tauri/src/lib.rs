@@ -2,6 +2,8 @@ mod claude;
 mod config;
 mod fs;
 mod git;
+#[cfg(target_os = "macos")]
+mod macos;
 mod overview;
 mod pty;
 mod shell;
@@ -179,6 +181,15 @@ pub fn run() {
                     let _ = w.maximize();
                 }
                 w.show().unwrap_or_default();
+
+                // The set_size/set_position/maximize calls above make AppKit
+                // reset the native traffic-light buttons to their default
+                // offset, discarding the trafficLightPosition from config.
+                // Re-apply it now so the buttons stay inset on first paint.
+                #[cfg(target_os = "macos")]
+                if let Ok(ptr) = w.ns_window() {
+                    macos::apply_traffic_light_position(ptr);
+                }
             }
 
             Ok(())
@@ -189,6 +200,22 @@ pub fn run() {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     window.hide().unwrap_or_default();
+                }
+            }
+
+            // Resizing/maximizing/fullscreen-exit and scale-factor changes reset
+            // the native traffic lights to their default offset on macOS; re-inset
+            // the main window's buttons each time so they stay aligned.
+            #[cfg(target_os = "macos")]
+            if window.label() == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::Resized(_)
+                        | tauri::WindowEvent::ScaleFactorChanged { .. }
+                )
+            {
+                if let Ok(ptr) = window.ns_window() {
+                    macos::apply_traffic_light_position(ptr);
                 }
             }
         })
