@@ -22,6 +22,10 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
     minify: !process.env.TAURI_ENV_DEBUG,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    // Desktop app: assets are embedded in the binary and loaded from disk, so
+    // the default 500 kB chunk warning (a web download-time heuristic) is just
+    // noise. Raise it past our main app chunk (~560 kB).
+    chunkSizeWarningLimit: 700,
     rollupOptions: {
       output: {
         manualChunks(id) {
