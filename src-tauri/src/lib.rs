@@ -105,6 +105,7 @@ pub fn run() {
         .manage(ExpectedClaudeSessions(Arc::new(Mutex::new(HashMap::new()))))
         .manage(Cache(Mutex::new(UsageCache::new())))
         .manage(FileWatchers(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(git::GitWatchers::new())
         .setup(|app| {
             // Create a hidden auth WebView at startup. If the user has a valid
             // session (persisted WebView2 cookies), the injected script will
@@ -257,6 +258,8 @@ pub fn run() {
             pty::get_session_cwd,
             pty::get_session_shell_idle,
             git::get_session_git_info,
+            git::watch_git,
+            git::unwatch_git,
             exit_app,
             get_locale,
             focus_webview,

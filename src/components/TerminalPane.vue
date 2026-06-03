@@ -6,6 +6,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
 import { useDevSettingsStore } from '../stores/devSettings'
+import { useConfirm } from '../composables/useConfirm'
+import type { GitInfo } from '../types/pane'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
 import { mdiInformationOutline, mdiChevronDoubleRight, mdiPencilOutline, mdiBash, mdiPowershell } from '@mdi/js'
@@ -22,6 +24,7 @@ import { waitForShellIdle } from '../utils/shellIdle'
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
 const devSettings = useDevSettingsStore()
+const { confirm } = useConfirm()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
 let xterm: XtermInstance | null = null
@@ -34,6 +37,9 @@ let resizeObserver: ResizeObserver | null = null
 let fitTimer: ReturnType<typeof setTimeout> | null = null
 let focusHandler: (() => void) | null = null
 let workspaceActivatedHandler: (() => void) | null = null
+let gitRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let gitFocusHandler: (() => void) | null = null
+let unlistenGitChanged: (() => void) | null = null
 
 // Three callers register byte-identical pty-output listeners; this helper
 // keeps the write callback in one place. `term` is captured by reference, so
@@ -51,7 +57,7 @@ const footerVisible = ref(true)
 
 const sessionCwd = ref<string | null>(null)
 const folderName = ref<string | null>(null)
-const gitInfo = ref<{ is_repo: boolean; branch: string | null } | null>(null)
+const gitInfo = ref<GitInfo | null>(null)
 let unlistenCwd: (() => void) | null = null
 let unlistenActivity: (() => void) | null = null
 
@@ -101,6 +107,25 @@ function cancelEditName() {
   isEditingName.value = false
 }
 
+// Footer folder-icon click: rename this terminal to the repo name (the git
+// toplevel basename, e.g. "arbiter-app" — not the cwd subfolder), behind a
+// confirm dialog. Only meaningful when the terminal sits inside a git repo.
+async function renameToRepoName() {
+  const cwd = sessionCwd.value
+  if (!cwd || !gitInfo.value?.is_repo) return
+  const root = await invoke<string | null>('git_repo_root', { path: cwd }).catch(() => null)
+  if (!root) return
+  const repoName = root.replace(/\\/g, '/').split('/').filter(Boolean).pop()
+  if (!repoName) return
+  const ok = await confirm({
+    title: `Rename terminal to "${repoName}"?`,
+    message: `Set this terminal's name from "${terminalName.value}" to the repository name "${repoName}".`,
+    confirmText: 'Rename',
+    cancelText: 'Cancel',
+  })
+  if (ok) store.setTerminalName(props.paneId, repoName)
+}
+
 function scheduleFit() {
   if (fitTimer) clearTimeout(fitTimer)
   fitTimer = setTimeout(() => xterm?.safeFit(), 50)
@@ -142,14 +167,26 @@ function continueClaude() {
 // handled by persistent listeners in pane.ts — they survive component
 // unmount/remount. This function only subscribes to CWD changes.
 async function subscribeToSession(sid: string) {
-  unlistenCwd = await listen<{ cwd: string; folder: string | null; git: { is_repo: boolean; branch: string | null } }>(
+  unlistenCwd = await listen<{ cwd: string; folder: string | null; git: GitInfo }>(
     `cwd-changed-${sid}`,
     (event) => {
       sessionCwd.value = event.payload.cwd
       folderName.value = event.payload.folder
       gitInfo.value = event.payload.git
+      updateGitWatch(sid, event.payload.cwd)
     },
   )
+
+  // Backend fires this when the repo's .git dir changes (stage/commit/branch),
+  // including ops made from VS Code. Refresh the footer counts (debounced).
+  unlistenGitChanged = await listen(`git-changed-${sid}`, () => scheduleGitRefresh())
+
+  // Refresh when the app window regains focus — catches external working-tree
+  // edits (new/modified files) made while we were in another app.
+  if (!gitFocusHandler) {
+    gitFocusHandler = () => refreshGitInfo()
+    window.addEventListener('focus', gitFocusHandler)
+  }
 
   // Live driver for the shell-switch button (gitBashPath && shellIdle). The
   // status/Claude-lifecycle shell-activity listener in paneClaudeEvents.ts is
@@ -170,9 +207,10 @@ async function subscribeToSession(sid: string) {
   if (currentCwd && !sessionCwd.value) {
     sessionCwd.value = currentCwd
     folderName.value = currentCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
-    const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: currentCwd }).catch(() => null)
+    const git = await invoke<GitInfo>('get_session_git_info', { cwd: currentCwd }).catch(() => null)
     if (git) gitInfo.value = git
   }
+  if (sessionCwd.value) updateGitWatch(sid, sessionCwd.value)
   if (isWindows && gitBashPath.value && !claudeActive.value) {
     const currentIdle = await invoke<boolean | null>('get_session_shell_idle', { sessionId: sid }).catch(() => null)
     if (currentIdle !== null && currentIdle !== undefined) {
@@ -188,6 +226,37 @@ async function subscribeToSession(sid: string) {
 function unsubscribeComponentLocal() {
   unlistenCwd?.(); unlistenCwd = null
   unlistenActivity?.(); unlistenActivity = null
+  unlistenGitChanged?.(); unlistenGitChanged = null
+  if (gitRefreshTimer) { clearTimeout(gitRefreshTimer); gitRefreshTimer = null }
+  if (gitFocusHandler) { window.removeEventListener('focus', gitFocusHandler); gitFocusHandler = null }
+  if (sessionId) invoke('unwatch_git', { sessionId }).catch(() => {})
+}
+
+// Git status only changes via OSC 7 on a cwd change, so staging from outside
+// the terminal (VS Code, or `git add` at the prompt) wouldn't update the
+// footer. Instead a backend watcher on the repo's .git dir fires
+// `git-changed-{sid}`, and we also refresh on window focus (catches external
+// working-tree edits when switching back from VS Code). No polling.
+async function refreshGitInfo() {
+  const cwd = sessionCwd.value
+  if (!cwd) return
+  // force: bypass the backend's 1.5s cache — the index just changed.
+  const git = await invoke<GitInfo>('get_session_git_info', { cwd, force: true }).catch(() => null)
+  if (git) gitInfo.value = git
+}
+
+// Coalesce watcher bursts (staging writes index.lock then renames to index,
+// emitting several events) into one refresh.
+function scheduleGitRefresh() {
+  if (gitRefreshTimer) clearTimeout(gitRefreshTimer)
+  gitRefreshTimer = setTimeout(refreshGitInfo, 150)
+}
+
+// Point the backend .git watcher at the current cwd's repo. Idempotent within
+// the same repo; the backend swaps/clears the watcher as the repo root changes.
+function updateGitWatch(sid: string, cwd: string | null) {
+  if (!cwd) return
+  invoke('watch_git', { sessionId: sid, cwd }).catch(() => {})
 }
 
 async function switchShell() {
@@ -354,7 +423,7 @@ onMounted(async () => {
       if (savedCwd) {
         sessionCwd.value = savedCwd
         folderName.value = savedCwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null
-        const git = await invoke<{ is_repo: boolean; branch: string | null }>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
+        const git = await invoke<GitInfo>('get_session_git_info', { cwd: savedCwd }).catch(() => null)
         gitInfo.value = git
         if (claudeRestore?.wasOpen) {
           footerVisible.value = true
@@ -618,6 +687,7 @@ onBeforeUnmount(() => {
       :git-info="gitInfo"
       :session-id="sessionId"
       :hide-git-menu="inProjectWorkspace"
+      @rename-to-repo="renameToRepoName"
     />
   </div>
 </template>
