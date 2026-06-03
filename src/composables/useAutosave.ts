@@ -161,6 +161,7 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       if (!devStore.useCustomTerminalBg) devSettings.useCustomTerminalBg = false
       if (devStore.hideClaudeButtons) devSettings.hideClaudeButtons = true
       if (devStore.hideShellButton) devSettings.hideShellButton = true
+      if (!devStore.overviewClaudeOnly) devSettings.overviewClaudeOnly = false
       if (Object.keys(devSettings).length > 0) config.devSettings = devSettings
 
       await invoke('save_config', { config })
@@ -189,6 +190,7 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       devStore.useCustomTerminalBg,
       devStore.hideClaudeButtons,
       devStore.hideShellButton,
+      devStore.overviewClaudeOnly,
       // Narrow projection of claudePaneStates: only fields that actually get
       // persisted (lifecycle, sessionId, confirmed). Deep-watching the full
       // map would re-fire — and trigger O(N) get_session_cwd IPC roundtrips —

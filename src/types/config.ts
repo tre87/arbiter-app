@@ -76,6 +76,8 @@ export interface DevSettings {
   hideClaudeButtons?: boolean
   // Hide the PowerShell↔Git Bash toggle in terminal headers (Windows). Default false.
   hideShellButton?: boolean
+  // Overview: only show terminals running Claude. Undefined/missing is true.
+  overviewClaudeOnly?: boolean
 }
 
 export interface WindowGeometry {

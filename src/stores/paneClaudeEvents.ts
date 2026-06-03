@@ -10,6 +10,13 @@ interface ClaudeStatusPayload {
   output_tokens?: number | null
   cache_creation_input_tokens?: number | null
   cache_read_input_tokens?: number | null
+  // Claude is blocked on the user via an interaction tool (AskUserQuestion /
+  // ExitPlanMode). Reliable from the transcript.
+  awaiting_input?: boolean | null
+  // A tool_use is pending (running, or awaiting a permission prompt). Combined
+  // with a BEL this distinguishes a permission wait (attention) from a finished
+  // turn (ready).
+  pending_tool_use?: boolean | null
   folder?: string | null
   branch?: string | null
 }
@@ -53,7 +60,20 @@ export async function wireClaudeEventListeners(
 
   const listeners: Array<() => void> = []
 
-  // When no activity arrives within 300ms, revert from working → ready.
+  // Whether a tool_use is pending for this pane (latest from claude-status).
+  // Used by the BEL handler to tell a permission wait from a finished turn.
+  let pendingToolUse = false
+  // When the Stop hook last fired. The final assistant message hits the JSONL
+  // (and Claude redraws its prompt) right around turn-end, which would re-flip
+  // the pane to 'working' just after we set 'ready'. Suppress working for a
+  // short window after Stop so the animation halts instantly and stays halted.
+  let lastStopAt = 0
+  const STOP_SUPPRESS_MS = 700
+
+  // 'working' is sticky within a turn: Claude pauses between tool calls, so
+  // reverting on a short gap would flicker the status (and the header gradient)
+  // mid-turn. A definitive end-of-turn (BEL with no pending tool, or shell idle)
+  // reverts immediately; this fallback only fires after a longer lull.
   function resetIdleTimer() {
     if (idleTimers[paneId]) clearTimeout(idleTimers[paneId])
     idleTimers[paneId] = setTimeout(() => {
@@ -63,7 +83,7 @@ export async function wireClaudeEventListeners(
         updateClaudePaneState(paneId, { lifecycle: 'ready' })
       }
       delete idleTimers[paneId]
-    }, 300)
+    }, 2000)
   }
 
   // claude-started: JSONL adopted → Claude confirmed running
@@ -93,7 +113,11 @@ export async function wireClaudeEventListeners(
       const lastResize = resizeTimestamps[paneId] ?? 0
       if (lastResize > 0 && Date.now() - lastResize < 500) return
 
-      if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
+      // ready/launching → working, and attention → working (Claude resumed
+      // after the user answered a prompt/question). Suppressed briefly after a
+      // Stop so the end-of-turn redraw doesn't revive the animation.
+      if (Date.now() - lastStopAt >= STOP_SUPPRESS_MS
+        && (state.lifecycle === 'ready' || state.lifecycle === 'launching' || state.lifecycle === 'attention')) {
         updateClaudePaneState(paneId, { lifecycle: 'working' })
       }
     }
@@ -111,11 +135,18 @@ export async function wireClaudeEventListeners(
     const state = getClaudePaneState(paneId)
     const update: Partial<ClaudePaneState> = {}
 
+    if (p?.pending_tool_use != null) pendingToolUse = p.pending_tool_use
+
     if (p?.output_tokens != null && turnBaselines[paneId] === -1) {
       turnBaselines[paneId] = p.output_tokens
     }
     if (p?.output_tokens != null && p.output_tokens > (turnBaselines[paneId] ?? 0)) {
-      if (state.lifecycle === 'ready' || state.lifecycle === 'launching') {
+      // Output grew → Claude is generating; resume from ready/launching and also
+      // from attention (the user answered and Claude is responding again).
+      // Suppressed briefly after a Stop: the turn's FINAL message lands here and
+      // would otherwise re-flip 'working' right after Stop set 'ready'.
+      if (Date.now() - lastStopAt >= STOP_SUPPRESS_MS
+        && (state.lifecycle === 'ready' || state.lifecycle === 'launching' || state.lifecycle === 'attention')) {
         update.lifecycle = 'working'
       }
       resetIdleTimer()
@@ -141,6 +172,12 @@ export async function wireClaudeEventListeners(
     }
     if (state.lifecycle === 'working') {
       resetIdleTimer()
+    }
+    // Transcript says Claude is blocked on a question / plan approval — this is
+    // authoritative, so it overrides any working transition computed above.
+    if (p?.awaiting_input) {
+      update.lifecycle = 'attention'
+      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
     }
     updateClaudePaneState(paneId, update)
   })
@@ -182,18 +219,51 @@ export async function wireClaudeEventListeners(
   })
   listeners.push(unShellActivity as unknown as () => void)
 
-  // claude-bell: BEL → end of turn (working → ready) or attention (ready → attention)
+  // claude-bell: Claude rings the BEL when it wants the user. Disambiguate via
+  // the transcript's pending-tool flag:
+  //   pending tool  → it's blocked on a permission prompt / menu  → attention
+  //   no pending    → end-of-turn notification                    → ready
+  // (AskUserQuestion / ExitPlanMode also surface as 'attention' directly from
+  // claude-status's awaiting_input, independent of the bell.)
   const unBell = await listen(`claude-bell-${sid}`, () => {
     const state = getClaudePaneState(paneId)
     if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
-    if (state.lifecycle === 'working') {
+    if (pendingToolUse) {
+      updateClaudePaneState(paneId, { lifecycle: 'attention' })
+    } else if (state.lifecycle === 'working') {
       turnBaselines[paneId] = state.outputTokens
       updateClaudePaneState(paneId, { lifecycle: 'ready' })
-    } else if (state.lifecycle === 'ready') {
-      updateClaudePaneState(paneId, { lifecycle: 'attention' })
     }
   })
   listeners.push(unBell as unknown as () => void)
+
+  // claude-attention: the backend detected an interactive prompt (permission,
+  // plan approval, AskUserQuestion) in the terminal output. These prompts are
+  // not in the JSONL transcript while live, so this PTY-text signal is the
+  // reliable trigger. Cleared automatically when Claude resumes (the activity /
+  // output-token handlers move attention → working).
+  const unAttention = await listen(`claude-attention-${sid}`, () => {
+    const state = getClaudePaneState(paneId)
+    if (state.lifecycle === 'ready' || state.lifecycle === 'working' || state.lifecycle === 'launching') {
+      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
+      updateClaudePaneState(paneId, { lifecycle: 'attention' })
+    }
+  })
+  listeners.push(unAttention as unknown as () => void)
+
+  // claude-stop: the Stop hook fired — Claude finished its turn. End the turn
+  // promptly (working → ready) instead of waiting on the idle-timer fallback.
+  // Leaves an active attention prompt untouched (Stop doesn't fire at a prompt).
+  const unStop = await listen(`claude-stop-${sid}`, () => {
+    lastStopAt = Date.now()
+    const state = getClaudePaneState(paneId)
+    if (state.lifecycle === 'working') {
+      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
+      turnBaselines[paneId] = state.outputTokens
+      updateClaudePaneState(paneId, { lifecycle: 'ready' })
+    }
+  })
+  listeners.push(unStop as unknown as () => void)
 
   // claude-context: authoritative context usage captured from Claude's own
   // statusLine payload (model + window size + used % + per-component tokens).

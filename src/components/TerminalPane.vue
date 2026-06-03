@@ -591,7 +591,11 @@ onBeforeUnmount(() => {
     />
 
     <div ref="terminalEl" class="terminal-inner" />
-    <div v-if="claudeWorking" class="progress-bar">
+    <!-- Mounted for the whole Claude session so the slide animation is never
+         re-created mid-turn; the `working` class fades it in and resumes the
+         (paused) animation from its current position — no reset across the
+         working↔ready flicker between tool calls. -->
+    <div v-if="claudeActive" class="progress-bar" :class="{ working: claudeWorking }">
       <div class="progress-bar-inner" />
     </div>
     <TerminalFooter
@@ -776,6 +780,16 @@ onBeforeUnmount(() => {
   background-size: 50% 100%;
   background-repeat: no-repeat;
   animation: progress-slide 3s ease-in-out infinite alternate;
+  /* Hidden + paused while not actively working; the `working` class fades it in
+     and resumes the animation from where it paused (no restart). */
+  opacity: 0;
+  animation-play-state: paused;
+  transition: opacity 0.25s ease;
+}
+
+.progress-bar.working .progress-bar-inner {
+  opacity: 1;
+  animation-play-state: running;
 }
 
 @keyframes progress-slide {

@@ -2,7 +2,8 @@
 import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import HexPulse from './components/HexPulse.vue'
+import ClaudeWorkingIcon from './components/ClaudeWorkingIcon.vue'
+import ClaudeIcon from './components/ClaudeIcon.vue'
 import MdiIcon from './components/MdiIcon.vue'
 import { mdiConsole, mdiFolder, mdiChevronRight, mdiChevronDown } from '@mdi/js'
 
@@ -72,8 +73,23 @@ async function hideWindow() {
   getCurrentWindow().hide()
 }
 
+// Right-click anywhere → a small menu to toggle the Claude-only filter. The
+// setting lives in the main window's store, so we optimistically flip the local
+// copy and tell the main window to update (and persist) it.
+const menu = ref<{ x: number; y: number } | null>(null)
+
 function handleContextMenu(e: MouseEvent) {
   e.preventDefault()
+  menu.value = { x: e.clientX, y: e.clientY }
+}
+
+function closeMenu() { menu.value = null }
+
+function toggleClaudeOnly() {
+  const next = !claudeOnly.value
+  claudeOnly.value = next
+  emit('overview-set-claude-only', next)
+  closeMenu()
 }
 
 // ── Drag reorder (pointer-based) ───────────────────────────────────────────
@@ -147,15 +163,22 @@ onMounted(async () => {
     error.value = String(e)
   }
 
-  window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') hideWindow()
-  })
+  window.addEventListener('keydown', onKeydown)
   window.addEventListener('contextmenu', handleContextMenu)
+  window.addEventListener('click', closeMenu)
 })
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return
+  if (menu.value) closeMenu()
+  else hideWindow()
+}
 
 onBeforeUnmount(() => {
   unlistenUpdate?.()
+  window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('contextmenu', handleContextMenu)
+  window.removeEventListener('click', closeMenu)
 })
 </script>
 
@@ -201,14 +224,29 @@ onBeforeUnmount(() => {
             class="overview-row"
             @click="handleClick(group.workspaceIndex, t.paneId)"
           >
-            <span class="overview-name">{{ t.name }}</span>
+            <span class="overview-left">
+              <ClaudeIcon v-if="t.claudeActive" :size="12" class="overview-claude-icon" />
+              <span class="overview-name">{{ t.name }}</span>
+            </span>
             <span class="overview-status">
-              <HexPulse v-if="t.status === 'working'" :size="12" />
+              <ClaudeWorkingIcon v-if="t.status === 'working'" :size="16" />
               <span v-else class="status-dot" :class="t.status" />
             </span>
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- Right-click context menu -->
+    <div
+      v-if="menu"
+      class="overview-menu"
+      :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
+      @click.stop
+    >
+      <button class="overview-menu-item" @click="toggleClaudeOnly">
+        {{ claudeOnly ? 'Show all terminals' : 'Show only Claude terminals' }}
+      </button>
     </div>
   </div>
 </template>
@@ -248,9 +286,16 @@ onBeforeUnmount(() => {
   background: none;
   border: none;
   color: var(--color-text-muted);
-  font-size: 16px;
+  font-size: 18px;
   cursor: pointer;
-  padding: 0 4px;
+  /* Square box, centered in the shared right gutter so the × lines up with the
+     workspace counts and status dots below it. */
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   line-height: 1;
   border-radius: 3px;
   transition: color 0.1s, background 0.1s;
@@ -296,7 +341,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 4px 12px 2px;
+  padding: 4px 8px 2px 12px;
   font-size: 10px;
   font-weight: 600;
   color: var(--color-text-muted);
@@ -334,19 +379,35 @@ onBeforeUnmount(() => {
   letter-spacing: 0;
   text-transform: none;
   pointer-events: none;
+  /* Centered in the shared right slot so counts line up with the × and dots. */
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
 }
 
 .overview-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 5px 12px;
+  padding: 5px 8px 5px 12px;
   cursor: pointer;
   transition: background 0.1s;
 }
 
 .overview-row:hover {
   background: var(--color-card-border);
+}
+
+.overview-left {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.overview-claude-icon {
+  flex-shrink: 0;
+  display: block;
 }
 
 .overview-name {
@@ -357,10 +418,14 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 
+/* Fixed-width, centered slot so the working glyph and the 6px dot share the
+   same centre (otherwise the wider glyph sits left of the dots). */
 .overview-status {
   display: flex;
   align-items: center;
-  margin-left: 12px;
+  justify-content: center;
+  width: 20px;
+  margin-left: 8px;
   flex-shrink: 0;
 }
 
@@ -380,8 +445,10 @@ onBeforeUnmount(() => {
   animation: pulse-running 1.5s ease-in-out infinite;
 }
 
+/* Claude session alive but idle — neutral grey (green is reserved for an
+   actually-running job; the animations cover working / attention). */
 .status-dot.ready {
-  background: var(--color-success);
+  background: var(--color-text-muted);
   opacity: 0.7;
 }
 
@@ -393,5 +460,36 @@ onBeforeUnmount(() => {
 @keyframes pulse-running {
   0%, 100% { opacity: 0.5; transform: scale(0.9); }
   50% { opacity: 1; transform: scale(1.1); }
+}
+
+.overview-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-card-border);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  min-width: 160px;
+}
+
+.overview-menu-item {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 6px 10px;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.1s, color 0.1s;
+}
+
+.overview-menu-item:hover {
+  background: var(--color-accent, var(--azure));
+  color: #fff;
 }
 </style>

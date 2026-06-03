@@ -98,6 +98,7 @@ let unlistenOverviewRequest: (() => void) | null = null
 let unlistenOverviewNavigate: (() => void) | null = null
 let unlistenOverviewClosed: (() => void) | null = null
 let unlistenOverviewReorder: (() => void) | null = null
+let unlistenOverviewSetClaudeOnly: (() => void) | null = null
 
 onMounted(async () => {
   if (isDev) document.addEventListener('mousedown', onDevMenuClickOutside)
@@ -117,6 +118,11 @@ onMounted(async () => {
   }) as unknown as (() => void)
   unlistenOverviewClosed = await listen('overview-closed', () => {
     overviewOpen.value = false
+  }) as unknown as (() => void)
+  // Overview's right-click menu toggled the Claude-only filter. Update the
+  // store (the overviewClaudeOnly watch persists it and re-pushes the list).
+  unlistenOverviewSetClaudeOnly = await listen<boolean>('overview-set-claude-only', (event) => {
+    devStore.overviewClaudeOnly = event.payload
   }) as unknown as (() => void)
 
   await loadAndRestore(overviewOpen)
@@ -149,6 +155,7 @@ onBeforeUnmount(() => {
   unlistenOverviewNavigate?.()
   unlistenOverviewReorder?.()
   unlistenOverviewClosed?.()
+  unlistenOverviewSetClaudeOnly?.()
 })
 </script>
 
