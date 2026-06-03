@@ -104,6 +104,7 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let activity_event_name = format!("shell-activity-{}", sid);
     let bell_event_name = format!("claude-bell-{}", sid);
     let claude_activity_event_name = format!("claude-activity-{}", sid);
+    let attention_event_name = format!("claude-attention-{}", sid);
     let error_event_name = format!("pty-error-{}", sid);
     let reader_sid = sid.clone();
     // Cloned for the panic-recovery emit outside the inner closure that owns
@@ -132,6 +133,8 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
         // Only emitted when Claude is tracked for this session (monitor entry exists).
         let mut last_activity_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
         let mut last_activity_kind: Option<&str> = None;
+        // Debounce for the "needs attention" signal (interactive prompt on screen).
+        let mut last_attention_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break, // clean EOF — shell closed
@@ -259,6 +262,27 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                     // Substantial printable text without spinners → "generating"
                     // Pure ANSI escapes / short chunks → ignored (resize redraws)
                     if claude_tracked_reader.load(Ordering::Relaxed) {
+                        // "Needs attention" for the prompts Claude does NOT
+                        // expose via a hook: AskUserQuestion menus and plan-mode
+                        // (ExitPlanMode) approval. Permission prompts come from
+                        // the PermissionRequest/Notification hooks instead, so
+                        // they're intentionally not matched here. Detected from
+                        // the rendered menu text and handled INSTEAD of activity
+                        // classification — a menu redraw is substantial text that
+                        // would otherwise read as "generating" and flicker
+                        // attention↔working. Cleared when Claude resumes.
+                        let needs_attention = text.contains("to navigate")
+                            || text.contains("Esc to cancel")
+                            || text.contains("Would you like to proceed");
+
+                        if needs_attention {
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_attention_emit).as_millis() >= 400 {
+                                app_handle.emit(&attention_event_name, ()).ok();
+                                last_attention_emit = now;
+                            }
+                        } else {
+                        // Activity classification: thinking (spinner) vs generating.
                         let is_spinner_char = |c: char| {
                             ('\u{2800}'..='\u{28FF}').contains(&c) ||
                             ('\u{2700}'..='\u{27BF}').contains(&c)
@@ -289,10 +313,7 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                                 last_activity_kind = Some(k);
                             }
                         }
-
-                        // Context-window usage is sourced authoritatively from
-                        // Claude's statusLine capture (claude.rs::start_capture_watcher),
-                        // not scraped from terminal text.
+                        } // end else (activity classification)
                     }
 
                     {

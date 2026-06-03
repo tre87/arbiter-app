@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::pty::PtySession;
 
@@ -32,6 +32,15 @@ pub struct ClaudeSessionStatus {
     output_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
+    /// True when Claude is blocked waiting on the user via a user-interaction
+    /// tool (AskUserQuestion / ExitPlanMode) — i.e. the last assistant turn
+    /// ended with such a tool_use and no user reply has followed yet. Permission
+    /// prompts for ordinary tools aren't visible here; the BEL signal covers
+    /// those on the frontend.
+    awaiting_input: Option<bool>,
+    /// A tool_use is pending (running or awaiting permission). Disambiguated by
+    /// the BEL signal on the frontend.
+    pending_tool_use: Option<bool>,
     folder: Option<String>,
     branch: Option<String>,
 }
@@ -189,6 +198,14 @@ struct JsonlCacheEntry {
     output_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
+    /// Set true when an assistant turn ends with an AskUserQuestion/ExitPlanMode
+    /// tool_use; cleared by the next user-role line (the reply).
+    awaiting_input: bool,
+    /// Set true when the last assistant turn stopped on `tool_use` (a tool is
+    /// pending — either running or awaiting a permission prompt); cleared by the
+    /// next user-role line. Combined with BEL on the frontend to tell a
+    /// permission wait (attention) apart from a finished turn (ready).
+    pending_tool_use: bool,
 }
 
 static JSONL_CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, JsonlCacheEntry>>> = std::sync::OnceLock::new();
@@ -211,6 +228,7 @@ fn parse_jsonl_status(path: &std::path::Path) -> Option<ClaudeSessionStatus> {
         cwd: None, branch: None, model_id: None,
         input_tokens: None, output_tokens: None,
         cache_creation_input_tokens: None, cache_read_input_tokens: None,
+        awaiting_input: false, pending_tool_use: false,
     });
 
     // File shrank (truncated / replaced) — discard cached offset and re-read
@@ -264,16 +282,44 @@ fn parse_jsonl_status(path: &std::path::Path) -> Option<ClaudeSessionStatus> {
             if let Some(b) = value.get("gitBranch").and_then(|v| v.as_str()) {
                 entry.branch = Some(b.to_string());
             }
-            if value.pointer("/message/role").and_then(|v| v.as_str()) == Some("assistant") {
-                if let Some(m) = value.pointer("/message/model").and_then(|v| v.as_str()) {
-                    entry.model_id = Some(m.to_string());
+            match value.pointer("/message/role").and_then(|v| v.as_str()) {
+                Some("assistant") => {
+                    if let Some(m) = value.pointer("/message/model").and_then(|v| v.as_str()) {
+                        entry.model_id = Some(m.to_string());
+                    }
+                    if let Some(u) = value.pointer("/message/usage") {
+                        entry.input_tokens   = u.get("input_tokens").and_then(|v| v.as_u64()).or(entry.input_tokens);
+                        entry.output_tokens  = u.get("output_tokens").and_then(|v| v.as_u64()).or(entry.output_tokens);
+                        entry.cache_creation_input_tokens = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).or(entry.cache_creation_input_tokens);
+                        entry.cache_read_input_tokens     = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).or(entry.cache_read_input_tokens);
+                    }
+                    // Awaiting user input iff this turn ends with a user-interaction
+                    // tool_use. Any other assistant turn clears it (a normal turn /
+                    // auto-running tool); ordinary permission prompts are covered by BEL.
+                    entry.awaiting_input = value
+                        .pointer("/message/content")
+                        .and_then(|c| c.as_array())
+                        .map(|items| {
+                            items.iter().any(|it| {
+                                it.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                                    && matches!(
+                                        it.get("name").and_then(|n| n.as_str()),
+                                        Some("AskUserQuestion") | Some("ExitPlanMode")
+                                    )
+                            })
+                        })
+                        .unwrap_or(false);
+                    entry.pending_tool_use =
+                        value.pointer("/message/stop_reason").and_then(|v| v.as_str())
+                            == Some("tool_use");
                 }
-                if let Some(u) = value.pointer("/message/usage") {
-                    entry.input_tokens   = u.get("input_tokens").and_then(|v| v.as_u64()).or(entry.input_tokens);
-                    entry.output_tokens  = u.get("output_tokens").and_then(|v| v.as_u64()).or(entry.output_tokens);
-                    entry.cache_creation_input_tokens = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).or(entry.cache_creation_input_tokens);
-                    entry.cache_read_input_tokens     = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).or(entry.cache_read_input_tokens);
+                // A user-role line (the reply, or a tool_result) means Claude is
+                // no longer blocked on the user.
+                Some("user") => {
+                    entry.awaiting_input = false;
+                    entry.pending_tool_use = false;
                 }
+                _ => {}
             }
         }
 
@@ -292,6 +338,8 @@ fn parse_jsonl_status(path: &std::path::Path) -> Option<ClaudeSessionStatus> {
         output_tokens: entry.output_tokens,
         cache_creation_input_tokens: entry.cache_creation_input_tokens,
         cache_read_input_tokens: entry.cache_read_input_tokens,
+        awaiting_input: Some(entry.awaiting_input),
+        pending_tool_use: Some(entry.pending_tool_use),
         folder,
         branch: entry.branch.clone(),
     })
@@ -442,6 +490,7 @@ fn stub_status(session_id: String) -> ClaudeSessionStatus {
         session_id,
         model_id: None, input_tokens: None, output_tokens: None,
         cache_creation_input_tokens: None, cache_read_input_tokens: None,
+        awaiting_input: None, pending_tool_use: None,
         folder: None, branch: None,
     }
 }
@@ -460,6 +509,15 @@ fn list_recent_jsonl(project_dir: &std::path::Path) -> Vec<PathBuf> {
         .collect();
     files.sort_by(|a, b| b.1.cmp(&a.1));
     files.into_iter().map(|(p, _)| p).collect()
+}
+
+/// True if `path` was last modified at or after `threshold`. Used to avoid
+/// adopting a previous (closed) session's stale transcript on a fresh relaunch.
+fn modified_after(path: &std::path::Path, threshold: std::time::SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t >= threshold)
+        .unwrap_or(false)
 }
 
 fn claude_home() -> Option<PathBuf> {
@@ -509,32 +567,47 @@ pub fn spawn_pane_monitor(
             });
             let Some((claude_pid, _)) = claude else { continue };
 
-            // Claude just appeared — adopt a JSONL if one already exists.
+            // Claude just appeared. Adopt an existing transcript only if it was
+            // written around/after this detection — a fresh launch creates a new
+            // file, so a previous (closed) session's stale transcript in the same
+            // dir must NOT be grabbed (that froze the footer on old stats and the
+            // real new transcript then never adopted). Resumed sessions carry an
+            // `expected` id; leave those to the file watcher, which matches the
+            // exact id rather than "most recent".
+            let detected_at = std::time::SystemTime::now();
+            let fresh_after = detected_at
+                .checked_sub(std::time::Duration::from_secs(5))
+                .unwrap_or(detected_at);
+            let has_expected = expected.lock().unwrap().contains_key(&session_id);
             let cwd = pane_cwd(&sessions, &session_id);
             let mut adopted = false;
-            if let Some(ref cwd) = cwd {
-                if let Some(project_dir) = claude_home().map(|h| h.join("projects").join(encode_project_dir(cwd))) {
-                    if project_dir.is_dir() {
-                        for path in list_recent_jsonl(&project_dir).into_iter().take(5) {
-                            // Hold a single guard across the check + insert so
-                            // the global JSONL watcher can't adopt the same
-                            // path into a different pane between the two ops.
-                            {
-                                let mut mguard = monitor.lock().unwrap();
-                                if mguard.values().any(|e| e.jsonl == path) { continue; }
-                                mguard.insert(session_id.clone(), ClaudeEntry { jsonl: path.clone() });
+            if !has_expected {
+                if let Some(ref cwd) = cwd {
+                    if let Some(project_dir) = claude_home().map(|h| h.join("projects").join(encode_project_dir(cwd))) {
+                        if project_dir.is_dir() {
+                            for path in list_recent_jsonl(&project_dir).into_iter().take(5) {
+                                if !modified_after(&path, fresh_after) { continue; }
+                                // Hold a single guard across the check + insert so
+                                // the global JSONL watcher can't adopt the same
+                                // path into a different pane between the two ops.
+                                {
+                                    let mut mguard = monitor.lock().unwrap();
+                                    if mguard.values().any(|e| e.jsonl == path) { continue; }
+                                    mguard.insert(session_id.clone(), ClaudeEntry { jsonl: path.clone() });
+                                }
+                                expected.lock().unwrap().remove(&session_id);
+                                set_tracked(&sessions, &session_id);
+                                let stem = path.file_stem().and_then(|s| s.to_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| session_id.clone());
+                                app.emit(&format!("claude-started-{}", session_id), stub_status(stem.clone())).ok();
+                                if let Some(status) = parse_jsonl_status(&path) {
+                                    app.emit(&format!("claude-status-{}", session_id), &status).ok();
+                                }
+                                emit_capture_for_pane(&app, &session_id, &stem);
+                                adopted = true;
+                                break;
                             }
-                            expected.lock().unwrap().remove(&session_id);
-                            set_tracked(&sessions, &session_id);
-                            let stem = path.file_stem().and_then(|s| s.to_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| session_id.clone());
-                            app.emit(&format!("claude-started-{}", session_id), stub_status(stem)).ok();
-                            if let Some(status) = parse_jsonl_status(&path) {
-                                app.emit(&format!("claude-status-{}", session_id), &status).ok();
-                            }
-                            adopted = true;
-                            break;
                         }
                     }
                 }
@@ -633,10 +706,11 @@ fn try_adopt_jsonl(
     let stem = jsonl_path.file_stem().and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| pane_id.clone());
-    app.emit(&format!("claude-started-{}", pane_id), stub_status(stem)).ok();
+    app.emit(&format!("claude-started-{}", pane_id), stub_status(stem.clone())).ok();
     if let Some(status) = parse_jsonl_status(jsonl_path) {
         app.emit(&format!("claude-status-{}", pane_id), &status).ok();
     }
+    emit_capture_for_pane(app, &pane_id, &stem);
 
     // Find the Claude PID under this pane's shell and spawn a blocking exit
     // watcher so we get a `claude-exited` event the instant the process dies.
@@ -802,6 +876,21 @@ fn parse_capture(path: &std::path::Path) -> Option<ClaudeContextStatus> {
     })
 }
 
+/// Emit the latest captured statusLine context for a just-adopted pane, if a
+/// capture file already exists. Closes the race where Claude wrote its first
+/// statusLine capture *before* the JSONL was adopted into a pane: the capture
+/// watcher drops unroutable captures, so a session that goes idle right after
+/// its first render would otherwise never show stats until an app restart.
+fn emit_capture_for_pane(app: &AppHandle, pane_id: &str, claude_session_id: &str) {
+    let Ok(dir) = app.path().app_data_dir() else { return };
+    let path = dir
+        .join(crate::claude_shim::CAPTURE_SUBDIR)
+        .join(format!("{claude_session_id}.json"));
+    if let Some(status) = parse_capture(&path) {
+        app.emit(&format!("claude-context-{}", pane_id), &status).ok();
+    }
+}
+
 /// Find the pane tracking the Claude session whose JSONL stem == `session_id`.
 /// Returns None until our JSONL watcher has adopted the session into a pane —
 /// the next statusLine render (Claude renders frequently) re-routes it.
@@ -857,6 +946,60 @@ pub fn start_capture_watcher(
                 let Some(status) = parse_capture(&path) else { continue };
                 if let Some(pane_id) = pane_for_session(&monitor, &status.session_id) {
                     app.emit(&format!("claude-context-{}", pane_id), &status).ok();
+                }
+            }
+        }
+    });
+}
+
+/// Watch the hook-signal dir for `<session_id>.json` files written by
+/// `arbiter claude-hook` (our injected Notification/PermissionRequest/Stop
+/// hooks) and route them to the matching pane: `attention` → `claude-attention`
+/// (permission prompt / idle / elicitation), `stop` → `claude-stop` (turn end).
+pub fn start_hook_watcher(
+    app: AppHandle,
+    monitor: Arc<Mutex<HashMap<String, ClaudeEntry>>>,
+    hooks_dir: PathBuf,
+) {
+    std::thread::spawn(move || {
+        if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
+            eprintln!("start_hook_watcher: cannot create {}: {e}", hooks_dir.display());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(tx, NotifyConfig::default()) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("start_hook_watcher: watcher init failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(&hooks_dir, RecursiveMode::NonRecursive) {
+            eprintln!("start_hook_watcher: cannot watch {}: {e}", hooks_dir.display());
+            return;
+        }
+        let _watcher = watcher; // keep alive
+
+        for result in &rx {
+            let Ok(event) = result else { continue };
+            if !matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Other | EventKind::Any
+            ) {
+                continue;
+            }
+            for path in event.paths {
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+                let Some(pane_id) = pane_for_session(&monitor, session_id) else { continue };
+                let signal = std::fs::read_to_string(&path).ok()
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+                    .and_then(|v| v.get("signal").and_then(|s| s.as_str()).map(str::to_string));
+                match signal.as_deref() {
+                    Some("attention") => { app.emit(&format!("claude-attention-{}", pane_id), ()).ok(); }
+                    Some("stop") => { app.emit(&format!("claude-stop-{}", pane_id), ()).ok(); }
+                    _ => {}
                 }
             }
         }

@@ -142,6 +142,11 @@ pub fn run() {
                     monitor_arc.clone(),
                     data_dir.join(claude_shim::CAPTURE_SUBDIR),
                 );
+                claude::start_hook_watcher(
+                    app.handle().clone(),
+                    monitor_arc.clone(),
+                    data_dir.join(claude_shim::HOOKS_SUBDIR),
+                );
             }
             claude::start_claude_watcher(app.handle().clone(), sessions_arc, monitor_arc, expected_arc);
 

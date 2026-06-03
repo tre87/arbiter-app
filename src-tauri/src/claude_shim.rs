@@ -29,11 +29,15 @@ pub const SETTINGS_ENV: &str = "ARBITER_CLAUDE_SETTINGS";
 pub const CAPTURE_DIR_ENV: &str = "ARBITER_CAPTURE_DIR";
 /// The user's original `statusLine.command`, if any, to call through to.
 pub const ORIG_STATUSLINE_ENV: &str = "ARBITER_ORIG_STATUSLINE";
+/// Directory where the hook subcommand writes per-session attention/stop signals.
+pub const HOOKS_DIR_ENV: &str = "ARBITER_HOOKS_DIR";
 
 /// Subdir (under app-data) that holds the shim `bin/` and generated settings.
 const SHIM_SUBDIR: &str = "claude-shim";
 /// Subdir (under app-data) that holds per-session capture files.
 pub const CAPTURE_SUBDIR: &str = "claude-sessions";
+/// Subdir (under app-data) that holds per-session hook signal files.
+pub const HOOKS_SUBDIR: &str = "claude-hooks";
 
 // ── Capture subcommand (`arbiter claude-statusline`) ─────────────────────────
 
@@ -58,6 +62,60 @@ pub fn run_statusline_capture() {
         if !orig.trim().is_empty() {
             forward_to_original(&orig, &buf);
         }
+    }
+}
+
+/// Entry point for `arbiter claude-hook`, invoked by Claude's Notification /
+/// PermissionRequest / Stop hooks (configured via our injected `--settings`).
+/// Reads the hook JSON from stdin and writes a per-session signal file
+/// (`<HOOKS_DIR>/<session_id>.json` = `{"signal":"attention"|"stop",...}`) that
+/// the hook watcher routes to the matching pane. Permission prompts and idle
+/// waits become `attention`; turn end (`Stop`) becomes `stop` (→ ready).
+pub fn run_hook_signal() {
+    let mut buf = Vec::new();
+    if std::io::stdin().read_to_end(&mut buf).is_err() {
+        return;
+    }
+    let v: serde_json::Value = match serde_json::from_slice(&buf) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else { return };
+    if session_id.is_empty()
+        || !session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return;
+    }
+    let event = v.get("hook_event_name").and_then(|s| s.as_str()).unwrap_or("");
+    let ntype = v.get("notification_type").and_then(|s| s.as_str()).unwrap_or("");
+    let signal = match event {
+        "Stop" => "stop",
+        "PermissionRequest" => "attention",
+        "Notification" => match ntype {
+            // Note: `idle_prompt` is intentionally excluded — it fires after ~60s
+            // idle and would turn a merely-idle pane amber (we keep idle grey).
+            "permission_prompt" | "elicitation_dialog" => "attention",
+            _ => return, // idle_prompt / auth_success / elicitation_complete — not attention
+        },
+        _ => return,
+    };
+
+    let Ok(dir) = std::env::var(HOOKS_DIR_ENV) else { return };
+    let dir = Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    // A nonce makes every write distinct so the watcher fires even on a repeat
+    // of the same signal (e.g. two permission prompts in a row).
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = format!("{{\"signal\":\"{signal}\",\"nonce\":{nonce}}}");
+    let final_path = dir.join(format!("{session_id}.json"));
+    let tmp_path = dir.join(format!("{session_id}.json.tmp"));
+    if std::fs::write(&tmp_path, body).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &final_path);
     }
 }
 
@@ -125,6 +183,8 @@ pub struct ShimSetup {
     pub settings_file: PathBuf,
     /// Per-session capture dir (`CAPTURE_DIR_ENV`).
     pub capture_dir: PathBuf,
+    /// Per-session hook-signal dir (`HOOKS_DIR_ENV`).
+    pub hooks_dir: PathBuf,
     /// User's original status-line command, if any (`ORIG_STATUSLINE_ENV`).
     pub orig_statusline: Option<String>,
 }
@@ -136,11 +196,13 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
     let shim_dir = data_dir.join(SHIM_SUBDIR);
     let bin_dir = shim_dir.join("bin");
     let capture_dir = data_dir.join(CAPTURE_SUBDIR);
+    let hooks_dir = data_dir.join(HOOKS_SUBDIR);
 
     let real_claude = find_real_claude(original_path, &bin_dir)?;
 
     std::fs::create_dir_all(&bin_dir).ok()?;
     std::fs::create_dir_all(&capture_dir).ok()?;
+    std::fs::create_dir_all(&hooks_dir).ok()?;
 
     let settings_file = shim_dir.join("settings.json");
     write_settings(&settings_file, arbiter_bin)?;
@@ -151,6 +213,7 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
         real_claude,
         settings_file,
         capture_dir,
+        hooks_dir,
         orig_statusline: read_user_statusline(),
     })
 }
@@ -245,13 +308,26 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
-/// Write the settings file that points `statusLine` at our capture subcommand.
-/// Built with serde_json so the binary path is correctly escaped.
+/// Write the settings file that points `statusLine` at our capture subcommand
+/// and registers the attention hooks (Notification / PermissionRequest / Stop)
+/// at our hook subcommand. Built with serde_json so the binary path is escaped.
+/// Claude merges this with the user's own settings/hooks (it's loaded via
+/// `--settings`), so the user's hooks still run.
 fn write_settings(path: &Path, arbiter_bin: &Path) -> Option<()> {
-    // statusLine.command is run by Claude via a shell, so quote the binary path.
-    let command = format!("\"{}\" claude-statusline", arbiter_bin.display());
+    // Commands are run by Claude via a shell, so quote the binary path.
+    let bin = arbiter_bin.display();
+    let status_command = format!("\"{bin}\" claude-statusline");
+    let hook_command = format!("\"{bin}\" claude-hook");
+    let hook_entry = serde_json::json!({
+        "hooks": [{ "type": "command", "command": hook_command }]
+    });
     let settings = serde_json::json!({
-        "statusLine": { "type": "command", "command": command, "padding": 0 }
+        "statusLine": { "type": "command", "command": status_command, "padding": 0 },
+        "hooks": {
+            "Notification": [hook_entry.clone()],
+            "PermissionRequest": [hook_entry.clone()],
+            "Stop": [hook_entry],
+        }
     });
     let json = serde_json::to_string_pretty(&settings).ok()?;
     std::fs::write(path, json).ok()?;
