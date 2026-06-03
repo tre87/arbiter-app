@@ -14,6 +14,18 @@ export interface SplitNode {
 
 export type PaneNode = TerminalLeaf | SplitNode
 
+// Git status for a terminal's cwd, mirrors the Rust GitInfo struct. Emitted via
+// the cwd-changed event and returned by the get_session_git_info command.
+export interface GitInfo {
+  is_repo: boolean
+  branch: string | null
+  staged: number
+  unstaged: number
+  untracked: number
+  ahead: number
+  behind: number
+}
+
 // ── Worktree types (for project workspaces) ─────────────────────────────────
 
 export interface Worktree {

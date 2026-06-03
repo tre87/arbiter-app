@@ -223,7 +223,7 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                                         app_handle.emit(&cwd_event_name, serde_json::json!({
                                             "cwd": path,
                                             "folder": folder,
-                                            "git": { "is_repo": git.is_repo, "branch": git.branch }
+                                            "git": git
                                         })).ok();
                                     }
                                 }

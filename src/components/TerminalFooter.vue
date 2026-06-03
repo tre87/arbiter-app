@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import MdiIcon from './MdiIcon.vue'
 import GitMenu from './GitMenu.vue'
+import type { GitInfo } from '../types/pane'
 import {
   mdiSourceBranch,
   mdiFolderOutline,
@@ -12,6 +13,9 @@ import {
   mdiCached,
   mdiBookOpenPageVariant,
   mdiAlertOutline,
+  mdiCheckCircleOutline,
+  mdiCircleEditOutline,
+  mdiPlusCircleOutline,
 } from '@mdi/js'
 
 interface ClaudeSessionStatus {
@@ -32,12 +36,21 @@ const props = defineProps<{
   claudeRunning: boolean
   status: ClaudeSessionStatus | null
   folderName: string | null
-  gitInfo: { is_repo: boolean; branch: string | null } | null
+  gitInfo: GitInfo | null
   sessionId: string | null
   // When true, the inline git actions menu is suppressed. Used in project
   // workspaces where git actions live in the worktree sidebar instead.
   hideGitMenu?: boolean
 }>()
+
+const emit = defineEmits<{ (e: 'rename-to-repo'): void }>()
+
+// Clicking the folder segment renames the terminal to the repo name. Only
+// actionable inside a git repo; the parent (TerminalPane) resolves the repo
+// root and runs the confirm flow.
+function onFolderClick() {
+  if (props.gitInfo?.is_repo) emit('rename-to-repo')
+}
 
 function modelLabel(id: string | null | undefined): { name: string; cls: string } {
   if (!id) return { name: '', cls: '' }
@@ -118,7 +131,14 @@ function fmtK(n: number | null | undefined): string {
 
       <span class="spacer" />
 
-      <span v-if="status.folder" class="seg folder-seg">
+      <span
+        v-if="status.folder"
+        class="seg folder-seg"
+        :class="{ clickable: gitInfo?.is_repo }"
+        :role="gitInfo?.is_repo ? 'button' : undefined"
+        :title="gitInfo?.is_repo ? 'Rename terminal to repo name' : undefined"
+        @click="onFolderClick"
+      >
         <MdiIcon :path="mdiFolderOutline" :size="12" />
         <span class="folder">{{ status.folder }}</span>
       </span>
@@ -138,10 +158,33 @@ function fmtK(n: number | null | undefined): string {
       <span class="spacer" />
     </template>
 
-    <!-- Not running Claude: show folder/git info right-aligned -->
+    <!-- Not running Claude: compact git status on the LEFT; folder/branch stay right -->
     <template v-else>
+      <span v-if="gitInfo?.is_repo" class="seg git-status">
+        <span v-if="gitInfo.staged" class="git-staged" title="Staged">
+          <MdiIcon :path="mdiCheckCircleOutline" :size="14" /><span class="git-num">{{ gitInfo.staged }}</span>
+        </span>
+        <span v-if="gitInfo.unstaged" class="git-unstaged" title="Modified (unstaged)">
+          <MdiIcon :path="mdiCircleEditOutline" :size="14" /><span class="git-num">{{ gitInfo.unstaged }}</span>
+        </span>
+        <span v-if="gitInfo.untracked" class="git-untracked" title="Untracked">
+          <MdiIcon :path="mdiPlusCircleOutline" :size="14" /><span class="git-num">{{ gitInfo.untracked }}</span>
+        </span>
+        <span v-if="gitInfo.ahead || gitInfo.behind" class="git-commits" title="Ahead / behind upstream">
+          <span v-if="gitInfo.ahead" class="git-commit-grp"><MdiIcon :path="mdiArrowUp" :size="13" /><span class="git-num">{{ gitInfo.ahead }}</span></span>
+          <span v-if="gitInfo.behind" class="git-commit-grp"><MdiIcon :path="mdiArrowDown" :size="13" /><span class="git-num">{{ gitInfo.behind }}</span></span>
+        </span>
+      </span>
+
       <span class="spacer" />
-      <span class="seg folder-seg">
+
+      <span
+        class="seg folder-seg"
+        :class="{ clickable: gitInfo?.is_repo }"
+        :role="gitInfo?.is_repo ? 'button' : undefined"
+        :title="gitInfo?.is_repo ? 'Rename terminal to repo name' : undefined"
+        @click="onFolderClick"
+      >
         <MdiIcon :path="mdiFolderOutline" :size="12" />
         <span class="folder">{{ folderName }}</span>
         <template v-if="gitInfo?.branch">
@@ -218,11 +261,29 @@ function fmtK(n: number | null | undefined): string {
 
 .folder-seg { gap: 4px; color: var(--color-text-muted); }
 .folder { color: var(--color-text-primary); }
+.folder-seg.clickable { cursor: pointer; border-radius: 3px; padding: 1px 3px; margin: 0 -3px; }
+.folder-seg.clickable:hover { background: var(--color-card-border); }
 
 .branch-seg { gap: 3px; }
 .branch-icon { color: #F05032; }
 .branch { color: #6a9955; font-weight: 600; }
 .branch-bracket { color: var(--color-text-muted); opacity: 0.5; }
+
+/* Compact working-tree status; zero-count groups are hidden in the template.
+   Numbers stay at the footer's 11px; only the leading icons are larger. Icons
+   use inline `vertical-align: middle` so each icon's centre lines up with the
+   digit's optical middle (flex box-centering leaves digits looking high). */
+.git-status { gap: 8px; font-weight: 600; }
+.git-status > span { display: inline-flex; align-items: center; gap: 2px; }
+.git-status svg { display: block; }
+/* Flex centres the icon against the digit's line-box, but the numeral's mass
+   sits high in that box — nudge the digit down to sit on the icon's centre. */
+.git-num { display: block; transform: translateY(1px); }
+.git-staged { color: #6a9955; }
+.git-unstaged { color: #e5a03c; }
+.git-untracked { color: #569cd6; }
+.git-commits { color: var(--color-text-muted); gap: 5px; }
+.git-commit-grp { display: inline-flex; align-items: center; gap: 1px; }
 
 .waiting { font-style: italic; }
 </style>

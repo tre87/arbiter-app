@@ -42,8 +42,24 @@ export const usePaneStore = defineStore('pane', () => {
 
   const terminalNames = ref<Record<string, string>>({})
 
-  function assignTerminalName(id: string) {
-    const n = nextAvailableNumber('Terminal', Object.values(terminalNames.value))
+  // Pane ids of the workspace that currently contains `id` (empty if the pane
+  // isn't attached to any workspace tree yet, e.g. mid-restore).
+  function paneIdsForWorkspaceContaining(id: string): string[] {
+    const ws = workspaces.value.find(w =>
+      w.type === 'project'
+        ? w.worktrees.some(wt => nodeContainsId(wt.root, id))
+        : nodeContainsId(w.root, id),
+    )
+    return ws ? collectAllPaneIds(ws) : []
+  }
+
+  // Numbering is scoped to the pane's workspace so each workspace restarts at
+  // "Terminal 1". Callers may pass `scopeIds` explicitly for panes not yet in a
+  // workspace tree (the restore path builds the tree before pushing the ws).
+  function assignTerminalName(id: string, scopeIds?: string[]) {
+    const ids = scopeIds ?? paneIdsForWorkspaceContaining(id)
+    const names = ids.filter(i => i !== id).map(i => terminalNames.value[i]).filter(Boolean)
+    const n = nextAvailableNumber('Terminal', names)
     terminalNames.value[id] = `Terminal ${n}`
   }
 
@@ -810,7 +826,9 @@ export const usePaneStore = defineStore('pane', () => {
           }
           if (t.shell) savedShells.value[id] = t.shell
         } else {
-          assignTerminalName(id)
+          // Tree isn't attached to a workspace yet; scope numbering to the
+          // siblings built so far in this same tree.
+          assignTerminalName(id, terminalIdsByIndex)
         }
         return { type: 'terminal', id }
       }

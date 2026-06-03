@@ -1,13 +1,37 @@
 use crate::util::hidden_command;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Serialize, Clone)]
 pub struct GitInfo {
     pub is_repo: bool,
     pub branch: Option<String>,
+    // Working-tree status counts (repo-wide), surfaced compactly in the footer.
+    pub staged: u32,
+    pub unstaged: u32,
+    pub untracked: u32,
+    // Commits ahead/behind the configured upstream (0 when no upstream).
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+impl GitInfo {
+    fn not_repo() -> Self {
+        GitInfo {
+            is_repo: false,
+            branch: None,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            ahead: 0,
+            behind: 0,
+        }
+    }
 }
 
 // Cache get_git_info results for a short window to avoid spawning two `git`
@@ -27,33 +51,82 @@ fn git_info_cache() -> &'static Mutex<HashMap<String, GitInfoCacheEntry>> {
 fn compute_git_info(cwd: &str) -> GitInfo {
     let path = std::path::Path::new(cwd);
     if !path.is_dir() {
-        return GitInfo { is_repo: false, branch: None };
+        return GitInfo::not_repo();
     }
-    let is_repo = hidden_command("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
+    // A single `git status` call yields branch, upstream ahead/behind, and
+    // per-file staged/unstaged/untracked counts — cheaper than the previous
+    // rev-parse + branch pair and gives everything the footer needs.
+    let output = hidden_command("git")
+        .args(["status", "--porcelain=v1", "--branch"])
         .current_dir(cwd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !is_repo {
-        return GitInfo { is_repo: false, branch: None };
-    }
-    let branch = hidden_command("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        // Non-zero exit (or spawn failure) means this isn't a work tree.
+        _ => return GitInfo::not_repo(),
+    };
+    parse_status(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the output of `git status --porcelain=v1 --branch` into a GitInfo.
+fn parse_status(stdout: &str) -> GitInfo {
+    let mut info = GitInfo {
+        is_repo: true,
+        branch: None,
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        ahead: 0,
+        behind: 0,
+    };
+    for line in stdout.lines() {
+        if let Some(header) = line.strip_prefix("## ") {
+            // Forms: "main", "main...origin/main", "main...origin/main [ahead 1, behind 2]",
+            // "No commits yet on main", or "HEAD (no branch)" (detached).
+            // Branch name is everything before "...", minus the no-commits prefix.
+            let name_part = header.split("...").next().unwrap_or(header);
+            let name = name_part
+                .trim()
+                .strip_prefix("No commits yet on ")
+                .unwrap_or(name_part.trim())
+                .trim();
+            if !name.is_empty() && name != "HEAD (no branch)" {
+                info.branch = Some(name.to_string());
             }
-        })
-        .filter(|s| !s.is_empty());
-    GitInfo { is_repo, branch }
+            if let Some(start) = header.find('[') {
+                if let Some(end) = header[start..].find(']') {
+                    let tracking = &header[start + 1..start + end];
+                    for part in tracking.split(',') {
+                        let part = part.trim();
+                        if let Some(n) = part.strip_prefix("ahead ") {
+                            info.ahead = n.trim().parse().unwrap_or(0);
+                        } else if let Some(n) = part.strip_prefix("behind ") {
+                            info.behind = n.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // Entry line: "XY <path>". X = index (staged) status, Y = worktree status.
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        if x == '?' && y == '?' {
+            info.untracked += 1;
+            continue;
+        }
+        if matches!(x, 'M' | 'A' | 'D' | 'R' | 'C') {
+            info.staged += 1;
+        }
+        if matches!(y, 'M' | 'D') {
+            info.unstaged += 1;
+        }
+    }
+    info
 }
 
 /// Standalone git info lookup (usable from both Tauri commands and background
@@ -76,8 +149,79 @@ pub fn get_git_info(cwd: &str) -> GitInfo {
 }
 
 #[tauri::command]
-pub fn get_session_git_info(cwd: String) -> GitInfo {
+pub fn get_session_git_info(cwd: String, force: Option<bool>) -> GitInfo {
+    // `force` bypasses the 1.5 s cache — used by the .git watcher / focus
+    // refresh, where the index just changed and the cached value is stale.
+    if force.unwrap_or(false) {
+        let info = compute_git_info(&cwd);
+        let mut cache = git_info_cache().lock().unwrap();
+        cache.insert(cwd.clone(), GitInfoCacheEntry { info: info.clone(), at: Instant::now() });
+        return info;
+    }
     get_git_info(&cwd)
+}
+
+// Per-session watchers on the repo's .git directory. Staging/commit/branch ops
+// (from VS Code or the terminal) write under .git, so this fires a
+// `git-changed-{session}` event without polling. Keyed by session id; the
+// watched repo root is tracked so cd'ing within the same repo is a no-op.
+pub struct GitWatchers(pub Arc<Mutex<HashMap<String, GitWatchEntry>>>);
+pub struct GitWatchEntry {
+    _watcher: RecommendedWatcher,
+    repo_root: String,
+}
+
+impl GitWatchers {
+    pub fn new() -> Self {
+        GitWatchers(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
+/// Point a session's git watcher at the repo containing `cwd`. Replaces the
+/// existing watcher when the repo root changes; removes it when `cwd` is not in
+/// a repo. Idempotent while staying inside the same repo.
+#[tauri::command]
+pub fn watch_git(app: AppHandle, watchers: State<GitWatchers>, session_id: String, cwd: String) {
+    let root = git_repo_root(cwd);
+    let mut map = watchers.0.lock().unwrap();
+
+    let Some(root) = root else {
+        map.remove(&session_id);
+        return;
+    };
+
+    if map.get(&session_id).map(|e| e.repo_root == root).unwrap_or(false) {
+        return; // already watching this repo
+    }
+
+    let sid = session_id.clone();
+    let app_handle = app.clone();
+    let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(ev) = res {
+            if matches!(ev.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)) {
+                let _ = app_handle.emit(&format!("git-changed-{}", sid), ());
+            }
+        }
+    }) {
+        Ok(w) => w,
+        Err(_) => { map.remove(&session_id); return; }
+    };
+
+    // Watch .git recursively so refs/heads updates (commits, branch switches)
+    // are caught alongside index/HEAD. If .git is a file (worktree/submodule),
+    // fall back to watching the work tree root.
+    let git_dir = Path::new(&root).join(".git");
+    let target = if git_dir.is_dir() { git_dir } else { Path::new(&root).to_path_buf() };
+    if watcher.watch(&target, RecursiveMode::Recursive).is_err() {
+        map.remove(&session_id);
+        return;
+    }
+    map.insert(session_id, GitWatchEntry { _watcher: watcher, repo_root: root });
+}
+
+#[tauri::command]
+pub fn unwatch_git(session_id: String, watchers: State<GitWatchers>) {
+    watchers.0.lock().unwrap().remove(&session_id);
 }
 
 #[derive(Serialize, Clone)]
