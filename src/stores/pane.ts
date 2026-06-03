@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { emit } from '@tauri-apps/api/event'
 import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree, ClaudePaneState } from '../types/pane'
 import type { SavedPaneNode, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace, LegacySavedWorkspace } from '../types/config'
@@ -237,21 +237,59 @@ export const usePaneStore = defineStore('pane', () => {
   // event (potentially several per second per pane), and emitting + serialising
   // every terminal's status when no one's listening is pure waste.
   const overviewWindowOpen = ref(false)
-  function setOverviewOpen(open: boolean) { overviewWindowOpen.value = open }
+  // Heartbeat: while the overview window is open, re-push a full snapshot on a
+  // timer so a dropped cross-window event (observed on macOS) self-heals within
+  // ~1.5s instead of leaving the overview stale.
+  let overviewHeartbeat: ReturnType<typeof setInterval> | null = null
+  function setOverviewOpen(open: boolean) {
+    overviewWindowOpen.value = open
+    if (open) {
+      emitOverviewUpdate()
+      if (!overviewHeartbeat) overviewHeartbeat = setInterval(emitOverviewUpdate, 1500)
+    } else if (overviewHeartbeat) {
+      clearInterval(overviewHeartbeat)
+      overviewHeartbeat = null
+    }
+  }
 
   function setTerminalStatus(paneId: string, status: 'idle' | 'running' | 'ready' | 'working' | 'attention') {
     terminalStatuses.value[paneId] = status
-    emitOverviewUpdate()
+    // (emit is driven by the overviewSignature watch below)
+  }
+
+  // Unified per-pane status: Claude lifecycle takes precedence when Claude is
+  // active, otherwise the shell-activity status (idle / running a job). This is
+  // the single source of truth the overview, workspace tabs and worktree cards
+  // all read, so they always agree.
+  function getPaneStatus(paneId: string): 'idle' | 'running' | 'ready' | 'working' | 'attention' {
+    const claude = claudePaneStates.value[paneId]
+    if (claude && claude.lifecycle !== 'closed') {
+      if (claude.lifecycle === 'working') return 'working'
+      if (claude.lifecycle === 'attention') return 'attention'
+      return 'ready' // ready / launching
+    }
+    return terminalStatuses.value[paneId] ?? 'idle'
+  }
+
+  // Aggregate a workspace's panes into one status for its tab indicator:
+  // attention > working > running > idle (a Claude 'ready'/idle pane adds no
+  // indicator). Used by WorkspaceTabs.
+  function getWorkspaceStatus(workspaceIndex: number): 'idle' | 'running' | 'working' | 'attention' {
+    const rank = { idle: 0, running: 1, working: 2, attention: 3 } as const
+    let best: 'idle' | 'running' | 'working' | 'attention' = 'idle'
+    for (const t of getAllTerminals()) {
+      if (t.workspaceIndex !== workspaceIndex) continue
+      const s = getPaneStatus(t.paneId)
+      const mapped: 'idle' | 'running' | 'working' | 'attention' =
+        s === 'ready' ? 'idle' : s
+      if (rank[mapped] > rank[best]) best = mapped
+    }
+    return best
   }
 
   function emitOverviewUpdate() {
     if (!overviewWindowOpen.value) return
     const devSettings = useDevSettingsStore()
-    // Send all terminals plus per-terminal `claudeActive` and the current
-    // filter setting. The overview window applies the filter locally so it
-    // stays correct even when this fires before Claude lifecycle states
-    // have been populated by mounting panes (the initial overview-request
-    // happens before TerminalPane.onMounted runs).
     const terminals = getAllTerminals().map(t => ({
       paneId: t.paneId,
       workspaceId: t.workspaceId,
@@ -259,7 +297,7 @@ export const usePaneStore = defineStore('pane', () => {
       workspaceName: t.workspaceName,
       workspaceType: t.workspaceType,
       name: getTerminalName(t.paneId),
-      status: getTerminalStatus(t.paneId),
+      status: getPaneStatus(t.paneId),
       claudeActive: getClaudePaneState(t.paneId).lifecycle !== 'closed',
     }))
     emit('overview-update', { terminals, claudeOnly: devSettings.overviewClaudeOnly })
@@ -268,6 +306,22 @@ export const usePaneStore = defineStore('pane', () => {
   function getTerminalStatus(paneId: string): 'idle' | 'running' | 'ready' | 'working' | 'attention' {
     return terminalStatuses.value[paneId] ?? 'idle'
   }
+
+  // Re-push to the overview whenever the overview-relevant view changes — any
+  // pane's unified status, the set/names of terminals, or the Claude-only
+  // filter. A signature string means we only emit on real changes (not on the
+  // frequent token/cost updates that also mutate claudePaneStates).
+  const overviewSignature = computed(() => {
+    const devSettings = useDevSettingsStore()
+    const parts = getAllTerminals().map(t =>
+      `${t.paneId}:${t.workspaceIndex}:${getTerminalName(t.paneId)}:${getPaneStatus(t.paneId)}:${getClaudePaneState(t.paneId).lifecycle !== 'closed' ? 1 : 0}`,
+    )
+    return `${devSettings.overviewClaudeOnly ? 1 : 0}|${parts.join('|')}`
+  })
+  // NOTE: the watch that drives this is registered at the very end of the store
+  // setup — `overviewSignature` reads `claudePaneStates` (declared below) via
+  // `getPaneStatus`, and watch() evaluates its source eagerly, so registering it
+  // here would hit `claudePaneStates`'s temporal dead zone and crash app init.
 
   function getAllTerminals(): Array<{ paneId: string; workspaceId: string; workspaceIndex: number; workspaceName: string; workspaceType: 'terminal' | 'project' }> {
     const result: Array<{ paneId: string; workspaceId: string; workspaceIndex: number; workspaceName: string; workspaceType: 'terminal' | 'project' }> = []
@@ -308,18 +362,22 @@ export const usePaneStore = defineStore('pane', () => {
 
   function updateClaudePaneState(paneId: string, update: Partial<ClaudePaneState>) {
     const current = getClaudePaneState(paneId)
-    const lifecycleChanged = update.lifecycle !== undefined && update.lifecycle !== current.lifecycle
-    claudePaneStates.value[paneId] = { ...current, ...update }
+    // Entering 'launching' starts a NEW Claude session — clear the previous
+    // session's stats so the footer shows "waiting" instead of stale numbers
+    // until the new session reports (anything in `update` still wins).
+    const base = update.lifecycle === 'launching'
+      ? {
+          ...current,
+          model: null, inputTokens: 0, outputTokens: 0,
+          cacheReadTokens: 0, cacheWriteTokens: 0, contextPercent: 0,
+          contextWindowSize: null, usedPercentage: null, hasContext: false, cost: 0,
+        }
+      : current
+    claudePaneStates.value[paneId] = { ...base, ...update }
     if (update.lifecycle === 'launching') {
       launchTimestamps[paneId] = Date.now()
     }
-    // When `overviewClaudeOnly` is on, a pane appearing/disappearing from the
-    // overview is driven by its Claude lifecycle, not by terminal-status
-    // shell-activity events. Re-emit so the list re-filters as soon as a
-    // Claude launch/exit transitions across the `closed` boundary.
-    if (lifecycleChanged && (update.lifecycle === 'closed' || current.lifecycle === 'closed')) {
-      emitOverviewUpdate()
-    }
+    // The overview re-emits via the overviewSignature watch on any status change.
   }
 
   function isClaudeActive(paneId: string): boolean {
@@ -858,6 +916,11 @@ export const usePaneStore = defineStore('pane', () => {
     activeWorkspaceIndex.value = (savedActiveIndex != null && savedActiveIndex < restored.length) ? savedActiveIndex : 0
   }
 
+  // Push overview snapshots on any status-relevant change. Registered last so
+  // the eager initial evaluation of overviewSignature sees every ref/function
+  // it depends on already initialized (notably claudePaneStates).
+  watch(overviewSignature, () => emitOverviewUpdate())
+
   return {
     // Workspace state
     workspaces, activeWorkspaceIndex,
@@ -880,7 +943,7 @@ export const usePaneStore = defineStore('pane', () => {
     isClaudeActive, getClaudeSessionForSave, markResize,
     subscribeClaudeEvents, unsubscribeClaudeEvents, armClaudeListeners,
     // Terminal status
-    terminalStatuses, setTerminalStatus, getTerminalStatus, getAllTerminals, emitOverviewUpdate,
+    terminalStatuses, setTerminalStatus, getTerminalStatus, getPaneStatus, getWorkspaceStatus, getAllTerminals, emitOverviewUpdate,
     setOverviewOpen,
     // Saved state for restoration
     savedCwds, savedClaudeRestore,

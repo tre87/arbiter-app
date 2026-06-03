@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import RobotIcon from './RobotIcon.vue'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
-import HexPulse from './HexPulse.vue'
+import ClaudeWorkingIcon from './ClaudeWorkingIcon.vue'
 import { mdiBellRing, mdiSourceMerge, mdiConsole, mdiAlertOutline } from '@mdi/js'
 import type { WorktreeClaudeStatus } from '../stores/project'
 
@@ -115,7 +115,7 @@ const progressColor = computed(() => {
             Merged
           </span>
           <span v-else class="status-badge" :class="statusClass">
-            <HexPulse v-if="status.status === 'working'" :size="12" />
+            <ClaudeWorkingIcon v-if="status.status === 'working'" :size="13" />
             <MdiIcon v-else-if="status.status === 'attention'" :path="mdiBellRing" :size="12" class="icon-ring" />
             <ClaudeIcon v-else-if="status.status === 'ready'" :size="12" />
             <MdiIcon v-else :path="mdiConsole" :size="12" />

@@ -281,6 +281,13 @@ function onPointerDown(e: PointerEvent, index: number) {
           @click.stop
         />
         <template v-else>
+          <span
+            v-if="store.getWorkspaceStatus(i) !== 'idle'"
+            class="tab-status"
+            :class="'st-' + store.getWorkspaceStatus(i)"
+            :title="store.getWorkspaceStatus(i) === 'attention' ? 'Needs attention'
+              : store.getWorkspaceStatus(i) === 'working' ? 'Claude working' : 'Running'"
+          />
           <MdiIcon v-if="ws.type === 'project'" :path="mdiFolder" :size="12" class="tab-type-icon" />
           <MdiIcon v-else :path="mdiConsole" :size="12" class="tab-type-icon" />
           <span class="tab-label">{{ ws.name }}</span>
@@ -516,6 +523,23 @@ function onPointerDown(e: PointerEvent, index: number) {
   display: block;
   opacity: 0.5;
   margin-right: 2px;
+}
+
+/* Aggregated workspace status dot (attention > working > running). Shares the
+   colour language used by the overview and worktree cards. */
+.tab-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: 1px;
+}
+.tab-status.st-attention { background: #e5a03c; animation: tab-status-pulse 1.2s ease-in-out infinite; }
+.tab-status.st-working   { background: var(--azure); animation: tab-status-pulse 1.5s ease-in-out infinite; }
+.tab-status.st-running   { background: var(--color-success); animation: tab-status-pulse 1.5s ease-in-out infinite; }
+@keyframes tab-status-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
 }
 
 .new-menu {

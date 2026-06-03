@@ -130,6 +130,7 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
       if (config.devSettings.useCustomTerminalBg === false) dev.useCustomTerminalBg = false
       if (config.devSettings.hideClaudeButtons === true) dev.hideClaudeButtons = true
       if (config.devSettings.hideShellButton === true) dev.hideShellButton = true
+      if (config.devSettings.overviewClaudeOnly === false) dev.overviewClaudeOnly = false
     }
 
     if (config.overviewVisible && config.overview) {
