@@ -192,24 +192,40 @@ export async function wireClaudeEventListeners(
   })
   listeners.push(unExited as unknown as () => void)
 
-  // shell-activity: exit fallback via OSC 133 idle detection
+  // shell-activity: exit fallback via OSC 133 idle detection. The OSC-133 idle
+  // can fire spuriously while Claude is still alive, which previously flipped a
+  // running pane to 'closed' permanently (nothing re-opens it) and lost the
+  // running state across restarts. So before closing, confirm with the backend
+  // that no Claude process is actually alive. The authoritative PID-based
+  // `claude-exited` remains the fast path; this is only the safety net.
+  async function confirmExitThenClose(extra: Partial<ClaudePaneState>) {
+    let running = true
+    try {
+      const info = await invoke<{ running: boolean }>('claude_persist_info', { sessionId: sid })
+      running = info.running
+    } catch {
+      running = false // backend unreachable: trust the idle signal and close
+    }
+    if (running) return
+    const s = getClaudePaneState(paneId)
+    if (s.lifecycle === 'closed') return
+    if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
+    delete launchTimestamps[paneId]
+    updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false, ...extra })
+    invoke('clear_claude_monitor', { sessionId: sid })
+      .catch(e => console.error(`clear_claude_monitor failed for ${sid}:`, e))
+  }
+
   const unShellActivity = await listen<boolean>(`shell-activity-${sid}`, (event) => {
     const idle = event.payload
     const state = getClaudePaneState(paneId)
 
     if (idle && (state.lifecycle === 'ready' || state.lifecycle === 'working' || state.lifecycle === 'attention')) {
-      if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
-      delete launchTimestamps[paneId]
-      updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false })
-      invoke('clear_claude_monitor', { sessionId: sid })
-        .catch(e => console.error(`clear_claude_monitor failed for ${sid}:`, e))
+      confirmExitThenClose({})
     } else if (idle && state.lifecycle === 'launching') {
       const launchedAt = launchTimestamps[paneId] ?? 0
       if (launchedAt > 0 && Date.now() - launchedAt > 5000) {
-        delete launchTimestamps[paneId]
-        updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false, hasContext: false })
-        invoke('clear_claude_monitor', { sessionId: sid })
-          .catch(e => console.error(`clear_claude_monitor failed for ${sid}:`, e))
+        confirmExitThenClose({ hasContext: false })
       }
     }
 

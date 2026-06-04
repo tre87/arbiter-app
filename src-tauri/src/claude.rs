@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::pty::PtySession;
+use crate::pty::{PtySession, Sessions};
 
 /// State for an active Claude process detected under a pane's shell.
 #[derive(Clone)]
@@ -64,6 +64,42 @@ pub fn set_expected_claude_session(
 #[tauri::command]
 pub fn clear_claude_monitor(session_id: String, monitor: State<ClaudeMonitor>) {
     monitor.0.lock().unwrap().remove(&session_id);
+}
+
+/// Authoritative "is Claude running in this pane" check, driven by the live
+/// process table + the JSONL monitor — NOT the frontend lifecycle, which can
+/// flicker to 'closed' on a spurious shell idle. Used by autosave so a running
+/// Claude is reliably remembered across restarts, and by the OSC-133 exit
+/// fallback so a live Claude is never wrongly marked closed.
+#[derive(Serialize)]
+pub struct ClaudePersistInfo {
+    /// A Claude process is alive under this pane's shell right now.
+    pub running: bool,
+    /// The adopted transcript's session id (for `claude --resume`), if one has
+    /// been matched to this pane. None for a just-launched, not-yet-adopted run.
+    pub claude_session_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn claude_persist_info(
+    session_id: String,
+    sessions: State<Sessions>,
+    monitor: State<ClaudeMonitor>,
+) -> ClaudePersistInfo {
+    let shell_pid = sessions.0.lock().unwrap().get(&session_id).and_then(|s| s.shell_pid);
+    let running = match shell_pid {
+        Some(pid) => shared_system()
+            .with(std::time::Duration::from_millis(250), |sys| find_claude_in(sys, pid))
+            .is_some(),
+        None => false,
+    };
+    let claude_session_id = monitor
+        .0
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .and_then(|e| e.jsonl.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()));
+    ClaudePersistInfo { running, claude_session_id }
 }
 
 // ── Claude process monitoring (file-system events + per-PID exit watch) ─────
