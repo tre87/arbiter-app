@@ -121,15 +121,28 @@ pub fn run() {
             // Create a hidden overview window at startup so WebView2
             // initialises during the event-loop setup phase (avoids the
             // deadlock that occurs when building a window from a command).
-            WebviewWindowBuilder::new(app, OVERVIEW_WINDOW_LABEL, tauri::WebviewUrl::default())
-                .title("Arbiter – Overview")
-                .inner_size(240.0, 320.0)
-                .min_inner_size(180.0, 120.0)
-                .always_on_top(true)
-                .decorations(false)
-                .resizable(true)
-                .visible(false)
-                .build()?;
+            // Build it AT its saved geometry so the webview initialises on the
+            // correct monitor at the correct DPI scale — creating it on one
+            // monitor and moving it to a different-DPI monitor later leaves the
+            // webview at the wrong devicePixelRatio (content fills only part of
+            // the window).
+            let saved_overview = overview::saved_geometry(&app.handle());
+            let mut overview_builder =
+                WebviewWindowBuilder::new(app, OVERVIEW_WINDOW_LABEL, tauri::WebviewUrl::default())
+                    .title("Arbiter – Overview")
+                    .min_inner_size(180.0, 120.0)
+                    .always_on_top(true)
+                    .decorations(false)
+                    .resizable(true)
+                    .visible(false);
+            overview_builder = match saved_overview {
+                Some((x, y, width, height)) => overview_builder
+                    .position(x, y)
+                    .inner_size(width, height),
+                None => overview_builder
+                    .inner_size(overview::OVERVIEW_DEFAULT_WIDTH, overview::OVERVIEW_DEFAULT_HEIGHT),
+            };
+            overview_builder.build()?;
 
             // Start the event-driven Claude session watcher
             let sessions_arc = app.state::<Sessions>().0.clone();
@@ -242,6 +255,8 @@ pub fn run() {
             pty::write_to_session,
             pty::resize_session,
             pty::close_session,
+            pty::pause_session,
+            pty::resume_session,
             pty::get_session_replay,
             pty::get_session_size,
             usage::get_usage,
@@ -291,6 +306,13 @@ pub fn run() {
             fs::trash_path,
             open_devtools,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Cmd+Q / dock Quit bypass the JS close handler's autosave flush, so
+            // persist the overview window's geometry here before teardown.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                overview::persist_overview_geometry(app_handle);
+            }
+        });
 }

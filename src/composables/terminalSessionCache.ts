@@ -37,6 +37,11 @@ export function getTerminalSession(paneId: string): TerminalSession | undefined 
   return cache.get(paneId)
 }
 
+/** Number of live (cached) terminal sessions — surfaced in the debug footer. */
+export function sessionCount(): number {
+  return cache.size
+}
+
 export function setTerminalSession(paneId: string, session: TerminalSession): void {
   cache.set(paneId, session)
 }

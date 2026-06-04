@@ -15,6 +15,7 @@ import MdiIcon from './components/MdiIcon.vue'
 import { mdiCogOutline, mdiKeyboardOutline, mdiViewDashboardOutline, mdiBugOutline, mdiLoading, mdiWrenchOutline } from '@mdi/js'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import WindowControls from './components/WindowControls.vue'
+import DebugFooter from './components/DebugFooter.vue'
 import logoUrl from './assets/logo.svg'
 import { useAutosave } from './composables/useAutosave'
 import { loadAndRestore } from './composables/useStartupRestore'
@@ -48,7 +49,7 @@ function onDevMenuClickOutside(e: MouseEvent) {
 
 const isMac = typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac')
 
-const { flush: flushAutosave } = useAutosave(ready, overviewOpen)
+const { flush: flushAutosave, requestSave } = useAutosave(ready, overviewOpen)
 
 // Mirror overview-open state into the pane store so emitOverviewUpdate can
 // skip the cross-window IPC when nobody's listening.
@@ -99,6 +100,7 @@ let unlistenOverviewNavigate: (() => void) | null = null
 let unlistenOverviewClosed: (() => void) | null = null
 let unlistenOverviewReorder: (() => void) | null = null
 let unlistenOverviewSetClaudeOnly: (() => void) | null = null
+let unlistenOverviewGeometry: (() => void) | null = null
 
 onMounted(async () => {
   if (isDev) document.addEventListener('mousedown', onDevMenuClickOutside)
@@ -118,6 +120,12 @@ onMounted(async () => {
   }) as unknown as (() => void)
   unlistenOverviewClosed = await listen('overview-closed', () => {
     overviewOpen.value = false
+  }) as unknown as (() => void)
+  // The overview window's move/resize happens in its own webview, so the main
+  // window's geometry listeners don't see it. It notifies us here; schedule a
+  // (debounced) save that captures the overview geometry via get_overview_state.
+  unlistenOverviewGeometry = await listen('overview-geometry-changed', () => {
+    requestSave()
   }) as unknown as (() => void)
   // Overview's right-click menu toggled the Claude-only filter. Update the
   // store (the overviewClaudeOnly watch persists it and re-pushes the list).
@@ -156,6 +164,7 @@ onBeforeUnmount(() => {
   unlistenOverviewReorder?.()
   unlistenOverviewClosed?.()
   unlistenOverviewSetClaudeOnly?.()
+  unlistenOverviewGeometry?.()
 })
 </script>
 
@@ -224,6 +233,8 @@ onBeforeUnmount(() => {
     <OrgSelectionDialog v-if="usageStore.orgPickerVisible" />
 
     <ConfirmDialog />
+
+    <DebugFooter v-if="devStore.showDebugFooter" />
   </div>
 </template>
 
@@ -332,15 +343,13 @@ onBeforeUnmount(() => {
     var(--azure-baby)    100%
   );
   background-size: 250% auto;
+  background-position: 30% center;
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: title-shimmer 6s ease-in-out infinite alternate;
-}
-
-@keyframes title-shimmer {
-  from { background-position: 0% center; }
-  to   { background-position: 100% center; }
+  /* Static gradient (no infinite animation): a continuously animated
+     background-position on background-clip:text repaints the title every frame,
+     and re-blurs the backdrop-filtered active tab behind it — ~idle 60→45 FPS. */
 }
 
 .titlebar-actions {

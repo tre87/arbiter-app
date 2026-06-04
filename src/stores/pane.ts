@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import { emit } from '@tauri-apps/api/event'
-import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree, ClaudePaneState } from '../types/pane'
+import type { PaneNode, TerminalLeaf, SplitNode, Workspace, TerminalWorkspace, ProjectWorkspace, Worktree, ClaudePaneState, GitInfo } from '../types/pane'
 import type { SavedPaneNode, SavedTerminal, SavedWorkspace, SavedTerminalWorkspace, SavedProjectWorkspace, LegacySavedWorkspace } from '../types/config'
 import {
   nextAvailableNumber, getWorkspaceRoot, setWorkspaceRoot,
@@ -315,6 +315,7 @@ export const usePaneStore = defineStore('pane', () => {
       name: getTerminalName(t.paneId),
       status: getPaneStatus(t.paneId),
       claudeActive: getClaudePaneState(t.paneId).lifecycle !== 'closed',
+      gitInfo: paneGitInfo.value[t.paneId] ?? null,
     }))
     emit('overview-update', { terminals, claudeOnly: devSettings.overviewClaudeOnly })
   }
@@ -329,9 +330,11 @@ export const usePaneStore = defineStore('pane', () => {
   // frequent token/cost updates that also mutate claudePaneStates).
   const overviewSignature = computed(() => {
     const devSettings = useDevSettingsStore()
-    const parts = getAllTerminals().map(t =>
-      `${t.paneId}:${t.workspaceIndex}:${getTerminalName(t.paneId)}:${getPaneStatus(t.paneId)}:${getClaudePaneState(t.paneId).lifecycle !== 'closed' ? 1 : 0}`,
-    )
+    const parts = getAllTerminals().map(t => {
+      const g = paneGitInfo.value[t.paneId]
+      const gs = g?.is_repo ? `${g.staged},${g.unstaged},${g.untracked},${g.ahead},${g.behind}` : ''
+      return `${t.paneId}:${t.workspaceIndex}:${getTerminalName(t.paneId)}:${getPaneStatus(t.paneId)}:${getClaudePaneState(t.paneId).lifecycle !== 'closed' ? 1 : 0}:${gs}`
+    })
     return `${devSettings.overviewClaudeOnly ? 1 : 0}|${parts.join('|')}`
   })
   // NOTE: the watch that drives this is registered at the very end of the store
@@ -488,6 +491,15 @@ export const usePaneStore = defineStore('pane', () => {
   const savedCwds = ref<Record<string, string>>({})
   const savedClaudeRestore = ref<Record<string, { sessionId: string | null; wasOpen: boolean }>>({})
   const savedShells = ref<Record<string, 'powershell' | 'gitbash'>>({})
+
+  // Live git info per pane (reported by TerminalPane from its cwd/git watcher),
+  // surfaced in the overview window so its rows can show the same compact git
+  // stats as the terminal footer.
+  const paneGitInfo = ref<Record<string, GitInfo>>({})
+  function setPaneGitInfo(paneId: string, info: GitInfo | null) {
+    if (info) paneGitInfo.value[paneId] = info
+    else delete paneGitInfo.value[paneId]
+  }
 
   function getSavedCwd(paneId: string): string | undefined {
     return savedCwds.value[paneId]
@@ -962,7 +974,7 @@ export const usePaneStore = defineStore('pane', () => {
     subscribeClaudeEvents, unsubscribeClaudeEvents, armClaudeListeners,
     // Terminal status
     terminalStatuses, setTerminalStatus, getTerminalStatus, getPaneStatus, getWorkspaceStatus, getAllTerminals, emitOverviewUpdate,
-    setOverviewOpen,
+    setOverviewOpen, setPaneGitInfo,
     // Saved state for restoration
     savedCwds, savedClaudeRestore,
     getSavedCwd, consumeSavedCwd, consumeSavedClaudeRestore, getSavedShell, consumeSavedShell,

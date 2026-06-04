@@ -2,7 +2,7 @@ import { watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
 import { useProjectStore } from '../stores/project'
-import { useDevSettingsStore } from '../stores/devSettings'
+import { useDevSettingsStore, clampScrollback } from '../stores/devSettings'
 import { useFilesSettingsStore } from '../stores/filesSettings'
 import { waitForShellIdle } from '../utils/shellIdle'
 import type { ArbiterConfig } from '../types/config'
@@ -131,14 +131,14 @@ export async function loadAndRestore(overviewOpen: Ref<boolean>) {
       if (config.devSettings.hideClaudeButtons === true) dev.hideClaudeButtons = true
       if (config.devSettings.hideShellButton === true) dev.hideShellButton = true
       if (config.devSettings.overviewClaudeOnly === false) dev.overviewClaudeOnly = false
+      if (typeof config.devSettings.scrollback === 'number') dev.scrollback = clampScrollback(config.devSettings.scrollback)
     }
 
-    if (config.overviewVisible && config.overview) {
+    if (config.overviewVisible) {
+      // Geometry is applied at window-creation time in Rust setup() (so the
+      // webview gets the right DPI on multi-monitor setups); here we just show it.
       overviewOpen.value = true
-      invoke('restore_overview_window', {
-        x: config.overview.x, y: config.overview.y,
-        width: config.overview.width, height: config.overview.height,
-      })
+      invoke('show_overview_window')
     }
 
     // Populate project store paneToWorktree map BEFORE bootstrap so the

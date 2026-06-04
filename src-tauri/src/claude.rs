@@ -83,23 +83,94 @@ pub struct ClaudePersistInfo {
 #[tauri::command]
 pub fn claude_persist_info(
     session_id: String,
+    app: AppHandle,
     sessions: State<Sessions>,
     monitor: State<ClaudeMonitor>,
 ) -> ClaudePersistInfo {
-    let shell_pid = sessions.0.lock().unwrap().get(&session_id).and_then(|s| s.shell_pid);
+    let (shell_pid, cwd) = {
+        let s = sessions.0.lock().unwrap();
+        match s.get(&session_id) {
+            Some(sess) => (sess.shell_pid, sess.cwd.lock().unwrap().clone()),
+            None => (None, None),
+        }
+    };
     let running = match shell_pid {
         Some(pid) => shared_system()
             .with(std::time::Duration::from_millis(250), |sys| find_claude_in(sys, pid))
             .is_some(),
         None => false,
     };
-    let claude_session_id = monitor
-        .0
-        .lock()
-        .unwrap()
-        .get(&session_id)
-        .and_then(|e| e.jsonl.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()));
+
+    // Prefer the session id from the most-recent statusLine capture for this
+    // pane's cwd. Claude re-reports its CURRENT session id on every render, so
+    // this tracks session switches within a pane (exit → `claude --resume` a
+    // different session, or `/clear`) that the monitor's adopted id can miss —
+    // which previously caused restart to resume a stale/empty session. Only used
+    // when exactly one running Claude shares this cwd, so it maps unambiguously.
+    let mut claude_session_id = None;
+    if running {
+        if let (Some(cwd), Ok(data_dir)) = (cwd.as_ref(), app.path().app_data_dir()) {
+            if running_claude_panes_for_cwd(&sessions.0, cwd) == 1 {
+                let cap_dir = data_dir.join(crate::claude_shim::CAPTURE_SUBDIR);
+                claude_session_id = latest_capture_session_for_cwd(&cap_dir, cwd);
+            }
+        }
+    }
+    // Fall back to the adopted monitor id (PID-precise per pane).
+    if claude_session_id.is_none() {
+        claude_session_id = monitor
+            .0
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .and_then(|e| e.jsonl.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()));
+    }
+
     ClaudePersistInfo { running, claude_session_id }
+}
+
+/// Number of panes whose cwd encodes to the same project dir as `cwd` and that
+/// have a live Claude process. Used to confirm a statusLine capture maps to a
+/// single pane before trusting it for that pane's persisted session id.
+fn running_claude_panes_for_cwd(
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+    cwd: &str,
+) -> usize {
+    let want = encode_project_dir(cwd);
+    let candidates: Vec<u32> = {
+        let s = sessions.lock().unwrap();
+        s.values()
+            .filter_map(|sess| {
+                let c = sess.cwd.lock().unwrap().clone()?;
+                if encode_project_dir(&c) == want { sess.shell_pid } else { None }
+            })
+            .collect()
+    };
+    shared_system().with(std::time::Duration::from_millis(250), |sys| {
+        candidates.iter().filter(|pid| find_claude_in(sys, **pid).is_some()).count()
+    })
+}
+
+/// Session id of the most-recently-written statusLine capture whose `cwd` field
+/// encodes to the same project dir as `cwd`. None when no capture matches (e.g.
+/// the shim hasn't rendered yet) — the caller then falls back to the monitor id.
+fn latest_capture_session_for_cwd(capture_dir: &std::path::Path, cwd: &str) -> Option<String> {
+    let want = encode_project_dir(cwd);
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(capture_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        let Ok(data) = std::fs::read_to_string(&path) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+        let Some(ccwd) = v.get("cwd").and_then(|x| x.as_str()) else { continue };
+        if encode_project_dir(ccwd) != want { continue; }
+        let Some(sid) = v.get("session_id").and_then(|x| x.as_str()) else { continue };
+        let Some(mtime) = entry.metadata().and_then(|m| m.modified()).ok() else { continue };
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, sid.to_string()));
+        }
+    }
+    best.map(|(_, sid)| sid)
 }
 
 // ── Claude process monitoring (file-system events + per-PID exit watch) ─────

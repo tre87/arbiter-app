@@ -2,6 +2,7 @@ import { onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { usePaneStore } from '../stores/pane'
 import { useFilesSettingsStore } from '../stores/filesSettings'
+import { useDevSettingsStore } from '../stores/devSettings'
 import { useConfirm } from './useConfirm'
 import { computeLeafRects, findNeighbor, findResizableSplit, type Direction } from '../utils/spatial'
 import { dirnameOf, pickAndAttach } from '../utils/attachFiles'
@@ -16,6 +17,7 @@ const arrowToDirection: Record<string, Direction> = {
 export function useKeyboardShortcuts(toggleOverview: () => void) {
   const store = usePaneStore()
   const filesStore = useFilesSettingsStore()
+  const devStore = useDevSettingsStore()
   const { confirm: confirmDialog } = useConfirm()
 
   async function attachFromScreenshots() {
@@ -77,6 +79,14 @@ export function useKeyboardShortcuts(toggleOverview: () => void) {
       e.preventDefault()
       e.stopPropagation()
       invoke('open_devtools').catch(err => console.error('Arbiter: open_devtools failed:', err))
+      return
+    }
+
+    // Ctrl/Cmd+Shift+P → toggle the perf/debug footer (D is taken by split-down)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyP') {
+      e.preventDefault()
+      e.stopPropagation()
+      devStore.showDebugFooter = !devStore.showDebugFooter
       return
     }
 
