@@ -177,8 +177,11 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
 pub struct ShimSetup {
     /// Prepend to PATH so `claude`/`cc` resolve to our launcher.
     pub bin_dir: PathBuf,
-    /// Absolute path to the real claude binary (`REAL_CLAUDE_ENV`).
-    pub real_claude: PathBuf,
+    /// Absolute path to the real claude binary (`REAL_CLAUDE_ENV`). None when the
+    /// GUI process's PATH couldn't resolve it (e.g. a Finder/Dock-launched .app
+    /// gets a minimal PATH without Homebrew/npm/nvm) — the launcher then resolves
+    /// `claude` at runtime from the spawned shell's full PATH instead.
+    pub real_claude: Option<PathBuf>,
     /// Generated settings file (`SETTINGS_ENV`).
     pub settings_file: PathBuf,
     /// Per-session capture dir (`CAPTURE_DIR_ENV`).
@@ -198,7 +201,12 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
     let capture_dir = data_dir.join(CAPTURE_SUBDIR);
     let hooks_dir = data_dir.join(HOOKS_SUBDIR);
 
-    let real_claude = find_real_claude(original_path, &bin_dir)?;
+    // Best-effort: may be None when the GUI's PATH lacks claude (Finder-launched
+    // .app). NOT fatal — the launcher falls back to a PATH scan in the spawned
+    // shell, which has the user's full PATH. Bailing here was the cause of "no
+    // stats in the release build" (shim never injected → claude ran without
+    // --settings → no statusLine capture).
+    let real_claude = find_real_claude(original_path, &bin_dir);
 
     std::fs::create_dir_all(&bin_dir).ok()?;
     std::fs::create_dir_all(&capture_dir).ok()?;
