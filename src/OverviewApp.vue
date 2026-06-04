@@ -5,7 +5,11 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import ClaudeWorkingIcon from './components/ClaudeWorkingIcon.vue'
 import ClaudeIcon from './components/ClaudeIcon.vue'
 import MdiIcon from './components/MdiIcon.vue'
-import { mdiConsole, mdiFolder, mdiChevronRight, mdiChevronDown } from '@mdi/js'
+import {
+  mdiConsole, mdiFolder, mdiChevronRight, mdiChevronDown,
+  mdiCheckCircleOutline, mdiCircleEditOutline, mdiPlusCircleOutline, mdiArrowUp, mdiArrowDown,
+} from '@mdi/js'
+import type { GitInfo } from './types/pane'
 
 interface TerminalInfo {
   paneId: string
@@ -16,6 +20,7 @@ interface TerminalInfo {
   name: string
   status: 'idle' | 'running' | 'ready' | 'working' | 'attention'
   claudeActive: boolean
+  gitInfo?: GitInfo | null
 }
 
 interface OverviewUpdate {
@@ -36,6 +41,18 @@ const claudeOnly = ref(true)
 const error = ref('')
 const collapsed = ref<Set<string>>(new Set())
 let unlistenUpdate: UnlistenFn | null = null
+let unlistenResized: UnlistenFn | null = null
+let unlistenMoved: UnlistenFn | null = null
+let geomTimer: ReturnType<typeof setTimeout> | null = null
+
+// This window's move/resize lives in its own webview, invisible to the main
+// window's autosave geometry listeners. Notify the main window (debounced) so it
+// persists our size/position — otherwise it's only captured at quit and lost on
+// Cmd+Q / a missed flush.
+function notifyGeometryChanged() {
+  if (geomTimer) clearTimeout(geomTimer)
+  geomTimer = setTimeout(() => emit('overview-geometry-changed'), 200)
+}
 
 const grouped = computed<WorkspaceGroup[]>(() => {
   const groups: WorkspaceGroup[] = []
@@ -159,6 +176,10 @@ onMounted(async () => {
 
     // Request initial state from main window
     await emit('overview-request-update')
+
+    const win = getCurrentWindow()
+    unlistenResized = await win.onResized(notifyGeometryChanged)
+    unlistenMoved = await win.onMoved(notifyGeometryChanged)
   } catch (e: any) {
     error.value = String(e)
   }
@@ -176,6 +197,9 @@ function onKeydown(e: KeyboardEvent) {
 
 onBeforeUnmount(() => {
   unlistenUpdate?.()
+  unlistenResized?.()
+  unlistenMoved?.()
+  if (geomTimer) clearTimeout(geomTimer)
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('contextmenu', handleContextMenu)
   window.removeEventListener('click', closeMenu)
@@ -228,8 +252,23 @@ onBeforeUnmount(() => {
               <ClaudeIcon v-if="t.claudeActive" :size="12" class="overview-claude-icon" />
               <span class="overview-name">{{ t.name }}</span>
             </span>
+            <span v-if="t.gitInfo?.is_repo" class="overview-git">
+              <span v-if="t.gitInfo.staged" class="git-staged" title="Staged">
+                <MdiIcon :path="mdiCheckCircleOutline" :size="12" /><span class="git-num">{{ t.gitInfo.staged }}</span>
+              </span>
+              <span v-if="t.gitInfo.unstaged" class="git-unstaged" title="Modified">
+                <MdiIcon :path="mdiCircleEditOutline" :size="12" /><span class="git-num">{{ t.gitInfo.unstaged }}</span>
+              </span>
+              <span v-if="t.gitInfo.untracked" class="git-untracked" title="Untracked">
+                <MdiIcon :path="mdiPlusCircleOutline" :size="12" /><span class="git-num">{{ t.gitInfo.untracked }}</span>
+              </span>
+              <span v-if="t.gitInfo.ahead || t.gitInfo.behind" class="git-commits" title="Ahead / behind">
+                <span v-if="t.gitInfo.ahead" class="gc"><MdiIcon :path="mdiArrowUp" :size="11" /><span class="git-num">{{ t.gitInfo.ahead }}</span></span>
+                <span v-if="t.gitInfo.behind" class="gc"><MdiIcon :path="mdiArrowDown" :size="11" /><span class="git-num">{{ t.gitInfo.behind }}</span></span>
+              </span>
+            </span>
             <span class="overview-status">
-              <ClaudeWorkingIcon v-if="t.status === 'working'" :size="16" />
+              <ClaudeWorkingIcon v-if="t.status === 'working'" :size="18" />
               <span v-else class="status-dot" :class="t.status" />
             </span>
           </div>
@@ -403,7 +442,28 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 5px;
   min-width: 0;
+  flex: 1 1 auto;
 }
+
+/* Compact git stats, mirroring the terminal footer. Right-aligned next to the
+   status dot; never squished (the name truncates instead). */
+.overview-git {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.overview-git > span { display: inline-flex; align-items: center; gap: 2px; }
+.overview-git svg { display: block; }
+.overview-git .git-num { display: block; transform: translateY(1px); }
+.overview-git .git-staged { color: #6a9955; }
+.overview-git .git-unstaged { color: #e5a03c; }
+.overview-git .git-untracked { color: #569cd6; }
+.overview-git .git-commits { color: var(--color-text-muted); gap: 4px; }
+.overview-git .gc { display: inline-flex; align-items: center; gap: 1px; }
 
 .overview-claude-icon {
   flex-shrink: 0;
@@ -430,8 +490,8 @@ onBeforeUnmount(() => {
 }
 
 .status-dot {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
 }
 

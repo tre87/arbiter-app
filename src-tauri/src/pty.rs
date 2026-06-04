@@ -36,6 +36,11 @@ pub struct PtySession {
     // "is Claude tracked for this pane?" without locking the global monitor
     // mutex on every 4KB read chunk. Updated at adoption and exit sites.
     pub(crate) claude_tracked: Arc<AtomicBool>,
+    // Flow control: the frontend pauses us when its xterm falls behind during a
+    // firehose of output. The reader then parks (stops draining the PTY) so the
+    // OS pipe back-pressures the shell — the consumer never builds an unbounded
+    // backlog and the UI stays responsive. Resumed under a low watermark.
+    paused: Arc<(Mutex<bool>, std::sync::Condvar)>,
 }
 
 // Arc so the watcher background thread can share ownership
@@ -96,6 +101,8 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let shell_idle_writer = session_shell_idle.clone();
     let claude_tracked: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let claude_tracked_reader = claude_tracked.clone();
+    let paused: Arc<(Mutex<bool>, std::sync::Condvar)> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let paused_reader = paused.clone();
 
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
@@ -119,7 +126,11 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
         // Memory cost scales per-pane; at 20 concurrent panes this is 5 MB total.
         const MAX_BUF: usize = 262_144;
         const MAX_UTF8_REMAINDER: usize = 8;
-        let mut buf = [0u8; 4096];
+        // Large read buffer: one IPC emit per 4 KB read floods the webview during
+        // heavy Claude output. Reading up to 64 KB per syscall (and coalescing
+        // below) cuts the number of emits — and the per-chunk scan passes — for
+        // bursty output, while small interactive reads still return immediately.
+        let mut buf = vec![0u8; 65_536];
         // Holds trailing bytes from an incomplete UTF-8 sequence at chunk boundary
         let mut utf8_remainder: Vec<u8> = Vec::new();
         // Accumulates partial OSC sequences across chunks
@@ -135,9 +146,33 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
         let mut last_activity_kind: Option<&str> = None;
         // Debounce for the "needs attention" signal (interactive prompt on screen).
         let mut last_attention_emit = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        // Coalesce display output into ~60fps frames. Emitting one IPC event per
+        // read floods the webview's main thread (deserialize + term.write) during
+        // heavy Claude output, which janks the whole UI — even toolbar
+        // animations. Accumulate and flush on size / a ~16ms frame / a small read
+        // (interactive typing or a burst tail) so the renderer gets fewer, larger
+        // writes without adding latency to interactive use.
+        let mut pending = String::new();
+        let mut last_flush = std::time::Instant::now();
         loop {
+            // Flow control: park while the frontend has paused us (its xterm is
+            // behind). Not reading lets the PTY's OS buffer back-pressure the
+            // shell, capping the consumer's backlog. close_session resumes us so
+            // a parked reader wakes, hits EOF, and exits rather than leaking.
+            {
+                let (lock, cvar) = &*paused_reader;
+                let mut p = lock.lock().unwrap();
+                while *p {
+                    p = cvar.wait(p).unwrap();
+                }
+            }
             match reader.read(&mut buf) {
-                Ok(0) => break, // clean EOF — shell closed
+                Ok(0) => {
+                    if !pending.is_empty() {
+                        let _ = app_handle.emit(&event_name, std::mem::take(&mut pending));
+                    }
+                    break; // clean EOF — shell closed
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     // Real read error — surface to the frontend so the pane
@@ -322,7 +357,17 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                         let excess = b.len().saturating_sub(MAX_BUF);
                         if excess > 0 { b.drain(..excess); }
                     }
-                    let _ = app_handle.emit(&event_name, text.to_string());
+                    // Frame-coalesced emit (see `pending` above). Flush on a 32 KB
+                    // batch, a 16 ms frame, or a small read (n < 4 KB ⇒ interactive
+                    // input or the tail of a burst) so nothing is held while idle.
+                    pending.push_str(text);
+                    if pending.len() >= 32_768
+                        || n < 4096
+                        || last_flush.elapsed() >= std::time::Duration::from_millis(16)
+                    {
+                        let _ = app_handle.emit(&event_name, std::mem::take(&mut pending));
+                        last_flush = std::time::Instant::now();
+                    }
                 }
             }
         }
@@ -349,6 +394,7 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
             shell_idle: session_shell_idle,
             last_size: Mutex::new((initial_cols, initial_rows)),
             claude_tracked,
+            paused,
         },
     );
 
@@ -432,8 +478,35 @@ pub fn close_session(
     sessions: State<Sessions>,
     expected: State<ExpectedClaudeSessions>,
 ) {
+    // Wake a parked (flow-control-paused) reader first, so dropping the master
+    // below gives it EOF and it exits instead of leaking a blocked thread.
+    {
+        let map = sessions.0.lock().unwrap();
+        if let Some(s) = map.get(&session_id) {
+            *s.paused.0.lock().unwrap() = false;
+            s.paused.1.notify_all();
+        }
+    }
     sessions.0.lock().unwrap().remove(&session_id);
     expected.0.lock().unwrap().remove(&session_id);
+}
+
+/// Flow control: the frontend pauses a session's PTY reader when its xterm
+/// write-buffer crosses the high watermark, and resumes it under the low one.
+/// Pausing stops draining the PTY so the OS pipe back-pressures the shell.
+#[tauri::command]
+pub fn pause_session(session_id: String, sessions: State<Sessions>) {
+    if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
+        *s.paused.0.lock().unwrap() = true;
+    }
+}
+
+#[tauri::command]
+pub fn resume_session(session_id: String, sessions: State<Sessions>) {
+    if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
+        *s.paused.0.lock().unwrap() = false;
+        s.paused.1.notify_all();
+    }
 }
 
 /// Return the current terminal dimensions (cols, rows) for a session.

@@ -7,6 +7,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { usePaneStore } from '../stores/pane'
 import { useDevSettingsStore } from '../stores/devSettings'
 import { useConfirm } from '../composables/useConfirm'
+import { usePerfStore } from '../stores/perf'
 import type { GitInfo } from '../types/pane'
 import MdiIcon from './MdiIcon.vue'
 import ClaudeIcon from './ClaudeIcon.vue'
@@ -24,6 +25,7 @@ import { waitForShellIdle } from '../utils/shellIdle'
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
 const devSettings = useDevSettingsStore()
+const perf = usePerfStore()
 const { confirm } = useConfirm()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
@@ -44,8 +46,34 @@ let unlistenGitChanged: (() => void) | null = null
 // Three callers register byte-identical pty-output listeners; this helper
 // keeps the write callback in one place. `term` is captured by reference, so
 // it picks up reassignments (cached vs fresh-create mount paths).
+//
+// Flow control: xterm parses/renders on the main thread, so a firehose of
+// output (a heavy Claude turn) can outrun it and jank the whole UI. We track
+// bytes written but not yet processed (xterm's write callback acks each chunk)
+// and pause the backend PTY reader above a high watermark, resuming below a low
+// one — the standard xterm.js back-pressure pattern. State lives in this closure,
+// which survives remounts (the cached reattach reuses the same listener).
+const FLOW_HIGH = 1 << 17 // 128 KiB unprocessed → pause the PTY
+const FLOW_LOW = 1 << 14  // 16 KiB → resume
 function attachPtyOutput(sid: string): Promise<UnlistenFn> {
-  return listen<string>(`pty-output-${sid}`, (event) => { term.write(event.payload) })
+  let pending = 0
+  let paused = false
+  return listen<string>(`pty-output-${sid}`, (event) => {
+    perf.markOutput(props.paneId)
+    const len = event.payload.length
+    pending += len
+    if (!paused && pending > FLOW_HIGH) {
+      paused = true
+      invoke('pause_session', { sessionId: sid }).catch(() => {})
+    }
+    term.write(event.payload, () => {
+      pending -= len
+      if (paused && pending < FLOW_LOW) {
+        paused = false
+        invoke('resume_session', { sessionId: sid }).catch(() => {})
+      }
+    })
+  })
 }
 
 // All Claude lifecycle state is centralized in the pane store (claudePaneStates).
@@ -58,6 +86,9 @@ const footerVisible = ref(true)
 const sessionCwd = ref<string | null>(null)
 const folderName = ref<string | null>(null)
 const gitInfo = ref<GitInfo | null>(null)
+// Mirror git info into the store so the overview window can show the same
+// compact git stats as the footer.
+watch(gitInfo, (g) => store.setPaneGitInfo(props.paneId, g))
 let unlistenCwd: (() => void) | null = null
 let unlistenActivity: (() => void) | null = null
 
@@ -129,6 +160,17 @@ async function renameToRepoName() {
 function scheduleFit() {
   if (fitTimer) clearTimeout(fitTimer)
   fitTimer = setTimeout(() => xterm?.safeFit(), 50)
+}
+
+// Hold a WebGL context only while this pane is actually visible. Background
+// workspaces stay mounted (v-show → display:none), so without this every
+// terminal across every workspace would keep a GL context + glyph atlas alive —
+// WebKit chokes on that many (idle FPS collapses). offsetParent is null when the
+// pane (or an ancestor workspace) is display:none.
+function applyWebglVisibility() {
+  if (!xterm) return
+  if (terminalEl.value?.offsetParent != null) xterm.loadWebgl()
+  else xterm.unloadWebgl()
 }
 
 watch(isFocused, (focused) => {
@@ -328,7 +370,7 @@ onMounted(async () => {
     terminalEl.value!.appendChild(cached.wrapperEl)
 
     await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
-    xterm.loadWebgl()
+    applyWebglVisibility()
     // Don't call safeFit here: the WebGL addon hasn't rendered a frame yet, so
     // _renderService.dimensions is stale. A wrong cell-width measurement would
     // resize xterm (and SIGWINCH the PTY) to narrow cols, baking Claude's
@@ -366,7 +408,7 @@ onMounted(async () => {
 
     await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
 
-    xterm.loadWebgl()
+    applyWebglVisibility()
     xterm.safeFit()
 
     term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
@@ -527,7 +569,13 @@ onMounted(async () => {
 
     term.onData((data) => {
       const sid = getTerminalSession(props.paneId)?.sessionId
-      if (sid) invoke('write_to_session', { sessionId: sid, data })
+      if (sid) {
+        perf.markInput(props.paneId)
+        const t0 = performance.now()
+        invoke('write_to_session', { sessionId: sid, data })
+          .then(() => perf.recordWrite(props.paneId, performance.now() - t0))
+          .catch(() => {})
+      }
     })
 
     session = {
@@ -550,6 +598,10 @@ onMounted(async () => {
   // one-shot refit on reveal. offsetParent check skips panes in other still-
   // hidden workspaces. safeFit no-ops if dimensions haven't changed.
   workspaceActivatedHandler = () => {
+    // Switching workspaces toggles display:none — load WebGL for the now-visible
+    // pane and free it for hidden ones, capping live GL contexts to the active
+    // workspace's terminals.
+    applyWebglVisibility()
     if (terminalEl.value?.offsetParent !== null) scheduleFit()
   }
   window.addEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
@@ -583,7 +635,11 @@ onBeforeUnmount(() => {
   } else {
     // Pane survives (split, worktree switch, workspace switch). Detach the
     // wrapper from the current DOM container; xterm + PTY listener stay
-    // alive in the cache for the next mount to adopt.
+    // alive in the cache for the next mount to adopt. Free the WebGL context
+    // while hidden so visible terminals always keep one (WebKit evicts the
+    // oldest past its cap, silently dropping a visible pane to the DOM
+    // renderer); loadWebgl() on the next mount re-acquires it.
+    xterm?.unloadWebgl()
     wrapperEl?.remove()
   }
 })

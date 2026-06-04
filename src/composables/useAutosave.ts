@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { usePaneStore } from '../stores/pane'
 import { useFilesSettingsStore } from '../stores/filesSettings'
-import { useDevSettingsStore } from '../stores/devSettings'
+import { useDevSettingsStore, SCROLLBACK_DEFAULT } from '../stores/devSettings'
 import type {
   ArbiterConfig, SavedTerminal, SavedWorkspace,
   SavedTerminalWorkspace, SavedProjectWorkspace,
@@ -176,6 +176,7 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
       if (devStore.hideClaudeButtons) devSettings.hideClaudeButtons = true
       if (devStore.hideShellButton) devSettings.hideShellButton = true
       if (!devStore.overviewClaudeOnly) devSettings.overviewClaudeOnly = false
+      if (devStore.scrollback !== SCROLLBACK_DEFAULT) devSettings.scrollback = devStore.scrollback
       if (Object.keys(devSettings).length > 0) config.devSettings = devSettings
 
       await invoke('save_config', { config })
@@ -234,5 +235,5 @@ export function useAutosave(ready: Ref<boolean>, overviewOpen: Ref<boolean>) {
     await performAutoSave()
   }
 
-  return { flush }
+  return { flush, requestSave: scheduleAutoSave }
 }

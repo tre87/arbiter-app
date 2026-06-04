@@ -9,7 +9,17 @@ export interface XtermInstance {
   term: Terminal
   safeFit: () => void
   loadWebgl: () => void
+  unloadWebgl: () => void
+  hasWebgl: () => boolean
   dispose: () => void
+}
+
+// Count of live WebGL contexts across all terminals — surfaced in the debug
+// footer. WebKit caps these; if it exceeds the cap a visible terminal silently
+// drops to the slow DOM renderer.
+let webglContextCount = 0
+export function activeWebglCount(): number {
+  return webglContextCount
 }
 
 function buildTheme(useCustomBg: boolean): ITheme {
@@ -31,8 +41,12 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     cursorStyle: 'block',
     cursorInactiveStyle: 'outline',
     cursorWidth: 1,
-    scrollback: 5000,
-    allowTransparency: true,
+    scrollback: devStore.scrollback,
+    // Opaque: every terminal theme bg is a solid hex, so transparency buys no
+    // visual change but makes WebGL render with an alpha channel and the
+    // compositor blend each terminal over the full-window radial gradient every
+    // frame. Off = opaque layers the compositor can skip behind → faster render.
+    allowTransparency: false,
   })
 
   // Live-update background when the toggle flips, so open terminals respond
@@ -40,6 +54,12 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
   const stopThemeWatcher = watch(
     () => devStore.useCustomTerminalBg,
     (useCustomBg) => { term.options.theme = buildTheme(useCustomBg) },
+  )
+
+  // Apply scrollback changes live to already-open terminals.
+  const stopScrollbackWatcher = watch(
+    () => devStore.scrollback,
+    (n) => { term.options.scrollback = n },
   )
 
   term.loadAddon(new WebLinksAddon())
@@ -55,13 +75,29 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     try {
       webglAddon = new WebglAddon()
       term.loadAddon(webglAddon)
+      webglContextCount++
       webglAddon.onContextLoss(() => {
         webglAddon?.dispose()
         webglAddon = null
+        webglContextCount--
       })
     } catch (e) {
       console.warn('WebGL addon failed, using DOM renderer:', e)
       webglAddon = null
+    }
+  }
+
+  // Release the GPU/WebGL context while the terminal is hidden (kept cached
+  // across worktree/workspace switches). WebKit caps live WebGL contexts and
+  // evicts the oldest when exceeded — which would silently drop a *visible*
+  // heavy terminal to the slow DOM renderer. Freeing hidden terminals' contexts
+  // keeps the live count ≈ the few visible panes. loadWebgl() re-acquires on the
+  // next mount. The Terminal/scrollback are untouched.
+  function unloadWebgl() {
+    if (webglAddon) {
+      webglAddon.dispose()
+      webglAddon = null
+      webglContextCount--
     }
   }
 
@@ -122,10 +158,14 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
 
   function dispose() {
     stopThemeWatcher()
-    webglAddon?.dispose()
-    webglAddon = null
+    stopScrollbackWatcher()
+    if (webglAddon) {
+      webglAddon.dispose()
+      webglAddon = null
+      webglContextCount--
+    }
     term.dispose()
   }
 
-  return { term, safeFit, loadWebgl, dispose }
+  return { term, safeFit, loadWebgl, unloadWebgl, hasWebgl: () => webglAddon !== null, dispose }
 }

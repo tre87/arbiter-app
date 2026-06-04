@@ -417,9 +417,10 @@ function onPointerDown(e: PointerEvent, index: number) {
 
 .tab.active {
   color: var(--color-text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.14);
-  backdrop-filter: blur(8px);
+  /* No backdrop-filter: blur is re-rasterised every frame in WebKit (worse when
+     the titlebar gradient animates behind it), a continuous idle GPU cost. */
 }
 
 .tab.dragging {

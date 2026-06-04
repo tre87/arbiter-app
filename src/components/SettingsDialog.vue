@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { open } from '@tauri-apps/plugin-dialog'
-import { useDevSettingsStore } from '../stores/devSettings'
+import { useDevSettingsStore, SCROLLBACK_MIN, SCROLLBACK_MAX, clampScrollback } from '../stores/devSettings'
 import { useUsageStore } from '../stores/usage'
 import { useFilesSettingsStore } from '../stores/filesSettings'
 
@@ -55,6 +55,10 @@ async function browseScreenshotFolder() {
 
 function resetScreenshotFolder() {
   filesStore.setScreenshotFolder(null)
+}
+
+function onScrollbackChange(e: Event) {
+  devStore.scrollback = clampScrollback(parseInt((e.target as HTMLInputElement).value, 10))
 }
 
 async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
@@ -261,6 +265,21 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                   <input type="checkbox" v-model="devStore.hideShellButton" />
                   <span class="switch-track"></span>
                 </span>
+              </label>
+              <label class="toggle-row">
+                <span class="toggle-label">
+                  Terminal scrollback lines
+                  <span class="toggle-sub">Lines kept per terminal ({{ SCROLLBACK_MIN }}–{{ SCROLLBACK_MAX.toLocaleString() }}). Lower = less memory.</span>
+                </span>
+                <input
+                  type="number"
+                  class="num-input"
+                  :min="SCROLLBACK_MIN"
+                  :max="SCROLLBACK_MAX"
+                  step="100"
+                  :value="devStore.scrollback"
+                  @change="onScrollbackChange"
+                />
               </label>
             </div>
           </div>
@@ -551,6 +570,33 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 .toggle-label {
   font-size: 13px;
   color: var(--color-text-secondary);
+}
+
+.toggle-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.num-input {
+  width: 90px;
+  flex-shrink: 0;
+  padding: 6px 8px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  text-align: right;
+  outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.num-input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px rgba(51, 153, 255, 0.25);
 }
 
 /* iOS-style toggle switch */

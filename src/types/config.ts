@@ -78,6 +78,8 @@ export interface DevSettings {
   hideShellButton?: boolean
   // Overview: only show terminals running Claude. Undefined/missing is true.
   overviewClaudeOnly?: boolean
+  // Terminal scrollback lines. Undefined/missing uses the default (1000).
+  scrollback?: number
 }
 
 export interface WindowGeometry {
