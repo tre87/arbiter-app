@@ -106,7 +106,12 @@ fn apply_claude_shim(app: &AppHandle, cmd: &mut CommandBuilder) {
     cmd.env("PATH", format!("{}{}{}", s.bin_dir.display(), sep, orig_path));
     // zsh re-prepends this after path_helper; harmless elsewhere.
     cmd.env("ARBITER_SHIM_BIN", &s.bin_dir);
-    cmd.env(claude_shim::REAL_CLAUDE_ENV, &s.real_claude);
+    // Only set when the GUI could resolve it; otherwise the launcher resolves
+    // `claude` at runtime from the shell's full PATH (handles Finder-launched
+    // .apps whose process PATH lacks Homebrew/npm/nvm).
+    if let Some(real_claude) = &s.real_claude {
+        cmd.env(claude_shim::REAL_CLAUDE_ENV, real_claude);
+    }
     cmd.env(claude_shim::SETTINGS_ENV, &s.settings_file);
     cmd.env(claude_shim::CAPTURE_DIR_ENV, &s.capture_dir);
     cmd.env(claude_shim::HOOKS_DIR_ENV, &s.hooks_dir);
