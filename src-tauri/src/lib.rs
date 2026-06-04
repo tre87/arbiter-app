@@ -260,6 +260,7 @@ pub fn run() {
             git::get_session_git_info,
             git::watch_git,
             git::unwatch_git,
+            claude::claude_persist_info,
             exit_app,
             get_locale,
             focus_webview,

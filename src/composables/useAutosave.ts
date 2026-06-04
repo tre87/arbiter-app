@@ -19,9 +19,23 @@ async function enrichTerminal(store: ReturnType<typeof usePaneStore>, t: { id: s
       const cwd = await invoke<string | null>('get_session_cwd', { sessionId })
       if (cwd) entry.cwd = cwd
     } catch { /* ignore */ }
-    const claudeSave = store.getClaudeSessionForSave(t.id)
-    if (claudeSave.sessionId) entry.claudeSessionId = claudeSave.sessionId
-    if (claudeSave.wasOpen) entry.claudeWasRunning = true
+    // The backend's live process check is the source of truth for "is Claude
+    // running" — the frontend lifecycle can flicker to 'closed' on a spurious
+    // shell idle, which previously lost the running state across restarts.
+    // OR-combine with the local view so the sub-second launch window (process
+    // not yet spawned, but lifecycle already 'launching') is still remembered.
+    const local = store.getClaudeSessionForSave(t.id)
+    let wasRunning = local.wasOpen
+    let claudeSessionId = local.sessionId
+    try {
+      const info = await invoke<{ running: boolean; claude_session_id: string | null }>('claude_persist_info', { sessionId })
+      if (info.running) wasRunning = true
+      if (info.claude_session_id) claudeSessionId = info.claude_session_id
+    } catch { /* fall back to local view */ }
+    if (wasRunning) {
+      entry.claudeWasRunning = true
+      if (claudeSessionId) entry.claudeSessionId = claudeSessionId
+    }
     const shell = store.getTerminalShell(t.id)
     if (shell !== 'powershell') entry.shell = shell
   } else {
