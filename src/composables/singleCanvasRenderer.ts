@@ -1,9 +1,10 @@
-// SPIKE — single-canvas GPU terminal renderer.
+// Single-canvas GPU terminal renderer — the WebGL2 drawing core.
 //
-// Renders many terminal grids into ONE WebGL2 canvas (one compositing layer) to
-// test whether that removes the per-canvas compositing ceiling that tanks FPS
-// with many xterm WebGL instances. Throwaway/measurement code: text + fg/bg +
-// cursor only — no selection/links/search/ligatures.
+// Renders many terminal grids into ONE WebGL2 canvas (one compositing layer),
+// which removes the per-canvas compositing ceiling that tanks FPS with many
+// xterm WebGL instances. Driven by useTerminalGrid, which owns the grids,
+// selection/links/search highlighting, and the on-demand draw scheduling; this
+// class is purely the glyph atlas + instanced quad drawing.
 //
 // Design: an on-demand glyph atlas (2D-rasterised glyphs uploaded to a texture)
 // + one instanced draw call per frame. Each instance is one cell:
@@ -156,9 +157,9 @@ export class SingleCanvasRenderer {
   private glyphsPerRow: number
   private atlasDirty = false
   private uniforms: Record<string, WebGLUniformLocation | null> = {}
-  // Transparent mode: clear to alpha 0 so the canvas composites over the DOM
-  // (the production renderer floats over the pane layout; empty cells let the
-  // pane's own background show through). Opaque mode (spike) clears to `bg`.
+  // Transparent mode (what useTerminalGrid uses): clear to alpha 0 so the canvas
+  // composites over the DOM — it floats over the pane layout and empty cells let
+  // each pane's own background show through. Opaque mode clears to `bg` instead.
   private transparent: boolean
 
   constructor(canvas: HTMLCanvasElement, opts: { fontFamily: string; fontSize: number; dpr: number; alpha?: boolean; lineHeight?: number }) {
