@@ -175,7 +175,11 @@ export class SingleCanvasRenderer {
   constructor(canvas: HTMLCanvasElement, opts: { fontFamily: string; fontSize: number; dpr: number; alpha?: boolean; lineHeight?: number; onContextLost?: () => void; onContextRestored?: () => void }) {
     this.onContextRestored = opts.onContextRestored
     this.transparent = opts.alpha ?? false
-    const gl = canvas.getContext('webgl2', { alpha: this.transparent, antialias: false, depth: false, premultipliedAlpha: true })
+    // powerPreference 'low-power': a text renderer doesn't need the discrete
+    // GPU; this keeps macOS (dual-GPU Intel) / Windows on the integrated GPU
+    // rather than waking the dGPU just to hold a context. No-op on single-GPU
+    // (Apple Silicon) machines.
+    const gl = canvas.getContext('webgl2', { alpha: this.transparent, antialias: false, depth: false, premultipliedAlpha: true, powerPreference: 'low-power' })
     if (!gl) throw new Error('WebGL2 not available')
     this.gl = gl
 
