@@ -3,10 +3,8 @@
 // Parses real PTY sessions with `alacritty_terminal` OFF the webview main
 // thread (the existing PTY reader feeds a per-session HeadlessTerm), and ships
 // compact binary cell-diffs over a Tauri `Channel` to one WebGL canvas in the
-// webview. This is the productionised version of the validated spike (see
-// memory: terminal-renderer-architecture) — it removes the two costs the
-// per-terminal xterm path pays: N WebGL compositing layers and main-thread VT
-// parsing.
+// webview. This removes the two costs the per-terminal xterm path pays: N WebGL
+// compositing layers and main-thread VT parsing.
 //
 // Non-breaking: a session's grid is None/inactive until the frontend calls
 // `termgrid_attach`, so the existing xterm path is unaffected when the GPU
