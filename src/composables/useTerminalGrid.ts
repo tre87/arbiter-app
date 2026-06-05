@@ -150,6 +150,10 @@ export function initTerminalCanvas(canvas: HTMLCanvasElement) {
   try {
     renderer = new SingleCanvasRenderer(canvas, {
       fontFamily: FONT_FAMILY, fontSize: FONT_SIZE, dpr, alpha: true, lineHeight: 1.0,
+      onContextLost: () => console.warn('Arbiter: GPU context lost — terminals repaint on restore'),
+      // GL objects were rebuilt; re-apply the canvas size (viewport/uCanvas) and
+      // force a full repaint from the (intact) per-pane grids.
+      onContextRestored: () => { resizeCanvas(); markDirty() },
     })
   } catch (e) {
     // Defensive: gpuRendererSupported() gates this, but if construction fails
