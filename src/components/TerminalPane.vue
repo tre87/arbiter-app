@@ -25,6 +25,7 @@ import {
   attachPane as gpuAttachPane, detachPane as gpuDetachPane, terminalBgHex as gpuTerminalBgHex,
   selectionStart as gpuSelectionStart, selectionExtend as gpuSelectionExtend,
   clearSelection as gpuClearSelection, hasSelection as gpuHasSelection, selectionRange as gpuSelectionRange,
+  urlAt as gpuUrlAt,
 } from '../composables/useTerminalGrid'
 import { CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
 
@@ -283,8 +284,29 @@ function onGpuCopy(e: ClipboardEvent) {
     .catch(() => {})
 }
 
+// Pointer cursor when hovering a link (set inline on the xterm element, which
+// otherwise forces a text cursor). Cmd/Ctrl+click opens it.
+function onGpuHover(e: MouseEvent) {
+  if (!gpu || !sessionId || gpuDragging) return
+  const url = gpuUrlAt(sessionId, e.clientX, e.clientY)
+  if (term?.element) term.element.style.cursor = url ? 'pointer' : ''
+}
+function onGpuLeave() {
+  if (term?.element) term.element.style.cursor = ''
+}
+
 function onGpuMouseDown(e: MouseEvent) {
   if (!gpu || !sessionId || e.button !== 0) return
+  // Cmd/Ctrl+click on a link opens it (instead of starting a selection).
+  if (e.metaKey || e.ctrlKey) {
+    const url = gpuUrlAt(sessionId, e.clientX, e.clientY)
+    if (url) {
+      e.preventDefault()
+      e.stopPropagation()
+      invoke('open_url', { url }).catch(() => {})
+      return
+    }
+  }
   // Capture the drag for our own selection and keep xterm from starting its own
   // (empty) one. preventDefault cancels the browser's default focus change so
   // the explicit term.focus() below sticks — without it, typing breaks.
@@ -872,7 +894,7 @@ onBeforeUnmount(() => {
       :cache-read-tokens="claudeState.cacheReadTokens"
     />
 
-    <div ref="terminalEl" class="terminal-inner" @wheel="onGpuWheel" @mousedown.capture="onGpuMouseDown" />
+    <div ref="terminalEl" class="terminal-inner" @wheel="onGpuWheel" @mousedown.capture="onGpuMouseDown" @mousemove="onGpuHover" @mouseleave="onGpuLeave" />
     <!-- Mounted for the whole Claude session so the slide animation is never
          re-created mid-turn; the `working` class fades it in and resumes the
          (paused) animation from its current position — no reset across the
