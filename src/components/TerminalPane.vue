@@ -21,12 +21,20 @@ import {
 } from '../composables/terminalSessionCache'
 import { gitBashPath, ensureGitBashProbed } from '../composables/gitBashPath'
 import { waitForShellIdle } from '../utils/shellIdle'
+import { attachPane as gpuAttachPane, detachPane as gpuDetachPane, terminalBgHex as gpuTerminalBgHex } from '../composables/useTerminalGrid'
+import { CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
 
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
 const store = usePaneStore()
 const devSettings = useDevSettingsStore()
 const perf = usePerfStore()
 const { confirm } = useConfirm()
+// GPU single-canvas renderer mode (read once at mount; the toggle reloads the
+// app). In this mode xterm stays mounted as the invisible INPUT layer (no PTY
+// output is written to it, so it never parses), and the shared WebGL canvas
+// draws the grid that Rust parses. Removes both the xterm WebGL layer and the
+// main-thread VT parse.
+const gpu = devSettings.useGpuRenderer
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
 let xterm: XtermInstance | null = null
@@ -159,7 +167,7 @@ async function renameToRepoName() {
 
 function scheduleFit() {
   if (fitTimer) clearTimeout(fitTimer)
-  fitTimer = setTimeout(() => xterm?.safeFit(), 50)
+  fitTimer = setTimeout(() => { if (gpu) gpuFit(); else xterm?.safeFit() }, 50)
 }
 
 // Hold a WebGL context only while this pane is actually visible. Background
@@ -168,9 +176,61 @@ function scheduleFit() {
 // WebKit chokes on that many (idle FPS collapses). offsetParent is null when the
 // pane (or an ancestor workspace) is display:none.
 function applyWebglVisibility() {
+  // GPU mode: never load xterm's WebGL — the shared canvas renders, and xterm
+  // stays a DOM-rendered (empty, invisible) input layer with no GPU context.
+  if (gpu) return
   if (!xterm) return
   if (terminalEl.value?.offsetParent != null) xterm.loadWebgl()
   else xterm.unloadWebgl()
+}
+
+// GPU mode: register this pane's terminal element with the shared canvas and
+// tell the backend to start parsing this session into a grid. Idempotent — a
+// remount (split / workspace switch) rebinds the new element and the backend
+// replays a full frame. Hides xterm visually (input still works via its
+// textarea underneath the pointer-events:none canvas).
+function gpuCellPx(): { cw: number; ch: number } | null {
+  const core = (term as any)?._core
+  const cw = core?._renderService?.dimensions?.device?.cell?.width
+  const ch = core?._renderService?.dimensions?.device?.cell?.height
+  if (!cw || !ch) return null
+  return { cw, ch }
+}
+
+// GPU-mode fit: derive cols/rows straight from the pane rect + xterm's measured
+// device cell, bypassing xterm.safeFit's "≥20 cols" guard so narrow panes wrap
+// at their true width (the guard protects xterm scrollback, which is irrelevant
+// here — the grid lives in the backend). term.resize → resize_session → grid.
+function gpuFit() {
+  if (!gpu || !term || !terminalEl.value) return
+  const cell = gpuCellPx()
+  if (!cell) return
+  const dpr = window.devicePixelRatio || 1
+  const rect = terminalEl.value.getBoundingClientRect()
+  if (!rect.width || !rect.height) return
+  const cols = Math.max(1, Math.floor((rect.width * dpr) / cell.cw))
+  const rows = Math.max(1, Math.floor((rect.height * dpr) / cell.ch))
+  if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows)
+}
+
+function gpuAttach() {
+  if (!gpu || !sessionId || !terminalEl.value) return
+  // Hide xterm's own cursor — we draw ours on the shared canvas. Deliberately
+  // NOT via opacity/transform/filter: those promote each terminal to its own
+  // compositing layer (WebKit), reintroducing the exact per-frame cost the
+  // single canvas removes. The empty xterm rows already match the terminal
+  // background (#141416), so they're invisible without hiding the element.
+  if (term) {
+    term.options.theme = { ...(term.options.theme ?? {}), cursor: 'rgba(0,0,0,0)', cursorAccent: 'rgba(0,0,0,0)' }
+  }
+  // Paint the pane background to match the theme — the transparent canvas lets
+  // empty cells show this through.
+  terminalEl.value.style.background = gpuTerminalBgHex()
+  // Size the grid to the true pane width (narrow panes included), then attach
+  // with xterm's EXACT measured device cell so the grid fits the pane.
+  gpuFit()
+  const cell = gpuCellPx()
+  gpuAttachPane(sessionId, props.paneId, terminalEl.value, term?.cols ?? 80, term?.rows ?? 24, cell?.cw, cell?.ch)
 }
 
 watch(isFocused, (focused) => {
@@ -389,7 +449,7 @@ onMounted(async () => {
     wrapperEl.style.height = '100%'
     terminalEl.value!.appendChild(wrapperEl)
 
-    xterm = createXtermInstance(wrapperEl)
+    xterm = createXtermInstance(wrapperEl, gpu ? { bg: CUSTOM_TERMINAL_BG } : {})
     term = xterm.term
 
     // Store OSC 0 title for display in toolbar (Claude detection is handled
@@ -437,14 +497,14 @@ onMounted(async () => {
       sessionId = existingSession
       currentShell.value = store.getTerminalShell(props.paneId)
 
-      unlisten = await attachPtyOutput(sessionId)
+      if (!gpu) unlisten = await attachPtyOutput(sessionId)
 
       // Backend skips the actual resize (and SIGWINCH) when dimensions are
       // unchanged — avoids Claude's Ink TUI redrawing on worktree switch.
       store.markResize(props.paneId)
       try {
         const resized = await invoke<boolean>('resize_session', { sessionId, cols: term.cols, rows: term.rows })
-        if (!resized) {
+        if (!gpu && !resized) {
           const replay = await invoke<string>('get_session_replay', { sessionId })
           if (replay) term.write(replay)
         }
@@ -496,7 +556,7 @@ onMounted(async () => {
       store.setPtySession(props.paneId, sessionId)
       const newSessionId = sessionId
 
-      unlisten = await attachPtyOutput(newSessionId)
+      if (!gpu) unlisten = await attachPtyOutput(newSessionId)
 
       if (claudeRestore) {
         if (claudeRestore.sessionId) {
@@ -611,6 +671,8 @@ onMounted(async () => {
 
   if (sessionId) await subscribeToSession(sessionId)
 
+  if (gpu) gpuAttach()
+
   if (isFocused.value) {
     await nextTick()
     term?.focus()
@@ -626,6 +688,7 @@ onBeforeUnmount(() => {
 
   if (!store.hasPaneId(props.paneId)) {
     // Pane truly removed from layout — tear down everything.
+    if (gpu && sessionId) gpuDetachPane(sessionId)
     disposeTerminalSession(props.paneId)
     if (sessionId) {
       invoke('close_session', { sessionId })
@@ -646,7 +709,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="terminal-pane" :class="{ focused: isFocused, compact }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
+  <div class="terminal-pane" :class="{ focused: isFocused, compact, gpu }" :data-pane-id="paneId" @mousedown="store.setFocus(paneId)">
     <div v-if="!compact" class="pane-toolbar">
       <span class="toolbar-process" v-if="terminalTitle">{{ terminalTitle }}</span>
       <span class="toolbar-process" v-else>&nbsp;</span>
@@ -896,21 +959,22 @@ onBeforeUnmount(() => {
 
 .progress-bar-inner {
   height: 100%;
-  width: 100%;
+  width: 50%;
   background: linear-gradient(
     90deg,
     transparent 0%,
     var(--azure) 50%,
     transparent 100%
   );
-  background-size: 50% 100%;
-  background-repeat: no-repeat;
   animation: progress-slide 3s ease-in-out infinite alternate;
   /* Hidden + paused while not actively working; the `working` class fades it in
-     and resumes the animation from where it paused (no restart). */
+     and resumes the animation from where it paused (no restart). transform +
+     opacity keep this on the compositor — no per-frame repaint (the old
+     background-position animation painted the bar every frame). */
   opacity: 0;
   animation-play-state: paused;
   transition: opacity 0.25s ease;
+  will-change: transform;
 }
 
 .progress-bar.working .progress-bar-inner {
@@ -919,8 +983,8 @@ onBeforeUnmount(() => {
 }
 
 @keyframes progress-slide {
-  0%   { background-position: -20% 0; }
-  100% { background-position: 120% 0; }
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
 }
 
 .compact .progress-bar {
@@ -932,5 +996,21 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow: hidden;
   padding-left: 4px;
+}
+
+/* GPU mode: the shared canvas draws the grid on top, so drop the left padding
+   (the grid origin = this element's rect). Default background avoids a launch
+   flash before gpuAttach sets the exact theme background inline; empty cells
+   show this through the transparent canvas. */
+.terminal-pane.gpu .terminal-inner {
+  padding-left: 0;
+  background: #121212;
+}
+
+/* Pin the whole pane to the terminal background in GPU mode so the area is the
+   right color from the first paint — no black flash during startup before the
+   canvas/first frame render. gpuAttach sets the exact theme bg inline. */
+.terminal-pane.gpu {
+  background: #121212;
 }
 </style>

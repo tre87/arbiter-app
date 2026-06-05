@@ -14,6 +14,14 @@ const filesStore = useFilesSettingsStore()
 
 const isWindows = navigator.platform.startsWith('Win')
 const gitBashAvailable = ref(false)
+
+// The GPU renderer flag is read at pane mount, so persist it and reload to
+// apply cleanly (backend PTY sessions survive the reload and are re-adopted).
+function onToggleGpuRenderer(e: Event) {
+  const next = (e.target as HTMLInputElement).checked
+  localStorage.setItem('arbiter:gpuRenderer', next ? '1' : '0')
+  location.reload()
+}
 const appVersion = ref('')
 const screenshotDefaultPath = ref('')
 
@@ -249,6 +257,16 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
                 <span class="toggle-label">Use Arbiter terminal background (off = native theme bg)</span>
                 <span class="switch">
                   <input type="checkbox" v-model="devStore.useCustomTerminalBg" />
+                  <span class="switch-track"></span>
+                </span>
+              </label>
+              <label class="toggle-row">
+                <span class="toggle-label">
+                  GPU terminal renderer (experimental)
+                  <span class="toggle-sub">Parses terminals in Rust and draws all panes in one WebGL canvas instead of per-terminal xterm. Reloads to apply.</span>
+                </span>
+                <span class="switch">
+                  <input type="checkbox" :checked="devStore.useGpuRenderer" @change="onToggleGpuRenderer" />
                   <span class="switch-track"></span>
                 </span>
               </label>

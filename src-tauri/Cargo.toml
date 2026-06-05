@@ -22,6 +22,10 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = { path = "portable-pty" }
+# Headless VT parser + cell-grid engine for the single-canvas renderer spike:
+# parse PTY bytes in Rust (off the webview main thread) and ship binary cell
+# diffs to a GPU canvas. Apache-2.0; re-exports its `vte` parser.
+alacritty_terminal = "0.26"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
@@ -45,6 +49,8 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
   "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow",
 ] }
+# NSString for the high-refresh rAF unlock (already resolved transitively).
+objc2-foundation = "0.3"
 
 [profile.dev]
 codegen-units = 1

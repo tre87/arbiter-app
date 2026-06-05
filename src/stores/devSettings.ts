@@ -34,8 +34,15 @@ export const useDevSettingsStore = defineStore('devSettings', () => {
   // Lines of scrollback kept per terminal. Lower = less memory + cheaper resize
   // reflow. Applied live to open terminals.
   const scrollback = ref(SCROLLBACK_DEFAULT)
-  // Global perf/debug footer (toggle with Ctrl/Cmd+Shift+D). Runtime-only.
+  // Global perf/debug footer (toggle with Ctrl/Cmd+Shift+P). Runtime-only.
   const showDebugFooter = ref(false)
+  // Single-canvas renderer spike overlay (Ctrl/Cmd+Shift+G). Runtime-only.
+  const showRendererSpike = ref(false)
+  // GPU single-canvas terminal renderer (Ctrl/Cmd+Shift+Y). Parses terminals in
+  // Rust and draws all panes into one WebGL canvas instead of per-terminal
+  // xterm. ON by default — only off when explicitly toggled off (persisted as
+  // '0'). Read at pane mount, so the toggle reloads the app to apply cleanly.
+  const useGpuRenderer = ref(localStorage.getItem('arbiter:gpuRenderer') !== '0')
 
-  return { alwaysShowFooter, hideUsageBar, hideSonnetUsage, defaultShell, overviewClaudeOnly, useCustomTerminalBg, hideClaudeButtons, hideShellButton, scrollback, showDebugFooter }
+  return { alwaysShowFooter, hideUsageBar, hideSonnetUsage, defaultShell, overviewClaudeOnly, useCustomTerminalBg, hideClaudeButtons, hideShellButton, scrollback, showDebugFooter, showRendererSpike, useGpuRenderer }
 })

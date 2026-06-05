@@ -30,10 +30,19 @@ function buildTheme(useCustomBg: boolean): ITheme {
 /** Create a configured xterm Terminal with WebLinksAddon and a safeFit() that
  *  computes cols/rows directly — FitAddon's circular css.cell.width derivation
  *  misfires on detach/reattach, so we don't use it. */
-export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
+export function createXtermInstance(mountEl: HTMLElement, opts: { transparent?: boolean; bg?: string } = {}): XtermInstance {
   const devStore = useDevSettingsStore()
+  // GPU mode renders xterm as the invisible input layer. `bg` forces a fixed
+  // background (Arbiter's terminal color) so it never paints iTerm2 black, and
+  // matches the GPU cells exactly. `transparent` is an alternative (unused).
+  const themeFor = (useCustomBg: boolean): ITheme => {
+    const base = buildTheme(useCustomBg)
+    if (opts.transparent) return { ...base, background: 'rgba(0,0,0,0)' }
+    if (opts.bg) return { ...base, background: opts.bg }
+    return base
+  }
   const term = new Terminal({
-    theme: buildTheme(devStore.useCustomTerminalBg),
+    theme: themeFor(devStore.useCustomTerminalBg),
     fontFamily: "Consolas, 'Cascadia Code', Menlo, 'SF Mono', monospace",
     fontSize: 12,
     lineHeight: 1.0,
@@ -46,14 +55,15 @@ export function createXtermInstance(mountEl: HTMLElement): XtermInstance {
     // visual change but makes WebGL render with an alpha channel and the
     // compositor blend each terminal over the full-window radial gradient every
     // frame. Off = opaque layers the compositor can skip behind → faster render.
-    allowTransparency: false,
+    // (GPU mode forces it on — xterm is the transparent, content-free input layer.)
+    allowTransparency: opts.transparent ?? false,
   })
 
   // Live-update background when the toggle flips, so open terminals respond
   // immediately without needing a restart.
   const stopThemeWatcher = watch(
     () => devStore.useCustomTerminalBg,
-    (useCustomBg) => { term.options.theme = buildTheme(useCustomBg) },
+    (useCustomBg) => { term.options.theme = themeFor(useCustomBg) },
   )
 
   // Apply scrollback changes live to already-open terminals.

@@ -13,6 +13,25 @@ export const usePerfStore = defineStore('perf', () => {
   const writeMs = ref<Record<string, number>>({})
   let pendingInput: { paneId: string; at: number } | null = null
 
+  // GPU single-canvas renderer telemetry (when useGpuRenderer is on). Populated
+  // by useTerminalGrid; surfaced in the debug footer in place of the per-xterm
+  // echo/write/gl readings (which don't apply when xterm isn't rendering).
+  const gpuActive = ref(false)
+  const gpuFramesPerSec = ref(0) // binary diff frames received from Rust / sec
+  const gpuKbPerSec = ref(0)     // transport throughput
+  const gpuDecodeMs = ref(0)     // main-thread decode cost per frame
+  const gpuDrawMs = ref(0)       // main-thread build + draw cost per frame
+
+  function setGpuActive(active: boolean) {
+    gpuActive.value = active
+  }
+  function setGpuStats(s: { framesPerSec: number; kbPerSec: number; decodeMs: number; drawMs: number }) {
+    gpuFramesPerSec.value = s.framesPerSec
+    gpuKbPerSec.value = s.kbPerSec
+    gpuDecodeMs.value = s.decodeMs
+    gpuDrawMs.value = s.drawMs
+  }
+
   function markInput(paneId: string) {
     pendingInput = { paneId, at: performance.now() }
   }
@@ -30,5 +49,8 @@ export const usePerfStore = defineStore('perf', () => {
     writeMs.value[paneId] = ms
   }
 
-  return { echoMs, writeMs, markInput, markOutput, recordWrite }
+  return {
+    echoMs, writeMs, markInput, markOutput, recordWrite,
+    gpuActive, gpuFramesPerSec, gpuKbPerSec, gpuDecodeMs, gpuDrawMs, setGpuActive, setGpuStats,
+  }
 })

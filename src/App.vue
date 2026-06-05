@@ -24,6 +24,8 @@ import { useTitlebarDrag, useWindowChrome } from './composables/useWindowChrome'
 
 // Lazy-loaded: these dialogs are only needed when the user opens them,
 // so they don't belong in the initial bundle.
+const RendererSpike = defineAsyncComponent(() => import('./spike/TransportSpike.vue'))
+const SharedTerminalCanvas = defineAsyncComponent(() => import('./components/SharedTerminalCanvas.vue'))
 const ShortcutsDialog = defineAsyncComponent(() => import('./components/ShortcutsDialog.vue'))
 const SettingsDialog = defineAsyncComponent(() => import('./components/SettingsDialog.vue'))
 const LoaderShowcaseDialog = defineAsyncComponent(() => import('./components/LoaderShowcaseDialog.vue'))
@@ -227,6 +229,8 @@ onBeforeUnmount(() => {
       </div>
     </template>
 
+    <SharedTerminalCanvas v-if="devStore.useGpuRenderer" />
+
     <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
     <SettingsDialog v-if="settingsOpen" @close="settingsOpen = false" />
     <LoaderShowcaseDialog v-if="loaderShowcaseOpen" @close="loaderShowcaseOpen = false" />
@@ -235,6 +239,7 @@ onBeforeUnmount(() => {
     <ConfirmDialog />
 
     <DebugFooter v-if="devStore.showDebugFooter" />
+    <RendererSpike v-if="devStore.showRendererSpike" @close="devStore.showRendererSpike = false" />
   </div>
 </template>
 

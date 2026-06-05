@@ -5,9 +5,13 @@ mod fs;
 mod git;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_fps;
 mod overview;
 mod pty;
 mod shell;
+mod spike;
+mod termgrid;
 mod usage;
 mod util;
 
@@ -106,6 +110,8 @@ pub fn run() {
         .manage(Cache(Mutex::new(UsageCache::new())))
         .manage(FileWatchers(Arc::new(Mutex::new(HashMap::new()))))
         .manage(git::GitWatchers::new())
+        .manage(spike::SpikeState::new())
+        .manage(termgrid::TermGridState::new())
         .setup(|app| {
             // Create a hidden auth WebView at startup. If the user has a valid
             // session (persisted WebView2 cookies), the injected script will
@@ -142,7 +148,14 @@ pub fn run() {
                 None => overview_builder
                     .inner_size(overview::OVERVIEW_DEFAULT_WIDTH, overview::OVERVIEW_DEFAULT_HEIGHT),
             };
-            overview_builder.build()?;
+            let overview_window = overview_builder.build()?;
+            // Same high-refresh unlock as the main window (see macos_fps.rs).
+            #[cfg(target_os = "macos")]
+            {
+                let _ = overview_window.with_webview(|pw| unsafe {
+                    macos_fps::unlock_high_fps(pw.inner());
+                });
+            }
 
             // Start the event-driven Claude session watcher
             let sessions_arc = app.state::<Sessions>().0.clone();
@@ -218,6 +231,16 @@ pub fn run() {
                 #[cfg(target_os = "macos")]
                 if let Ok(ptr) = w.ns_window() {
                     macos::apply_traffic_light_position(ptr);
+                }
+
+                // Lift WebKit's ~60fps page-rendering cap so rAF runs at the
+                // display's native refresh (e.g. 120/144 Hz). Private SPI —
+                // guarded to no-op if the API changes. See macos_fps.rs.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = w.with_webview(|pw| unsafe {
+                        macos_fps::unlock_high_fps(pw.inner());
+                    });
                 }
             }
 
@@ -305,6 +328,15 @@ pub fn run() {
             fs::rename_path,
             fs::trash_path,
             open_devtools,
+            spike::spike_start,
+            spike::spike_stop,
+            spike::spike_write,
+            spike::spike_resize,
+            spike::spike_stress,
+            spike::spike_stress_stop,
+            termgrid::termgrid_start,
+            termgrid::termgrid_attach,
+            termgrid::termgrid_detach,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

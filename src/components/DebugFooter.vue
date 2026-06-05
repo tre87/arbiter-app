@@ -56,19 +56,37 @@ const write = computed(() => { const v = perf.writeMs[store.focusedId]; return v
   <div class="debug-footer">
     <span class="grp" :class="{ warn: fps > 0 && fps < 50 }">FPS {{ fps }}</span>
     <span class="grp" :class="{ warn: jank > 32 }">jank {{ jank }}ms</span>
-    <span class="sep">|</span>
-    <span class="grp lbl">input</span>
-    <span class="grp" :class="{ warn: echo != null && echo > 25 }">echo {{ echo ?? '—' }}ms</span>
-    <span class="grp">write {{ write ?? '—' }}ms</span>
-    <span class="sep">|</span>
-    <span class="grp lbl">focus</span>
-    <span class="grp" :class="{ warn: renderer === 'DOM' }">{{ renderer }}</span>
-    <span class="grp">{{ size }}</span>
-    <span class="grp">sb {{ scrollback }}</span>
-    <span class="sep">|</span>
-    <span class="grp">terms {{ terms }}</span>
-    <span class="grp" :class="{ warn: webgl > 12 }">gl {{ webgl }}</span>
-    <span v-if="heapMb !== null" class="grp">heap {{ heapMb }}MB</span>
+
+    <!-- GPU single-canvas renderer: parse-in-Rust → binary diff → 1 canvas. -->
+    <template v-if="perf.gpuActive">
+      <span class="sep">|</span>
+      <span class="grp lbl">gpu</span>
+      <span class="grp">{{ perf.gpuFramesPerSec }} frm/s</span>
+      <span class="grp">{{ perf.gpuKbPerSec }} KB/s</span>
+      <span class="grp" :class="{ warn: perf.gpuDecodeMs > 4 }">dec {{ perf.gpuDecodeMs }}ms</span>
+      <span class="grp" :class="{ warn: perf.gpuDrawMs > 6 }">draw {{ perf.gpuDrawMs }}ms</span>
+      <span class="sep">|</span>
+      <span class="grp">terms {{ terms }}</span>
+      <span v-if="heapMb !== null" class="grp">heap {{ heapMb }}MB</span>
+    </template>
+
+    <!-- Legacy per-terminal xterm path. -->
+    <template v-else>
+      <span class="sep">|</span>
+      <span class="grp lbl">input</span>
+      <span class="grp" :class="{ warn: echo != null && echo > 25 }">echo {{ echo ?? '—' }}ms</span>
+      <span class="grp">write {{ write ?? '—' }}ms</span>
+      <span class="sep">|</span>
+      <span class="grp lbl">focus</span>
+      <span class="grp" :class="{ warn: renderer === 'DOM' }">{{ renderer }}</span>
+      <span class="grp">{{ size }}</span>
+      <span class="grp">sb {{ scrollback }}</span>
+      <span class="sep">|</span>
+      <span class="grp">terms {{ terms }}</span>
+      <span class="grp" :class="{ warn: webgl > 12 }">gl {{ webgl }}</span>
+      <span v-if="heapMb !== null" class="grp">heap {{ heapMb }}MB</span>
+    </template>
+
     <span class="spacer" />
     <span class="grp hint">Ctrl/Cmd+Shift+P</span>
   </div>
