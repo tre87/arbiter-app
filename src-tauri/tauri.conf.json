@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Arbiter",
-  "version": "1.0.14",
+  "version": "1.1.0",
   "identifier": "com.arbiter.app",
   "build": {
     "frontendDist": "../dist",
