@@ -44,6 +44,13 @@ use tauri::State;
 
 use crate::pty::Sessions;
 
+#[derive(serde::Serialize)]
+pub struct SearchMatch {
+    pub line: i32,
+    pub col: u32,
+    pub len: u32,
+}
+
 // ── HeadlessTerm: alacritty Term + parser + base palette ─────────────────────
 
 #[derive(Clone, Copy, Default)]
@@ -109,6 +116,47 @@ impl HeadlessTerm {
     pub fn scroll(&mut self, delta: i32) {
         self.term.scroll_display(Scroll::Delta(delta));
         self.force_full = true;
+    }
+
+    /// Case-insensitive search over the whole grid (scrollback included).
+    /// Returns matches as (content-line, start-col, length), capped.
+    pub fn search(&self, query: &str) -> Vec<SearchMatch> {
+        let q: Vec<char> = query.to_lowercase().chars().collect();
+        let ql = q.len();
+        let mut out = Vec::new();
+        if ql == 0 {
+            return out;
+        }
+        let grid = self.term.grid();
+        let cols = self.term.columns();
+        let top = -(grid.history_size() as i32);
+        let bottom = self.term.screen_lines() as i32 - 1;
+        let mut line = top;
+        while line <= bottom {
+            let row = &grid[Line(line)];
+            let mut chars: Vec<char> = Vec::with_capacity(cols);
+            for c in 0..cols {
+                let ch = row[Column(c)].c;
+                let lc = if ch == '\0' { ' ' } else { ch.to_lowercase().next().unwrap_or(ch) };
+                chars.push(lc);
+            }
+            if chars.len() >= ql {
+                let mut start = 0;
+                while start + ql <= chars.len() {
+                    if chars[start..start + ql] == q[..] {
+                        out.push(SearchMatch { line, col: start as u32, len: ql as u32 });
+                        if out.len() >= 5000 {
+                            return out;
+                        }
+                        start += ql;
+                    } else {
+                        start += 1;
+                    }
+                }
+            }
+            line += 1;
+        }
+        out
     }
 
     /// Extract selected text. Lines are content-line coords (0 = top of the
@@ -396,6 +444,16 @@ pub fn termgrid_selection_text(
         return s.selection_text(s_line, s_col, e_line, e_col);
     }
     String::new()
+}
+
+/// Search a session's grid (scrollback included); returns matches in
+/// content-line coords for highlighting and scroll-to.
+#[tauri::command]
+pub fn termgrid_search(sessions: State<Sessions>, session_id: String, query: String) -> Vec<SearchMatch> {
+    if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
+        return s.search_grid(&query);
+    }
+    Vec::new()
 }
 
 /// Stop GPU rendering for a session (frees its grid).

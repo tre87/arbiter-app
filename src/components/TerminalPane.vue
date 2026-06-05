@@ -25,7 +25,7 @@ import {
   attachPane as gpuAttachPane, detachPane as gpuDetachPane, terminalBgHex as gpuTerminalBgHex,
   selectionStart as gpuSelectionStart, selectionExtend as gpuSelectionExtend,
   clearSelection as gpuClearSelection, hasSelection as gpuHasSelection, selectionRange as gpuSelectionRange,
-  urlAt as gpuUrlAt,
+  urlAt as gpuUrlAt, setSearch as gpuSetSearch, clearSearch as gpuClearSearch, scrollToLine as gpuScrollToLine,
 } from '../composables/useTerminalGrid'
 import { CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
 
@@ -319,6 +319,59 @@ function onGpuMouseDown(e: MouseEvent) {
   gpuDragging = true
   window.addEventListener('mousemove', onGpuMouseMove)
   window.addEventListener('mouseup', onGpuMouseUp)
+}
+
+// ── Find / search (GPU mode) ─────────────────────────────────────────────────
+const searchOpen = ref(false)
+const searchQuery = ref('')
+const searchCount = ref(0)
+const searchIdx = ref(-1)
+const searchInputEl = ref<HTMLInputElement>()
+const findTop = ref(0)
+const findRight = ref(0)
+let searchResults: { line: number; col: number; len: number }[] = []
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+function openSearch() {
+  const rect = terminalEl.value?.getBoundingClientRect()
+  if (rect) {
+    findTop.value = Math.round(rect.top + 6)
+    findRight.value = Math.max(8, Math.round(window.innerWidth - rect.right + 10))
+  }
+  searchOpen.value = true
+  nextTick(() => { searchInputEl.value?.focus(); searchInputEl.value?.select() })
+}
+function closeSearch() {
+  searchOpen.value = false
+  searchResults = []
+  searchCount.value = 0
+  searchIdx.value = -1
+  gpuClearSearch()
+  term?.focus()
+}
+async function runSearch() {
+  const sid = sessionId
+  const q = searchQuery.value
+  if (!gpu || !sid || !q) {
+    searchResults = []; searchCount.value = 0; searchIdx.value = -1; gpuClearSearch(); return
+  }
+  const matches = await invoke<{ line: number; col: number; len: number }[]>('termgrid_search', { sessionId: sid, query: q }).catch(() => [])
+  searchResults = matches
+  searchCount.value = matches.length
+  searchIdx.value = matches.length ? 0 : -1
+  gpuSetSearch(sid, matches, searchIdx.value)
+  if (matches.length) gpuScrollToLine(sid, matches[0].line)
+}
+watch(searchQuery, () => {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(runSearch, 120)
+})
+function searchStep(dir: number) {
+  const sid = sessionId
+  if (!sid || !searchCount.value) return
+  searchIdx.value = (searchIdx.value + dir + searchCount.value) % searchCount.value
+  gpuSetSearch(sid, searchResults, searchIdx.value)
+  gpuScrollToLine(sid, searchResults[searchIdx.value].line)
 }
 
 function gpuAttach() {
@@ -695,6 +748,8 @@ onMounted(async () => {
 
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
+      // GPU mode: Cmd/Ctrl+F opens the find bar.
+      if (gpu && (e.metaKey || e.ctrlKey) && e.code === 'KeyF') { openSearch(); return false }
       if (e.ctrlKey && e.code === 'KeyC' && (e.shiftKey || term.hasSelection())) {
         if (term.hasSelection()) {
           clipboardWrite(term.getSelection())
@@ -796,6 +851,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (gpuDragging) onGpuMouseUp()
+  if (searchTimer) clearTimeout(searchTimer)
+  if (searchOpen.value) gpuClearSearch()
   if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
   if (workspaceActivatedHandler) window.removeEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
   if (fitTimer) clearTimeout(fitTimer)
@@ -895,6 +952,25 @@ onBeforeUnmount(() => {
     />
 
     <div ref="terminalEl" class="terminal-inner" @wheel="onGpuWheel" @mousedown.capture="onGpuMouseDown" @mousemove="onGpuHover" @mouseleave="onGpuLeave" />
+
+    <Teleport to="body">
+      <div v-if="searchOpen" class="gpu-find" :style="{ top: findTop + 'px', right: findRight + 'px' }" @mousedown.stop>
+        <input
+          ref="searchInputEl"
+          v-model="searchQuery"
+          class="gpu-find-input"
+          placeholder="Find"
+          spellcheck="false"
+          @keydown.enter.exact.prevent="searchStep(1)"
+          @keydown.shift.enter.prevent="searchStep(-1)"
+          @keydown.escape.prevent="closeSearch"
+        />
+        <span class="gpu-find-count">{{ searchCount ? `${searchIdx + 1}/${searchCount}` : '0/0' }}</span>
+        <button class="gpu-find-btn" title="Previous (Shift+Enter)" @click="searchStep(-1)">↑</button>
+        <button class="gpu-find-btn" title="Next (Enter)" @click="searchStep(1)">↓</button>
+        <button class="gpu-find-btn" title="Close (Esc)" @click="closeSearch">✕</button>
+      </div>
+    </Teleport>
     <!-- Mounted for the whole Claude session so the slide animation is never
          re-created mid-turn; the `working` class fades it in and resumes the
          (paused) animation from its current position — no reset across the
@@ -1113,6 +1189,54 @@ onBeforeUnmount(() => {
   overflow: hidden;
   padding-left: 4px;
 }
+
+/* Find bar (GPU search) — teleported to body so it sits above the shared
+   canvas (z-index 10); positioned at the focused pane's top-right inline. */
+.gpu-find {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: var(--color-bg-elevated, #1e1e22);
+  border: 1px solid var(--color-card-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+}
+.gpu-find-input {
+  width: 160px;
+  font: 12px/1.4 inherit;
+  color: var(--color-text-primary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-card-border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  outline: none;
+}
+.gpu-find-input:focus { border-color: var(--color-accent); }
+.gpu-find-count {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  min-width: 34px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.gpu-find-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  background: none;
+  border: 1px solid var(--color-card-border);
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.gpu-find-btn:hover { color: var(--color-text-primary); background: var(--color-bg); }
 
 /* GPU mode: the shared canvas draws the grid on top, so drop the left padding
    (the grid origin = this element's rect). Default background avoids a launch

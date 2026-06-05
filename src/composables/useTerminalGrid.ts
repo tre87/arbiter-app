@@ -40,6 +40,9 @@ let bgR = 0x12, bgG = 0x12, bgB = 0x12
 const SEL_R = 0x26, SEL_G = 0x4f, SEL_B = 0x78
 // Link foreground (GitHub link blue) so URLs stand out.
 const LINK_R = 0x58, LINK_G = 0xa6, LINK_B = 0xff
+// Search match backgrounds: all matches (dark gold) + current match (bright).
+const MATCH_R = 0x5a, MATCH_G = 0x4a, MATCH_B = 0x12
+const CUR_R = 0xc2, CUR_G = 0x8a, CUR_B = 0x24
 
 function hexToRgb(hex: string): [number, number, number] {
   let h = (hex || '').replace('#', '').trim()
@@ -356,6 +359,44 @@ function markLinks(pane: GridPane, row: number) {
   }
 }
 
+// ── Search ───────────────────────────────────────────────────────────────────
+
+interface SearchMatch { line: number; col: number; len: number }
+let searchSlot: number | null = null
+let searchMatches: SearchMatch[] = []
+let searchCurrent = -1
+
+export function setSearch(sessionId: string, matches: SearchMatch[], current: number) {
+  searchSlot = slotBySession.get(sessionId) ?? null
+  searchMatches = matches
+  searchCurrent = current
+  needsDraw = true
+}
+
+export function clearSearch() {
+  if (searchSlot !== null || searchMatches.length) {
+    searchSlot = null; searchMatches = []; searchCurrent = -1; needsDraw = true
+  }
+}
+
+export function searchMatchLine(index: number): number | null {
+  const m = searchMatches[index]
+  return m ? m.line : null
+}
+
+/** Scroll a content line into view (centered) if it's currently off-screen. */
+export function scrollToLine(sessionId: string, line: number) {
+  const slot = slotBySession.get(sessionId)
+  if (slot === undefined) return
+  const pane = bySlot.get(slot)
+  if (!pane) return
+  const vr = line + pane.offset // visible row if shown now
+  if (vr >= 0 && vr < pane.rows) return // already visible
+  const targetOffset = Math.max(0, Math.floor(pane.rows / 2) - line)
+  const delta = targetOffset - pane.offset
+  if (delta !== 0) invoke('termgrid_scroll', { sessionId, delta }).catch(() => {})
+}
+
 // ── Decode binary diffs ──────────────────────────────────────────────────────
 
 function decode(msg: ArrayBuffer | ArrayBufferView | number[]) {
@@ -467,6 +508,19 @@ function drawAll() {
     const { cols, rows, code, fg, bg, flags, link } = pane
     const total = cols * rows
     const sel = (pane.slot === selSlot && hasSelection()) ? orderedSel() : null
+    // Search highlight spans for this pane, keyed by visible row.
+    let searchByRow: Map<number, Array<[number, number, boolean]>> | null = null
+    if (pane.slot === searchSlot && searchMatches.length) {
+      searchByRow = new Map()
+      for (let i = 0; i < searchMatches.length; i++) {
+        const sm = searchMatches[i]
+        const vr = sm.line + pane.offset
+        if (vr < 0 || vr >= rows) continue
+        let arr = searchByRow.get(vr)
+        if (!arr) { arr = []; searchByRow.set(vr, arr) }
+        arr.push([sm.col, sm.col + sm.len, i === searchCurrent])
+      }
+    }
     for (let ci = 0; ci < total; ci++) {
       const fl = flags[ci]
       if (fl & FLAG_WIDE_SPACER) continue
@@ -483,9 +537,17 @@ function drawAll() {
       const selected = sel !== null &&
         (absLine > sel.a.line || (absLine === sel.a.line && col >= sel.a.col)) &&
         (absLine < sel.b.line || (absLine === sel.b.line && col <= sel.b.col))
+      let searched = false, isCur = false
+      if (!selected && searchByRow) {
+        const spans = searchByRow.get(row)
+        if (spans) for (const sp of spans) { if (col >= sp[0] && col < sp[1]) { searched = true; isCur = sp[2]; break } }
+      }
       if (selected) {
         br = SEL_R; bgc = SEL_G; bb = SEL_B
         if (cp === 0) cp = 32 // draw the highlight even on empty cells
+      } else if (searched) {
+        br = isCur ? CUR_R : MATCH_R; bgc = isCur ? CUR_G : MATCH_G; bb = isCur ? CUR_B : MATCH_B
+        if (cp === 0) cp = 32
       } else {
         // Never-written cells (code 0, bg 0,0,0 = black) and default-bg spaces
         // are skipped so the pane's own #121212 shows through (no black blocks).

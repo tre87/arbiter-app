@@ -111,6 +111,15 @@ impl PtySession {
         }
         String::new()
     }
+
+    pub(crate) fn search_grid(&self, query: &str) -> Vec<crate::termgrid::SearchMatch> {
+        if let Ok(g) = self.grid.lock() {
+            if let Some(t) = g.as_ref() {
+                return t.search(query);
+            }
+        }
+        Vec::new()
+    }
 }
 
 // Arc so the watcher background thread can share ownership
