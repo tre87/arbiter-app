@@ -30,9 +30,9 @@ const activeTab = ref<Tab>('general')
 
 const tabs: { id: Tab; label: string }[] = [
   { id: 'general', label: 'General' },
+  { id: 'display', label: 'Display' },
   { id: 'files', label: 'Files' },
   { id: 'usage', label: 'Claude Usage' },
-  { id: 'display', label: 'Display' },
 ]
 
 onMounted(async () => {
@@ -122,15 +122,19 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
       <div class="dialog-content">
         <!-- General -->
         <div v-if="activeTab === 'general'" class="tab-panel">
+          <h2 class="tab-heading">General</h2>
           <div class="panel-section">
             <h4 class="panel-title">Saved Data</h4>
             <div class="panel-body">
-              <div class="btn-row">
-                <button class="btn btn-secondary" @click="clearSaved('sessions')">Clear saved sessions</button>
-                <button class="btn btn-secondary" @click="clearSaved('paths')">Clear saved paths</button>
-                <button class="btn btn-secondary" @click="clearSaved('layout')">Clear saved layout</button>
-                <button class="btn btn-danger" @click="clearSaved('all')">Clear all saved data</button>
+              <p class="panel-hint">
+                Forget state Arbiter remembers between launches. This clears data on disk only — your open terminals aren't affected.
+              </p>
+              <div class="clear-row">
+                <button class="btn btn-secondary" @click="clearSaved('sessions')">Clear sessions</button>
+                <button class="btn btn-secondary" @click="clearSaved('paths')">Clear paths</button>
+                <button class="btn btn-secondary" @click="clearSaved('layout')">Clear layout</button>
               </div>
+              <button class="btn btn-danger clear-all" @click="clearSaved('all')">Clear all saved data</button>
             </div>
           </div>
 
@@ -327,8 +331,10 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
   border: 1px solid var(--color-card-border);
   border-radius: 8px;
   display: flex;
-  width: 640px;
-  height: 440px;
+  width: 820px;
+  height: 600px;
+  max-width: 92vw;
+  max-height: 90vh;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   overflow: hidden;
 }
@@ -407,6 +413,29 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
 .tab-panel {
   flex: 1;
   overflow-y: auto;
+}
+
+.tab-heading {
+  margin: 0 0 20px;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+/* Saved-data clears: the three selective actions share a row at equal width;
+   the destructive "clear all" sits on its own full-width row below. */
+.clear-row {
+  display: flex;
+  gap: 8px;
+}
+
+.clear-row .btn {
+  flex: 1;
+}
+
+.clear-all {
+  width: 100%;
+  margin-top: 2px;
 }
 
 .panel-section + .panel-section {
