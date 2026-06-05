@@ -340,6 +340,7 @@ pub fn run() {
             termgrid::termgrid_detach,
             termgrid::termgrid_scroll,
             termgrid::termgrid_selection_text,
+            termgrid::termgrid_search,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
