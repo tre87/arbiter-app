@@ -90,6 +90,26 @@ export function useKeyboardShortcuts(toggleOverview: () => void) {
       return
     }
 
+    // Ctrl/Cmd+Shift+G → toggle the single-canvas renderer spike overlay
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyG') {
+      e.preventDefault()
+      e.stopPropagation()
+      devStore.showRendererSpike = !devStore.showRendererSpike
+      return
+    }
+
+    // Ctrl/Cmd+Shift+Y → toggle the GPU single-canvas terminal renderer.
+    // The flag is read at pane mount, so persist it and reload to apply cleanly
+    // (backend PTY sessions survive the reload and are re-adopted).
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyY') {
+      e.preventDefault()
+      e.stopPropagation()
+      const next = !devStore.useGpuRenderer
+      localStorage.setItem('arbiter:gpuRenderer', next ? '1' : '0')
+      location.reload()
+      return
+    }
+
     // Ctrl+Tab / Ctrl+Shift+Tab → next/prev workspace
     if (e.ctrlKey && e.code === 'Tab') {
       e.preventDefault()

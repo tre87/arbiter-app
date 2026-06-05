@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::claude::{spawn_pane_monitor, ClaudeMonitor, ExpectedClaudeSessions};
 use crate::git::get_git_info;
 use crate::shell::build_shell_command;
+use crate::termgrid::HeadlessTerm;
 
 pub struct PtySession {
     // Per-session writer lock so `write_to_session` doesn't serialize through
@@ -41,6 +42,55 @@ pub struct PtySession {
     // OS pipe back-pressures the shell — the consumer never builds an unbounded
     // backlog and the UI stays responsive. Resumed under a low watermark.
     paused: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    // GPU renderer (termgrid): when the frontend attaches this session, the PTY
+    // reader feeds bytes into this alacritty-backed grid in addition to the
+    // xterm byte stream, and a frame thread ships cell diffs. None/inactive by
+    // default, so the existing xterm path is unaffected when the renderer is off.
+    grid: Arc<Mutex<Option<HeadlessTerm>>>,
+    grid_active: Arc<AtomicBool>,
+    pub(crate) grid_dirty: Arc<AtomicBool>,
+}
+
+impl PtySession {
+    /// Start GPU rendering: build the grid, replay buffered history so the
+    /// current screen is reconstructed, mark it active+dirty. Returns the Arcs
+    /// the frame thread registry needs.
+    pub(crate) fn attach_grid(
+        &self,
+        cols: u16,
+        rows: u16,
+        fg: &[u8],
+        bg: &[u8],
+        ansi: &[u8],
+    ) -> (Arc<Mutex<Option<HeadlessTerm>>>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let mut term = HeadlessTerm::new(cols as usize, rows as usize);
+        term.set_theme(fg, bg, ansi);
+        if let Ok(buf) = self.output_buffer.lock() {
+            let (a, b) = buf.as_slices();
+            term.feed(a);
+            term.feed(b);
+        }
+        *self.grid.lock().unwrap() = Some(term);
+        self.grid_active.store(true, Ordering::Relaxed);
+        self.grid_dirty.store(true, Ordering::Relaxed);
+        (self.grid.clone(), self.grid_active.clone(), self.grid_dirty.clone())
+    }
+
+    pub(crate) fn detach_grid(&self) {
+        self.grid_active.store(false, Ordering::Relaxed);
+        *self.grid.lock().unwrap() = None;
+    }
+
+    fn resize_grid(&self, cols: u16, rows: u16) {
+        if self.grid_active.load(Ordering::Relaxed) {
+            if let Ok(mut g) = self.grid.lock() {
+                if let Some(t) = g.as_mut() {
+                    t.resize(cols as usize, rows as usize);
+                }
+            }
+            self.grid_dirty.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 // Arc so the watcher background thread can share ownership
@@ -103,6 +153,12 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let claude_tracked_reader = claude_tracked.clone();
     let paused: Arc<(Mutex<bool>, std::sync::Condvar)> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let paused_reader = paused.clone();
+    let grid: Arc<Mutex<Option<HeadlessTerm>>> = Arc::new(Mutex::new(None));
+    let grid_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let grid_dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let grid_reader = grid.clone();
+    let grid_active_reader = grid_active.clone();
+    let grid_dirty_reader = grid_dirty.clone();
 
     // Spawn thread to stream PTY output to the frontend and buffer it for replay
     let app_handle = app.clone();
@@ -357,16 +413,32 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                         let excess = b.len().saturating_sub(MAX_BUF);
                         if excess > 0 { b.drain(..excess); }
                     }
+                    // Feed the GPU-renderer grid (termgrid) when this session is
+                    // attached. Cheap atomic check skips it entirely otherwise.
+                    if grid_active_reader.load(Ordering::Relaxed) {
+                        if let Ok(mut g) = grid_reader.lock() {
+                            if let Some(t) = g.as_mut() {
+                                t.feed(valid_chunk);
+                            }
+                        }
+                        grid_dirty_reader.store(true, Ordering::Relaxed);
+                    }
                     // Frame-coalesced emit (see `pending` above). Flush on a 32 KB
                     // batch, a 16 ms frame, or a small read (n < 4 KB ⇒ interactive
                     // input or the tail of a burst) so nothing is held while idle.
-                    pending.push_str(text);
-                    if pending.len() >= 32_768
-                        || n < 4096
-                        || last_flush.elapsed() >= std::time::Duration::from_millis(16)
-                    {
-                        let _ = app_handle.emit(&event_name, std::mem::take(&mut pending));
-                        last_flush = std::time::Instant::now();
+                    // Skipped when the GPU renderer is attached: the frontend has
+                    // no pty-output listener then (it renders from grid diffs), so
+                    // serialising the string to nobody is pure waste. The OSC/cwd/
+                    // activity scanning above and the replay buffer still run.
+                    if !grid_active_reader.load(Ordering::Relaxed) {
+                        pending.push_str(text);
+                        if pending.len() >= 32_768
+                            || n < 4096
+                            || last_flush.elapsed() >= std::time::Duration::from_millis(16)
+                        {
+                            let _ = app_handle.emit(&event_name, std::mem::take(&mut pending));
+                            last_flush = std::time::Instant::now();
+                        }
                     }
                 }
             }
@@ -395,6 +467,9 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
             last_size: Mutex::new((initial_cols, initial_rows)),
             claude_tracked,
             paused,
+            grid,
+            grid_active,
+            grid_dirty,
         },
     );
 
@@ -466,6 +541,7 @@ pub fn resize_session(
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())?;
+        session.resize_grid(cols, rows);
         Ok(true)
     } else {
         Ok(false)
