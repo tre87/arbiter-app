@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -632,29 +632,68 @@ fn claude_home() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude"))
 }
 
-/// Per-PTY process monitor: polls ~1s for Claude descendants under the shell
-/// PID. When Claude appears, emits `claude-started`, adopts a matching JSONL
-/// if one already exists (for the "Claude started but hasn't written yet"
-/// window), and blocks the thread on the Claude exit handle. When Claude
-/// exits, emits `claude-exited` and loops to detect relaunches.
+/// Why the monitor woke. `Edge` = a command actually started (scan with retries
+/// to absorb Claude's exec delay). `Poll` = fallback tick for a shell with no
+/// OSC-133 integration (one scan). `Skip` = integration is live and nothing
+/// started — nothing to scan, idle cost stays ~0.
+enum Wake { Edge, Poll, Skip }
+
+/// Block until the next command starts in this pane, or a fallback interval.
 ///
-/// Polling here is intentional: see the justifying comment at the call site
-/// in `create_session`. Cost stays bounded via `SharedSystem` (one full
-/// process refresh shared across panes, min 250 ms between refreshes).
+/// Lock + drop `shell_idle` BEFORE taking `cmd_epoch`: the reader holds
+/// `shell_idle` then bumps `cmd_epoch`, so the reverse lock order here can
+/// deadlock.
+fn wait_for_command(
+    cmd_epoch: &Arc<(Mutex<u64>, Condvar)>,
+    shell_idle: &Arc<Mutex<Option<bool>>>,
+    last_epoch: &mut u64,
+) -> Wake {
+    let integrated = shell_idle.lock().unwrap().is_some();
+    let timeout = if integrated {
+        std::time::Duration::from_secs(15) // safety net only; edges drive the scans
+    } else {
+        std::time::Duration::from_secs(4)  // no integration → degrade to a slow poll
+    };
+    let (lock, cvar) = &**cmd_epoch;
+    let guard = lock.lock().unwrap();
+    let prev = *last_epoch;
+    let (guard, res) = cvar.wait_timeout_while(guard, timeout, |e| *e == prev).unwrap();
+    *last_epoch = *guard;
+    if !res.timed_out() { Wake::Edge } else if !integrated { Wake::Poll } else { Wake::Skip }
+}
+
+/// Per-PTY Claude launch monitor. Event-driven: it waits on `cmd_epoch` (bumped
+/// by the PTY reader on each OSC-133 command-start edge) and scans for a Claude
+/// descendant only when a command actually starts — an idle pane triggers zero
+/// scans. When Claude appears, emits `claude-started`, adopts a matching JSONL
+/// if one already exists, and blocks the thread on the Claude exit handle. When
+/// Claude exits, emits `claude-exited` and loops to detect relaunches.
+///
+/// Fallback: panes whose shell never reports OSC 133 (`shell_idle` stays None)
+/// degrade to a slow poll (see `wait_for_command`), so detection still works
+/// without shell integration — just not at zero idle cost.
 pub fn spawn_pane_monitor(
     app:      AppHandle,
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     monitor:  Arc<Mutex<HashMap<String, ClaudeEntry>>>,
     expected: Arc<Mutex<HashMap<String, String>>>,
     session_id: String,
+    cmd_epoch: Arc<(Mutex<u64>, Condvar)>,
+    shell_idle: Arc<Mutex<Option<bool>>>,
 ) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut last_epoch = *cmd_epoch.0.lock().unwrap();
+        let mut first = true;
 
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            // First pass scans once (catch an already-running Claude, e.g. a
+            // restore); afterwards block until a command starts (or the slow
+            // fallback fires).
+            let wake = if first { first = false; Wake::Poll } else { wait_for_command(&cmd_epoch, &shell_idle, &mut last_epoch) };
 
-            // Session closed? stop monitoring.
+            // Session closed? stop monitoring (checked every wake — incl. Skip —
+            // so the thread exits within one wait interval of close).
             let shell_pid = {
                 let s = sessions.lock().unwrap();
                 match s.get(&session_id) {
@@ -668,10 +707,22 @@ pub fn spawn_pane_monitor(
             // iteration)? Don't compete with the existing exit watcher.
             if monitor.lock().unwrap().contains_key(&session_id) { continue; }
 
-            // Is a Claude descendant running under this shell right now?
-            let claude = shared_system().with(std::time::Duration::from_millis(250), |sys| {
-                find_claude_in(sys, shell_pid)
-            });
+            // Skip = integrated idle tick (nothing ran). Edge = a command started;
+            // `claude` execs a moment after the OSC-133 edge so it may miss the
+            // first look — retry to absorb the exec delay, but bail the instant
+            // the shell returns to idle (a finished command wasn't Claude, which
+            // is a long-running TUI, so a quick `ls` costs one scan). Poll =
+            // no-integration fallback or first pass → a single scan.
+            let attempts = match wake { Wake::Skip => continue, Wake::Edge => 8, Wake::Poll => 1 };
+            let mut claude = None;
+            for i in 0..attempts {
+                claude = shared_system().with(std::time::Duration::from_millis(200), |sys| {
+                    find_claude_in(sys, shell_pid)
+                });
+                if claude.is_some() { break; }
+                if *shell_idle.lock().unwrap() == Some(true) { break; }
+                if i + 1 < attempts { std::thread::sleep(std::time::Duration::from_millis(250)); }
+            }
             let Some((claude_pid, _)) = claude else { continue };
 
             // Claude just appeared. Adopt an existing transcript only if it was

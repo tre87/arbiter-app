@@ -17,6 +17,7 @@
 //  - We only redraw when something changed (a diff, the cursor blink, or a
 //    layout refresh), so idle costs nothing.
 
+import { watch } from 'vue'
 import { invoke, Channel } from '@tauri-apps/api/core'
 import { SingleCanvasRenderer } from '../spike/singleCanvasRenderer'
 import { usePerfStore } from '../stores/perf'
@@ -110,11 +111,13 @@ const slotBySession = new Map<string, number>()
 let nextSlot = 1
 let raf = 0
 let resizeObs: ResizeObserver | null = null
-let lastFocused: string | undefined
+let drawScheduled = false
+let perfTimer: ReturnType<typeof setInterval> | null = null
+let stopFocusWatch: (() => void) | null = null
 let perf: ReturnType<typeof usePerfStore> | null = null
 let paneStore: ReturnType<typeof usePaneStore> | null = null
 let loggedDecodeErr = false
-let needsDraw = true
+let needsDraw = false
 
 // Perf sampling (transport + decode + draw).
 let windowStart = 0
@@ -148,12 +151,20 @@ export function initTerminalCanvas(canvas: HTMLCanvasElement) {
   invoke('termgrid_start', { channel: ch }).catch((e) => console.error('Arbiter: termgrid_start failed', e))
 
   refreshRects()
-  raf = requestAnimationFrame(loop)
+  // Redraw on focus change so the (static) cursor moves to the newly focused
+  // pane (the perpetual loop used to poll focusedId every frame for this).
+  stopFocusWatch = watch(() => paneStore!.focusedId, markDirty)
+  windowStart = performance.now()
+  perfTimer = setInterval(samplePerf, 500)
+  markDirty() // initial paint
   perf.setGpuActive(true)
 }
 
 export function teardownTerminalCanvas() {
   cancelAnimationFrame(raf)
+  drawScheduled = false
+  if (perfTimer) { clearInterval(perfTimer); perfTimer = null }
+  stopFocusWatch?.(); stopFocusWatch = null
   resizeObs?.disconnect(); resizeObs = null
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('arbiter:workspace-activated', scheduleRefresh)
@@ -196,7 +207,7 @@ function refreshRects() {
     pane.rectW = Math.round(r.width * dpr)
     pane.rectH = Math.round(r.height * dpr)
   }
-  needsDraw = true
+  markDirty()
 }
 
 export function attachPane(sessionId: string, paneId: string, el: HTMLElement, cols: number, rows: number, cellW?: number, cellH?: number) {
@@ -235,6 +246,7 @@ export function detachPane(sessionId: string) {
     if (pane) resizeObs?.unobserve(pane.el)
     bySlot.delete(slot)
     slotBySession.delete(sessionId)
+    markDirty() // redraw without the removed pane
   }
   invoke('termgrid_detach', { sessionId }).catch(() => {})
 }
@@ -276,7 +288,7 @@ export function selectionStart(sessionId: string, clientX: number, clientY: numb
   if (slot === undefined) return
   const p = cellAt(slot, clientX, clientY)
   if (!p) return
-  selSlot = slot; selAnchor = p; selHead = p; needsDraw = true
+  selSlot = slot; selAnchor = p; selHead = p; markDirty()
 }
 
 export function selectionExtend(sessionId: string, clientX: number, clientY: number) {
@@ -284,11 +296,11 @@ export function selectionExtend(sessionId: string, clientX: number, clientY: num
   if (slotBySession.get(sessionId) !== selSlot) return
   const p = cellAt(selSlot, clientX, clientY)
   if (!p) return
-  selHead = p; needsDraw = true
+  selHead = p; markDirty()
 }
 
 export function clearSelection() {
-  if (selSlot !== null) { selSlot = null; selAnchor = null; selHead = null; needsDraw = true }
+  if (selSlot !== null) { selSlot = null; selAnchor = null; selHead = null; markDirty() }
 }
 
 export function hasSelection(): boolean {
@@ -370,12 +382,12 @@ export function setSearch(sessionId: string, matches: SearchMatch[], current: nu
   searchSlot = slotBySession.get(sessionId) ?? null
   searchMatches = matches
   searchCurrent = current
-  needsDraw = true
+  markDirty()
 }
 
 export function clearSearch() {
   if (searchSlot !== null || searchMatches.length) {
-    searchSlot = null; searchMatches = []; searchCurrent = -1; needsDraw = true
+    searchSlot = null; searchMatches = []; searchCurrent = -1; markDirty()
   }
 }
 
@@ -414,7 +426,7 @@ function decode(msg: ArrayBuffer | ArrayBufferView | number[]) {
     if (!loggedDecodeErr) { loggedDecodeErr = true; console.error('Arbiter: termgrid decode error', e) }
   }
   decodeAcc += performance.now() - t0
-  needsDraw = true
+  markDirty()
 }
 
 function decodeBody(bytes: Uint8Array) {
@@ -471,25 +483,46 @@ function decodeBody(bytes: Uint8Array) {
 // ── Draw all visible panes into the one canvas (only when something changed) ─
 
 const uv = { u: 0, v: 0 }
-function loop(t: number) {
-  // Redraw on focus change so the (static) cursor moves to the newly focused
-  // pane — the blink timer used to drive this; now this cheap check does.
-  const fid = paneStore?.focusedId
-  if (fid !== lastFocused) { lastFocused = fid; needsDraw = true }
+// On-demand rendering: we schedule at most ONE rAF and only when something
+// actually changed (a diff, selection, search, focus, or layout marked the
+// canvas dirty). An idle app schedules nothing → ~0% CPU. The old perpetual
+// rAF loop ran ~120×/sec doing a focus-poll + needsDraw check even when
+// nothing changed; that was the entire idle CPU cost the profile flagged.
+function scheduleDraw() {
+  if (drawScheduled || !renderer) return
+  drawScheduled = true
+  raf = requestAnimationFrame(drawFrame)
+}
+
+function markDirty() {
+  needsDraw = true
+  scheduleDraw()
+}
+
+function drawFrame() {
+  drawScheduled = false
   if (needsDraw) { drawAll(); needsDraw = false }
-  if (windowStart && t - windowStart >= 500) {
-    const secs = (t - windowStart) / 1000
-    perf?.setGpuStats({
-      framesPerSec: Math.round(framesRecv / secs),
-      kbPerSec: Math.round(bytesAcc / 1024 / secs),
-      decodeMs: Math.round((decodeAcc / Math.max(1, framesRecv)) * 100) / 100,
-      drawMs: lastDrawMs,
-    })
-    framesRecv = 0; bytesAcc = 0; decodeAcc = 0; windowStart = t
-  } else if (!windowStart) {
-    windowStart = t
-  }
-  raf = requestAnimationFrame(loop)
+}
+
+// Perf stats roll up on a cheap 500ms timer instead of every frame. Redundant
+// store writes are skipped while persistently idle so nothing reactive churns.
+let lastReportedFps = -1
+function samplePerf() {
+  if (!perf) return
+  const now = performance.now()
+  const secs = windowStart ? (now - windowStart) / 1000 : 0
+  windowStart = now
+  if (secs <= 0) return
+  const fps = Math.round(framesRecv / secs)
+  if (fps === 0 && lastReportedFps === 0) { framesRecv = 0; bytesAcc = 0; decodeAcc = 0; return }
+  lastReportedFps = fps
+  perf.setGpuStats({
+    framesPerSec: fps,
+    kbPerSec: Math.round(bytesAcc / 1024 / secs),
+    decodeMs: Math.round((decodeAcc / Math.max(1, framesRecv)) * 100) / 100,
+    drawMs: lastDrawMs,
+  })
+  framesRecv = 0; bytesAcc = 0; decodeAcc = 0
 }
 
 function drawAll() {

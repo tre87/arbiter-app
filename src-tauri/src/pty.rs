@@ -89,6 +89,7 @@ impl PtySession {
                 }
             }
             self.grid_dirty.store(true, Ordering::Relaxed);
+            crate::termgrid::notify_frame_dirty();
         }
     }
 
@@ -178,6 +179,12 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
     let cwd_writer = session_cwd.clone();
     let session_shell_idle: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let shell_idle_writer = session_shell_idle.clone();
+    let shell_idle_monitor = session_shell_idle.clone();
+    // Command-execution epoch: bumped on each OSC-133 idle→busy edge (a command
+    // started). The Claude launch monitor waits on this instead of polling the
+    // process table every second — idle terminals wake it zero times.
+    let cmd_epoch: Arc<(Mutex<u64>, std::sync::Condvar)> = Arc::new((Mutex::new(0), std::sync::Condvar::new()));
+    let cmd_epoch_reader = cmd_epoch.clone();
     let claude_tracked: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let claude_tracked_reader = claude_tracked.clone();
     let paused: Arc<(Mutex<bool>, std::sync::Condvar)> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -327,6 +334,14 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                                         if prev_idle != Some(idle) {
                                             prev_idle = Some(idle);
                                             app_handle.emit(&activity_event_name, idle).ok();
+                                            // idle→busy: a command just started. Wake the
+                                            // Claude launch monitor so it scans once now,
+                                            // instead of it polling every second forever.
+                                            if !idle {
+                                                let (lock, cvar) = &*cmd_epoch_reader;
+                                                *lock.lock().unwrap() += 1;
+                                                cvar.notify_all();
+                                            }
                                         }
                                     }
                                 }
@@ -451,6 +466,7 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
                             }
                         }
                         grid_dirty_reader.store(true, Ordering::Relaxed);
+                        crate::termgrid::notify_frame_dirty();
                     }
                     // Frame-coalesced emit (see `pending` above). Flush on a 32 KB
                     // batch, a 16 ms frame, or a small read (n < 4 KB ⇒ interactive
@@ -502,23 +518,19 @@ pub fn create_session(app: AppHandle, sessions: State<Sessions>, monitor: State<
         },
     );
 
-    // Per-PTY process monitor: polls every 1s for Claude descendants.
-    //
-    // Polling is intentional here (CLAUDE.md forbids polling without a comment):
-    // the `notify`-based watcher in start_claude_watcher sees JSONL files but
-    // cannot observe process lifecycle, and no cross-platform event-driven API
-    // exists for "a descendant of PID N was spawned." The alternatives
-    // (`ptrace`/`PROC_EVENT` on Linux only, ETW on Windows only) aren't portable.
-    // The scan uses a shared sysinfo System cached across all panes and
-    // refreshed at most once per 250ms globally, so 8 panes = 1 scan/250ms
-    // total, not 8.
+    // Per-PTY Claude launch monitor: event-driven off the OSC-133 command-start
+    // edge (shell integration, injected in shell.rs). When a command starts in a
+    // pane the reader bumps `cmd_epoch` and the monitor scans once for a Claude
+    // descendant — so an idle pane triggers zero scans. Panes whose shell never
+    // reports OSC 133 fall back to a slow poll inside the monitor. This replaces
+    // the old unconditional 1s-per-pane process-table scan.
     {
         let app3 = app.clone();
         let sessions3 = sessions.0.clone();
         let monitor3 = monitor.0.clone();
         let expected3: Arc<Mutex<HashMap<String, String>>> = app.state::<ExpectedClaudeSessions>().0.clone();
         let sid3 = session_id.clone();
-        spawn_pane_monitor(app3, sessions3, monitor3, expected3, sid3);
+        spawn_pane_monitor(app3, sessions3, monitor3, expected3, sid3, cmd_epoch, shell_idle_monitor);
     }
 
     Ok(session_id)
