@@ -21,10 +21,10 @@ import { useAutosave } from './composables/useAutosave'
 import { loadAndRestore } from './composables/useStartupRestore'
 import { useKeyboardShortcuts } from './composables/useKeyboardShortcuts'
 import { useTitlebarDrag, useWindowChrome } from './composables/useWindowChrome'
+import { gpuRendererSupported } from './composables/useTerminalGrid'
 
 // Lazy-loaded: these dialogs are only needed when the user opens them,
 // so they don't belong in the initial bundle.
-const RendererSpike = defineAsyncComponent(() => import('./spike/TransportSpike.vue'))
 const SharedTerminalCanvas = defineAsyncComponent(() => import('./components/SharedTerminalCanvas.vue'))
 const ShortcutsDialog = defineAsyncComponent(() => import('./components/ShortcutsDialog.vue'))
 const SettingsDialog = defineAsyncComponent(() => import('./components/SettingsDialog.vue'))
@@ -33,6 +33,9 @@ const OrgSelectionDialog = defineAsyncComponent(() => import('./components/OrgSe
 
 const store = usePaneStore()
 const devStore = useDevSettingsStore()
+// GPU renderer is only used when enabled AND WebGL2 is actually available
+// (some WebView2/VM/RDP setups lack it) — otherwise we keep the xterm path.
+const gpuOk = gpuRendererSupported()
 const usageStore = useUsageStore()
 const ready = ref(false)
 const overviewOpen = ref(false)
@@ -229,7 +232,7 @@ onBeforeUnmount(() => {
       </div>
     </template>
 
-    <SharedTerminalCanvas v-if="devStore.useGpuRenderer" />
+    <SharedTerminalCanvas v-if="devStore.useGpuRenderer && gpuOk" />
 
     <ShortcutsDialog v-if="shortcutsOpen" @close="shortcutsOpen = false" />
     <SettingsDialog v-if="settingsOpen" @close="settingsOpen = false" />
@@ -239,7 +242,6 @@ onBeforeUnmount(() => {
     <ConfirmDialog />
 
     <DebugFooter v-if="devStore.showDebugFooter" />
-    <RendererSpike v-if="devStore.showRendererSpike" @close="devStore.showRendererSpike = false" />
   </div>
 </template>
 

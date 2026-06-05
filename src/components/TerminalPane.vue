@@ -26,6 +26,7 @@ import {
   selectionStart as gpuSelectionStart, selectionExtend as gpuSelectionExtend,
   clearSelection as gpuClearSelection, hasSelection as gpuHasSelection, selectionRange as gpuSelectionRange,
   urlAt as gpuUrlAt, setSearch as gpuSetSearch, clearSearch as gpuClearSearch, scrollToLine as gpuScrollToLine,
+  gpuRendererSupported,
 } from '../composables/useTerminalGrid'
 import { CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
 
@@ -39,7 +40,9 @@ const { confirm } = useConfirm()
 // output is written to it, so it never parses), and the shared WebGL canvas
 // draws the grid that Rust parses. Removes both the xterm WebGL layer and the
 // main-thread VT parse.
-const gpu = devSettings.useGpuRenderer
+// GPU path requires both the setting AND working WebGL2 — without it we keep the
+// xterm renderer rather than rendering nothing (see gpuRendererSupported).
+const gpu = devSettings.useGpuRenderer && gpuRendererSupported()
 const terminalEl = ref<HTMLDivElement>()
 const isFocused = computed(() => store.focusedId === props.paneId)
 let xterm: XtermInstance | null = null

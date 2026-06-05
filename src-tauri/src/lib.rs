@@ -10,7 +10,6 @@ mod macos_fps;
 mod overview;
 mod pty;
 mod shell;
-mod spike;
 mod termgrid;
 mod usage;
 mod util;
@@ -110,7 +109,6 @@ pub fn run() {
         .manage(Cache(Mutex::new(UsageCache::new())))
         .manage(FileWatchers(Arc::new(Mutex::new(HashMap::new()))))
         .manage(git::GitWatchers::new())
-        .manage(spike::SpikeState::new())
         .manage(termgrid::TermGridState::new())
         .setup(|app| {
             // Create a hidden auth WebView at startup. If the user has a valid
@@ -329,12 +327,6 @@ pub fn run() {
             fs::rename_path,
             fs::trash_path,
             open_devtools,
-            spike::spike_start,
-            spike::spike_stop,
-            spike::spike_write,
-            spike::spike_resize,
-            spike::spike_stress,
-            spike::spike_stress_stop,
             termgrid::termgrid_start,
             termgrid::termgrid_attach,
             termgrid::termgrid_detach,

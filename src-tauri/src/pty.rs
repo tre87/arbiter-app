@@ -101,6 +101,7 @@ impl PtySession {
                 }
             }
             self.grid_dirty.store(true, Ordering::Relaxed);
+            crate::termgrid::notify_frame_dirty();
         }
     }
 
