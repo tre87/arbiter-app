@@ -31,7 +31,7 @@
 //         u8  flags  (bit0 INVERSE,1 BOLD,2 ITALIC,3 UNDERLINE,4 HIDDEN,5 WIDE,6 WIDE_SPACER)
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
@@ -73,13 +73,16 @@ pub struct HeadlessTerm {
     palette: [Rgb; 256],
     default_fg: Rgb,
     default_bg: Rgb,
+    // Force a full frame on the next pack (after a scroll or resize, where
+    // alacritty's per-line damage doesn't capture the wholesale view change).
+    force_full: bool,
 }
 
 impl HeadlessTerm {
     pub fn new(cols: usize, rows: usize) -> Self {
         let size = Size { cols, rows };
         let mut config = Config::default();
-        config.scrolling_history = 1000;
+        config.scrolling_history = 5000;
         let term = Term::new(config, &size, NoopListener);
         HeadlessTerm {
             term,
@@ -87,6 +90,7 @@ impl HeadlessTerm {
             palette: build_xterm_256_palette(),
             default_fg: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
             default_bg: Rgb { r: 0x14, g: 0x14, b: 0x16 },
+            force_full: false,
         }
     }
 
@@ -97,6 +101,52 @@ impl HeadlessTerm {
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.term.resize(Size { cols, rows });
+        self.force_full = true;
+    }
+
+    /// Scroll the viewport into scrollback history by `delta` lines (positive =
+    /// older/up). Forces a full frame so the whole scrolled view is re-sent.
+    pub fn scroll(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+        self.force_full = true;
+    }
+
+    /// Extract selected text. Lines are content-line coords (0 = top of the
+    /// active screen, negative = scrollback history), so a selection can span
+    /// content scrolled out of view. Trailing spaces per line are trimmed.
+    pub fn selection_text(&self, sl: i32, sc: usize, el: i32, ec: usize) -> String {
+        let grid = self.term.grid();
+        let cols = self.term.columns();
+        if cols == 0 {
+            return String::new();
+        }
+        let top = -(grid.history_size() as i32);
+        let bottom = self.term.screen_lines() as i32 - 1;
+        // Order endpoints lexicographically (line, then column).
+        let (first, last) = if (sl, sc) <= (el, ec) { ((sl, sc), (el, ec)) } else { ((el, ec), (sl, sc)) };
+        let (fl, fc) = first;
+        let (ll, lc) = last;
+        let mut line = fl.clamp(top, bottom);
+        let last_line = ll.clamp(top, bottom);
+        let mut out = String::new();
+        while line <= last_line {
+            let s = if line == fl { fc.min(cols - 1) } else { 0 };
+            let e = if line == ll { lc.min(cols - 1) } else { cols - 1 };
+            let row = &grid[Line(line)];
+            let mut text = String::new();
+            let mut col = s;
+            while col <= e {
+                let c = row[Column(col)].c;
+                text.push(if c == '\0' { ' ' } else { c });
+                col += 1;
+            }
+            out.push_str(text.trim_end());
+            if line < last_line {
+                out.push('\n');
+            }
+            line += 1;
+        }
+        out
     }
 
     /// Apply the frontend's xterm theme so resolved colors match the old
@@ -142,9 +192,15 @@ impl HeadlessTerm {
     pub fn pack_into(&mut self, slot: u16, out: &mut Vec<u8>, force_full: bool) -> bool {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
+        // How far the viewport is scrolled into history (0 = at the bottom).
+        let offset = self.term.grid().display_offset() as i32;
+        // A scrolled view (or a pending scroll/resize) changes every visible
+        // line, so send a full frame; otherwise use per-line damage.
+        let full = force_full || self.force_full || offset != 0;
+        self.force_full = false;
 
         let mut dirty: Vec<(usize, usize, usize)> = Vec::new();
-        if force_full {
+        if full {
             for line in 0..rows {
                 dirty.push((line, 0, cols.saturating_sub(1)));
             }
@@ -173,7 +229,9 @@ impl HeadlessTerm {
         let cursor = self.term.grid().cursor.point;
         let cur_row = cursor.line.0.max(0) as u16;
         let cur_col = cursor.column.0 as u16;
-        let cur_vis = self.term.mode().contains(TermMode::SHOW_CURSOR) as u8;
+        // Hide the cursor while scrolled back — it lives in the active screen,
+        // below the viewport.
+        let cur_vis = (offset == 0 && self.term.mode().contains(TermMode::SHOW_CURSOR)) as u8;
 
         out.extend_from_slice(&slot.to_le_bytes());
         out.extend_from_slice(&(cols as u16).to_le_bytes());
@@ -181,6 +239,9 @@ impl HeadlessTerm {
         out.extend_from_slice(&cur_row.to_le_bytes());
         out.extend_from_slice(&cur_col.to_le_bytes());
         out.push(cur_vis);
+        // Scroll offset (lines into history) so the frontend can map visible
+        // rows to content lines for content-anchored selection.
+        out.extend_from_slice(&(offset.max(0) as u16).to_le_bytes());
         out.extend_from_slice(&(dirty.len() as u16).to_le_bytes());
 
         let grid = self.term.grid();
@@ -188,7 +249,9 @@ impl HeadlessTerm {
             out.extend_from_slice(&(line as u16).to_le_bytes());
             out.extend_from_slice(&(left as u16).to_le_bytes());
             out.extend_from_slice(&(right as u16).to_le_bytes());
-            let row = &grid[Line(line as i32)];
+            // Apply the scroll offset: visible row `line` maps to grid line
+            // `line - offset` (negative indices read scrollback history).
+            let row = &grid[Line(line as i32 - offset)];
             for col in left..=right {
                 let cell = &row[Column(col)];
                 let fg = self.resolve(cell.fg, true);
@@ -308,6 +371,31 @@ pub fn termgrid_attach(
     let mut list = state.attached.lock().unwrap();
     list.retain(|a| a.sid != session_id && a.slot != slot);
     list.push(Attached { sid: session_id, slot, grid, active, dirty });
+}
+
+/// Scroll a session's viewport into scrollback by `delta` lines (positive = up).
+#[tauri::command]
+pub fn termgrid_scroll(sessions: State<Sessions>, session_id: String, delta: i32) {
+    if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
+        s.scroll_grid(delta);
+    }
+}
+
+/// Extract selected text (content-line coords) — used for copy, so a selection
+/// can span scrolled-out-of-view history.
+#[tauri::command]
+pub fn termgrid_selection_text(
+    sessions: State<Sessions>,
+    session_id: String,
+    s_line: i32,
+    s_col: usize,
+    e_line: i32,
+    e_col: usize,
+) -> String {
+    if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
+        return s.selection_text(s_line, s_col, e_line, e_col);
+    }
+    String::new()
 }
 
 /// Stop GPU rendering for a session (frees its grid).

@@ -21,7 +21,11 @@ import {
 } from '../composables/terminalSessionCache'
 import { gitBashPath, ensureGitBashProbed } from '../composables/gitBashPath'
 import { waitForShellIdle } from '../utils/shellIdle'
-import { attachPane as gpuAttachPane, detachPane as gpuDetachPane, terminalBgHex as gpuTerminalBgHex } from '../composables/useTerminalGrid'
+import {
+  attachPane as gpuAttachPane, detachPane as gpuDetachPane, terminalBgHex as gpuTerminalBgHex,
+  selectionStart as gpuSelectionStart, selectionExtend as gpuSelectionExtend,
+  clearSelection as gpuClearSelection, hasSelection as gpuHasSelection, selectionRange as gpuSelectionRange,
+} from '../composables/useTerminalGrid'
 import { CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
 
 const props = withDefaults(defineProps<{ paneId: string; compact?: boolean }>(), { compact: false })
@@ -211,6 +215,88 @@ function gpuFit() {
   const cols = Math.max(1, Math.floor((rect.width * dpr) / cell.cw))
   const rows = Math.max(1, Math.floor((rect.height * dpr) / cell.ch))
   if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows)
+}
+
+// Mouse-wheel scrollback in GPU mode: the shared canvas is pointer-events:none,
+// so the wheel lands on the pane element; route it to the backend grid's scroll.
+// Does NOT clear the selection — content-anchored selection follows the buffer,
+// so you can wheel to extend a long selection past the visible area.
+function onGpuWheel(e: WheelEvent) {
+  if (!gpu || !sessionId) return
+  e.preventDefault()
+  const n = Math.max(1, Math.min(10, Math.round(Math.abs(e.deltaY) / 12)))
+  // Wheel up (deltaY<0) scrolls into history (positive delta).
+  invoke('termgrid_scroll', { sessionId, delta: e.deltaY < 0 ? n : -n }).catch(() => {})
+}
+
+// Drag-to-select in GPU mode, driven by our own handlers so the highlight is
+// LIVE (xterm's buffer is empty, so it can't track a real selection). We do NOT
+// stopPropagation, so xterm still focuses on mousedown (typing keeps working);
+// `user-select: none` on the pane stops the browser's native drag-select.
+let gpuDragging = false
+let gpuAutoScroll: ReturnType<typeof setInterval> | undefined
+let gpuMouse = { x: 0, y: 0 }
+function gpuEdgeDelta(): number {
+  const el = terminalEl.value
+  if (!el) return 0
+  const r = el.getBoundingClientRect()
+  if (gpuMouse.y < r.top) return 3       // above top → scroll into history
+  if (gpuMouse.y > r.bottom) return -3   // below bottom → scroll toward latest
+  return 0
+}
+function stopGpuAutoScroll() {
+  if (gpuAutoScroll) { clearInterval(gpuAutoScroll); gpuAutoScroll = undefined }
+}
+function onGpuMouseMove(e: MouseEvent) {
+  if (!gpuDragging || !sessionId) return
+  gpuMouse = { x: e.clientX, y: e.clientY }
+  gpuSelectionExtend(sessionId, e.clientX, e.clientY)
+  // Auto-scroll while dragging past the top/bottom edge, extending as it goes.
+  if (gpuEdgeDelta() !== 0 && !gpuAutoScroll) {
+    gpuAutoScroll = setInterval(() => {
+      if (!sessionId) return
+      const d = gpuEdgeDelta()
+      if (d === 0) { stopGpuAutoScroll(); return }
+      invoke('termgrid_scroll', { sessionId, delta: d }).catch(() => {})
+      gpuSelectionExtend(sessionId, gpuMouse.x, gpuMouse.y)
+    }, 50)
+  } else if (gpuEdgeDelta() === 0) {
+    stopGpuAutoScroll()
+  }
+}
+function onGpuMouseUp() {
+  gpuDragging = false
+  stopGpuAutoScroll()
+  window.removeEventListener('mousemove', onGpuMouseMove)
+  window.removeEventListener('mouseup', onGpuMouseUp)
+}
+// Copy our grid selection on the native copy event (Cmd/Ctrl+C). preventDefault
+// stops xterm copying its own (empty) selection; we fetch the text from the
+// backend (it has the full scrollback) and write it asynchronously.
+function onGpuCopy(e: ClipboardEvent) {
+  if (!gpu || !sessionId || !gpuHasSelection()) return
+  e.preventDefault()
+  const r = gpuSelectionRange()
+  if (!r) return
+  invoke<string>('termgrid_selection_text', { sessionId, sLine: r.sLine, sCol: r.sCol, eLine: r.eLine, eCol: r.eCol })
+    .then((text) => { if (text) clipboardWrite(text) })
+    .catch(() => {})
+}
+
+function onGpuMouseDown(e: MouseEvent) {
+  if (!gpu || !sessionId || e.button !== 0) return
+  // Capture the drag for our own selection and keep xterm from starting its own
+  // (empty) one. preventDefault cancels the browser's default focus change so
+  // the explicit term.focus() below sticks — without it, typing breaks.
+  e.preventDefault()
+  e.stopPropagation()
+  store.setFocus(props.paneId)
+  term?.focus()
+  gpuMouse = { x: e.clientX, y: e.clientY }
+  gpuSelectionStart(sessionId, e.clientX, e.clientY)
+  gpuDragging = true
+  window.addEventListener('mousemove', onGpuMouseMove)
+  window.addEventListener('mouseup', onGpuMouseUp)
 }
 
 function gpuAttach() {
@@ -472,6 +558,7 @@ onMounted(async () => {
     xterm.safeFit()
 
     term.textarea?.addEventListener('focus', () => store.setFocus(props.paneId))
+    if (gpu) term.textarea?.addEventListener('copy', onGpuCopy)
 
     // Persistent handlers read the current session id through the cache so
     // shell-switch updates reach them even though they were registered once.
@@ -635,6 +722,12 @@ onMounted(async () => {
         invoke('write_to_session', { sessionId: sid, data })
           .then(() => perf.recordWrite(props.paneId, performance.now() - t0))
           .catch(() => {})
+        // Typing returns the GPU viewport to the bottom (so you see your input)
+        // and clears any selection.
+        if (gpu) {
+          gpuClearSelection()
+          invoke('termgrid_scroll', { sessionId: sid, delta: -1_000_000 }).catch(() => {})
+        }
       }
     })
 
@@ -680,6 +773,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (gpuDragging) onGpuMouseUp()
   if (focusHandler) window.removeEventListener('arbiter:request-focus', focusHandler)
   if (workspaceActivatedHandler) window.removeEventListener('arbiter:workspace-activated', workspaceActivatedHandler)
   if (fitTimer) clearTimeout(fitTimer)
@@ -778,7 +872,7 @@ onBeforeUnmount(() => {
       :cache-read-tokens="claudeState.cacheReadTokens"
     />
 
-    <div ref="terminalEl" class="terminal-inner" />
+    <div ref="terminalEl" class="terminal-inner" @wheel="onGpuWheel" @mousedown.capture="onGpuMouseDown" />
     <!-- Mounted for the whole Claude session so the slide animation is never
          re-created mid-turn; the `working` class fades it in and resumes the
          (paused) animation from its current position — no reset across the
@@ -1005,6 +1099,9 @@ onBeforeUnmount(() => {
 .terminal-pane.gpu .terminal-inner {
   padding-left: 0;
   background: #121212;
+  /* We draw our own selection on the canvas; suppress the browser's native
+     drag-select of the (empty) xterm DOM so it doesn't fight ours. */
+  user-select: none;
 }
 
 /* Pin the whole pane to the terminal background in GPU mode so the area is the
