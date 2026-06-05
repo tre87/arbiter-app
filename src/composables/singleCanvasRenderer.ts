@@ -140,10 +140,14 @@ export class SingleCanvasRenderer {
   readonly gl: WebGL2RenderingContext
   cellW: number
   cellH: number
-  private prog: WebGLProgram
-  private instanceVBO: WebGLBuffer
+  // Recreated by initGL() — on construction and again on WebGL context restore
+  // (GPU reset / driver update / sleep-resume / GPU switch invalidate all GL
+  // objects, so they must be rebuilt). The CPU-side atlasCanvas + glyphSlots
+  // survive a loss, so glyphs aren't re-rasterised — just re-uploaded.
+  private prog!: WebGLProgram
+  private instanceVBO!: WebGLBuffer
   private instanceData = new Float32Array(0)
-  private atlasTex: WebGLTexture
+  private atlasTex!: WebGLTexture
   private atlasCanvas: HTMLCanvasElement
   private atlasCtx: CanvasRenderingContext2D
   // Keyed by codepoint (number), NOT string: the hot path looks up a glyph per
@@ -161,12 +165,34 @@ export class SingleCanvasRenderer {
   // composites over the DOM — it floats over the pane layout and empty cells let
   // each pane's own background show through. Opaque mode clears to `bg` instead.
   private transparent: boolean
+  // True between webglcontextlost and webglcontextrestored — draw() no-ops so we
+  // don't issue GL calls against a dead context.
+  private contextLost = false
+  // Fired after the context is restored + GL rebuilt, so the host can re-apply
+  // the canvas size (viewport/uCanvas) and trigger a full repaint.
+  private onContextRestored?: () => void
 
-  constructor(canvas: HTMLCanvasElement, opts: { fontFamily: string; fontSize: number; dpr: number; alpha?: boolean; lineHeight?: number }) {
+  constructor(canvas: HTMLCanvasElement, opts: { fontFamily: string; fontSize: number; dpr: number; alpha?: boolean; lineHeight?: number; onContextLost?: () => void; onContextRestored?: () => void }) {
+    this.onContextRestored = opts.onContextRestored
     this.transparent = opts.alpha ?? false
     const gl = canvas.getContext('webgl2', { alpha: this.transparent, antialias: false, depth: false, premultipliedAlpha: true })
     if (!gl) throw new Error('WebGL2 not available')
     this.gl = gl
+
+    // Context-loss recovery. preventDefault() on loss is REQUIRED for the
+    // browser to fire `restored` — without it a lost context stays dead and the
+    // terminal is blank forever (common after GPU sleep/resume).
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault()
+      this.contextLost = true
+      opts.onContextLost?.()
+    })
+    canvas.addEventListener('webglcontextrestored', () => {
+      this.initGL()
+      this.atlasDirty = true // re-upload the (surviving) glyph atlas to the new texture
+      this.contextLost = false
+      this.onContextRestored?.()
+    })
 
     // Measure the monospace cell at device resolution.
     const probe = document.createElement('canvas').getContext('2d')!
@@ -189,6 +215,15 @@ export class SingleCanvasRenderer {
     this.atlasCtx.textAlign = 'left'
     this.atlasCtx.fillStyle = '#fff'
     this.glyphsPerRow = Math.floor(ATLAS_SIZE / this.cellW)
+
+    this.initGL()
+  }
+
+  /** (Re)create all GL objects: program, quad + instance buffers, atlas texture,
+   *  uniforms. Runs on construction and on context restore. Idempotent — old
+   *  handles are simply discarded (a lost context already invalidated them). */
+  private initGL() {
+    const gl = this.gl
 
     // Program.
     this.prog = gl.createProgram()!
@@ -285,6 +320,7 @@ export class SingleCanvasRenderer {
 
   /** Draw `count` instances from `data` (stride-10 floats). Clears to `bg` first. */
   draw(data: Float32Array, count: number, bg: [number, number, number]) {
+    if (this.contextLost) return // GL calls are no-ops on a lost context; wait for restore
     const gl = this.gl
     if (this.atlasDirty) {
       gl.bindTexture(gl.TEXTURE_2D, this.atlasTex)
