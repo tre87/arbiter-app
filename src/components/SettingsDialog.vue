@@ -262,7 +262,7 @@ async function clearSaved(what: 'all' | 'layout' | 'paths' | 'sessions') {
               </label>
               <label class="toggle-row">
                 <span class="toggle-label">
-                  GPU terminal renderer (experimental)
+                  GPU terminal renderer
                   <span class="toggle-sub">Parses terminals in Rust and draws all panes in one WebGL canvas instead of per-terminal xterm. Reloads to apply.</span>
                 </span>
                 <span class="switch">
