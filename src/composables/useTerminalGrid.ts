@@ -36,6 +36,8 @@ const FLAG_WIDE_SPACER = 1 << 6
 // colors match exactly. Empty cells with this bg are skipped (the pane's own
 // background shows through the transparent canvas). Set by getTheme().
 let bgR = 0x12, bgG = 0x12, bgB = 0x12
+// Selection highlight background (VS Code-ish blue).
+const SEL_R = 0x26, SEL_G = 0x4f, SEL_B = 0x78
 
 function hexToRgb(hex: string): [number, number, number] {
   let h = (hex || '').replace('#', '').trim()
@@ -85,6 +87,8 @@ interface GridPane {
   cursorRow: number
   cursorCol: number
   cursorVisible: number
+  // Scroll offset (lines into history); visible row r shows content line r-offset.
+  offset: number
   // Cached layout (device px), refreshed only on layout events.
   visible: boolean
   rectLeft: number
@@ -200,7 +204,7 @@ export function attachPane(sessionId: string, paneId: string, el: HTMLElement, c
     slot, paneId, el, cols, rows,
     code: new Uint32Array(len), fg: new Uint8Array(len * 3),
     bg: new Uint8Array(len * 3), flags: new Uint8Array(len),
-    cursorRow: 0, cursorCol: 0, cursorVisible: 0,
+    cursorRow: 0, cursorCol: 0, cursorVisible: 0, offset: 0,
     visible: false, rectLeft: 0, rectTop: 0, rectW: 0, rectH: 0,
   })
   resizeObs?.observe(el)
@@ -227,6 +231,70 @@ export function detachPane(sessionId: string) {
     slotBySession.delete(sessionId)
   }
   invoke('termgrid_detach', { sessionId }).catch(() => {})
+}
+
+// ── Selection (drag to select, copy text from the grid) ──────────────────────
+
+// Selection is anchored to CONTENT lines (line = visibleRow - scrollOffset, so
+// negative = scrollback), so it follows the buffer as it scrolls. Copy text is
+// extracted in the backend (it has the full scrollback).
+interface SelPoint { line: number; col: number }
+let selSlot: number | null = null
+let selAnchor: SelPoint | null = null
+let selHead: SelPoint | null = null
+
+function orderedSel(): { a: SelPoint; b: SelPoint } | null {
+  if (selAnchor === null || selHead === null) return null
+  let a = selAnchor, b = selHead
+  if (a.line > b.line || (a.line === b.line && a.col > b.col)) { const t = a; a = b; b = t }
+  return { a, b }
+}
+
+// Map a client (CSS px) point to a content cell {line, col}. Lines are clamped
+// to [topVisible, bottomVisible] so dragging past the edge selects the edge row
+// (the caller auto-scrolls to bring more into view).
+function cellAt(slot: number, clientX: number, clientY: number): SelPoint | null {
+  const r = renderer
+  const pane = bySlot.get(slot)
+  if (!r || !pane) return null
+  const dpr = window.devicePixelRatio || 1
+  const x = clientX * dpr - pane.rectLeft
+  const y = clientY * dpr - pane.rectTop
+  const col = Math.max(0, Math.min(pane.cols - 1, Math.floor(x / r.cellW)))
+  const row = Math.max(0, Math.min(pane.rows - 1, Math.floor(y / r.cellH)))
+  return { line: row - pane.offset, col }
+}
+
+export function selectionStart(sessionId: string, clientX: number, clientY: number) {
+  const slot = slotBySession.get(sessionId)
+  if (slot === undefined) return
+  const p = cellAt(slot, clientX, clientY)
+  if (!p) return
+  selSlot = slot; selAnchor = p; selHead = p; needsDraw = true
+}
+
+export function selectionExtend(sessionId: string, clientX: number, clientY: number) {
+  if (selSlot === null) return
+  if (slotBySession.get(sessionId) !== selSlot) return
+  const p = cellAt(selSlot, clientX, clientY)
+  if (!p) return
+  selHead = p; needsDraw = true
+}
+
+export function clearSelection() {
+  if (selSlot !== null) { selSlot = null; selAnchor = null; selHead = null; needsDraw = true }
+}
+
+export function hasSelection(): boolean {
+  return selSlot !== null && selAnchor !== null && selHead !== null &&
+    !(selAnchor.line === selHead.line && selAnchor.col === selHead.col)
+}
+
+/** Ordered selection range in content-line coords, for backend text extraction. */
+export function selectionRange(): { sLine: number; sCol: number; eLine: number; eCol: number } | null {
+  const ord = orderedSel()
+  if (!ord) return null
+  return { sLine: ord.a.line, sCol: ord.a.col, eLine: ord.b.line, eCol: ord.b.col }
 }
 
 // ── Decode binary diffs ──────────────────────────────────────────────────────
@@ -261,6 +329,7 @@ function decodeBody(bytes: Uint8Array) {
     const curRow = dv.getUint16(o, true); o += 2
     const curCol = dv.getUint16(o, true); o += 2
     const curVis = bytes[o]; o += 1
+    const offset = dv.getUint16(o, true); o += 2
     const dirtyLines = dv.getUint16(o, true); o += 2
     let pane = bySlot.get(slot)
     if (pane && (pane.cols !== cols || pane.rows !== rows)) {
@@ -293,7 +362,7 @@ function decodeBody(bytes: Uint8Array) {
         pane.bg[c3] = br; pane.bg[c3 + 1] = bgc; pane.bg[c3 + 2] = bb
       }
     }
-    if (pane) { pane.cursorRow = curRow; pane.cursorCol = curCol; pane.cursorVisible = curVis }
+    if (pane) { pane.cursorRow = curRow; pane.cursorCol = curCol; pane.cursorVisible = curVis; pane.offset = offset }
   }
 }
 
@@ -336,26 +405,34 @@ function drawAll() {
     const oy = pane.rectTop
     const { cols, rows, code, fg, bg, flags } = pane
     const total = cols * rows
+    const sel = (pane.slot === selSlot && hasSelection()) ? orderedSel() : null
     for (let ci = 0; ci < total; ci++) {
       const fl = flags[ci]
       if (fl & FLAG_WIDE_SPACER) continue
-      let cp = code[ci]
-      // Never-written cells are zero-initialised (code 0, bg 0,0,0 = black).
-      // Skip them so the pane's own #121212 shows instead of a black block —
-      // this is the "black cycling through panes on startup" before diffs land.
-      if (cp === 0) continue
-      const c3 = ci * 3
-      const br = bg[c3], bgc = bg[c3 + 1], bb = bg[c3 + 2]
-      const isSpace = cp === 32
-      if (isSpace && br === bgR && bgc === bgG && bb === bgB) continue
-      if (cp < 32 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) cp = 32
       const col = ci % cols
       const row = (ci - col) / cols
       // Clip to the pane's actual rect — a very narrow/short pane can have more
       // cols/rows than fit (xterm's safeFit bails under 20 cols), so don't draw
       // cells that start outside the pane.
       if (col * r.cellW >= pane.rectW || row * r.cellH >= pane.rectH) continue
-      r.glyphUV(isSpace ? 32 : cp, uv)
+      let cp = code[ci]
+      const c3 = ci * 3
+      let br = bg[c3], bgc = bg[c3 + 1], bb = bg[c3 + 2]
+      const absLine = row - pane.offset
+      const selected = sel !== null &&
+        (absLine > sel.a.line || (absLine === sel.a.line && col >= sel.a.col)) &&
+        (absLine < sel.b.line || (absLine === sel.b.line && col <= sel.b.col))
+      if (selected) {
+        br = SEL_R; bgc = SEL_G; bb = SEL_B
+        if (cp === 0) cp = 32 // draw the highlight even on empty cells
+      } else {
+        // Never-written cells (code 0, bg 0,0,0 = black) and default-bg spaces
+        // are skipped so the pane's own #121212 shows through (no black blocks).
+        if (cp === 0) continue
+        if (cp === 32 && br === bgR && bgc === bgG && bb === bgB) continue
+      }
+      if (cp < 32 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) cp = 32
+      r.glyphUV(cp === 32 ? 32 : cp, uv)
       const o = n * 10
       data[o] = ox + col * r.cellW
       data[o + 1] = oy + row * r.cellH

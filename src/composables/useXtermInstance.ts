@@ -38,7 +38,9 @@ export function createXtermInstance(mountEl: HTMLElement, opts: { transparent?: 
   const themeFor = (useCustomBg: boolean): ITheme => {
     const base = buildTheme(useCustomBg)
     if (opts.transparent) return { ...base, background: 'rgba(0,0,0,0)' }
-    if (opts.bg) return { ...base, background: opts.bg }
+    // GPU mode: hide xterm's own selection highlight — the shared canvas draws
+    // selection. xterm stays the (invisible) input layer.
+    if (opts.bg) return { ...base, background: opts.bg, selectionBackground: 'rgba(0,0,0,0)' }
     return base
   }
   const term = new Terminal({

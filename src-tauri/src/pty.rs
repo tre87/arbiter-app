@@ -91,6 +91,26 @@ impl PtySession {
             self.grid_dirty.store(true, Ordering::Relaxed);
         }
     }
+
+    pub(crate) fn scroll_grid(&self, delta: i32) {
+        if self.grid_active.load(Ordering::Relaxed) {
+            if let Ok(mut g) = self.grid.lock() {
+                if let Some(t) = g.as_mut() {
+                    t.scroll(delta);
+                }
+            }
+            self.grid_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn selection_text(&self, sl: i32, sc: usize, el: i32, ec: usize) -> String {
+        if let Ok(g) = self.grid.lock() {
+            if let Some(t) = g.as_ref() {
+                return t.selection_text(sl, sc, el, ec);
+            }
+        }
+        String::new()
+    }
 }
 
 // Arc so the watcher background thread can share ownership
