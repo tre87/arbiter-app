@@ -19,7 +19,7 @@
 
 import { watch } from 'vue'
 import { invoke, Channel } from '@tauri-apps/api/core'
-import { SingleCanvasRenderer } from '../spike/singleCanvasRenderer'
+import { SingleCanvasRenderer } from './singleCanvasRenderer'
 import { usePerfStore } from '../stores/perf'
 import { usePaneStore } from '../stores/pane'
 import { pickPlatformTheme, CUSTOM_TERMINAL_BG } from '../themes/terminalThemes'
@@ -126,14 +126,40 @@ let framesRecv = 0
 let decodeAcc = 0
 let lastDrawMs = 0
 
+// WebGL2 capability probe (memoized). When false, callers fall back to the
+// per-terminal xterm renderer instead of the single-canvas GPU path — some
+// WebView2 / VM / RDP environments lack WebGL2 and would otherwise render
+// nothing. Gates both SharedTerminalCanvas (App.vue) and TerminalPane's `gpu`.
+let gpuSupported: boolean | null = null
+export function gpuRendererSupported(): boolean {
+  if (gpuSupported === null) {
+    try {
+      gpuSupported = !!document.createElement('canvas').getContext('webgl2')
+    } catch {
+      gpuSupported = false
+    }
+  }
+  return gpuSupported
+}
+
 export function initTerminalCanvas(canvas: HTMLCanvasElement) {
   canvasEl = canvas
   perf = usePerfStore()
   paneStore = usePaneStore()
   const dpr = window.devicePixelRatio || 1
-  renderer = new SingleCanvasRenderer(canvas, {
-    fontFamily: FONT_FAMILY, fontSize: FONT_SIZE, dpr, alpha: true, lineHeight: 1.0,
-  })
+  try {
+    renderer = new SingleCanvasRenderer(canvas, {
+      fontFamily: FONT_FAMILY, fontSize: FONT_SIZE, dpr, alpha: true, lineHeight: 1.0,
+    })
+  } catch (e) {
+    // Defensive: gpuRendererSupported() gates this, but if construction fails
+    // anyway (e.g. shader/context loss) leave the renderer null rather than
+    // throwing out of onMounted. Terminals show their xterm layer / blank; the
+    // user can disable the GPU renderer in Settings.
+    console.error('Arbiter: GPU renderer init failed; disable the GPU renderer in Settings.', e)
+    renderer = null
+    return
+  }
   resizeCanvas()
   window.addEventListener('resize', onWindowResize)
   // Workspace switch toggles display:none — defer a frame so the now-visible

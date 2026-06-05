@@ -640,9 +640,9 @@ enum Wake { Edge, Poll, Skip }
 
 /// Block until the next command starts in this pane, or a fallback interval.
 ///
-/// Lock + drop `shell_idle` BEFORE taking `cmd_epoch`: the reader holds
-/// `shell_idle` then bumps `cmd_epoch`, so the reverse lock order here can
-/// deadlock.
+/// `shell_idle` is locked + dropped before `cmd_epoch` is taken (never held
+/// together) — matching the reader, which also touches them sequentially, so
+/// the two locks are never nested in either site.
 fn wait_for_command(
     cmd_epoch: &Arc<(Mutex<u64>, Condvar)>,
     shell_idle: &Arc<Mutex<Option<bool>>>,

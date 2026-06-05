@@ -461,8 +461,7 @@ pub fn termgrid_attach(
 #[tauri::command]
 pub fn termgrid_scroll(sessions: State<Sessions>, session_id: String, delta: i32) {
     if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
-        s.scroll_grid(delta);
-        notify_frame_dirty();
+        s.scroll_grid(delta); // wakes the frame thread itself
     }
 }
 
