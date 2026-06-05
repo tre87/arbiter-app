@@ -37,7 +37,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::State;
@@ -347,6 +347,20 @@ impl TermGridState {
     }
 }
 
+/// Wakes the frame thread when a grid goes dirty so it can BLOCK while idle
+/// instead of polling every 8ms (which spun ~125 idle wake-ups/sec on the main
+/// process). The PTY reader / scroll / resize / attach paths call
+/// `notify_frame_dirty()` after marking a grid dirty.
+static FRAME_WAKE: OnceLock<Arc<(Mutex<bool>, Condvar)>> = OnceLock::new();
+fn frame_wake() -> &'static Arc<(Mutex<bool>, Condvar)> {
+    FRAME_WAKE.get_or_init(|| Arc::new((Mutex::new(false), Condvar::new())))
+}
+pub fn notify_frame_dirty() {
+    let (lock, cvar) = &**frame_wake();
+    *lock.lock().unwrap() = true;
+    cvar.notify_one();
+}
+
 /// Begin streaming grid diffs to the frontend over `channel`. Spawns one frame
 /// thread (~120 Hz) that packs damage for all attached sessions into one blob.
 /// Re-callable: a new call retires the old thread and binds the new channel.
@@ -355,7 +369,25 @@ pub fn termgrid_start(state: State<TermGridState>, channel: Channel<InvokeRespon
     let my_gen = state.gen.fetch_add(1, Ordering::SeqCst) + 1;
     let attached = state.attached.clone();
     let gen = state.gen.clone();
+    // Wake any prior frame thread so it re-checks `gen` and exits promptly.
+    notify_frame_dirty();
     std::thread::spawn(move || loop {
+        if gen.load(Ordering::SeqCst) != my_gen {
+            break;
+        }
+        // Block until a grid goes dirty (reader calls notify_frame_dirty), with a
+        // 1s safety timeout in case a wake is ever missed. Idle = ~1 wake/sec
+        // instead of 125. Then an 8ms batch window coalesces a burst of output
+        // into a single frame (~120fps cap) before packing.
+        {
+            let (lock, cvar) = &**frame_wake();
+            let mut dirty = lock.lock().unwrap();
+            if !*dirty {
+                let (g, _) = cvar.wait_timeout(dirty, Duration::from_secs(1)).unwrap();
+                dirty = g;
+            }
+            *dirty = false;
+        }
         if gen.load(Ordering::SeqCst) != my_gen {
             break;
         }
@@ -419,6 +451,10 @@ pub fn termgrid_attach(
     let mut list = state.attached.lock().unwrap();
     list.retain(|a| a.sid != session_id && a.slot != slot);
     list.push(Attached { sid: session_id, slot, grid, active, dirty });
+    drop(list);
+    // Pane is registered + dirty (replayed history) — wake the frame thread to
+    // send the initial frame now rather than after the 1s safety timeout.
+    notify_frame_dirty();
 }
 
 /// Scroll a session's viewport into scrollback by `delta` lines (positive = up).
@@ -426,6 +462,7 @@ pub fn termgrid_attach(
 pub fn termgrid_scroll(sessions: State<Sessions>, session_id: String, delta: i32) {
     if let Some(s) = sessions.0.lock().unwrap().get(&session_id) {
         s.scroll_grid(delta);
+        notify_frame_dirty();
     }
 }
 
