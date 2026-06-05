@@ -1178,8 +1178,13 @@ onBeforeUnmount(() => {
 }
 
 @keyframes progress-slide {
-  0%   { transform: translateX(-100%); }
-  100% { transform: translateX(300%); }
+  /* The bar is 50% wide with the blue centred; -50%→150% sweeps that centre
+     from the left edge to the right edge so the blue stays visible the whole
+     cycle (fading at the very edges via the gradient), instead of dwelling
+     off-screen at the slow ease-in-out ends. Half the old travel = half the
+     speed, so it reads as a smooth scan rather than a fast blur. */
+  0%   { transform: translateX(-50%); }
+  100% { transform: translateX(150%); }
 }
 
 .compact .progress-bar {
