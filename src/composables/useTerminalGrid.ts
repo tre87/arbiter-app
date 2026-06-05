@@ -38,6 +38,8 @@ const FLAG_WIDE_SPACER = 1 << 6
 let bgR = 0x12, bgG = 0x12, bgB = 0x12
 // Selection highlight background (VS Code-ish blue).
 const SEL_R = 0x26, SEL_G = 0x4f, SEL_B = 0x78
+// Link foreground (GitHub link blue) so URLs stand out.
+const LINK_R = 0x58, LINK_G = 0xa6, LINK_B = 0xff
 
 function hexToRgb(hex: string): [number, number, number] {
   let h = (hex || '').replace('#', '').trim()
@@ -84,6 +86,7 @@ interface GridPane {
   fg: Uint8Array
   bg: Uint8Array
   flags: Uint8Array
+  link: Uint8Array // 1 where the cell is part of a detected URL
   cursorRow: number
   cursorCol: number
   cursorVisible: number
@@ -203,7 +206,7 @@ export function attachPane(sessionId: string, paneId: string, el: HTMLElement, c
   bySlot.set(slot, {
     slot, paneId, el, cols, rows,
     code: new Uint32Array(len), fg: new Uint8Array(len * 3),
-    bg: new Uint8Array(len * 3), flags: new Uint8Array(len),
+    bg: new Uint8Array(len * 3), flags: new Uint8Array(len), link: new Uint8Array(len),
     cursorRow: 0, cursorCol: 0, cursorVisible: 0, offset: 0,
     visible: false, rectLeft: 0, rectTop: 0, rectW: 0, rectH: 0,
   })
@@ -297,6 +300,62 @@ export function selectionRange(): { sLine: number; sCol: number; eLine: number; 
   return { sLine: ord.a.line, sCol: ord.a.col, eLine: ord.b.line, eCol: ord.b.col }
 }
 
+// ── Links ────────────────────────────────────────────────────────────────────
+
+const URL_RE = /(https?:\/\/[^\s'"<>` ]+)/g
+
+/** The http(s) URL under a client point, or null. Single-row detection. */
+export function urlAt(sessionId: string, clientX: number, clientY: number): string | null {
+  const slot = slotBySession.get(sessionId)
+  const r = renderer
+  if (slot === undefined || !r) return null
+  const pane = bySlot.get(slot)
+  if (!pane) return null
+  const dpr = window.devicePixelRatio || 1
+  const col = Math.floor((clientX * dpr - pane.rectLeft) / r.cellW)
+  const row = Math.floor((clientY * dpr - pane.rectTop) / r.cellH)
+  if (row < 0 || row >= pane.rows || col < 0 || col >= pane.cols) return null
+  let text = ''
+  for (let c = 0; c < pane.cols; c++) {
+    const cp = pane.code[row * pane.cols + c]
+    text += (cp === 0 || cp < 32 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) ? ' ' : String.fromCodePoint(cp)
+  }
+  URL_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = URL_RE.exec(text)) !== null) {
+    if (col >= m.index && col < m.index + m[0].length) {
+      return m[0].replace(/[.,;:!?)\]}'"]+$/, '') // trim trailing punctuation
+    }
+  }
+  return null
+}
+
+// Mark which cells of a row belong to a URL (so they render in link color).
+// Called per dirty line on decode; cheap quick-reject for lines without ":" "/".
+function markLinks(pane: GridPane, row: number) {
+  const { cols, code, link } = pane
+  const base = row * cols
+  for (let c = 0; c < cols; c++) link[base + c] = 0
+  let hasColon = false, hasSlash = false
+  for (let c = 0; c < cols; c++) {
+    const cp = code[base + c]
+    if (cp === 58) hasColon = true
+    else if (cp === 47) hasSlash = true
+  }
+  if (!hasColon || !hasSlash) return
+  let text = ''
+  for (let c = 0; c < cols; c++) {
+    const cp = code[base + c]
+    text += (cp === 0 || cp < 32 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) ? ' ' : String.fromCodePoint(cp)
+  }
+  URL_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = URL_RE.exec(text)) !== null) {
+    const end = m.index + m[0].replace(/[.,;:!?)\]}'"]+$/, '').length
+    for (let c = m.index; c < end && c < cols; c++) link[base + c] = 1
+  }
+}
+
 // ── Decode binary diffs ──────────────────────────────────────────────────────
 
 function decode(msg: ArrayBuffer | ArrayBufferView | number[]) {
@@ -339,6 +398,7 @@ function decodeBody(bytes: Uint8Array) {
       pane.fg = new Uint8Array(len * 3)
       pane.bg = new Uint8Array(len * 3)
       pane.flags = new Uint8Array(len)
+      pane.link = new Uint8Array(len)
     }
     for (let dl = 0; dl < dirtyLines; dl++) {
       const row = dv.getUint16(o, true); o += 2
@@ -361,6 +421,7 @@ function decodeBody(bytes: Uint8Array) {
         pane.fg[c3] = fr; pane.fg[c3 + 1] = fg; pane.fg[c3 + 2] = fb
         pane.bg[c3] = br; pane.bg[c3 + 1] = bgc; pane.bg[c3 + 2] = bb
       }
+      if (pane && row < pane.rows) markLinks(pane, row)
     }
     if (pane) { pane.cursorRow = curRow; pane.cursorCol = curCol; pane.cursorVisible = curVis; pane.offset = offset }
   }
@@ -403,7 +464,7 @@ function drawAll() {
     if (!pane.visible) continue
     const ox = pane.rectLeft
     const oy = pane.rectTop
-    const { cols, rows, code, fg, bg, flags } = pane
+    const { cols, rows, code, fg, bg, flags, link } = pane
     const total = cols * rows
     const sel = (pane.slot === selSlot && hasSelection()) ? orderedSel() : null
     for (let ci = 0; ci < total; ci++) {
@@ -438,7 +499,8 @@ function drawAll() {
       data[o + 1] = oy + row * r.cellH
       data[o + 2] = uv.u
       data[o + 3] = uv.v
-      data[o + 4] = fg[c3] / 255; data[o + 5] = fg[c3 + 1] / 255; data[o + 6] = fg[c3 + 2] / 255
+      if (link[ci]) { data[o + 4] = LINK_R / 255; data[o + 5] = LINK_G / 255; data[o + 6] = LINK_B / 255 }
+      else { data[o + 4] = fg[c3] / 255; data[o + 5] = fg[c3 + 1] / 255; data[o + 6] = fg[c3 + 2] / 255 }
       data[o + 7] = br / 255; data[o + 8] = bgc / 255; data[o + 9] = bb / 255
       n++
     }

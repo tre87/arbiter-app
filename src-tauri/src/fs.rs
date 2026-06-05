@@ -147,6 +147,31 @@ pub fn open_path(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Open an http(s) URL in the default browser. Restricted to http/https so
+/// terminal text can't trigger arbitrary schemes (file://, custom handlers).
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("refusing to open non-http(s) URL".into());
+    }
+    #[cfg(target_os = "windows")]
+    crate::util::hidden_command("cmd")
+        .args(["/C", "start", "", &url])
+        .spawn()
+        .map_err(|e| format!("Failed to open URL: {}", e))?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("Failed to open URL: {}", e))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("Failed to open URL: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn reveal_path(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);

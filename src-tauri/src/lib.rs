@@ -324,6 +324,7 @@ pub fn run() {
             fs::unwatch_directory,
             fs::get_project_model,
             fs::open_path,
+            fs::open_url,
             fs::reveal_path,
             fs::rename_path,
             fs::trash_path,
