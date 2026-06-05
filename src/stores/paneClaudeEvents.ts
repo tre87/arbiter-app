@@ -183,12 +183,15 @@ export async function wireClaudeEventListeners(
   })
   listeners.push(unStatus as unknown as () => void)
 
-  // claude-exited: process died → closed
+  // claude-exited: process died → closed. The shell is back at an idle prompt,
+  // so reset the shell status too (getPaneStatus now reads it) — otherwise a
+  // 'running' left over from launching `claude` shows as a stale pulse.
   const unExited = await listen(`claude-exited-${sid}`, () => {
     if (idleTimers[paneId]) { clearTimeout(idleTimers[paneId]); delete idleTimers[paneId] }
     delete launchTimestamps[paneId]
     delete turnBaselines[paneId]
     updateClaudePaneState(paneId, { lifecycle: 'closed', confirmed: false, hasContext: false })
+    setTerminalStatus(paneId, 'idle')
   })
   listeners.push(unExited as unknown as () => void)
 
@@ -229,9 +232,11 @@ export async function wireClaudeEventListeners(
       }
     }
 
-    if (state.lifecycle === 'closed') {
-      setTerminalStatus(paneId, idle ? 'idle' : 'running')
-    }
+    // Always track the shell's idle/busy. getPaneStatus only *uses* this when
+    // Claude is closed, but it must be current at that moment: a 'running' set
+    // while typing `claude` would otherwise persist as a stale green pulse after
+    // Claude exits, since no further shell-activity edge fires at an idle prompt.
+    setTerminalStatus(paneId, idle ? 'idle' : 'running')
   })
   listeners.push(unShellActivity as unknown as () => void)
 
