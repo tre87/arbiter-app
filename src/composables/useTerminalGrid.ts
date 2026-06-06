@@ -19,6 +19,7 @@
 
 import { watch } from 'vue'
 import { invoke, Channel } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { SingleCanvasRenderer } from './singleCanvasRenderer'
 import { usePerfStore } from '../stores/perf'
 import { usePaneStore } from '../stores/pane'
@@ -114,6 +115,11 @@ let resizeObs: ResizeObserver | null = null
 let drawScheduled = false
 let perfTimer: ReturnType<typeof setInterval> | null = null
 let stopFocusWatch: (() => void) | null = null
+// Windows-only: hide the transparent canvas while the window is being dragged
+// (see onWindowMoved). WKWebView (macOS) composites it fine during a move.
+const IS_WINDOWS = navigator.userAgent.includes('Windows')
+let moveUnlisten: (() => void) | null = null
+let moveHideTimer: ReturnType<typeof setTimeout> | null = null
 let perf: ReturnType<typeof usePerfStore> | null = null
 let paneStore: ReturnType<typeof usePaneStore> | null = null
 let loggedDecodeErr = false
@@ -186,14 +192,35 @@ export function initTerminalCanvas(canvas: HTMLCanvasElement) {
   stopFocusWatch = watch(() => paneStore!.focusedId, markDirty)
   windowStart = performance.now()
   perfTimer = setInterval(samplePerf, 500)
+  // Windows/WebView2 stutters dragging the window because it re-composites the
+  // transparent full-window canvas every move-frame. Hide it during an active
+  // drag and repaint once it settles. macOS handles the move compositing fine.
+  if (IS_WINDOWS) {
+    getCurrentWindow().onMoved(onWindowMoved).then(un => { moveUnlisten = un }).catch(() => {})
+  }
   markDirty() // initial paint
   perf.setGpuActive(true)
+}
+
+// Hide the canvas while the window is moving; a quiet gap means the drag ended,
+// so restore it and repaint from the (unchanged) per-pane grids.
+function onWindowMoved() {
+  if (!canvasEl) return
+  if (canvasEl.style.display !== 'none') canvasEl.style.display = 'none'
+  if (moveHideTimer) clearTimeout(moveHideTimer)
+  moveHideTimer = setTimeout(() => {
+    moveHideTimer = null
+    if (canvasEl) canvasEl.style.display = ''
+    markDirty()
+  }, 180)
 }
 
 export function teardownTerminalCanvas() {
   cancelAnimationFrame(raf)
   drawScheduled = false
   if (perfTimer) { clearInterval(perfTimer); perfTimer = null }
+  if (moveHideTimer) { clearTimeout(moveHideTimer); moveHideTimer = null }
+  moveUnlisten?.(); moveUnlisten = null
   stopFocusWatch?.(); stopFocusWatch = null
   resizeObs?.disconnect(); resizeObs = null
   window.removeEventListener('resize', onWindowResize)
