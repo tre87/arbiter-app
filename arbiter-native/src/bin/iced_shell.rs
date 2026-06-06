@@ -139,10 +139,11 @@ fn view(state: &State) -> Element<'_, Message> {
         let body = mouse_area(term).on_press(Message::Focus(pane));
         let focused = pane == focus;
         let busy = data.session.shell_idle() == Some(false); // OSC-133: a command is running
+        let claude = data.session.claude_running();
         let wrapped = container(body)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |theme: &iced::Theme| pane_style(theme, focused, busy));
+            .style(move |theme: &iced::Theme| pane_style(theme, focused, busy, claude));
         pane_grid::Content::new(wrapped)
     })
     .width(Length::Fill)
@@ -156,12 +157,13 @@ fn view(state: &State) -> Element<'_, Message> {
         .into()
 }
 
-fn pane_style(theme: &iced::Theme, focused: bool, busy: bool) -> container::Style {
+fn pane_style(theme: &iced::Theme, focused: bool, busy: bool, claude: bool) -> container::Style {
     let mut s = container::Style::default();
-    // Busy (a command running, incl. Claude) → amber, regardless of focus, so
-    // you can see which panes are active. Otherwise the focused pane gets the
-    // accent border.
-    let color = if busy {
+    // Claude running → green (you can see which panes have Claude); else a
+    // busy command → amber; else the focused pane gets the accent border.
+    let color = if claude {
+        iced::Color::from_rgb(0.20, 0.80, 0.45)
+    } else if busy {
         iced::Color::from_rgb(0.90, 0.63, 0.16)
     } else if focused {
         theme.palette().primary

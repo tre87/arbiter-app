@@ -7,12 +7,16 @@
 //! they'll drive the footer + status, and `core` grows claude/git/shim.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::term::VtTerm;
+
+/// Bumped on each OSC-133 idle→busy edge; the Claude monitor waits on it.
+type CmdEpoch = Arc<(Mutex<u64>, Condvar)>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -32,6 +36,7 @@ pub struct Session {
     term: SharedTerm,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
+    claude_running: Arc<AtomicBool>,
     _child: Box<dyn Child + Send + Sync>,
 }
 
@@ -42,6 +47,7 @@ impl Session {
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(io_err)?;
         let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
+        let shell_pid = child.process_id();
         drop(pair.slave); // child keeps its own handle
         let writer = pair.master.take_writer().map_err(io_err)?;
         let reader = pair.master.try_clone_reader().map_err(io_err)?;
@@ -49,11 +55,24 @@ impl Session {
         let term: SharedTerm = Arc::new(Mutex::new(VtTerm::new(cols as usize, rows as usize)));
         let cwd = Arc::new(Mutex::new(None));
         let shell_idle = Arc::new(Mutex::new(None));
+        let claude_running = Arc::new(AtomicBool::new(false));
+        let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
+
         {
             let term = term.clone();
             let cwd = cwd.clone();
             let shell_idle = shell_idle.clone();
-            std::thread::spawn(move || reader_loop(reader, term, cwd, shell_idle));
+            let claude_running = claude_running.clone();
+            let cmd_epoch = cmd_epoch.clone();
+            std::thread::spawn(move || reader_loop(reader, term, cwd, shell_idle, claude_running, cmd_epoch));
+        }
+
+        // Event-driven Claude monitor: on each busy edge, scan the shell's
+        // descendants for a `claude` process (it execs shortly after the edge).
+        if let Some(pid) = shell_pid {
+            let claude_running = claude_running.clone();
+            let shell_idle = shell_idle.clone();
+            std::thread::spawn(move || claude_monitor(pid, cmd_epoch, claude_running, shell_idle));
         }
 
         Ok(Self {
@@ -63,8 +82,14 @@ impl Session {
             term,
             cwd,
             shell_idle,
+            claude_running,
             _child: child,
         })
+    }
+
+    /// True if a `claude` process is running in this pane right now.
+    pub fn claude_running(&self) -> bool {
+        self.claude_running.load(Ordering::Relaxed)
     }
 
     /// Stable unique id for keying per-session GPU state.
@@ -99,12 +124,15 @@ fn reader_loop(
     term: SharedTerm,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
+    claude_running: Arc<AtomicBool>,
+    cmd_epoch: CmdEpoch,
 ) {
     let mut buf = [0u8; 8192];
     let mut remainder: Vec<u8> = Vec::new();
     let mut osc = String::new();
     let mut in_osc = false;
     let mut prev_cwd: Option<String> = None;
+    let mut prev_idle: Option<bool> = None;
 
     loop {
         let n = match reader.read(&mut buf) {
@@ -149,6 +177,19 @@ fn reader_loop(
                         };
                         if let Some(idle) = idle {
                             *shell_idle.lock().unwrap() = Some(idle);
+                            if prev_idle != Some(idle) {
+                                prev_idle = Some(idle);
+                                if idle {
+                                    // Prompt returned → the foreground command
+                                    // (incl. Claude) ended.
+                                    claude_running.store(false, Ordering::Relaxed);
+                                } else {
+                                    // A command started → wake the monitor to scan.
+                                    let (lock, cvar) = &*cmd_epoch;
+                                    *lock.lock().unwrap() += 1;
+                                    cvar.notify_all();
+                                }
+                            }
                         }
                     }
                     if let Some(path) = parse_osc7_uri(payload) {
@@ -174,6 +215,46 @@ fn reader_loop(
                 in_osc = true;
             } else {
                 osc.clear();
+            }
+        }
+    }
+}
+
+/// Per-session Claude monitor: blocks until a busy edge (a command started),
+/// then scans the shell's descendants for `claude` — with a short retry since
+/// `claude` execs a moment after the edge. Bails early if the shell returns to
+/// idle (a quick command that wasn't Claude). The reader clears `claude_running`
+/// on the idle edge. (Currently leaks one blocked thread per closed session —
+/// cleanup when sessions get a shutdown signal.)
+fn claude_monitor(
+    shell_pid: u32,
+    cmd_epoch: CmdEpoch,
+    claude_running: Arc<AtomicBool>,
+    shell_idle: Arc<Mutex<Option<bool>>>,
+) {
+    let (lock, cvar) = &*cmd_epoch;
+    let mut last = *lock.lock().unwrap();
+    loop {
+        // Wait for the next busy edge (epoch advance), with a safety timeout.
+        {
+            let guard = lock.lock().unwrap();
+            let prev = last;
+            let (guard, _timeout) = cvar
+                .wait_timeout_while(guard, Duration::from_secs(60), |e| *e == prev)
+                .unwrap();
+            last = *guard;
+        }
+        // A command started — scan for Claude, retrying through its exec delay.
+        for i in 0..8 {
+            if crate::claude::running_under(shell_pid) {
+                claude_running.store(true, Ordering::Relaxed);
+                break;
+            }
+            if *shell_idle.lock().unwrap() == Some(true) {
+                break; // finished already → wasn't Claude
+            }
+            if i + 1 < 8 {
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
     }
