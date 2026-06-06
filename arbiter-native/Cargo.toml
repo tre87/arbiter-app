@@ -19,6 +19,9 @@ bytemuck = { version = "1", features = ["derive"] }
 # Glyph rasterisation + cross-platform system-font discovery.
 ab_glyph = "0.2"
 fontdb = "0.18"
+# Per-OS data dir (zsh shell-integration files) + process-tree scan (Claude detection).
+dirs = "5"
+sysinfo = "0.31"
 # App shell / chrome (tabs, splits, settings, …). The terminal renderer is
 # hosted inside Iced via its custom `shader` widget (needs the wgpu + advanced
 # features). Used by the `iced` binary; the raw winit spike (default bin) doesn't.

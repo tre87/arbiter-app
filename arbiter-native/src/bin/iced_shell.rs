@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use portable_pty::{CommandBuilder, PtySize};
+use portable_pty::PtySize;
 
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{
@@ -62,20 +62,9 @@ enum Message {
     SelectWorkspace(usize),
 }
 
-fn shell_command() -> CommandBuilder {
-    if cfg!(windows) {
-        CommandBuilder::new("powershell.exe")
-    } else {
-        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut c = CommandBuilder::new(sh);
-        c.arg("-l");
-        c.env("TERM", "xterm-256color");
-        c
-    }
-}
-
 fn spawn_session() -> Session {
-    Session::spawn(80, 24, shell_command()).expect("spawn session")
+    // OSC-7/OSC-133 emitters injected so the Session can track cwd + busy/idle.
+    Session::spawn(80, 24, arbiter_native::shell::build_shell_command(None)).expect("spawn session")
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -149,10 +138,11 @@ fn view(state: &State) -> Element<'_, Message> {
 
         let body = mouse_area(term).on_press(Message::Focus(pane));
         let focused = pane == focus;
+        let busy = data.session.shell_idle() == Some(false); // OSC-133: a command is running
         let wrapped = container(body)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |theme: &iced::Theme| pane_style(theme, focused));
+            .style(move |theme: &iced::Theme| pane_style(theme, focused, busy));
         pane_grid::Content::new(wrapped)
     })
     .width(Length::Fill)
@@ -166,15 +156,19 @@ fn view(state: &State) -> Element<'_, Message> {
         .into()
 }
 
-fn pane_style(theme: &iced::Theme, focused: bool) -> container::Style {
+fn pane_style(theme: &iced::Theme, focused: bool, busy: bool) -> container::Style {
     let mut s = container::Style::default();
-    if focused {
-        s.border = iced::Border {
-            color: theme.palette().primary,
-            width: 1.5,
-            radius: 0.0.into(),
-        };
-    }
+    // Busy (a command running, incl. Claude) → amber, regardless of focus, so
+    // you can see which panes are active. Otherwise the focused pane gets the
+    // accent border.
+    let color = if busy {
+        iced::Color::from_rgb(0.90, 0.63, 0.16)
+    } else if focused {
+        theme.palette().primary
+    } else {
+        return s;
+    };
+    s.border = iced::Border { color, width: 1.5, radius: 0.0.into() };
     s
 }
 
