@@ -12,6 +12,27 @@ pub struct GitInfo {
     pub untracked: u32,
 }
 
+/// The repository top-level for `cwd` (to know what directory tree to watch).
+pub fn repo_root(cwd: &str) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--show-toplevel"]).current_dir(cwd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(root)
+    }
+}
+
 /// Run git in `cwd`. Returns None if not a repo / git missing.
 pub fn repo_info(cwd: &str) -> Option<GitInfo> {
     let mut cmd = Command::new("git");

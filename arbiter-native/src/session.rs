@@ -11,12 +11,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::term::VtTerm;
 
 /// Bumped on each OSC-133 idle→busy edge; the Claude monitor waits on it.
 type CmdEpoch = Arc<(Mutex<u64>, Condvar)>;
+/// Native FS watcher for the current repo (refreshes git on external edits).
+type GitWatcher = Debouncer<RecommendedWatcher>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -38,6 +42,7 @@ pub struct Session {
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude_running: Arc<AtomicBool>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
+    _watcher: Arc<Mutex<Option<GitWatcher>>>,
     _child: Box<dyn Child + Send + Sync>,
 }
 
@@ -58,6 +63,7 @@ impl Session {
         let shell_idle = Arc::new(Mutex::new(None));
         let claude_running = Arc::new(AtomicBool::new(false));
         let git = Arc::new(Mutex::new(None));
+        let watcher: Arc<Mutex<Option<GitWatcher>>> = Arc::new(Mutex::new(None));
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
 
         {
@@ -66,8 +72,11 @@ impl Session {
             let shell_idle = shell_idle.clone();
             let claude_running = claude_running.clone();
             let git = git.clone();
+            let watcher = watcher.clone();
             let cmd_epoch = cmd_epoch.clone();
-            std::thread::spawn(move || reader_loop(reader, term, cwd, shell_idle, claude_running, git, cmd_epoch));
+            std::thread::spawn(move || {
+                reader_loop(reader, term, cwd, shell_idle, claude_running, git, watcher, cmd_epoch)
+            });
         }
 
         // Event-driven Claude monitor: on each busy edge, scan the shell's
@@ -87,6 +96,7 @@ impl Session {
             shell_idle,
             claude_running,
             git,
+            _watcher: watcher,
             _child: child,
         })
     }
@@ -146,6 +156,7 @@ fn reader_loop(
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude_running: Arc<AtomicBool>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
+    watcher: Arc<Mutex<Option<GitWatcher>>>,
     cmd_epoch: CmdEpoch,
 ) {
     let mut buf = [0u8; 8192];
@@ -220,8 +231,11 @@ fn reader_loop(
                         let changed = prev_cwd.as_ref() != Some(&path);
                         *cwd.lock().unwrap() = Some(path.clone());
                         if changed {
-                            prev_cwd = Some(path);
+                            prev_cwd = Some(path.clone());
                             recompute_git(cwd.clone(), git.clone());
+                            // Re-point the FS watcher at the new repo so external
+                            // edits (made outside the terminal) refresh git too.
+                            repoint_watcher(&watcher, &cwd, &git, path);
                         }
                     }
                     osc.clear();
@@ -262,6 +276,42 @@ fn recompute_git(cwd: Arc<Mutex<Option<String>>>, git: Arc<Mutex<Option<crate::g
         if cwd.lock().unwrap().as_deref() == Some(path.as_str()) {
             *git.lock().unwrap() = info;
         }
+    });
+}
+
+/// Point the session's FS watcher at the repo containing `cwd_path`, replacing
+/// any previous watcher. On any debounced filesystem change under the repo root
+/// we recompute git — so edits made *outside* the terminal (a text editor, a
+/// branch switch in another tool) refresh the footer without polling. This is
+/// what VS Code does (FSEvents / ReadDirectoryChangesW / inotify via `notify`).
+/// Runs off the reader thread: resolving the repo root spawns `git`, which we
+/// don't want to block terminal output on.
+fn repoint_watcher(
+    watcher: &Arc<Mutex<Option<GitWatcher>>>,
+    cwd: &Arc<Mutex<Option<String>>>,
+    git: &Arc<Mutex<Option<crate::git::GitInfo>>>,
+    cwd_path: String,
+) {
+    let watcher = watcher.clone();
+    let cwd = cwd.clone();
+    let git = git.clone();
+    std::thread::spawn(move || {
+        let new = crate::git::repo_root(&cwd_path).and_then(|root| {
+            let cwd = cwd.clone();
+            let git = git.clone();
+            let mut deb = new_debouncer(Duration::from_millis(400), move |res: DebounceEventResult| {
+                if res.is_ok() {
+                    recompute_git(cwd.clone(), git.clone());
+                }
+            })
+            .ok()?;
+            deb.watcher()
+                .watch(std::path::Path::new(&root), RecursiveMode::Recursive)
+                .ok()?;
+            Some(deb)
+        });
+        // Replacing the slot drops the previous watcher, stopping the old watch.
+        *watcher.lock().unwrap() = new;
     });
 }
 
