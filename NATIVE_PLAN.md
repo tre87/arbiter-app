@@ -48,8 +48,13 @@ splits, footer, overview, settings, dialogs):
 - (Hand-rolled wgpu like WezTerm — rejected: our UI is far richer than WezTerm's
   tab strip, so hand-rolling all of it is wasteful.)
 
-**Decided in Phase 0 by a Windows bake-off**, because Windows-smoothness is the
-entire point and must be proven in the chosen stack before committing.
+**DECIDED: Iced.** Phase 0 (the raw winit+wgpu live-terminal spike) ran great on
+**both Windows and macOS** — the smoothness thesis is confirmed (WebView2 was the
+wall). Iced chosen for the shell: published/semver'd, wgpu-native (composites with
+our terminal renderer via a custom `shader` widget), retained (good for the
+complex stateful UI), and sustainable (no coupling to Zed's churn — matches the
+stability motivation). The terminal renderer stays raw wgpu and is decoupled to
+draw into a provided pass, then hosted inside Iced.
 
 ## Build ALONGSIDE — do NOT delete the webview app yet
 
