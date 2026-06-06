@@ -3,4 +3,5 @@
 
 pub mod gpu;
 pub mod session;
+pub mod shell;
 pub mod term;
