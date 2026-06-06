@@ -148,35 +148,49 @@ fn view(state: &State) -> Element<'_, Message> {
 
 fn subscription(_state: &State) -> Subscription<Message> {
     let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
-    let keys = iced::keyboard::on_key_press(|key, mods| key_to_bytes(key, mods).map(Message::Input));
+    let keys = iced::event::listen_with(|event, _status, _id| handle_key(event));
     Subscription::batch([tick, keys])
 }
 
-fn key_to_bytes(key: iced::keyboard::Key, mods: iced::keyboard::Modifiers) -> Option<Vec<u8>> {
-    use iced::keyboard::key::{Key, Named};
-    match key {
-        Key::Named(Named::Enter) => Some(b"\r".to_vec()),
-        Key::Named(Named::Backspace) => Some(vec![0x7f]),
-        Key::Named(Named::Tab) => Some(b"\t".to_vec()),
-        Key::Named(Named::Escape) => Some(vec![0x1b]),
-        Key::Named(Named::ArrowUp) => Some(b"\x1b[A".to_vec()),
-        Key::Named(Named::ArrowDown) => Some(b"\x1b[B".to_vec()),
-        Key::Named(Named::ArrowRight) => Some(b"\x1b[C".to_vec()),
-        Key::Named(Named::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-        Key::Named(Named::Space) => Some(b" ".to_vec()),
-        Key::Character(s) => {
-            if mods.control() {
-                if let Some(c) = s.chars().next() {
-                    let lc = c.to_ascii_lowercase();
-                    if lc.is_ascii_alphabetic() {
-                        return Some(vec![(lc as u8) - b'a' + 1]);
-                    }
+/// Map a keyboard event to PTY bytes. Special keys are hand-mapped; for
+/// printable input we use the event's `text` field, which already reflects
+/// Shift / symbols / keyboard layout (the base `key` is NOT modifier-applied,
+/// which is why holding Shift didn't capitalise).
+fn handle_key(event: iced::Event) -> Option<Message> {
+    use iced::keyboard::{key::Named, Event::KeyPressed, Key};
+    let iced::Event::Keyboard(KeyPressed { key, text, modifiers, .. }) = event else {
+        return None;
+    };
+    match &key {
+        Key::Named(Named::Enter) => return Some(Message::Input(b"\r".to_vec())),
+        Key::Named(Named::Backspace) => return Some(Message::Input(vec![0x7f])),
+        Key::Named(Named::Tab) => return Some(Message::Input(b"\t".to_vec())),
+        Key::Named(Named::Escape) => return Some(Message::Input(vec![0x1b])),
+        Key::Named(Named::ArrowUp) => return Some(Message::Input(b"\x1b[A".to_vec())),
+        Key::Named(Named::ArrowDown) => return Some(Message::Input(b"\x1b[B".to_vec())),
+        Key::Named(Named::ArrowRight) => return Some(Message::Input(b"\x1b[C".to_vec())),
+        Key::Named(Named::ArrowLeft) => return Some(Message::Input(b"\x1b[D".to_vec())),
+        // Ctrl+letter → control byte (use the base, un-shifted character).
+        Key::Character(s) if modifiers.control() => {
+            if let Some(c) = s.chars().next() {
+                let lc = c.to_ascii_lowercase();
+                if lc.is_ascii_alphabetic() {
+                    return Some(Message::Input(vec![(lc as u8) - b'a' + 1]));
                 }
             }
-            Some(s.as_bytes().to_vec())
         }
-        _ => None,
+        _ => {}
     }
+    // Printable text — Shift/symbols/layout already applied. Skip when a
+    // meaning-changing modifier (Ctrl/Alt/Cmd) is held; Shift is fine.
+    if !modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+        if let Some(t) = text {
+            if !t.is_empty() {
+                return Some(Message::Input(t.as_bytes().to_vec()));
+            }
+        }
+    }
+    None
 }
 
 // ── Custom shader widget: the wgpu terminal hosted inside Iced ────────────────
