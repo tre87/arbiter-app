@@ -222,7 +222,6 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs",
-                compilation_options: Default::default(),
                 buffers: &[
                     // quad corners (per-vertex)
                     wgpu::VertexBufferLayout {
@@ -243,7 +242,6 @@ impl Renderer {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs",
-                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: None,
@@ -257,7 +255,6 @@ impl Renderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
-            cache: None,
         });
 
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

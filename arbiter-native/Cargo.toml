@@ -10,11 +10,17 @@ description = "Native (no-webview) Arbiter — Phase 0 spike. See ../NATIVE_PLAN
 portable-pty = { path = "../src-tauri/portable-pty" }
 # Same VT parser + cell grid the shipping app already uses.
 alacritty_terminal = "0.26"
-# Native window + GPU (no webview).
+# Native window + GPU (no webview). wgpu pinned to 0.19 to match Iced 0.13's
+# wgpu, so the terminal renderer's types interoperate with Iced's shader widget.
 winit = "0.30"
-wgpu = "22"
+wgpu = "0.19"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 # Glyph rasterisation + cross-platform system-font discovery.
 ab_glyph = "0.2"
 fontdb = "0.18"
+# App shell / chrome (tabs, splits, settings, …). The terminal renderer is
+# hosted inside Iced via its custom `shader` widget (needs the wgpu + advanced
+# features). Used by the `iced` binary; the raw winit spike (default bin) doesn't.
+iced = { version = "0.13", features = ["wgpu", "advanced"] }
+
