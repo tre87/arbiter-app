@@ -146,6 +146,8 @@ pub fn run() {
                 None => overview_builder
                     .inner_size(overview::OVERVIEW_DEFAULT_WIDTH, overview::OVERVIEW_DEFAULT_HEIGHT),
             };
+            // Only consumed by the macOS high-FPS unlock below; unused elsewhere.
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             let overview_window = overview_builder.build()?;
             // Same high-refresh unlock as the main window (see macos_fps.rs).
             #[cfg(target_os = "macos")]
