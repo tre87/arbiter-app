@@ -9,6 +9,9 @@ dist-ssr/
 src-tauri/target/
 src-tauri/WixTools/
 
+# Native (no-webview) spike — see NATIVE_PLAN.md
+arbiter-native/target/
+
 # Vite
 *.local
 .vite/
