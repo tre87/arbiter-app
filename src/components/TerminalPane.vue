@@ -216,8 +216,17 @@ function gpuFit() {
   const dpr = window.devicePixelRatio || 1
   const rect = terminalEl.value.getBoundingClientRect()
   if (!rect.width || !rect.height) return
-  const cols = Math.max(1, Math.floor((rect.width * dpr) / cell.cw))
-  const rows = Math.max(1, Math.floor((rect.height * dpr) / cell.ch))
+  // Derive cols/rows from the SAME integer cell the GPU renderer draws with
+  // (SingleCanvasRenderer.setCell rounds the px cell). Dividing by the raw
+  // sub-pixel cell here while drawing with the rounded one let cols*round(cell)
+  // exceed the pane width on Windows (Consolas' ~6.5px cell rounds up to 7), so
+  // the rightmost columns drew past the pane edge and were clipped. Rounding
+  // first keeps cols*cellW ≤ pane width — the grid fits exactly. (macOS rounds
+  // down, so it only ever under-filled by a sub-pixel; this is a no-op there.)
+  const cw = Math.max(1, Math.round(cell.cw))
+  const ch = Math.max(1, Math.round(cell.ch))
+  const cols = Math.max(1, Math.floor((rect.width * dpr) / cw))
+  const rows = Math.max(1, Math.floor((rect.height * dpr) / ch))
   if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows)
 }
 
