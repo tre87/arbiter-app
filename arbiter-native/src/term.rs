@@ -54,6 +54,7 @@ impl VtTerm {
     }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
+    pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
     /// (row, col, visible) for the block cursor.
     pub fn cursor(&self) -> (usize, usize, bool) {

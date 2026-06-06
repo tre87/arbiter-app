@@ -8,9 +8,6 @@
 //!
 //! Run:  cd arbiter-native && cargo run
 
-mod gpu;
-mod term;
-
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -22,8 +19,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use gpu::Renderer;
-use term::VtTerm;
+use arbiter_native::gpu::Renderer;
+use arbiter_native::term::VtTerm;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -44,8 +41,8 @@ impl App {
         let (Some(win), Some(r)) = (&self.window, &mut self.renderer) else { return };
         let sz = win.inner_size();
         r.resize(sz.width, sz.height);
-        let cols = (sz.width / r.cell_w).max(1) as usize;
-        let rows = (sz.height / r.cell_h).max(1) as usize;
+        let cols = (sz.width / r.cell_w()).max(1) as usize;
+        let rows = (sz.height / r.cell_h()).max(1) as usize;
         if (cols, rows) != self.last_grid {
             self.last_grid = (cols, rows);
             self.term.lock().unwrap().resize(cols, rows);
