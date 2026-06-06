@@ -1,8 +1,9 @@
-//! Arbiter native — Phase 0.3: the Iced shell hosting the wgpu terminal.
+//! Arbiter native — Phase 0.3 / multiplexing: the Iced shell with split panes.
 //!
-//! An Iced app with a tab bar + one live terminal per tab, each rendered by the
-//! `TermGpu` renderer inside Iced's custom `shader` widget. No webview. Proves
-//! the chrome framework (Iced) and the GPU terminal compose cleanly.
+//! Uses Iced's `pane_grid` for resizable H/V splits, each pane a live terminal
+//! (a core `Session`) rendered by `TermGpu` inside Iced's `shader` widget. No
+//! webview.  Toolbar: Split →, Split ↓, Close. Click a pane to focus it;
+//! keystrokes go to the focused pane.
 //!
 //! Run:  cd arbiter-native && cargo run --bin iced_shell --release
 
@@ -12,20 +13,19 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize};
 
 use iced::widget::shader::{self, wgpu};
-use iced::widget::{button, column, container, row, shader as shader_widget, text, Space};
+use iced::widget::{button, column, container, mouse_area, pane_grid, row, shader as shader_widget, text};
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 
-struct Tab {
+struct PaneData {
     session: Session,
-    title: String,
 }
 
 struct State {
-    tabs: Vec<Tab>,
-    active: usize,
+    panes: pane_grid::State<PaneData>,
+    focus: pane_grid::Pane,
     font: Arc<(Vec<u8>, u32)>,
 }
 
@@ -33,8 +33,11 @@ struct State {
 enum Message {
     Tick,
     Input(Vec<u8>),
-    NewTab,
-    SelectTab(usize),
+    Focus(pane_grid::Pane),
+    SplitRight,
+    SplitDown,
+    Close,
+    Resized(pane_grid::ResizeEvent),
 }
 
 fn shell_command() -> CommandBuilder {
@@ -49,61 +52,88 @@ fn shell_command() -> CommandBuilder {
     }
 }
 
-fn spawn_tab(n: usize) -> Tab {
-    let session = Session::spawn(100, 30, shell_command()).expect("spawn session");
-    Tab { session, title: format!("Terminal {n}") }
+fn spawn_session() -> Session {
+    Session::spawn(80, 24, shell_command()).expect("spawn session")
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {}
         Message::Input(bytes) => {
-            if let Some(tab) = state.tabs.get_mut(state.active) {
-                tab.session.write(&bytes);
+            if let Some(p) = state.panes.get_mut(state.focus) {
+                p.session.write(&bytes);
             }
         }
-        Message::NewTab => {
-            let n = state.tabs.len() + 1;
-            state.tabs.push(spawn_tab(n));
-            state.active = state.tabs.len() - 1;
-        }
-        Message::SelectTab(i) => {
-            if i < state.tabs.len() {
-                state.active = i;
+        Message::Focus(pane) => state.focus = pane,
+        Message::SplitRight => split(state, pane_grid::Axis::Vertical),
+        Message::SplitDown => split(state, pane_grid::Axis::Horizontal),
+        Message::Close => {
+            if let Some((_, sibling)) = state.panes.close(state.focus) {
+                state.focus = sibling;
             }
+        }
+        Message::Resized(pane_grid::ResizeEvent { split, ratio }) => {
+            state.panes.resize(split, ratio);
         }
     }
     Task::none()
 }
 
-fn view(state: &State) -> Element<'_, Message> {
-    // Tab bar.
-    let mut tabs = row![].spacing(4);
-    for (i, t) in state.tabs.iter().enumerate() {
-        let label = text(t.title.clone()).size(13);
-        let mut b = button(label).on_press(Message::SelectTab(i)).padding([4, 10]);
-        if i != state.active {
-            b = b.style(button::secondary);
-        }
-        tabs = tabs.push(b);
+fn split(state: &mut State, axis: pane_grid::Axis) {
+    if let Some((new_pane, _)) = state.panes.split(axis, state.focus, PaneData { session: spawn_session() }) {
+        state.focus = new_pane;
     }
-    tabs = tabs.push(button(text("+").size(13)).on_press(Message::NewTab).padding([4, 10]));
+}
 
-    // Active terminal via the custom shader widget.
-    let active = &state.tabs[state.active];
-    let term_widget = shader_widget(TermProgram {
-        term: active.session.term(),
-        master: active.session.master(),
-        font: state.font.clone(),
+fn view(state: &State) -> Element<'_, Message> {
+    let toolbar = row![
+        button(text("Split →").size(13)).on_press(Message::SplitRight).padding([4, 10]),
+        button(text("Split ↓").size(13)).on_press(Message::SplitDown).padding([4, 10]),
+        button(text("Close").size(13)).on_press(Message::Close).style(button::secondary).padding([4, 10]),
+    ]
+    .spacing(6);
+
+    let focus = state.focus;
+    let font = &state.font;
+    let grid = pane_grid::PaneGrid::new(&state.panes, |pane, data, _maximized| {
+        let term = shader_widget(TermProgram {
+            term: data.session.term(),
+            master: data.session.master(),
+            font: font.clone(),
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        // Click anywhere in a pane to focus it.
+        let body = mouse_area(term).on_press(Message::Focus(pane));
+        let focused = pane == focus;
+        let wrapped = container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |theme: &iced::Theme| pane_style(theme, focused));
+        pane_grid::Content::new(wrapped)
     })
     .width(Length::Fill)
-    .height(Length::Fill);
+    .height(Length::Fill)
+    .spacing(2)
+    .on_resize(8, Message::Resized);
 
-    let chrome = container(tabs).padding(6).width(Length::Fill);
-    column![chrome, term_widget, Space::new(Length::Fill, Length::Fixed(0.0))]
+    column![container(toolbar).padding(6), grid]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn pane_style(theme: &iced::Theme, focused: bool) -> container::Style {
+    let mut s = container::Style::default();
+    if focused {
+        s.border = iced::Border {
+            color: theme.palette().primary,
+            width: 1.5,
+            radius: 0.0.into(),
+        };
+    }
+    s
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
@@ -112,10 +142,8 @@ fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([tick, keys])
 }
 
-/// Map a keyboard event to PTY bytes. Special keys are hand-mapped; for
-/// printable input we use the event's `text` field, which already reflects
-/// Shift / symbols / keyboard layout (the base `key` is NOT modifier-applied,
-/// which is why holding Shift didn't capitalise).
+/// Map a keyboard event to PTY bytes. Special keys are hand-mapped; printable
+/// input uses the event's `text` (Shift/symbols/layout already applied).
 fn handle_key(event: iced::Event) -> Option<Message> {
     use iced::keyboard::{key::Named, Event::KeyPressed, Key};
     let iced::Event::Keyboard(KeyPressed { key, text, modifiers, .. }) = event else {
@@ -130,7 +158,6 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         Key::Named(Named::ArrowDown) => return Some(Message::Input(b"\x1b[B".to_vec())),
         Key::Named(Named::ArrowRight) => return Some(Message::Input(b"\x1b[C".to_vec())),
         Key::Named(Named::ArrowLeft) => return Some(Message::Input(b"\x1b[D".to_vec())),
-        // Ctrl+letter → control byte (use the base, un-shifted character).
         Key::Character(s) if modifiers.control() => {
             if let Some(c) = s.chars().next() {
                 let lc = c.to_ascii_lowercase();
@@ -141,8 +168,6 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         }
         _ => {}
     }
-    // Printable text — Shift/symbols/layout already applied. Skip when a
-    // meaning-changing modifier (Ctrl/Alt/Cmd) is held; Shift is fine.
     if !modifiers.control() && !modifiers.alt() && !modifiers.logo() {
         if let Some(t) = text {
             if !t.is_empty() {
@@ -208,12 +233,8 @@ impl shader::Primitive for TermPrimitive {
         }
         let gpu = storage.get_mut::<TermGpu>().unwrap();
 
-        // Physical draw area for this widget.
         let pw = (bounds.width * scale).max(1.0) as u32;
         let ph = (bounds.height * scale).max(1.0) as u32;
-
-        // Resize the grid + PTY to fit the widget (self-contained — the widget
-        // knows its real size, so the app doesn't need scale/resize plumbing).
         let cols = (pw / gpu.cell_w).max(1) as usize;
         let rows = (ph / gpu.cell_h).max(1) as usize;
         {
@@ -247,7 +268,6 @@ impl shader::Primitive for TermPrimitive {
                 view: target,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // Load: composite over what Iced already drew (the chrome).
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
@@ -282,8 +302,7 @@ fn main() -> iced::Result {
     iced::application("Arbiter native (Iced shell)", update, view)
         .subscription(subscription)
         .run_with(move || {
-            let mut state = State { tabs: Vec::new(), active: 0, font: font.clone() };
-            state.tabs.push(spawn_tab(1));
-            (state, Task::none())
+            let (panes, first) = pane_grid::State::new(PaneData { session: spawn_session() });
+            (State { panes, focus: first, font: font.clone() }, Task::none())
         })
 }
