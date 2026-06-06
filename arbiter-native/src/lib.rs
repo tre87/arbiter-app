@@ -2,4 +2,5 @@
 //! binary (`main.rs`) and the Iced shell binary (`bin/iced_shell.rs`).
 
 pub mod gpu;
+pub mod session;
 pub mod term;
