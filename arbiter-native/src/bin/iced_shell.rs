@@ -6,29 +6,21 @@
 //!
 //! Run:  cd arbiter-native && cargo run --bin iced_shell --release
 
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, PtySize};
 
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{button, column, container, row, shader as shader_widget, text, Space};
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::gpu::TermGpu;
-use arbiter_native::term::VtTerm;
-
-type SharedTerm = Arc<Mutex<VtTerm>>;
-type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
-type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
+use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 
 struct Tab {
-    term: SharedTerm,
-    writer: SharedWriter,
-    master: SharedMaster,
+    session: Session,
     title: String,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 struct State {
@@ -57,54 +49,22 @@ fn shell_command() -> CommandBuilder {
     }
 }
 
-fn spawn_tab(font: &Arc<(Vec<u8>, u32)>, n: usize) -> Tab {
-    let pty = native_pty_system();
-    let pair = pty
-        .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
-        .expect("openpty");
-    let child = pair.slave.spawn_command(shell_command()).expect("spawn shell");
-    drop(pair.slave);
-    let writer = pair.master.take_writer().expect("writer");
-    let mut reader = pair.master.try_clone_reader().expect("reader");
-
-    let term: SharedTerm = Arc::new(Mutex::new(VtTerm::new(100, 30)));
-    {
-        let term = term.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(k) => term.lock().unwrap().feed(&buf[..k]),
-                }
-            }
-        });
-    }
-    let _ = font;
-    Tab {
-        term,
-        writer: Arc::new(Mutex::new(writer)),
-        master: Arc::new(Mutex::new(pair.master)),
-        title: format!("Terminal {n}"),
-        _child: child,
-    }
+fn spawn_tab(n: usize) -> Tab {
+    let session = Session::spawn(100, 30, shell_command()).expect("spawn session");
+    Tab { session, title: format!("Terminal {n}") }
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {}
         Message::Input(bytes) => {
-            if let Some(tab) = state.tabs.get(state.active) {
-                if let Ok(mut w) = tab.writer.lock() {
-                    let _ = w.write_all(&bytes);
-                    let _ = w.flush();
-                }
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                tab.session.write(&bytes);
             }
         }
         Message::NewTab => {
             let n = state.tabs.len() + 1;
-            let tab = spawn_tab(&state.font, n);
-            state.tabs.push(tab);
+            state.tabs.push(spawn_tab(n));
             state.active = state.tabs.len() - 1;
         }
         Message::SelectTab(i) => {
@@ -132,8 +92,8 @@ fn view(state: &State) -> Element<'_, Message> {
     // Active terminal via the custom shader widget.
     let active = &state.tabs[state.active];
     let term_widget = shader_widget(TermProgram {
-        term: active.term.clone(),
-        master: active.master.clone(),
+        term: active.session.term(),
+        master: active.session.master(),
         font: state.font.clone(),
     })
     .width(Length::Fill)
@@ -323,7 +283,7 @@ fn main() -> iced::Result {
         .subscription(subscription)
         .run_with(move || {
             let mut state = State { tabs: Vec::new(), active: 0, font: font.clone() };
-            state.tabs.push(spawn_tab(&state.font, 1));
+            state.tabs.push(spawn_tab(1));
             (state, Task::none())
         })
 }
