@@ -42,6 +42,22 @@ struct State {
     workspaces: Vec<Workspace>,
     active: usize,
     font: Arc<(Vec<u8>, u32)>,
+    theme: iced::Theme,
+}
+
+/// Foundational dark theme matching Arbiter's palette (#121212 bg, azure accent).
+/// The detailed chrome polish comes after the status/footer are functional.
+fn arbiter_theme() -> iced::Theme {
+    iced::Theme::custom(
+        "Arbiter".to_string(),
+        iced::theme::Palette {
+            background: iced::Color::from_rgb8(0x12, 0x12, 0x12),
+            text: iced::Color::from_rgb8(0xcc, 0xcc, 0xcc),
+            primary: iced::Color::from_rgb8(0x33, 0x99, 0xff),
+            success: iced::Color::from_rgb8(0x2d, 0xbd, 0x6e),
+            danger: iced::Color::from_rgb8(0xe5, 0x4a, 0x4a),
+        },
+    )
 }
 
 impl State {
@@ -136,7 +152,10 @@ fn view(state: &State) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let body = mouse_area(term).on_press(Message::Focus(pane));
+        let content = column![term, footer_bar(&data.session)]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let body = mouse_area(content).on_press(Message::Focus(pane));
         let focused = pane == focus;
         let busy = data.session.shell_idle() == Some(false); // OSC-133: a command is running
         let claude = data.session.claude_running();
@@ -154,6 +173,43 @@ fn view(state: &State) -> Element<'_, Message> {
     column![container(bar).padding(6), grid]
         .width(Length::Fill)
         .height(Length::Fill)
+        .into()
+}
+
+/// Per-pane footer: folder + git branch + status counts (from the Session's
+/// cwd-tracked git info). Claude model/context/tokens land here later.
+fn footer_bar(session: &Session) -> Element<'static, Message> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(f) = session.folder() {
+        parts.push(f);
+    }
+    if let Some(g) = session.git() {
+        if let Some(b) = &g.branch {
+            parts.push(format!("⎇ {b}"));
+        }
+        let mut counts = String::new();
+        if g.staged > 0 {
+            counts.push_str(&format!("●{} ", g.staged));
+        }
+        if g.unstaged > 0 {
+            counts.push_str(&format!("✎{} ", g.unstaged));
+        }
+        if g.untracked > 0 {
+            counts.push_str(&format!("+{}", g.untracked));
+        }
+        let counts = counts.trim();
+        if !counts.is_empty() {
+            parts.push(counts.to_string());
+        }
+    }
+    container(text(parts.join("   ")).size(11))
+        .width(Length::Fill)
+        .padding([2, 8])
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
+            text_color: Some(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
+            ..Default::default()
+        })
         .into()
 }
 
@@ -353,11 +409,13 @@ fn main() -> iced::Result {
 
     iced::application("Arbiter native (Iced shell)", update, view)
         .subscription(subscription)
+        .theme(|s: &State| s.theme.clone())
         .run_with(move || {
             let state = State {
                 workspaces: vec![Workspace::new("Workspace 1".to_string())],
                 active: 0,
                 font: font.clone(),
+                theme: arbiter_theme(),
             };
             (state, Task::none())
         })

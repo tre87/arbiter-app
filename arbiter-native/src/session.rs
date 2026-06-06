@@ -37,6 +37,7 @@ pub struct Session {
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude_running: Arc<AtomicBool>,
+    git: Arc<Mutex<Option<crate::git::GitInfo>>>,
     _child: Box<dyn Child + Send + Sync>,
 }
 
@@ -56,6 +57,7 @@ impl Session {
         let cwd = Arc::new(Mutex::new(None));
         let shell_idle = Arc::new(Mutex::new(None));
         let claude_running = Arc::new(AtomicBool::new(false));
+        let git = Arc::new(Mutex::new(None));
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
 
         {
@@ -63,8 +65,9 @@ impl Session {
             let cwd = cwd.clone();
             let shell_idle = shell_idle.clone();
             let claude_running = claude_running.clone();
+            let git = git.clone();
             let cmd_epoch = cmd_epoch.clone();
-            std::thread::spawn(move || reader_loop(reader, term, cwd, shell_idle, claude_running, cmd_epoch));
+            std::thread::spawn(move || reader_loop(reader, term, cwd, shell_idle, claude_running, git, cmd_epoch));
         }
 
         // Event-driven Claude monitor: on each busy edge, scan the shell's
@@ -83,6 +86,7 @@ impl Session {
             cwd,
             shell_idle,
             claude_running,
+            git,
             _child: child,
         })
     }
@@ -90,6 +94,22 @@ impl Session {
     /// True if a `claude` process is running in this pane right now.
     pub fn claude_running(&self) -> bool {
         self.claude_running.load(Ordering::Relaxed)
+    }
+
+    /// Basename of the current working directory, if known.
+    pub fn folder(&self) -> Option<String> {
+        self.cwd().map(|p| {
+            p.trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&p)
+                .to_string()
+        })
+    }
+
+    /// Cached git info for the cwd (branch + status counts), refreshed on cd.
+    pub fn git(&self) -> Option<crate::git::GitInfo> {
+        self.git.lock().unwrap().clone()
     }
 
     /// Stable unique id for keying per-session GPU state.
@@ -125,6 +145,7 @@ fn reader_loop(
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude_running: Arc<AtomicBool>,
+    git: Arc<Mutex<Option<crate::git::GitInfo>>>,
     cmd_epoch: CmdEpoch,
 ) {
     let mut buf = [0u8; 8192];
@@ -193,10 +214,17 @@ fn reader_loop(
                         }
                     }
                     if let Some(path) = parse_osc7_uri(payload) {
-                        if prev_cwd.as_ref() != Some(&path) {
+                        let changed = prev_cwd.as_ref() != Some(&path);
+                        *cwd.lock().unwrap() = Some(path.clone());
+                        if changed {
                             prev_cwd = Some(path.clone());
+                            // Recompute git off the reader thread (git spawn is slow).
+                            let git = git.clone();
+                            std::thread::spawn(move || {
+                                let info = crate::git::repo_info(&path);
+                                *git.lock().unwrap() = info;
+                            });
                         }
-                        *cwd.lock().unwrap() = Some(path);
                     }
                     osc.clear();
                     in_osc = false;
