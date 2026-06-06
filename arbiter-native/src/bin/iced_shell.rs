@@ -1,9 +1,8 @@
-//! Arbiter native — Phase 0.3 / multiplexing: the Iced shell with split panes.
+//! Arbiter native — Iced shell: workspaces (tabs) of split panes.
 //!
-//! Uses Iced's `pane_grid` for resizable H/V splits, each pane a live terminal
-//! (a core `Session`) rendered by `TermGpu` inside Iced's `shader` widget. No
-//! webview.  Toolbar: Split →, Split ↓, Close. Click a pane to focus it;
-//! keystrokes go to the focused pane.
+//! Each workspace is its own `pane_grid` of split terminals (core `Session`s
+//! rendered by `TermGpu` in Iced's `shader` widget). A tab bar switches
+//! workspaces; background workspaces keep their shells running. No webview.
 //!
 //! Run:  cd arbiter-native && cargo run --bin iced_shell --release
 
@@ -14,7 +13,9 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize};
 
 use iced::widget::shader::{self, wgpu};
-use iced::widget::{button, column, container, mouse_area, pane_grid, row, shader as shader_widget, text};
+use iced::widget::{
+    button, column, container, horizontal_space, mouse_area, pane_grid, row, shader as shader_widget, text,
+};
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::gpu::TermGpu;
@@ -24,10 +25,28 @@ struct PaneData {
     session: Session,
 }
 
-struct State {
+struct Workspace {
     panes: pane_grid::State<PaneData>,
     focus: pane_grid::Pane,
+    name: String,
+}
+
+impl Workspace {
+    fn new(name: String) -> Self {
+        let (panes, first) = pane_grid::State::new(PaneData { session: spawn_session() });
+        Workspace { panes, focus: first, name }
+    }
+}
+
+struct State {
+    workspaces: Vec<Workspace>,
+    active: usize,
     font: Arc<(Vec<u8>, u32)>,
+}
+
+impl State {
+    fn active(&self) -> &Workspace { &self.workspaces[self.active] }
+    fn active_mut(&mut self) -> &mut Workspace { &mut self.workspaces[self.active] }
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +58,8 @@ enum Message {
     SplitDown,
     Close,
     Resized(pane_grid::ResizeEvent),
+    NewWorkspace,
+    SelectWorkspace(usize),
 }
 
 fn shell_command() -> CommandBuilder {
@@ -61,42 +82,62 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {}
         Message::Input(bytes) => {
-            if let Some(p) = state.panes.get_mut(state.focus) {
+            let ws = state.active_mut();
+            if let Some(p) = ws.panes.get_mut(ws.focus) {
                 p.session.write(&bytes);
             }
         }
-        Message::Focus(pane) => state.focus = pane,
-        Message::SplitRight => split(state, pane_grid::Axis::Vertical),
-        Message::SplitDown => split(state, pane_grid::Axis::Horizontal),
+        Message::Focus(pane) => state.active_mut().focus = pane,
+        Message::SplitRight => split(state.active_mut(), pane_grid::Axis::Vertical),
+        Message::SplitDown => split(state.active_mut(), pane_grid::Axis::Horizontal),
         Message::Close => {
-            if let Some((_, sibling)) = state.panes.close(state.focus) {
-                state.focus = sibling;
+            let ws = state.active_mut();
+            if let Some((_, sibling)) = ws.panes.close(ws.focus) {
+                ws.focus = sibling;
             }
         }
         Message::Resized(pane_grid::ResizeEvent { split, ratio }) => {
-            state.panes.resize(split, ratio);
+            state.active_mut().panes.resize(split, ratio);
+        }
+        Message::NewWorkspace => {
+            let n = state.workspaces.len() + 1;
+            state.workspaces.push(Workspace::new(format!("Workspace {n}")));
+            state.active = state.workspaces.len() - 1;
+        }
+        Message::SelectWorkspace(i) => {
+            if i < state.workspaces.len() {
+                state.active = i;
+            }
         }
     }
     Task::none()
 }
 
-fn split(state: &mut State, axis: pane_grid::Axis) {
-    if let Some((new_pane, _)) = state.panes.split(axis, state.focus, PaneData { session: spawn_session() }) {
-        state.focus = new_pane;
+fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
+    if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, PaneData { session: spawn_session() }) {
+        ws.focus = new_pane;
     }
 }
 
 fn view(state: &State) -> Element<'_, Message> {
-    let toolbar = row![
-        button(text("Split →").size(13)).on_press(Message::SplitRight).padding([4, 10]),
-        button(text("Split ↓").size(13)).on_press(Message::SplitDown).padding([4, 10]),
-        button(text("Close").size(13)).on_press(Message::Close).style(button::secondary).padding([4, 10]),
-    ]
-    .spacing(6);
+    // Top bar: workspace tabs (left) + split/close actions (right).
+    let mut bar = row![].spacing(4);
+    for (i, ws) in state.workspaces.iter().enumerate() {
+        let mut b = button(text(ws.name.clone()).size(13)).on_press(Message::SelectWorkspace(i)).padding([4, 10]);
+        if i != state.active {
+            b = b.style(button::secondary);
+        }
+        bar = bar.push(b);
+    }
+    bar = bar.push(button(text("+").size(13)).on_press(Message::NewWorkspace).padding([4, 10]).style(button::secondary));
+    bar = bar.push(horizontal_space());
+    bar = bar.push(button(text("Split →").size(13)).on_press(Message::SplitRight).padding([4, 10]));
+    bar = bar.push(button(text("Split ↓").size(13)).on_press(Message::SplitDown).padding([4, 10]));
+    bar = bar.push(button(text("Close").size(13)).on_press(Message::Close).style(button::secondary).padding([4, 10]));
 
-    let focus = state.focus;
+    let focus = state.active().focus;
     let font = &state.font;
-    let grid = pane_grid::PaneGrid::new(&state.panes, |pane, data, _maximized| {
+    let grid = pane_grid::PaneGrid::new(&state.active().panes, |pane, data, _maximized| {
         let term = shader_widget(TermProgram {
             id: data.session.id(),
             term: data.session.term(),
@@ -106,7 +147,6 @@ fn view(state: &State) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        // Click anywhere in a pane to focus it.
         let body = mouse_area(term).on_press(Message::Focus(pane));
         let focused = pane == focus;
         let wrapped = container(body)
@@ -120,7 +160,7 @@ fn view(state: &State) -> Element<'_, Message> {
     .spacing(2)
     .on_resize(8, Message::Resized);
 
-    column![container(toolbar).padding(6), grid]
+    column![container(bar).padding(6), grid]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -183,9 +223,8 @@ fn handle_key(event: iced::Event) -> Option<Message> {
 // ── Custom shader widget: the wgpu terminal hosted inside Iced ────────────────
 
 /// Per-pane GPU renderers, keyed by session id. Iced's `Storage` is a global
-/// type-map shared across all shader widgets, so a single TermGpu would be
-/// shared by every pane (all drawing the last-prepared session). Key one
-/// TermGpu per session instead.
+/// type-map shared across all shader widgets, so we key one TermGpu per session
+/// (else every pane draws the last-prepared one).
 #[derive(Default)]
 struct Renderers(HashMap<u64, TermGpu>);
 
@@ -319,7 +358,11 @@ fn main() -> iced::Result {
     iced::application("Arbiter native (Iced shell)", update, view)
         .subscription(subscription)
         .run_with(move || {
-            let (panes, first) = pane_grid::State::new(PaneData { session: spawn_session() });
-            (State { panes, focus: first, font: font.clone() }, Task::none())
+            let state = State {
+                workspaces: vec![Workspace::new("Workspace 1".to_string())],
+                active: 0,
+                font: font.clone(),
+            };
+            (state, Task::none())
         })
 }
