@@ -7,11 +7,14 @@
 //! they'll drive the footer + status, and `core` grows claude/git/shim.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::term::VtTerm;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type SharedTerm = Arc<Mutex<VtTerm>>;
 pub type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
@@ -22,6 +25,8 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
 }
 
 pub struct Session {
+    /// Unique, stable id — used to key this session's per-pane GPU renderer.
+    id: u64,
     writer: Box<dyn Write + Send>,
     master: SharedMaster,
     term: SharedTerm,
@@ -52,6 +57,7 @@ impl Session {
         }
 
         Ok(Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             writer,
             master: Arc::new(Mutex::new(pair.master)),
             term,
@@ -60,6 +66,9 @@ impl Session {
             _child: child,
         })
     }
+
+    /// Stable unique id for keying per-session GPU state.
+    pub fn id(&self) -> u64 { self.id }
 
     /// Shared grid handle for the renderer.
     pub fn term(&self) -> SharedTerm { self.term.clone() }
