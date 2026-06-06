@@ -75,7 +75,17 @@ function newTerminalWorkspace() {
 
 async function openProjectAt(repoRoot: string) {
   const result = await projectStore.createProjectWorkspace(repoRoot)
-  if (result.kind === 'ok' || result.kind === 'error') return
+  if (result.kind === 'ok') return
+  if (result.kind === 'error') {
+    // Don't fail silently — surface why the workspace couldn't be created.
+    await confirmDialog({
+      title: 'Could not open project workspace',
+      message: result.message || 'An unknown error occurred.',
+      confirmText: 'OK',
+      cancelText: 'Close',
+    })
+    return
+  }
 
   // not-main: the user picked a linked worktree. Warn and offer to open the
   // main repo instead (Arbiter's model requires the workspace to be anchored
@@ -101,7 +111,17 @@ async function newProjectWorkspace() {
     if (!selected || typeof selected !== 'string') return
 
     const repoRoot = await invoke<string | null>('git_repo_root', { path: selected })
-    if (!repoRoot) return
+    if (!repoRoot) {
+      // Project workspaces are built around git worktrees, so they require a
+      // repo. Picking a plain folder used to silently do nothing — tell the user.
+      await confirmDialog({
+        title: 'Not a Git repository',
+        message: `"${selected}" isn't inside a Git repository. Project workspaces manage git worktrees, so they need a repo. Use a Terminal workspace for a plain folder, or run "git init" first.`,
+        confirmText: 'OK',
+        cancelText: 'Close',
+      })
+      return
+    }
 
     await openProjectAt(repoRoot)
   } catch (e) {
