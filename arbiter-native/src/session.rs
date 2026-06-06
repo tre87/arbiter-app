@@ -204,6 +204,9 @@ fn reader_loop(
                                     // Prompt returned → the foreground command
                                     // (incl. Claude) ended.
                                     claude_running.store(false, Ordering::Relaxed);
+                                    // A command just finished — it may have changed
+                                    // files, so refresh git for the footer.
+                                    recompute_git(cwd.clone(), git.clone());
                                 } else {
                                     // A command started → wake the monitor to scan.
                                     let (lock, cvar) = &*cmd_epoch;
@@ -217,13 +220,8 @@ fn reader_loop(
                         let changed = prev_cwd.as_ref() != Some(&path);
                         *cwd.lock().unwrap() = Some(path.clone());
                         if changed {
-                            prev_cwd = Some(path.clone());
-                            // Recompute git off the reader thread (git spawn is slow).
-                            let git = git.clone();
-                            std::thread::spawn(move || {
-                                let info = crate::git::repo_info(&path);
-                                *git.lock().unwrap() = info;
-                            });
+                            prev_cwd = Some(path);
+                            recompute_git(cwd.clone(), git.clone());
                         }
                     }
                     osc.clear();
@@ -246,6 +244,25 @@ fn reader_loop(
             }
         }
     }
+}
+
+/// Recompute git info for the current cwd off-thread. Only applies the result
+/// if the cwd hasn't changed since (so a `cd`'s stale pre-`cd` scan can't
+/// clobber the new dir's info — the idle edge fires before the OSC-7 cwd update).
+fn recompute_git(cwd: Arc<Mutex<Option<String>>>, git: Arc<Mutex<Option<crate::git::GitInfo>>>) {
+    let path = match cwd.lock().unwrap().clone() {
+        Some(p) => p,
+        None => {
+            *git.lock().unwrap() = None;
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        let info = crate::git::repo_info(&path);
+        if cwd.lock().unwrap().as_deref() == Some(path.as_str()) {
+            *git.lock().unwrap() = info;
+        }
+    });
 }
 
 /// Per-session Claude monitor: blocks until a busy edge (a command started),
