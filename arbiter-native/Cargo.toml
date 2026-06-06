@@ -10,3 +10,11 @@ description = "Native (no-webview) Arbiter — Phase 0 spike. See ../NATIVE_PLAN
 portable-pty = { path = "../src-tauri/portable-pty" }
 # Same VT parser + cell grid the shipping app already uses.
 alacritty_terminal = "0.26"
+# Native window + GPU (no webview).
+winit = "0.30"
+wgpu = "22"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+# Glyph rasterisation + cross-platform system-font discovery.
+ab_glyph = "0.2"
+fontdb = "0.18"
