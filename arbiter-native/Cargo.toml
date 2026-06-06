@@ -22,6 +22,9 @@ fontdb = "0.18"
 # Per-OS data dir (zsh shell-integration files) + process-tree scan (Claude detection).
 dirs = "5"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# Native filesystem watching (FSEvents/ReadDirectoryChangesW/inotify) so the
+# footer's git refreshes on external edits without polling — like VS Code.
+notify-debouncer-mini = "0.4"
 # App shell / chrome (tabs, splits, settings, …). The terminal renderer is
 # hosted inside Iced via its custom `shader` widget (needs the wgpu + advanced
 # features). Used by the `iced` binary; the raw winit spike (default bin) doesn't.
