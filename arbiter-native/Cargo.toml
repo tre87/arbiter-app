@@ -22,5 +22,5 @@ fontdb = "0.18"
 # App shell / chrome (tabs, splits, settings, …). The terminal renderer is
 # hosted inside Iced via its custom `shader` widget (needs the wgpu + advanced
 # features). Used by the `iced` binary; the raw winit spike (default bin) doesn't.
-iced = { version = "0.13", features = ["wgpu", "advanced"] }
+iced = { version = "0.13", features = ["wgpu", "advanced", "tokio"] }
 

@@ -1,8 +1,7 @@
-//! wgpu single-surface terminal renderer: a glyph atlas + one instanced quad
-//! per cell. Direct port of the web `singleCanvasRenderer.ts` design — except
-//! it draws into the window's own GPU surface (no transparent overlay, no
-//! webview compositor). One instance = one cell; the shader does
-//! mix(bg, fg, glyphCoverage).
+//! wgpu terminal renderer: a glyph atlas + one instanced quad per cell, ported
+//! from the web `singleCanvasRenderer.ts`. `TermGpu` is surface-agnostic — it
+//! draws into a *provided* render pass, so it works both inside a winit window
+//! surface (`Renderer`, the raw spike) and inside an Iced `shader` widget.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,6 +9,8 @@ use std::sync::Arc;
 use ab_glyph::{Font, FontVec, ScaleFont};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+use crate::term::VtTerm;
 
 const ATLAS: u32 = 1024;
 const SLOT_SOLID: u32 = 0; // fully-covered cell (block cursor)
@@ -62,20 +63,16 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-pub struct Renderer {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
+/// Surface-agnostic renderer: pipeline + glyph atlas + instance buffer.
+pub struct TermGpu {
     pipeline: wgpu::RenderPipeline,
     quad_vb: wgpu::Buffer,
     inst_vb: wgpu::Buffer,
-    inst_cap: u64, // capacity in instances
+    inst_cap: u64,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     atlas_tex: wgpu::Texture,
 
-    // CPU glyph atlas.
     font: FontVec,
     px: f32,
     pub cell_w: u32,
@@ -87,61 +84,39 @@ pub struct Renderer {
     per_row: u32,
     atlas_dirty: bool,
 
-    // Reusable per-frame instance scratch (10 f32 per instance).
     scratch: Vec<f32>,
+    count: u32,
 }
 
-impl Renderer {
-    pub async fn new(window: Arc<Window>, font_bytes: Vec<u8>, font_index: u32, scale: f32) -> Self {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(window).expect("create_surface");
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("request_adapter");
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
-            .await
-            .expect("request_device");
+/// Cell size (device px) for a font at a given scale — so callers (e.g. the
+/// Iced shell) can map a window size to cols/rows without constructing a GPU.
+pub fn measure_cell(font_bytes: &[u8], font_index: u32, scale: f32) -> (u32, u32) {
+    let font = FontVec::try_from_vec_and_index(font_bytes.to_vec(), font_index).expect("load font");
+    let px = (14.0 * scale).round().max(8.0);
+    let s = font.as_scaled(px);
+    let w = s.h_advance(font.glyph_id('M')).ceil().max(1.0) as u32;
+    let h = (s.ascent() - s.descent() + s.line_gap()).ceil().max(1.0) as u32;
+    (w, h)
+}
 
-        let caps = surface.get_capabilities(&adapter);
-        // Prefer a non-sRGB 8-bit format so our 0..1 colours aren't gamma-shifted.
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo, // vsync
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&device, &config);
-
-        // ── Glyph atlas (CPU) ────────────────────────────────────────────────
+impl TermGpu {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        font_bytes: Vec<u8>,
+        font_index: u32,
+        scale: f32,
+    ) -> Self {
+        // Glyph atlas (CPU).
         let font = FontVec::try_from_vec_and_index(font_bytes, font_index).expect("load font");
         let px = (14.0 * scale).round().max(8.0);
         let scaled = font.as_scaled(px);
-        let advance = scaled.h_advance(font.glyph_id('M'));
-        let cell_w = advance.ceil().max(1.0) as u32;
+        let cell_w = scaled.h_advance(font.glyph_id('M')).ceil().max(1.0) as u32;
         let ascent = scaled.ascent();
         let cell_h = (scaled.ascent() - scaled.descent() + scaled.line_gap()).ceil().max(1.0) as u32;
         let per_row = (ATLAS / cell_w).max(1);
         let mut atlas_cpu = vec![0u8; (ATLAS * ATLAS) as usize];
-        // Slot 0 = solid block (cursor).
         fill_slot(&mut atlas_cpu, SLOT_SOLID, per_row, cell_w, cell_h, 255);
-        // Slot 1 stays blank.
 
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("atlas"),
@@ -160,7 +135,6 @@ impl Renderer {
             ..Default::default()
         });
 
-        // ── Pipeline ─────────────────────────────────────────────────────────
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("term-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -223,13 +197,11 @@ impl Renderer {
                 module: &shader,
                 entry_point: "vs",
                 buffers: &[
-                    // quad corners (per-vertex)
                     wgpu::VertexBufferLayout {
                         array_stride: 2 * 4,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![0 => Float32x2],
                     },
-                    // per-instance: pos(2) uv(2) fg(3) bg(3) = 10 f32
                     wgpu::VertexBufferLayout {
                         array_stride: 10 * 4,
                         step_mode: wgpu::VertexStepMode::Instance,
@@ -271,21 +243,13 @@ impl Renderer {
         });
 
         Self {
-            device, queue, surface, config, pipeline, quad_vb, inst_vb, inst_cap,
-            uniform_buf, bind_group, atlas_tex,
+            pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex,
             font, px, cell_w, cell_h, ascent,
             atlas_cpu, glyphs: HashMap::new(), next_slot: 2, per_row, atlas_dirty: true,
-            scratch: Vec::new(),
+            scratch: Vec::new(), count: 0,
         }
     }
 
-    pub fn resize(&mut self, w: u32, h: u32) {
-        self.config.width = w.max(1);
-        self.config.height = h.max(1);
-        self.surface.configure(&self.device, &self.config);
-    }
-
-    /// Map a char to an atlas slot, rasterising it on first use.
     fn slot_for(&mut self, ch: char) -> u32 {
         if ch == ' ' || ch == '\0' {
             return SLOT_BLANK;
@@ -296,14 +260,9 @@ impl Renderer {
         let slot = self.next_slot;
         self.next_slot += 1;
         self.glyphs.insert(ch, slot);
-        let col = slot % self.per_row;
-        let row = slot / self.per_row;
-        let ox = col * self.cell_w;
-        let oy = row * self.cell_h;
-        rasterize_into(
-            &self.font, &mut self.atlas_cpu, self.px, self.ascent,
-            self.cell_w, self.cell_h, ox, oy, ch,
-        );
+        let ox = (slot % self.per_row) * self.cell_w;
+        let oy = (slot / self.per_row) * self.cell_h;
+        rasterize_into(&self.font, &mut self.atlas_cpu, self.px, self.ascent, self.cell_w, self.cell_h, ox, oy, ch);
         self.atlas_dirty = true;
         slot
     }
@@ -314,45 +273,27 @@ impl Renderer {
         ((col * self.cell_w) as f32 / ATLAS as f32, (row * self.cell_h) as f32 / ATLAS as f32)
     }
 
-    /// Build the instance list from the terminal grid and draw one frame.
-    pub fn render(&mut self, term: &crate::term::VtTerm) {
+    /// Build the instance list from the grid + upload atlas/buffers/uniforms.
+    /// `canvas_w/h` are the draw area in physical px.
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, term: &VtTerm, canvas_w: u32, canvas_h: u32) {
         let cw = self.cell_w as f32;
         let ch = self.cell_h as f32;
         let default_bg = term.default_bg();
-
-        // Pre-resolve every glyph slot we need (mutates the atlas), so the
-        // instance-building borrow of `self.scratch` doesn't clash with `slot_for`.
         let (cur_row, cur_col, cur_vis) = term.cursor();
-        let mut cells: Vec<(usize, usize, u32, [f32; 3], [f32; 3])> = Vec::new();
+
+        // Collect drawable cells, then resolve glyph slots (needs &mut self).
+        let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3])> = Vec::new();
         term.for_each_cell(|row, col, c, fg, bg| {
-            let blank = (c == ' ' || c == '\0') && bg == default_bg;
-            if blank {
+            if (c == ' ' || c == '\0') && bg == default_bg {
                 return;
             }
-            cells.push((row, col, 0, fg, bg)); // slot filled below
-            let _ = c;
+            cells.push((row, col, c, fg, bg));
         });
-        // Resolve slots (second pass — needs &mut self).
-        {
-            let mut i = 0;
-            term.for_each_cell(|_row, _col, c, fg, bg| {
-                let blank = (c == ' ' || c == '\0') && bg == default_bg;
-                if blank {
-                    return;
-                }
-                let s = self.slot_for(c);
-                if i < cells.len() {
-                    cells[i].2 = s;
-                }
-                i += 1;
-                let _ = (fg, bg);
-            });
-        }
 
-        // Pack instances.
         self.scratch.clear();
-        for (row, col, slot, fg, bg) in &cells {
-            let (u, v) = self.uv(*slot);
+        for (row, col, c, fg, bg) in &cells {
+            let slot = self.slot_for(*c);
+            let (u, v) = self.uv(slot);
             self.scratch.extend_from_slice(&[
                 *col as f32 * cw, *row as f32 * ch, u, v,
                 fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
@@ -366,11 +307,10 @@ impl Renderer {
                 cur[0], cur[1], cur[2], cur[0], cur[1], cur[2],
             ]);
         }
-        let count = (self.scratch.len() / 10) as u32;
+        self.count = (self.scratch.len() / 10) as u32;
 
-        // Upload atlas if new glyphs were added.
         if self.atlas_dirty {
-            self.queue.write_texture(
+            queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.atlas_tex,
                     mip_level: 0,
@@ -384,28 +324,96 @@ impl Renderer {
             self.atlas_dirty = false;
         }
 
-        // Grow the instance buffer if needed.
-        if count as u64 > self.inst_cap {
-            self.inst_cap = (count as u64).next_power_of_two();
-            self.inst_vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+        if self.count as u64 > self.inst_cap {
+            self.inst_cap = (self.count as u64).next_power_of_two();
+            self.inst_vb = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("inst"),
                 size: self.inst_cap * 10 * 4,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
         }
-        self.queue.write_buffer(&self.inst_vb, 0, bytemuck::cast_slice(&self.scratch));
+        queue.write_buffer(&self.inst_vb, 0, bytemuck::cast_slice(&self.scratch));
 
-        // Uniforms.
         let u = Uniforms {
-            canvas: [self.config.width as f32, self.config.height as f32],
+            canvas: [canvas_w.max(1) as f32, canvas_h.max(1) as f32],
             cell: [cw, ch],
             glyph: [cw / ATLAS as f32, ch / ATLAS as f32],
             _pad: [0.0, 0.0],
         };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
+    }
 
-        // Draw.
+    /// Draw into a pass. The caller owns the pass + viewport/scissor.
+    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.quad_vb.slice(..));
+        pass.set_vertex_buffer(1, self.inst_vb.slice(..));
+        pass.draw(0..4, 0..self.count);
+    }
+}
+
+/// Thin surface-owning wrapper (the raw winit spike). Iced uses `TermGpu` directly.
+pub struct Renderer {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    gpu: TermGpu,
+}
+
+impl Renderer {
+    pub async fn new(window: Arc<Window>, font_bytes: Vec<u8>, font_index: u32, scale: f32) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window).expect("create_surface");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("request_adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await
+            .expect("request_device");
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
+        let gpu = TermGpu::new(&device, format, font_bytes, font_index, scale);
+        Self { surface, device, queue, config, gpu }
+    }
+
+    pub fn cell_w(&self) -> u32 { self.gpu.cell_w }
+    pub fn cell_h(&self) -> u32 { self.gpu.cell_h }
+
+    pub fn resize(&mut self, w: u32, h: u32) {
+        self.config.width = w.max(1);
+        self.config.height = h.max(1);
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    pub fn render(&mut self, term: &VtTerm) {
+        self.gpu.prepare(&self.device, &self.queue, term, self.config.width, self.config.height);
+        let bg = term.default_bg();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(_) => {
@@ -423,9 +431,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: default_bg[0] as f64,
-                            g: default_bg[1] as f64,
-                            b: default_bg[2] as f64,
+                            r: bg[0] as f64,
+                            g: bg[1] as f64,
+                            b: bg[2] as f64,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -435,13 +443,7 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if count > 0 {
-                rp.set_pipeline(&self.pipeline);
-                rp.set_bind_group(0, &self.bind_group, &[]);
-                rp.set_vertex_buffer(0, self.quad_vb.slice(..));
-                rp.set_vertex_buffer(1, self.inst_vb.slice(..));
-                rp.draw(0..4, 0..count);
-            }
+            self.gpu.draw(&mut rp);
         }
         self.queue.submit([enc.finish()]);
         frame.present();
@@ -470,18 +472,14 @@ fn rasterize_into(
     oy: u32,
     ch: char,
 ) {
-    let glyph = font
-        .glyph_id(ch)
-        .with_scale_and_position(px, ab_glyph::point(0.0, ascent));
+    let glyph = font.glyph_id(ch).with_scale_and_position(px, ab_glyph::point(0.0, ascent));
     if let Some(outlined) = font.outline_glyph(glyph) {
         let b = outlined.px_bounds();
         outlined.draw(|gx, gy, c| {
             let xx = b.min.x as i32 + gx as i32;
             let yy = b.min.y as i32 + gy as i32;
             if xx >= 0 && (xx as u32) < cell_w && yy >= 0 && (yy as u32) < cell_h {
-                let ax = ox + xx as u32;
-                let ay = oy + yy as u32;
-                let idx = (ay * ATLAS + ax) as usize;
+                let idx = ((oy + yy as u32) * ATLAS + (ox + xx as u32)) as usize;
                 let cov = (c * 255.0) as u8;
                 if cov > atlas[idx] {
                     atlas[idx] = cov;
