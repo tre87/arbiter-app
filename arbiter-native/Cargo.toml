@@ -1,0 +1,12 @@
+[package]
+name = "arbiter-native"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Native (no-webview) Arbiter — Phase 0 spike. See ../NATIVE_PLAN.md"
+
+[dependencies]
+# Reuse the same PTY layer the shipping app uses (vendored, cross-platform/ConPTY).
+portable-pty = { path = "../src-tauri/portable-pty" }
+# Same VT parser + cell grid the shipping app already uses.
+alacritty_terminal = "0.26"
