@@ -322,8 +322,15 @@ fn make_executable(_path: &Path) {}
 /// Claude merges this with the user's own settings/hooks (it's loaded via
 /// `--settings`), so the user's hooks still run.
 fn write_settings(path: &Path, arbiter_bin: &Path) -> Option<()> {
-    // Commands are run by Claude via a shell, so quote the binary path.
-    let bin = arbiter_bin.display();
+    // Commands are run by Claude via a shell, so quote the binary path. On
+    // Windows that shell is Git Bash when it's installed, where backslashes are
+    // escape characters and silently corrupt the path (breaking the status bar +
+    // attention hooks). Forward slashes are valid for cmd.exe/PowerShell/Git Bash
+    // alike, so normalise to them on Windows.
+    #[cfg(windows)]
+    let bin = arbiter_bin.display().to_string().replace('\\', "/");
+    #[cfg(not(windows))]
+    let bin = arbiter_bin.display().to_string();
     let status_command = format!("\"{bin}\" claude-statusline");
     let hook_command = format!("\"{bin}\" claude-hook");
     let hook_entry = serde_json::json!({
