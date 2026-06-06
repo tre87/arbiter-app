@@ -7,6 +7,7 @@
 //!
 //! Run:  cd arbiter-native && cargo run --bin iced_shell --release
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +98,7 @@ fn view(state: &State) -> Element<'_, Message> {
     let font = &state.font;
     let grid = pane_grid::PaneGrid::new(&state.panes, |pane, data, _maximized| {
         let term = shader_widget(TermProgram {
+            id: data.session.id(),
             term: data.session.term(),
             master: data.session.master(),
             font: font.clone(),
@@ -180,7 +182,15 @@ fn handle_key(event: iced::Event) -> Option<Message> {
 
 // ── Custom shader widget: the wgpu terminal hosted inside Iced ────────────────
 
+/// Per-pane GPU renderers, keyed by session id. Iced's `Storage` is a global
+/// type-map shared across all shader widgets, so a single TermGpu would be
+/// shared by every pane (all drawing the last-prepared session). Key one
+/// TermGpu per session instead.
+#[derive(Default)]
+struct Renderers(HashMap<u64, TermGpu>);
+
 struct TermProgram {
+    id: u64,
     term: SharedTerm,
     master: SharedMaster,
     font: Arc<(Vec<u8>, u32)>,
@@ -198,6 +208,7 @@ impl shader::Program<Message> for TermProgram {
 
     fn draw(&self, _state: &Self::State, _cursor: iced::mouse::Cursor, _bounds: Rectangle) -> Self::Primitive {
         TermPrimitive {
+            id: self.id,
             term: self.term.clone(),
             master: self.master.clone(),
             font: self.font.clone(),
@@ -206,6 +217,7 @@ impl shader::Program<Message> for TermProgram {
 }
 
 struct TermPrimitive {
+    id: u64,
     term: SharedTerm,
     master: SharedMaster,
     font: Arc<(Vec<u8>, u32)>,
@@ -228,10 +240,14 @@ impl shader::Primitive for TermPrimitive {
         viewport: &shader::Viewport,
     ) {
         let scale = viewport.scale_factor() as f32;
-        if !storage.has::<TermGpu>() {
-            storage.store(TermGpu::new(device, format, self.font.0.clone(), self.font.1, scale));
+        if !storage.has::<Renderers>() {
+            storage.store(Renderers::default());
         }
-        let gpu = storage.get_mut::<TermGpu>().unwrap();
+        let renderers = storage.get_mut::<Renderers>().unwrap();
+        let gpu = renderers
+            .0
+            .entry(self.id)
+            .or_insert_with(|| TermGpu::new(device, format, self.font.0.clone(), self.font.1, scale));
 
         let pw = (bounds.width * scale).max(1.0) as u32;
         let ph = (bounds.height * scale).max(1.0) as u32;
@@ -261,7 +277,8 @@ impl shader::Primitive for TermPrimitive {
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
-        let Some(gpu) = storage.get::<TermGpu>() else { return };
+        let Some(renderers) = storage.get::<Renderers>() else { return };
+        let Some(gpu) = renderers.0.get(&self.id) else { return };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("term-widget"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
