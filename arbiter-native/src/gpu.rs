@@ -367,13 +367,17 @@ impl TermGpu {
         let default_bg = term.default_bg();
         let (cur_row, cur_col, cur_vis) = term.cursor();
 
+        // Selection highlight bg (VS Code blue, matches the web's #264f78).
+        const SEL_BG: [f32; 3] = [0x26 as f32 / 255.0, 0x4f as f32 / 255.0, 0x78 as f32 / 255.0];
         // Collect drawable cells, then resolve glyph slots (needs &mut self).
         let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3], bool)> = Vec::new();
-        term.for_each_cell(|row, col, c, fg, bg, bold| {
-            if (c == ' ' || c == '\0') && bg == default_bg {
-                return;
+        term.for_each_cell(|row, col, c, fg, bg, bold, selected| {
+            if selected {
+                // Draw every selected cell (even blanks) with the selection bg.
+                cells.push((row, col, c, fg, SEL_BG, bold));
+            } else if !((c == ' ' || c == '\0') && bg == default_bg) {
+                cells.push((row, col, c, fg, bg, bold));
             }
-            cells.push((row, col, c, fg, bg, bold));
         });
 
         self.scratch.clear();
