@@ -19,7 +19,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
-use arbiter_native::claude_shim::Capture;
+use arbiter_native::claude_status::Lifecycle;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 use arbiter_native::term::SelectKind;
@@ -36,9 +36,6 @@ struct PaneData {
     session: Session,
     name: String,
     shell: ShellKind,
-    /// Latest Claude statusLine capture bound to this pane (by cwd), or None when
-    /// Claude isn't running here. Refreshed by the ClaudePoll tick.
-    claude: Option<Capture>,
 }
 
 struct Workspace {
@@ -54,7 +51,6 @@ impl Workspace {
             session: spawn_session(None, None),
             name: "Terminal 1".to_string(),
             shell: ShellKind::PowerShell,
-            claude: None,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
         Workspace { panes, focus: first, name, next_term: 2 }
@@ -115,8 +111,6 @@ enum Message {
     Copy(bool),
     Paste,
     Pasted(Option<String>),
-    /// Periodic refresh of each pane's Claude stats from the statusLine captures.
-    ClaudePoll,
 }
 
 /// Spawn a session running `shell` (None = the platform default / PowerShell;
@@ -179,25 +173,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.active = i;
             }
         }
-        Message::ClaudePoll => {
-            // Bind each running-Claude pane to its statusLine capture by cwd.
-            let captures = arbiter_native::shell::app_data_dir()
-                .map(|d| arbiter_native::claude_shim::read_captures(&d.join("claude-sessions")))
-                .unwrap_or_default();
-            for ws in &mut state.workspaces {
-                let ids: Vec<_> = ws.panes.iter().map(|(p, _)| *p).collect();
-                for id in ids {
-                    if let Some(data) = ws.panes.get_mut(id) {
-                        data.claude = if data.session.claude_running() {
-                            let cwd = data.session.cwd();
-                            captures.iter().find(|c| Some(&c.cwd) == cwd.as_ref()).cloned()
-                        } else {
-                            None
-                        };
-                    }
-                }
-            }
-        }
         Message::Copy(allow_interrupt) => {
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
@@ -258,8 +233,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
 fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     let name = ws.next_name();
-    let pane =
-        PaneData { session: spawn_session(None, None), name, shell: ShellKind::PowerShell, claude: None };
+    let pane = PaneData { session: spawn_session(None, None), name, shell: ShellKind::PowerShell };
     if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, pane) {
         ws.focus = new_pane;
     }
@@ -296,8 +270,13 @@ fn view(state: &State) -> Element<'_, Message> {
         .height(Length::Fill);
 
         let focused = pane == focus;
-        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane);
-        let content = column![header, term, footer_bar(&data.session, data.claude.as_ref())]
+        // Claude status (a dot in the header) while Claude runs in this pane.
+        let claude = data
+            .session
+            .claude_running()
+            .then(|| data.session.claude_status().lifecycle);
+        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, claude);
+        let content = column![header, term, footer_bar(&data.session)]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -376,9 +355,11 @@ fn fmt_ctx_size(n: u64) -> String {
     }
 }
 
-fn footer_bar(session: &Session, claude: Option<&Capture>) -> Element<'static, Message> {
-    // Claude stats (Tier-2 capture) take over the footer while Claude runs.
-    if let Some(c) = claude {
+fn footer_bar(session: &Session) -> Element<'static, Message> {
+    // Claude stats (from the capture/hook watcher) take over the footer while
+    // Claude runs here.
+    let c = session.claude_status();
+    if session.claude_running() && c.has_stats {
         let mut r = row![].spacing(12).align_y(iced::Center);
         if let Some(m) = &c.model {
             r = r.push(text(m.clone()).size(11).color(iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)));
@@ -450,18 +431,32 @@ const ICON_BASH: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 /// focused) with a shell-switch button on the right when Git Bash is available
 /// (Windows). The button shows the icon of the shell you'd switch to. A matching
 /// left spacer keeps the title centred. Status will join the header later.
+/// A small filled status dot in the pane header.
+fn status_dot(r: u8, g: u8, b: u8) -> Element<'static, Message> {
+    text("●").size(10).color(iced::Color::from_rgb8(r, g, b)).into()
+}
+
 fn pane_header(
     name: &str,
     focused: bool,
     shell: ShellKind,
     has_git_bash: bool,
     pane: pane_grid::Pane,
+    claude: Option<Lifecycle>,
 ) -> Element<'static, Message> {
     const SLOT: f32 = 26.0;
     let color = if focused {
         iced::Color::from_rgb8(0x4d, 0xa6, 0xff)
     } else {
         iced::Color::from_rgb8(0x6b, 0x6b, 0x6b)
+    };
+    // Claude status dot in the left slot: attention → amber, working → azure,
+    // ready → teal; nothing when Claude isn't running here.
+    let left: Element<'static, Message> = match claude {
+        Some(Lifecycle::Attention) => status_dot(0xe5, 0xa0, 0x3c),
+        Some(Lifecycle::Working) => status_dot(0x33, 0x99, 0xff),
+        Some(Lifecycle::Ready) => status_dot(0x4e, 0xc9, 0xb0),
+        _ => Space::with_width(Length::Fixed(0.0)).into(),
     };
     let title = container(text(name.to_string()).size(12).color(color)).center_x(Length::Fill);
     let right: Element<'static, Message> = if has_git_bash {
@@ -478,7 +473,7 @@ fn pane_header(
         Space::with_width(Length::Fixed(0.0)).into()
     };
     let header = row![
-        Space::with_width(Length::Fixed(SLOT)),
+        container(left).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
         title,
         container(right).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
     ]
@@ -494,9 +489,8 @@ fn pane_header(
 
 fn subscription(_state: &State) -> Subscription<Message> {
     let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
-    let claude = iced::time::every(Duration::from_millis(250)).map(|_| Message::ClaudePoll);
     let keys = iced::event::listen_with(|event, _status, _id| handle_key(event));
-    Subscription::batch([tick, claude, keys])
+    Subscription::batch([tick, keys])
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
@@ -888,6 +882,9 @@ fn main() -> iced::Result {
 
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();
+    // Event-driven Claude status: a single notify watcher over the capture + hook
+    // dirs updates each Session's shared status (no polling). Lives for the app.
+    std::mem::forget(arbiter_native::claude_status::start_watcher());
 
     iced::application("Arbiter native (Iced shell)", update, view)
         .subscription(subscription)

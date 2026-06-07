@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod claude_shim;
+pub mod claude_status;
 pub mod font;
 pub mod git;
 pub mod gpu;
