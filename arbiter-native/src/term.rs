@@ -138,12 +138,13 @@ impl VtTerm {
     pub fn claude_screen(&self) -> Option<ClaudeScreen> {
         // Menu markers the web used (AskUserQuestion / plan-mode / proceed prompts).
         const MENU: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
-        // Claude keeps this in its status line for the whole working turn.
-        const WORKING: &[&str] = &["to interrupt"];
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
+        // The spinner lives on the status line at the very bottom; only look for its
+        // glyph in the last few rows so a star in scrolled-up answer text can't fire it.
+        let spin_start = rows.saturating_sub(6);
         let mut buf = String::with_capacity(cols);
         let mut working = false;
         for row in rows.saturating_sub(24)..rows {
@@ -155,7 +156,19 @@ impl VtTerm {
             if MENU.iter().any(|m| buf.contains(m)) {
                 return Some(ClaudeScreen::Menu);
             }
-            if WORKING.iter().any(|m| buf.contains(m)) {
+            // Working is whatever the user sees animating: Claude's "(esc to
+            // interrupt)" status line, or its ✻ spinner glyph. We match the star/
+            // asterisk dingbat block U+2722–273F (·✢✳✶✻✽ and friends) and Braille
+            // spinners U+2800–28FF — deliberately NOT the whole U+2700–27BF range,
+            // which includes the prompt arrow ❯ (U+276F) that made typing read as work.
+            if buf.contains("to interrupt") {
+                working = true;
+            }
+            if row >= spin_start
+                && buf.chars().any(|c| {
+                    ('\u{2722}'..='\u{273F}').contains(&c) || ('\u{2800}'..='\u{28FF}').contains(&c)
+                })
+            {
                 working = true;
             }
         }

@@ -663,7 +663,8 @@ fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
         }
         Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200))).into(),
         Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, pulse_alpha(1500))).into(),
-        Dot::Ready => text("●").size(size).color(rgba(0x4e, 0xc9, 0xb0, 0.85)).into(),
+        // Claude running but idle (between turns): solid grey — present, not busy.
+        Dot::Ready => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.85)).into(),
         Dot::Idle => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.5)).into(),
     }
 }
