@@ -129,16 +129,21 @@ impl ClaudeHandle {
         self.session_id.lock().unwrap().clone()
     }
 
-    /// The session id ONLY if at least one turn has happened (so the transcript
-    /// exists and `claude --resume` will find it). A freshly-launched Claude has a
-    /// session id but no conversation yet — resuming it errors ("no conversation
-    /// found"), so we return `None` and let restore launch a clean `claude`.
-    /// (Verified: an idle, just-launched Claude emits no spinner, so activity/stop
-    /// timestamps stay 0 until a real turn.)
+    /// The session id ONLY if `claude --resume` will actually find it — i.e. its
+    /// transcript exists on disk. A freshly-launched Claude has a session id (shown
+    /// in the statusline) but no conversation, so no transcript, so resuming it
+    /// errors ("no conversation found"); we return `None` and let restore launch a
+    /// clean `claude`. This is the webview's check: the transcript lives at
+    /// `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
     pub fn resumable_session(&self) -> Option<String> {
-        let had_turn = self.activity_ms.load(Ordering::Relaxed) > 0
-            || self.stop_ms.load(Ordering::Relaxed) > 0;
-        had_turn.then(|| self.session_id.lock().unwrap().clone()).flatten()
+        let sid = self.session_id.lock().unwrap().clone()?;
+        let cwd = self.cwd.lock().unwrap().clone()?;
+        let transcript = dirs::home_dir()?
+            .join(".claude")
+            .join("projects")
+            .join(encode_project_dir(&cwd))
+            .join(format!("{sid}.jsonl"));
+        transcript.is_file().then_some(sid)
     }
 
     /// Derived lifecycle: the most recent signal wins; activity counts as
@@ -171,6 +176,13 @@ impl ClaudeHandle {
         s.lifecycle = self.lifecycle();
         s
     }
+}
+
+/// Claude stores each session's transcript under `~/.claude/projects/<dir>/`,
+/// where `<dir>` is the cwd with every non-alphanumeric (and non-`-`) char
+/// replaced by `-`. (Mirrors the webview's `encode_project_dir`.)
+fn encode_project_dir(cwd: &str) -> String {
+    cwd.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
 }
 
 static REGISTRY: Mutex<Vec<Weak<ClaudeHandle>>> = Mutex::new(Vec::new());
@@ -282,5 +294,20 @@ fn process_hooks(dir: &Path) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_project_dir;
+
+    #[test]
+    fn encodes_cwd_like_claude() {
+        // Matches the real on-disk dir under ~/.claude/projects/.
+        assert_eq!(
+            encode_project_dir("/Users/tor/Private/Source/arbiter-app"),
+            "-Users-tor-Private-Source-arbiter-app"
+        );
+        assert_eq!(encode_project_dir("/a/b-c.d_e"), "-a-b-c-d-e");
     }
 }
