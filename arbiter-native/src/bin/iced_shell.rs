@@ -504,30 +504,38 @@ fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
     }
 }
 
+/// Left inset of the titlebar content so it clears the macOS traffic lights
+/// (the content extends behind them via fullsize_content_view).
+#[cfg(target_os = "macos")]
+const TITLEBAR_LEFT_PAD: f32 = 78.0;
+#[cfg(not(target_os = "macos"))]
+const TITLEBAR_LEFT_PAD: f32 = 10.0;
+
 fn main_view(state: &State) -> Element<'_, Message> {
-    // Top bar: Arbiter logo + animated wordmark, then workspace tabs (left) +
-    // split/close actions (right).
+    // Unified titlebar: Arbiter logo + animated wordmark, then workspace tabs
+    // (left) + actions (right). On macOS this IS the window titlebar (content
+    // extends behind it; traffic lights overlay the left pad).
     let mut bar = row![].spacing(6).align_y(iced::Center);
     bar = bar.push(
         svg(svg::Handle::from_memory(ARBITER_LOGO))
-            .width(Length::Fixed(22.0))
-            .height(Length::Fixed(22.0)),
+            .width(Length::Fixed(18.0))
+            .height(Length::Fixed(18.0)),
     );
     bar = bar.push(arbiter_wordmark());
-    bar = bar.push(Space::with_width(Length::Fixed(10.0)));
+    bar = bar.push(Space::with_width(Length::Fixed(12.0)));
     for (i, ws) in state.workspaces.iter().enumerate() {
-        let mut b = button(text(ws.name.clone()).size(13)).on_press(Message::SelectWorkspace(i)).padding([4, 10]);
+        let mut b = button(text(ws.name.clone()).size(12)).on_press(Message::SelectWorkspace(i)).padding([3, 8]);
         if i != state.active {
             b = b.style(button::secondary);
         }
         bar = bar.push(b);
     }
-    bar = bar.push(button(text("+").size(13)).on_press(Message::NewWorkspace).padding([4, 10]).style(button::secondary));
+    bar = bar.push(button(text("+").size(12)).on_press(Message::NewWorkspace).padding([3, 8]).style(button::secondary));
     bar = bar.push(horizontal_space());
-    bar = bar.push(button(text("⊞ Overview").size(13)).on_press(Message::ToggleOverview).padding([4, 10]).style(button::secondary));
-    bar = bar.push(button(text("Split →").size(13)).on_press(Message::SplitRight).padding([4, 10]));
-    bar = bar.push(button(text("Split ↓").size(13)).on_press(Message::SplitDown).padding([4, 10]));
-    bar = bar.push(button(text("Close").size(13)).on_press(Message::Close).style(button::secondary).padding([4, 10]));
+    bar = bar.push(button(text("⊞ Overview").size(12)).on_press(Message::ToggleOverview).padding([3, 8]).style(button::secondary));
+    bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
+    bar = bar.push(button(text("Split ↓").size(12)).on_press(Message::SplitDown).padding([3, 8]).style(button::secondary));
+    bar = bar.push(button(text("Close").size(12)).on_press(Message::Close).style(button::secondary).padding([3, 8]));
 
     let focus = state.active().focus;
     let font = &state.font;
@@ -595,20 +603,27 @@ fn main_view(state: &State) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    // Inset the content from the window edges with a chrome-coloured frame
-    // (#222222, like the web's --color-bg-chrome behind its panels).
-    let content = column![container(bar).padding([6, 8]), grid]
+    // The titlebar (flush at the very top; left-padded for the traffic lights).
+    let titlebar = container(bar)
         .width(Length::Fill)
-        .height(Length::Fill);
-    container(content)
+        .padding(iced::Padding { top: 9.0, right: 8.0, bottom: 7.0, left: TITLEBAR_LEFT_PAD })
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
+            ..Default::default()
+        });
+
+    // The terminal area, inset from the window edges with a chrome-coloured frame
+    // (#222222, like the web's --color-bg-chrome behind its panels).
+    let framed = container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(6)
+        .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 })
         .style(|_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x22, 0x22, 0x22))),
             ..Default::default()
-        })
-        .into()
+        });
+
+    column![titlebar, framed].width(Length::Fill).height(Length::Fill).into()
 }
 
 /// Hover-highlight style for a clickable overview row.
@@ -1527,6 +1542,15 @@ fn main() -> iced::Result {
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
+            // macOS: unified titlebar — hide the title, make the titlebar
+            // transparent, and let the content extend behind it, so the app's top
+            // bar IS the titlebar (traffic lights overlay on the left).
+            #[cfg(target_os = "macos")]
+            {
+                settings.platform_specific.title_hidden = true;
+                settings.platform_specific.titlebar_transparent = true;
+                settings.platform_specific.fullsize_content_view = true;
+            }
             if let Some(g) = main_geom {
                 settings.size = iced::Size::new(g.width, g.height);
                 if let (Some(x), Some(y)) = (g.x, g.y) {
