@@ -16,6 +16,14 @@ pub enum SelectKind {
     Line,
 }
 
+/// What Claude's visible screen currently shows, for status classification.
+pub enum ClaudeScreen {
+    /// A menu / approval prompt is on screen (AskUserQuestion, plan, "proceed?").
+    Menu,
+    /// Claude's working spinner / "esc to interrupt" status line is on screen.
+    Working,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct NoopListener;
 impl EventListener for NoopListener {}
@@ -122,29 +130,36 @@ impl VtTerm {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// True if the visible screen shows a Claude menu / approval prompt (which no
-    /// hook covers — AskUserQuestion, plan mode, "proceed?"). Scanning the
-    /// rendered grid (vs the raw byte stream) is robust to chunk splits and
-    /// catches the prompt for as long as it stays on screen.
-    pub fn visible_has_menu(&self) -> bool {
-        // The exact markers the web used (AskUserQuestion / plan-mode menus).
-        const MARKERS: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
+    /// Classify Claude's visible screen for status. Scanning the *rendered grid*
+    /// (vs the raw byte stream) is robust to chunk splits and is level-triggered,
+    /// so a menu reads as attention only while it's actually on screen — it clears
+    /// the instant the user escapes/answers. Returns `None` for plain output
+    /// (typing, redraws), which is neither working nor attention.
+    pub fn claude_screen(&self) -> Option<ClaudeScreen> {
+        // Menu markers the web used (AskUserQuestion / plan-mode / proceed prompts).
+        const MENU: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
+        // Claude keeps this in its status line for the whole working turn.
+        const WORKING: &[&str] = &["to interrupt"];
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
         let mut buf = String::with_capacity(cols);
+        let mut working = false;
         for row in rows.saturating_sub(24)..rows {
             buf.clear();
             let line = &grid[Line(row as i32 - off)];
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if MARKERS.iter().any(|m| buf.contains(m)) {
-                return true;
+            if MENU.iter().any(|m| buf.contains(m)) {
+                return Some(ClaudeScreen::Menu);
+            }
+            if WORKING.iter().any(|m| buf.contains(m)) {
+                working = true;
             }
         }
-        false
+        working.then_some(ClaudeScreen::Working)
     }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
