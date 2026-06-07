@@ -63,8 +63,11 @@ pub struct ClaudeHandle {
     stop_ms: AtomicU64,      // Stop hook (turn end)
 }
 
-/// Working reverts to ready after this long without activity.
-const WORKING_TTL_MS: u64 = 1500;
+/// Working reverts to ready after this long without activity (web parity).
+const WORKING_TTL_MS: u64 = 2000;
+/// After a Stop hook, ignore a trailing spinner frame (the turn's final redraw)
+/// for this long so the turn-end doesn't flicker working→ready→working (web parity).
+const STOP_SUPPRESS_MS: u64 = 700;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -105,14 +108,19 @@ impl ClaudeHandle {
             self.activity_ms.load(Ordering::Relaxed),
             self.stop_ms.load(Ordering::Relaxed),
         );
+        let now = now_ms();
         let latest = att.max(act).max(stop);
         if latest == 0 {
             Lifecycle::Ready
         } else if latest == att {
+            // A permission prompt / menu always wins while it's the latest signal.
             Lifecycle::Attention
+        } else if now.saturating_sub(stop) < STOP_SUPPRESS_MS {
+            // Just stopped: suppress a trailing spinner frame so the turn-end is clean.
+            Lifecycle::Ready
         } else if latest == stop {
             Lifecycle::Ready
-        } else if now_ms().saturating_sub(act) < WORKING_TTL_MS {
+        } else if now.saturating_sub(act) < WORKING_TTL_MS {
             Lifecycle::Working
         } else {
             Lifecycle::Ready

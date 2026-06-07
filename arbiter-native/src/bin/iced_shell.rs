@@ -490,7 +490,8 @@ fn footer_style(_t: &iced::Theme) -> container::Style {
 /// Compact token count: 4200 → "4.2k".
 fn fmt_k(n: u64) -> String {
     if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
+        // Truncate to one decimal (match the web's fmtK), e.g. 24450 → "24.4K".
+        format!("{:.1}K", (n / 100) as f64 / 10.0)
     } else {
         n.to_string()
     }
@@ -522,7 +523,8 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
         }
         r = r.push(
             text(format!(
-                "↑{} ↓{} +{} ⟳{}",
+                // ↓ input, ↑ output, + cache-write, ⟳ cache-read — matching the web's order/arrows.
+                "↓{} ↑{} +{} ⟳{}",
                 fmt_k(c.input_tokens),
                 fmt_k(c.output_tokens),
                 fmt_k(c.cache_write),
