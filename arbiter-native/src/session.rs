@@ -120,6 +120,13 @@ impl Session {
         self.claude_running.load(Ordering::Relaxed)
     }
 
+    /// The bound Claude session id IF Claude is running here — for persisting and
+    /// `claude --resume <id>` on restore. `None` if Claude isn't running or no
+    /// capture has bound a session yet.
+    pub fn claude_session_id(&self) -> Option<String> {
+        self.claude_running().then(|| self.claude.session_id()).flatten()
+    }
+
     /// Basename of the current working directory, if known.
     pub fn folder(&self) -> Option<String> {
         self.cwd().map(|p| {

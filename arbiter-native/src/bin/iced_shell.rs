@@ -76,6 +76,12 @@ struct State {
     main_window: iced::window::Id,
     /// The popout overview window, while open.
     overview_window: Option<iced::window::Id>,
+    /// Live geometry of each window (tracked from move/resize events) so it can be
+    /// persisted and restored. Positions are `None` until the WM reports one.
+    main_size: iced::Size,
+    main_pos: Option<iced::Point>,
+    overview_size: iced::Size,
+    overview_pos: Option<iced::Point>,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -126,6 +132,9 @@ enum Message {
     JumpTo(usize, pane_grid::Pane),
     /// A window was closed (main → exit; overview → forget it).
     WindowClosed(iced::window::Id),
+    /// A window was moved/resized — track its geometry for persistence.
+    WindowMoved(iced::window::Id, iced::Point),
+    WindowResized(iced::window::Id, iced::Size),
     /// No-op (used to discard a window-open Task's result).
     Noop,
 }
@@ -152,15 +161,23 @@ fn spawn_restored(
     shell: persist::SavedShell,
     cwd: Option<&str>,
     git_bash: Option<&str>,
+    claude: Option<&str>,
 ) -> (Session, ShellKind) {
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
-    match shell {
+    let (mut session, kind) = match shell {
         persist::SavedShell::GitBash => match git_bash {
             Some(gb) => (spawn_session(Some(gb), cwd), ShellKind::GitBash),
             None => (spawn_session(None, cwd), ShellKind::PowerShell),
         },
         persist::SavedShell::PowerShell => (spawn_session(None, cwd), ShellKind::PowerShell),
+    };
+    if let Some(sid) = claude {
+        // Reopen the previous Claude conversation here. The command queues in the
+        // PTY and runs at the shell's first prompt (after rc sets the shim PATH),
+        // so it goes through our launcher and rebinds statusline/hooks.
+        session.write(format!("claude --resume {sid}\r").as_bytes());
     }
+    (session, kind)
 }
 
 /// Build a workspace's `pane_grid` from its saved split tree, respawning each leaf.
@@ -175,8 +192,9 @@ fn saved_to_config(
             a: Box::new(saved_to_config(*a, git_bash)),
             b: Box::new(saved_to_config(*b, git_bash)),
         },
-        persist::SavedNode::Leaf { name, shell, cwd } => {
-            let (session, kind) = spawn_restored(shell, cwd.as_deref(), git_bash);
+        persist::SavedNode::Leaf { name, shell, cwd, claude } => {
+            let (session, kind) =
+                spawn_restored(shell, cwd.as_deref(), git_bash, claude.as_deref());
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind })
         }
     }
@@ -218,15 +236,29 @@ fn node_to_saved(ws: &Workspace, node: &pane_grid::Node) -> persist::SavedNode {
                     _ => persist::SavedShell::PowerShell,
                 },
                 cwd: data.and_then(|d| d.session.cwd()),
+                claude: data.and_then(|d| d.session.claude_session_id()),
             }
         }
     }
 }
 
-/// Persist the current layout (after layout-changing actions + on exit).
+/// Build a `SavedWindow` from a tracked size + optional position.
+fn saved_window(size: iced::Size, pos: Option<iced::Point>) -> persist::SavedWindow {
+    persist::SavedWindow {
+        width: size.width,
+        height: size.height,
+        x: pos.map(|p| p.x),
+        y: pos.map(|p| p.y),
+    }
+}
+
+/// Persist the current layout + window geometry (after layout-changing actions +
+/// on exit).
 fn save_session(state: &State) {
     persist::save(&persist::SavedState {
         active: state.active,
+        main_window: Some(saved_window(state.main_size, state.main_pos)),
+        overview_window: Some(saved_window(state.overview_size, state.overview_pos)),
         workspaces: state
             .workspaces
             .iter()
@@ -302,10 +334,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Some(id) = state.overview_window.take() {
                 return iced::window::close(id);
             }
-            let (id, open) = iced::window::open(iced::window::Settings {
-                size: iced::Size::new(720.0, 520.0),
-                ..Default::default()
-            });
+            let mut settings =
+                iced::window::Settings { size: state.overview_size, ..Default::default() };
+            if let Some(p) = state.overview_pos {
+                settings.position = iced::window::Position::Specific(p);
+            }
+            let (id, open) = iced::window::open(settings);
             state.overview_window = Some(id);
             return open.map(|_| Message::Noop);
         }
@@ -317,6 +351,20 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if state.overview_window == Some(id) {
                 state.overview_window = None;
+            }
+        }
+        Message::WindowMoved(id, p) => {
+            if id == state.main_window {
+                state.main_pos = Some(p);
+            } else if state.overview_window == Some(id) {
+                state.overview_pos = Some(p);
+            }
+        }
+        Message::WindowResized(id, s) => {
+            if id == state.main_window {
+                state.main_size = s;
+            } else if state.overview_window == Some(id) {
+                state.overview_size = s;
             }
         }
         Message::JumpTo(ws, pane) => {
@@ -842,7 +890,17 @@ fn subscription(_state: &State) -> Subscription<Message> {
         (MAIN_WINDOW.get().copied() == Some(id)).then(|| handle_key(event)).flatten()
     });
     let closes = iced::window::close_events().map(Message::WindowClosed);
-    Subscription::batch([tick, keys, closes])
+    // Track each window's geometry (no move_events(), so filter the event stream).
+    let geom = iced::window::events().map(|(id, ev)| match ev {
+        iced::window::Event::Moved(p) => Message::WindowMoved(id, p),
+        iced::window::Event::Resized(s) => Message::WindowResized(id, s),
+        iced::window::Event::Opened { position, size } => match position {
+            Some(p) => Message::WindowMoved(id, p),
+            None => Message::WindowResized(id, size),
+        },
+        _ => Message::Noop,
+    });
+    Subscription::batch([tick, keys, closes, geom])
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
@@ -1270,13 +1328,29 @@ fn main() -> iced::Result {
         .default_font(ui_font())
         .run_with(move || {
             // daemon starts with no windows — open the main one here.
-            let (main_id, open) = iced::window::open(iced::window::Settings::default());
+            let saved = arbiter_native::persist::load();
+            let main_geom = saved.as_ref().and_then(|s| s.main_window);
+            let overview_geom = saved.as_ref().and_then(|s| s.overview_window);
+
+            // Open the main window at its saved size/position (or the default).
+            let mut settings = iced::window::Settings::default();
+            if let Some(g) = main_geom {
+                settings.size = iced::Size::new(g.width, g.height);
+                if let (Some(x), Some(y)) = (g.x, g.y) {
+                    settings.position = iced::window::Position::Specific(iced::Point::new(x, y));
+                }
+            }
+            let main_size = settings.size;
+            let (main_id, open) = iced::window::open(settings);
             let _ = MAIN_WINDOW.set(main_id);
-            // Restore the saved layout (respawning each terminal in its cwd/shell);
-            // fall back to a single fresh workspace if there's nothing valid saved.
-            let (workspaces, active) = arbiter_native::persist::load()
+
+            // Restore the saved layout (respawning each terminal in its cwd/shell,
+            // resuming Claude where it ran); fall back to one fresh workspace.
+            let (workspaces, active) = saved
                 .and_then(|saved| restore_workspaces(saved, git_bash.as_deref()))
                 .unwrap_or_else(|| (vec![Workspace::new("Workspace 1".to_string())], 0));
+
+            let point = |g: persist::SavedWindow| g.x.zip(g.y).map(|(x, y)| iced::Point::new(x, y));
             let state = State {
                 workspaces,
                 active,
@@ -1285,6 +1359,12 @@ fn main() -> iced::Result {
                 theme: arbiter_theme(),
                 main_window: main_id,
                 overview_window: None,
+                main_size,
+                main_pos: main_geom.and_then(point),
+                overview_size: overview_geom
+                    .map(|g| iced::Size::new(g.width, g.height))
+                    .unwrap_or(iced::Size::new(720.0, 520.0)),
+                overview_pos: overview_geom.and_then(point),
             };
             (state, open.map(|_| Message::Noop))
         })
