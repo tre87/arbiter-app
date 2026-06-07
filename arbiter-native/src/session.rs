@@ -264,7 +264,11 @@ fn reader_loop(
                                 if idle {
                                     // Prompt returned → the foreground command
                                     // (incl. Claude) ended.
-                                    claude_running.store(false, Ordering::Relaxed);
+                                    let was = claude_running.swap(false, Ordering::Relaxed);
+                                    if was {
+                                        // Claude stopped → persist so a restore doesn't relaunch it.
+                                        crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
+                                    }
                                     // A command just finished — it may have changed
                                     // files, so refresh git for the footer.
                                     recompute_git(cwd.clone(), git.clone());
@@ -393,6 +397,9 @@ fn claude_monitor(
         for i in 0..8 {
             if crate::claude::running_under(shell_pid) {
                 claude_running.store(true, Ordering::Relaxed);
+                // Persist that Claude is now running here (even before a session
+                // binds), so a restore relaunches it.
+                crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
                 break;
             }
             if *shell_idle.lock().unwrap() == Some(true) {

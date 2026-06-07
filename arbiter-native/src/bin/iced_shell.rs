@@ -161,7 +161,8 @@ fn spawn_restored(
     shell: persist::SavedShell,
     cwd: Option<&str>,
     git_bash: Option<&str>,
-    claude: Option<&str>,
+    claude_running: bool,
+    claude_session: Option<&str>,
 ) -> (Session, ShellKind) {
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
     let (mut session, kind) = match shell {
@@ -171,11 +172,16 @@ fn spawn_restored(
         },
         persist::SavedShell::PowerShell => (spawn_session(None, cwd), ShellKind::PowerShell),
     };
-    if let Some(sid) = claude {
-        // Reopen the previous Claude conversation here. The command queues in the
-        // PTY and runs at the shell's first prompt (after rc sets the shim PATH),
-        // so it goes through our launcher and rebinds statusline/hooks.
-        session.write(format!("claude --resume {sid}\r").as_bytes());
+    if claude_running {
+        // Relaunch Claude here — resuming the previous conversation if one was bound,
+        // else a fresh session. The command queues in the PTY and runs at the shell's
+        // first prompt (after rc sets the shim PATH), so it goes through our launcher
+        // and rebinds statusline/hooks.
+        let cmd = match claude_session {
+            Some(sid) => format!("claude --resume {sid}\r"),
+            None => "claude\r".to_string(),
+        };
+        session.write(cmd.as_bytes());
     }
     (session, kind)
 }
@@ -192,9 +198,14 @@ fn saved_to_config(
             a: Box::new(saved_to_config(*a, git_bash)),
             b: Box::new(saved_to_config(*b, git_bash)),
         },
-        persist::SavedNode::Leaf { name, shell, cwd, claude } => {
-            let (session, kind) =
-                spawn_restored(shell, cwd.as_deref(), git_bash, claude.as_deref());
+        persist::SavedNode::Leaf { name, shell, cwd, claude_running, claude_session } => {
+            let (session, kind) = spawn_restored(
+                shell,
+                cwd.as_deref(),
+                git_bash,
+                claude_running,
+                claude_session.as_deref(),
+            );
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind })
         }
     }
@@ -236,7 +247,8 @@ fn node_to_saved(ws: &Workspace, node: &pane_grid::Node) -> persist::SavedNode {
                     _ => persist::SavedShell::PowerShell,
                 },
                 cwd: data.and_then(|d| d.session.cwd()),
-                claude: data.and_then(|d| d.session.claude_session_id()),
+                claude_running: data.map(|d| d.session.claude_running()).unwrap_or(false),
+                claude_session: data.and_then(|d| d.session.claude_session_id()),
             }
         }
     }
@@ -273,7 +285,16 @@ fn save_session(state: &State) {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
-        Message::Tick => {}
+        Message::Tick => {
+            // Persist when a Claude session newly bound in a pane (the watcher sets
+            // this on an FS event; the tick just reacts to the flag — a cheap atomic
+            // read, and the save only runs on the rare bind, not every frame).
+            if arbiter_native::claude_status::SAVE_DIRTY
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                save_session(state);
+            }
+        }
         Message::Input(bytes) => {
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
@@ -354,17 +375,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::WindowMoved(id, p) => {
+            let known = id == state.main_window || state.overview_window == Some(id);
             if id == state.main_window {
                 state.main_pos = Some(p);
             } else if state.overview_window == Some(id) {
                 state.overview_pos = Some(p);
             }
+            // Persist geometry as it changes, so it survives any exit path.
+            if known {
+                save_session(state);
+            }
         }
         Message::WindowResized(id, s) => {
+            let known = id == state.main_window || state.overview_window == Some(id);
             if id == state.main_window {
                 state.main_size = s;
             } else if state.overview_window == Some(id) {
                 state.overview_size = s;
+            }
+            if known {
+                save_session(state);
             }
         }
         Message::JumpTo(ws, pane) => {

@@ -163,6 +163,11 @@ impl ClaudeHandle {
 
 static REGISTRY: Mutex<Vec<Weak<ClaudeHandle>>> = Mutex::new(Vec::new());
 
+/// Set by the watcher when a Claude session newly binds to a pane, so the UI knows
+/// to persist the layout (capturing "Claude is running here, resume id X") without
+/// the watcher needing access to the window state. The UI clears it on save.
+pub static SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// Register a session handle for the watcher to update.
 pub fn register(handle: &Arc<ClaudeHandle>) {
     let mut reg = REGISTRY.lock().unwrap();
@@ -210,7 +215,15 @@ fn process_captures(dir: &Path) {
         }) else {
             continue;
         };
-        *h.session_id.lock().unwrap() = Some(c.session_id.clone());
+        {
+            // Bind the session id; flag a save only when it's NEWLY bound (not on
+            // every statusline refresh), so the restored layout knows to resume it.
+            let mut sid = h.session_id.lock().unwrap();
+            if sid.as_deref() != Some(c.session_id.as_str()) {
+                *sid = Some(c.session_id.clone());
+                SAVE_DIRTY.store(true, Ordering::Relaxed);
+            }
+        }
         let mut st = h.stats.lock().unwrap();
         st.model = c.model.clone();
         st.context_size = c.context_size;

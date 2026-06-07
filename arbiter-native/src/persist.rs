@@ -33,16 +33,18 @@ pub enum SavedNode {
         name: String,
         shell: SavedShell,
         cwd: Option<String>,
-        /// The Claude session id that was running here, if any — restored via
-        /// `claude --resume <id>` so the previous conversation reopens. Defaulted
-        /// so older save files (without it) still load.
+        /// Claude was running here → relaunch it on restore (`claude`, or
+        /// `claude --resume <id>` if a session was bound). Defaulted so older
+        /// save files (without these fields) still load.
         #[serde(default)]
-        claude: Option<String>,
+        claude_running: bool,
+        #[serde(default)]
+        claude_session: Option<String>,
     },
 }
 
 /// A window's saved size + (optional) position, in logical pixels.
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct SavedWindow {
     pub width: f32,
     pub height: f32,
@@ -111,13 +113,15 @@ mod tests {
                             name: "Terminal 1".into(),
                             shell: SavedShell::PowerShell,
                             cwd: Some("/tmp".into()),
-                            claude: Some("sess-abc-123".into()),
+                            claude_running: true,
+                            claude_session: Some("sess-abc-123".into()),
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
                             shell: SavedShell::GitBash,
                             cwd: None,
-                            claude: None,
+                            claude_running: false,
+                            claude_session: None,
                         }),
                     },
                 },
@@ -128,7 +132,8 @@ mod tests {
                         name: "Terminal 1".into(),
                         shell: SavedShell::PowerShell,
                         cwd: None,
-                        claude: None,
+                        claude_running: false,
+                        claude_session: None,
                     },
                 },
             ],
@@ -145,7 +150,10 @@ mod tests {
                 assert!(*vertical);
                 assert!((*ratio - 0.4).abs() < 1e-6);
                 match a.as_ref() {
-                    SavedNode::Leaf { claude, .. } => assert_eq!(claude.as_deref(), Some("sess-abc-123")),
+                    SavedNode::Leaf { claude_running, claude_session, .. } => {
+                        assert!(*claude_running);
+                        assert_eq!(claude_session.as_deref(), Some("sess-abc-123"));
+                    }
                     _ => panic!("expected a leaf"),
                 }
             }
@@ -161,7 +169,10 @@ mod tests {
         let s: SavedState = serde_json::from_str(json).unwrap();
         assert!(s.main_window.is_none());
         match &s.workspaces[0].layout {
-            SavedNode::Leaf { claude, .. } => assert!(claude.is_none()),
+            SavedNode::Leaf { claude_running, claude_session, .. } => {
+                assert!(!claude_running);
+                assert!(claude_session.is_none());
+            }
             _ => panic!("expected a leaf"),
         }
     }
