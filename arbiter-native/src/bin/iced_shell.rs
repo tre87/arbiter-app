@@ -19,6 +19,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
+use arbiter_native::claude_shim::Capture;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 use arbiter_native::term::SelectKind;
@@ -35,6 +36,9 @@ struct PaneData {
     session: Session,
     name: String,
     shell: ShellKind,
+    /// Latest Claude statusLine capture bound to this pane (by cwd), or None when
+    /// Claude isn't running here. Refreshed by the ClaudePoll tick.
+    claude: Option<Capture>,
 }
 
 struct Workspace {
@@ -50,6 +54,7 @@ impl Workspace {
             session: spawn_session(None, None),
             name: "Terminal 1".to_string(),
             shell: ShellKind::PowerShell,
+            claude: None,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
         Workspace { panes, focus: first, name, next_term: 2 }
@@ -110,6 +115,8 @@ enum Message {
     Copy(bool),
     Paste,
     Pasted(Option<String>),
+    /// Periodic refresh of each pane's Claude stats from the statusLine captures.
+    ClaudePoll,
 }
 
 /// Spawn a session running `shell` (None = the platform default / PowerShell;
@@ -172,6 +179,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.active = i;
             }
         }
+        Message::ClaudePoll => {
+            // Bind each running-Claude pane to its statusLine capture by cwd.
+            let captures = arbiter_native::shell::app_data_dir()
+                .map(|d| arbiter_native::claude_shim::read_captures(&d.join("claude-sessions")))
+                .unwrap_or_default();
+            for ws in &mut state.workspaces {
+                let ids: Vec<_> = ws.panes.iter().map(|(p, _)| *p).collect();
+                for id in ids {
+                    if let Some(data) = ws.panes.get_mut(id) {
+                        data.claude = if data.session.claude_running() {
+                            let cwd = data.session.cwd();
+                            captures.iter().find(|c| Some(&c.cwd) == cwd.as_ref()).cloned()
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+        }
         Message::Copy(allow_interrupt) => {
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
@@ -232,7 +258,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
 fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     let name = ws.next_name();
-    let pane = PaneData { session: spawn_session(None, None), name, shell: ShellKind::PowerShell };
+    let pane =
+        PaneData { session: spawn_session(None, None), name, shell: ShellKind::PowerShell, claude: None };
     if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, pane) {
         ws.focus = new_pane;
     }
@@ -270,7 +297,7 @@ fn view(state: &State) -> Element<'_, Message> {
 
         let focused = pane == focus;
         let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane);
-        let content = column![header, term, footer_bar(&data.session)]
+        let content = column![header, term, footer_bar(&data.session, data.claude.as_ref())]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -323,7 +350,67 @@ fn view(state: &State) -> Element<'_, Message> {
 
 /// Per-pane footer: folder + git branch + status counts (from the Session's
 /// cwd-tracked git info). Claude model/context/tokens land here later.
-fn footer_bar(session: &Session) -> Element<'static, Message> {
+fn footer_style(_t: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
+        text_color: Some(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
+        ..Default::default()
+    }
+}
+
+/// Compact token count: 4200 → "4.2k".
+fn fmt_k(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Context-window size: 1_000_000 → "1M", 200_000 → "200k".
+fn fmt_ctx_size(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else {
+        format!("{}k", n / 1000)
+    }
+}
+
+fn footer_bar(session: &Session, claude: Option<&Capture>) -> Element<'static, Message> {
+    // Claude stats (Tier-2 capture) take over the footer while Claude runs.
+    if let Some(c) = claude {
+        let mut r = row![].spacing(12).align_y(iced::Center);
+        if let Some(m) = &c.model {
+            r = r.push(text(m.clone()).size(11).color(iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)));
+        }
+        if let Some(p) = c.used_percent {
+            let size = c.context_size.map(fmt_ctx_size).unwrap_or_default();
+            r = r.push(
+                text(format!("ctx {p:.0}%/{size}")).size(11).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)),
+            );
+        }
+        r = r.push(
+            text(format!(
+                "↑{} ↓{} +{} ⟳{}",
+                fmt_k(c.input_tokens),
+                fmt_k(c.output_tokens),
+                fmt_k(c.cache_write),
+                fmt_k(c.cache_read),
+            ))
+            .size(11),
+        );
+        if c.cost_usd > 0.0 {
+            r = r.push(
+                text(format!("${:.2}", c.cost_usd)).size(11).color(iced::Color::from_rgb8(0xd7, 0xba, 0x7d)),
+            );
+        }
+        if let Some(f) = session.folder() {
+            r = r.push(text(format!("· {f}")).size(11));
+        }
+        return container(r).width(Length::Fill).padding([2, 8]).style(footer_style).into();
+    }
+
+    // Otherwise the git footer (folder · branch · counts).
     let mut parts: Vec<String> = Vec::new();
     if let Some(f) = session.folder() {
         parts.push(f);
@@ -350,11 +437,7 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
     container(text(parts.join("   ")).size(11))
         .width(Length::Fill)
         .padding([2, 8])
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
-            text_color: Some(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
-            ..Default::default()
-        })
+        .style(footer_style)
         .into()
 }
 
@@ -411,8 +494,9 @@ fn pane_header(
 
 fn subscription(_state: &State) -> Subscription<Message> {
     let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
+    let claude = iced::time::every(Duration::from_millis(250)).map(|_| Message::ClaudePoll);
     let keys = iced::event::listen_with(|event, _status, _id| handle_key(event));
-    Subscription::batch([tick, keys])
+    Subscription::batch([tick, claude, keys])
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
