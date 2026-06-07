@@ -122,6 +122,31 @@ impl VtTerm {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// True if the visible screen shows a Claude menu / approval prompt (which no
+    /// hook covers — AskUserQuestion, plan mode, "proceed?"). Scanning the
+    /// rendered grid (vs the raw byte stream) is robust to chunk splits and
+    /// catches the prompt for as long as it stays on screen.
+    pub fn visible_has_menu(&self) -> bool {
+        // The exact markers the web used (AskUserQuestion / plan-mode menus).
+        const MARKERS: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
+        let rows = self.term.screen_lines();
+        let cols = self.term.columns();
+        let grid = self.term.grid();
+        let off = grid.display_offset() as i32;
+        let mut buf = String::with_capacity(cols);
+        for row in rows.saturating_sub(24)..rows {
+            buf.clear();
+            let line = &grid[Line(row as i32 - off)];
+            for col in 0..cols {
+                buf.push(line[Column(col)].c);
+            }
+            if MARKERS.iter().any(|m| buf.contains(m)) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
