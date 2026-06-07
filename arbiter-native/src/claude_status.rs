@@ -9,9 +9,9 @@
 //! flip the lifecycle (Stop→ready, Permission/elicitation→attention).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
@@ -44,16 +44,87 @@ pub struct ClaudeStatus {
 }
 
 /// The watcher's view of one session: how to match it (cwd + alive flag + bound
-/// session id) and where to write its status.
+/// session id), the captured stats, and the timestamps the lifecycle is derived
+/// from. The lifecycle is *computed* (not stored) so the reader thread (activity/
+/// menu) and the watcher thread (hooks) never fight over a single field — each
+/// just stamps its latest event time.
 pub struct ClaudeHandle {
     pub shell_pid: Option<u32>,
     pub cwd: Arc<Mutex<Option<String>>>,
     pub claude_running: Arc<AtomicBool>,
-    pub status: Mutex<ClaudeStatus>,
+    stats: Mutex<ClaudeStatus>,
     /// Claude session id once a capture binds it (so hooks route here).
-    pub session_id: Mutex<Option<String>>,
+    session_id: Mutex<Option<String>>,
     /// Highest hook nonce applied (so a repeated signal still fires once).
-    pub last_nonce: Mutex<u128>,
+    last_nonce: Mutex<u128>,
+    /// Last-event times (ms since epoch); 0 = never.
+    activity_ms: AtomicU64,  // spinner / output (working)
+    attention_ms: AtomicU64, // permission hook / menu text
+    stop_ms: AtomicU64,      // Stop hook (turn end)
+}
+
+/// Working reverts to ready after this long without activity.
+const WORKING_TTL_MS: u64 = 1500;
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+impl ClaudeHandle {
+    pub fn new(
+        shell_pid: Option<u32>,
+        cwd: Arc<Mutex<Option<String>>>,
+        claude_running: Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            shell_pid,
+            cwd,
+            claude_running,
+            stats: Mutex::new(ClaudeStatus::default()),
+            session_id: Mutex::new(None),
+            last_nonce: Mutex::new(0),
+            activity_ms: AtomicU64::new(0),
+            attention_ms: AtomicU64::new(0),
+            stop_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// Reader-thread signals (PTY-text scan).
+    pub fn note_activity(&self) {
+        self.activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    pub fn note_attention(&self) {
+        self.attention_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Derived lifecycle: the most recent signal wins; activity counts as
+    /// "working" only while fresh, then reverts to ready.
+    fn lifecycle(&self) -> Lifecycle {
+        let (att, act, stop) = (
+            self.attention_ms.load(Ordering::Relaxed),
+            self.activity_ms.load(Ordering::Relaxed),
+            self.stop_ms.load(Ordering::Relaxed),
+        );
+        let latest = att.max(act).max(stop);
+        if latest == 0 {
+            Lifecycle::Ready
+        } else if latest == att {
+            Lifecycle::Attention
+        } else if latest == stop {
+            Lifecycle::Ready
+        } else if now_ms().saturating_sub(act) < WORKING_TTL_MS {
+            Lifecycle::Working
+        } else {
+            Lifecycle::Ready
+        }
+    }
+
+    /// Snapshot for the view: stats + the currently-derived lifecycle.
+    pub fn snapshot(&self) -> ClaudeStatus {
+        let mut s = self.stats.lock().unwrap().clone();
+        s.lifecycle = self.lifecycle();
+        s
+    }
 }
 
 static REGISTRY: Mutex<Vec<Weak<ClaudeHandle>>> = Mutex::new(Vec::new());
@@ -106,7 +177,7 @@ fn process_captures(dir: &Path) {
             continue;
         };
         *h.session_id.lock().unwrap() = Some(c.session_id.clone());
-        let mut st = h.status.lock().unwrap();
+        let mut st = h.stats.lock().unwrap();
         st.model = c.model.clone();
         st.context_size = c.context_size;
         st.used_percent = c.used_percent;
@@ -116,9 +187,6 @@ fn process_captures(dir: &Path) {
         st.cache_write = c.cache_write;
         st.cost_usd = c.cost_usd;
         st.has_stats = true;
-        if st.lifecycle == Lifecycle::Closed {
-            st.lifecycle = Lifecycle::Ready;
-        }
     }
 }
 
@@ -147,11 +215,10 @@ fn process_hooks(dir: &Path) {
             continue;
         }
         *last = nonce;
-        let mut st = h.status.lock().unwrap();
-        st.lifecycle = match signal {
-            "attention" => Lifecycle::Attention,
-            "stop" => Lifecycle::Ready,
-            _ => st.lifecycle,
-        };
+        match signal {
+            "attention" => h.attention_ms.store(now_ms(), Ordering::Relaxed),
+            "stop" => h.stop_ms.store(now_ms(), Ordering::Relaxed),
+            _ => {}
+        }
     }
 }

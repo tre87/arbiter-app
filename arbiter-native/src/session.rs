@@ -67,16 +67,22 @@ impl Session {
         let watcher: Arc<Mutex<Option<GitWatcher>>> = Arc::new(Mutex::new(None));
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
 
+        // Shared Claude status, updated by the capture/hook watcher (registered
+        // here so it routes by cwd / session id) + the reader (spinner/menu →
+        // activity/attention). Created before the reader so it gets a clone.
+        let claude = crate::claude_status::ClaudeHandle::new(shell_pid, cwd.clone(), claude_running.clone());
+        crate::claude_status::register(&claude);
+
         {
             let term = term.clone();
             let cwd = cwd.clone();
             let shell_idle = shell_idle.clone();
-            let claude_running = claude_running.clone();
+            let claude = claude.clone();
             let git = git.clone();
             let watcher = watcher.clone();
             let cmd_epoch = cmd_epoch.clone();
             std::thread::spawn(move || {
-                reader_loop(reader, term, cwd, shell_idle, claude_running, git, watcher, cmd_epoch)
+                reader_loop(reader, term, cwd, shell_idle, claude, git, watcher, cmd_epoch)
             });
         }
 
@@ -87,18 +93,6 @@ impl Session {
             let shell_idle = shell_idle.clone();
             std::thread::spawn(move || claude_monitor(pid, cmd_epoch, claude_running, shell_idle));
         }
-
-        // Shared Claude status, updated by the capture/hook watcher (registered
-        // here so the watcher can route updates to this pane by cwd / session id).
-        let claude = Arc::new(crate::claude_status::ClaudeHandle {
-            shell_pid,
-            cwd: cwd.clone(),
-            claude_running: claude_running.clone(),
-            status: Mutex::new(crate::claude_status::ClaudeStatus::default()),
-            session_id: Mutex::new(None),
-            last_nonce: Mutex::new(0),
-        });
-        crate::claude_status::register(&claude);
 
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -115,10 +109,10 @@ impl Session {
         })
     }
 
-    /// Current Claude status for this pane (stats + lifecycle), updated by the
-    /// capture/hook watcher. Cheap clone; read it from the view.
+    /// Current Claude status for this pane (stats + derived lifecycle). Cheap;
+    /// read it from the view.
     pub fn claude_status(&self) -> crate::claude_status::ClaudeStatus {
-        self.claude.status.lock().unwrap().clone()
+        self.claude.snapshot()
     }
 
     /// True if a `claude` process is running in this pane right now.
@@ -169,16 +163,42 @@ impl Session {
 
 const MAX_UTF8_REMAINDER: usize = 8;
 
+/// Classify a chunk of Claude's output: approval/menu prompts (no hook covers
+/// them) → attention; a spinner or a run of real output → activity (working).
+fn scan_claude_text(claude: &crate::claude_status::ClaudeHandle, bytes: &[u8]) {
+    let text = unsafe { std::str::from_utf8_unchecked(bytes) };
+    if text.contains("to navigate")
+        || text.contains("Esc to cancel")
+        || text.contains("Would you like to proceed")
+    {
+        claude.note_attention();
+        return;
+    }
+    let mut spinner = false;
+    let mut printable = 0u32;
+    for c in text.chars() {
+        if ('\u{2800}'..='\u{28FF}').contains(&c) || ('\u{2700}'..='\u{27BF}').contains(&c) {
+            spinner = true;
+        } else if !c.is_control() && c != '\u{1b}' {
+            printable += 1;
+        }
+    }
+    if spinner || printable > 10 {
+        claude.note_activity();
+    }
+}
+
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     term: SharedTerm,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
-    claude_running: Arc<AtomicBool>,
+    claude: Arc<crate::claude_status::ClaudeHandle>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
     watcher: Arc<Mutex<Option<GitWatcher>>>,
     cmd_epoch: CmdEpoch,
 ) {
+    let claude_running = claude.claude_running.clone();
     let mut buf = [0u8; 8192];
     let mut remainder: Vec<u8> = Vec::new();
     let mut osc = String::new();
@@ -213,6 +233,13 @@ fn reader_loop(
 
         // Feed the full byte stream to the grid (alacritty parses VT incl. OSC).
         term.lock().unwrap().feed(valid);
+
+        // Tier-3b: while Claude runs here, classify the output (spinner/menu) so
+        // the header dot reflects the live turn — the hooks/transcript can't see
+        // a spinner or an AskUserQuestion menu while it's on screen.
+        if claude_running.load(Ordering::Relaxed) {
+            scan_claude_text(&claude, valid);
+        }
 
         // Separately scan for OSC-7 (cwd) + OSC-133 (busy/idle), which the grid
         // doesn't surface.
