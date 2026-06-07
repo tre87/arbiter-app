@@ -123,9 +123,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Input(bytes) => {
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
-                // Typing returns the view to the live bottom (like the web).
+                // Typing returns the view to the live bottom + clears selection.
                 if let Ok(mut t) = p.session.term().lock() {
                     t.scroll_to_bottom();
+                    t.clear_selection();
                 }
                 p.session.write(&bytes);
             }
@@ -217,6 +218,7 @@ fn view(state: &State) -> Element<'_, Message> {
     let grid = pane_grid::PaneGrid::new(&state.active().panes, |pane, data, _maximized| {
         let term = shader_widget(TermProgram {
             id: data.session.id(),
+            pane,
             term: data.session.term(),
             master: data.session.master(),
             font: font.clone(),
@@ -479,6 +481,19 @@ fn handle_key(event: iced::Event) -> Option<Message> {
     None
 }
 
+/// Map a cursor position (logical px, relative to the widget) to a visible
+/// (row, col) cell plus whether the cursor is in the cell's right half. Cell
+/// size is derived from the widget bounds and the grid dimensions.
+fn cell_at(pos: iced::Point, bounds: Rectangle, term: &SharedTerm) -> (usize, usize, bool) {
+    let (cols, rows) = term.lock().unwrap().size();
+    let cw = (bounds.width / cols.max(1) as f32).max(1.0);
+    let ch = (bounds.height / rows.max(1) as f32).max(1.0);
+    let fx = pos.x / cw;
+    let col = (fx.max(0.0).floor() as usize).min(cols.saturating_sub(1));
+    let row = ((pos.y / ch).max(0.0).floor() as usize).min(rows.saturating_sub(1));
+    (row, col, fx.fract() >= 0.5)
+}
+
 // ── Custom shader widget: the wgpu terminal hosted inside Iced ────────────────
 
 /// Per-pane GPU renderers, keyed by session id. Iced's `Storage` is a global
@@ -489,9 +504,16 @@ struct Renderers(HashMap<u64, TermGpu>);
 
 struct TermProgram {
     id: u64,
+    pane: pane_grid::Pane,
     term: SharedTerm,
     master: SharedMaster,
     font: Arc<arbiter_native::font::FontSpec>,
+}
+
+/// Per-widget interaction state: whether a left-drag selection is in progress.
+#[derive(Default)]
+struct TermState {
+    dragging: bool,
 }
 
 impl std::fmt::Debug for TermProgram {
@@ -501,23 +523,25 @@ impl std::fmt::Debug for TermProgram {
 }
 
 impl shader::Program<Message> for TermProgram {
-    type State = ();
+    type State = TermState;
     type Primitive = TermPrimitive;
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: shader::Event,
         bounds: Rectangle,
         cursor: iced::mouse::Cursor,
         _shell: &mut iced::advanced::Shell<'_, Message>,
     ) -> (iced::event::Status, Option<Message>) {
-        use iced::mouse::{Event::WheelScrolled, ScrollDelta};
-        // Mouse wheel over this pane scrolls its scrollback. ×3 lines per notch
-        // (matches Alacritty); pixel deltas (trackpads) convert via the cell
-        // height. Typing jumps back to the bottom (handled in update()).
-        if let shader::Event::Mouse(WheelScrolled { delta }) = event {
-            if cursor.position_in(bounds).is_some() {
+        use iced::event::Status::{Captured, Ignored};
+        use iced::mouse::{Button, Event::*, ScrollDelta};
+        let captured = (Captured, None);
+        match event {
+            // Wheel over this pane scrolls its scrollback. ×3 lines per notch
+            // (matches Alacritty); pixel deltas (trackpads) convert via cell
+            // height. Typing jumps back to the bottom (handled in update()).
+            shader::Event::Mouse(WheelScrolled { delta }) if cursor.is_over(bounds) => {
                 let mut t = self.term.lock().unwrap();
                 let rows = t.size().1.max(1) as f32;
                 let lines = match delta {
@@ -527,10 +551,32 @@ impl shader::Program<Message> for TermProgram {
                 if lines != 0 {
                     t.scroll(lines);
                 }
-                return (iced::event::Status::Captured, None);
+                captured
             }
+            // Left press: focus the pane + begin a selection at the clicked cell.
+            shader::Event::Mouse(ButtonPressed(Button::Left)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    let (row, col, right) = cell_at(pos, bounds, &self.term);
+                    self.term.lock().unwrap().start_selection(row, col, right);
+                    state.dragging = true;
+                    (Captured, Some(Message::Focus(self.pane)))
+                } else {
+                    (Ignored, None)
+                }
+            }
+            shader::Event::Mouse(CursorMoved { .. }) if state.dragging => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    let (row, col, right) = cell_at(pos, bounds, &self.term);
+                    self.term.lock().unwrap().update_selection(row, col, right);
+                }
+                captured
+            }
+            shader::Event::Mouse(ButtonReleased(Button::Left)) if state.dragging => {
+                state.dragging = false;
+                captured
+            }
+            _ => (Ignored, None),
         }
-        (iced::event::Status::Ignored, None)
     }
 
     fn draw(&self, _state: &Self::State, _cursor: iced::mouse::Cursor, _bounds: Rectangle) -> Self::Primitive {

@@ -3,7 +3,8 @@
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
@@ -67,6 +68,41 @@ impl VtTerm {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    /// Map a visible row to an absolute grid line (accounting for scrollback).
+    fn abs_line(&self, row: usize) -> Line {
+        Line(row as i32 - self.term.grid().display_offset() as i32)
+    }
+
+    /// Begin a selection at a visible (row, col); `right` = cursor in the cell's
+    /// right half (which edge the selection snaps to).
+    pub fn start_selection(&mut self, row: usize, col: usize, right: bool) {
+        let point = Point::new(self.abs_line(row), Column(col));
+        let side = if right { Side::Right } else { Side::Left };
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+    }
+
+    /// Extend the active selection to a visible (row, col).
+    pub fn update_selection(&mut self, row: usize, col: usize, right: bool) {
+        let point = Point::new(self.abs_line(row), Column(col));
+        let side = if right { Side::Right } else { Side::Left };
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(point, side);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.term.selection.is_some()
+    }
+
+    /// The selected text, if any (for copy).
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
@@ -78,16 +114,19 @@ impl VtTerm {
         (p.line.0.max(0) as usize, p.column.0, vis)
     }
 
-    /// Walk the visible screen, yielding (row, col, char, fg, bg, bold) per cell.
-    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool)) {
+    /// Walk the visible screen, yielding (row, col, char, fg, bg, bold, selected)
+    /// per cell. `selected` is true for cells inside the active selection.
+    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool, bool)) {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
+        let sel = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
         let grid = self.term.grid();
         // Offset by the scrollback position so a scrolled-up view shows history
         // (negative line indices address the scrollback).
         let off = grid.display_offset() as i32;
         for row in 0..rows {
-            let line = &grid[Line(row as i32 - off)];
+            let line_idx = row as i32 - off;
+            let line = &grid[Line(line_idx)];
             for col in 0..cols {
                 let cell = &line[Column(col)];
                 let mut fg = self.resolve(cell.fg, true);
@@ -99,7 +138,9 @@ impl VtTerm {
                     fg = bg;
                 }
                 let bold = cell.flags.contains(Flags::BOLD);
-                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold);
+                let selected =
+                    sel.as_ref().is_some_and(|r| r.contains(Point::new(Line(line_idx), Column(col))));
+                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold, selected);
             }
         }
     }
