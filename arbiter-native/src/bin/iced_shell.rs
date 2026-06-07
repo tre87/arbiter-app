@@ -505,8 +505,16 @@ fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
 }
 
 fn main_view(state: &State) -> Element<'_, Message> {
-    // Top bar: workspace tabs (left) + split/close actions (right).
-    let mut bar = row![].spacing(4);
+    // Top bar: Arbiter logo + animated wordmark, then workspace tabs (left) +
+    // split/close actions (right).
+    let mut bar = row![].spacing(6).align_y(iced::Center);
+    bar = bar.push(
+        svg(svg::Handle::from_memory(ARBITER_LOGO))
+            .width(Length::Fixed(22.0))
+            .height(Length::Fixed(22.0)),
+    );
+    bar = bar.push(arbiter_wordmark());
+    bar = bar.push(Space::with_width(Length::Fixed(10.0)));
     for (i, ws) in state.workspaces.iter().enumerate() {
         let mut b = button(text(ws.name.clone()).size(13)).on_press(Message::SelectWorkspace(i)).padding([4, 10]);
         if i != state.active {
@@ -587,9 +595,19 @@ fn main_view(state: &State) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    column![container(bar).padding(6), grid]
+    // Inset the content from the window edges with a chrome-coloured frame
+    // (#222222, like the web's --color-bg-chrome behind its panels).
+    let content = column![container(bar).padding([6, 8]), grid]
+        .width(Length::Fill)
+        .height(Length::Fill);
+    container(content)
         .width(Length::Fill)
         .height(Length::Fill)
+        .padding(6)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x22, 0x22, 0x22))),
+            ..Default::default()
+        })
         .into()
 }
 
@@ -865,6 +883,48 @@ const CLAUDE_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// The Arbiter "A" mark (blue-gradient SVG, the web's assets/logo.svg).
+const ARBITER_LOGO: &[u8] = include_bytes!("../../assets/logo.svg");
+
+/// Sample the titlebar azure gradient at `t` (wrapped to [0,1)) — the web's
+/// `title-shimmer` stops: baby→azure→deep→tropical→baby.
+fn azure_at(t: f32) -> iced::Color {
+    const STOPS: [(f32, (u8, u8, u8)); 5] = [
+        (0.00, (0x88, 0xD1, 0xF1)),
+        (0.25, (0x33, 0x99, 0xFF)),
+        (0.50, (0x02, 0x7D, 0xFF)),
+        (0.75, (0x41, 0xAA, 0xDE)),
+        (1.00, (0x88, 0xD1, 0xF1)),
+    ];
+    let t = t - t.floor();
+    let mut i = 0;
+    while i + 1 < STOPS.len() - 1 && t > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (p0, c0) = STOPS[i];
+    let (p1, c1) = STOPS[i + 1];
+    let f = if p1 > p0 { (t - p0) / (p1 - p0) } else { 0.0 };
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    iced::Color::from_rgb8(mix(c0.0, c1.0), mix(c0.1, c1.1), mix(c0.2, c1.2))
+}
+
+/// The animated "Arbiter" wordmark: an azure gradient shimmering across the
+/// letters (the web's `title-shimmer`). Iced can't gradient-fill text, so each
+/// letter samples the gradient at a phase that eases back and forth over ~12s.
+fn arbiter_wordmark() -> Element<'static, Message> {
+    let p = (now_ms() % 12_000) as f32 / 6_000.0; // 0→2 over 12s
+    let tri = if p <= 1.0 { p } else { 2.0 - p }; // triangle 0→1→0
+    let phase = tri * tri * (3.0 - 2.0 * tri); // smoothstep (ease-in-out)
+    const WORD: &str = "Arbiter";
+    let n = WORD.chars().count() as f32;
+    let mut r = row![].align_y(iced::Center);
+    for (i, ch) in WORD.chars().enumerate() {
+        let col = azure_at(phase * 0.6 + (i as f32 / n) * 0.6);
+        r = r.push(text(ch.to_string()).size(15).color(col).font(ui_semibold()));
+    }
+    r.into()
 }
 
 /// The animated Claude "working" glyph (asterisk bloom) — matches the web's
