@@ -70,11 +70,14 @@ pub struct ClaudeHandle {
     hook_attention: AtomicBool,
 }
 
-/// Working reverts to ready after this long without a spinner frame. Only the
-/// FALLBACK for when no Stop hook arrives — Claude animates the spinner every
-/// ~100-300ms while working, so this comfortably bridges frame gaps while keeping
-/// the post-turn lag short. (Stop, when it fires, ends the turn instantly.)
-const WORKING_TTL_MS: u64 = 900;
+/// Working reverts to ready after this long without a detected spinner frame.
+/// Must comfortably exceed the gap BETWEEN detected frames: Claude's ✻ bloom
+/// passes through `·` frames (not in our star range) and animates slower while
+/// "thinking", so a too-short TTL makes working flicker on/off between frames.
+/// The web used 2s; matching it. The turn-end stays instant regardless — the Stop
+/// hook (+ post-stop guard) clears working immediately; this only bounds the
+/// no-hook fallback.
+const WORKING_TTL_MS: u64 = 2000;
 /// After a Stop hook, treat the turn as over: ignore a trailing spinner frame (the
 /// final redraw) and force ready for this long, so the turn-end can't flicker
 /// working→ready→working.
