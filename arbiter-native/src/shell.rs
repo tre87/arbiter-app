@@ -53,6 +53,42 @@ fn ensure_zsh_integration_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
+/// Locate Git Bash (`bash.exe`) on Windows so a terminal can switch to it.
+/// Checks the standard install dirs, then `where bash.exe` filtered to a Git
+/// one (not WSL/System32). Returns None off Windows or when not installed.
+pub fn detect_git_bash() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let candidates =
+            [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"];
+        for path in candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("where")
+            .arg("bash.exe")
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let l = line.to_lowercase();
+                if l.contains("git") && !l.contains("system32") {
+                    return Some(line.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 /// Build the interactive shell command with OSC-7/OSC-133 emitters injected.
 /// On Windows: `shell = Some(bash_path)` → Git Bash, else PowerShell.
 #[cfg_attr(target_os = "windows", allow(unused_variables))]
