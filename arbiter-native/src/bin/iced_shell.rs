@@ -405,7 +405,7 @@ fn overview_git(session: &Session) -> Element<'static, Message> {
             r = r.push(text(format!("●{}", g.staged)).size(11).color(iced::Color::from_rgb8(0x6a, 0x99, 0x55)));
         }
         if g.unstaged > 0 {
-            r = r.push(text(format!("✎{}", g.unstaged)).size(11).color(iced::Color::from_rgb8(0xe5, 0xa0, 0x3c)));
+            r = r.push(text(format!("○{}", g.unstaged)).size(11).color(iced::Color::from_rgb8(0xe5, 0xa0, 0x3c)));
         }
         if g.untracked > 0 {
             r = r.push(text(format!("+{}", g.untracked)).size(11).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)));
@@ -423,7 +423,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
     let mut col = column![]
         .spacing(2)
-        .push(container(text("ARBITER").size(11).color(muted)).padding([8, 12]));
+        .push(container(text("Arbiter").size(13).font(title_font()).color(muted)).padding([8, 12]));
 
     for (wi, ws) in state.workspaces.iter().enumerate() {
         let count = ws.panes.iter().count();
@@ -523,8 +523,8 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
         }
         r = r.push(
             text(format!(
-                // ↓ input, ↑ output, + cache-write, ⟳ cache-read — matching the web's order/arrows.
-                "↓{} ↑{} +{} ⟳{}",
+                // ↓ input, ↑ output, + cache-write, ↻ cache-read — matching the web's order/arrows.
+                "↓{} ↑{} +{} ↻{}",
                 fmt_k(c.input_tokens),
                 fmt_k(c.output_tokens),
                 fmt_k(c.cache_write),
@@ -557,7 +557,7 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
             counts.push_str(&format!("●{} ", g.staged));
         }
         if g.unstaged > 0 {
-            counts.push_str(&format!("✎{} ", g.unstaged));
+            counts.push_str(&format!("○{} ", g.unstaged));
         }
         if g.untracked > 0 {
             counts.push_str(&format!("+{}", g.untracked));
@@ -1106,6 +1106,22 @@ impl shader::Primitive for TermPrimitive {
     }
 }
 
+/// Web-parity UI fonts — the same the web app used outside terminals: Inter for
+/// body text, DM Sans for the title/logo. Both are variable fonts (weight axis);
+/// cosmic-text selects the weight. Bundled under assets/ (SIL OFL).
+const INTER_FONT: &[u8] = include_bytes!("../../assets/Inter-VariableFont.ttf");
+const DMSANS_FONT: &[u8] = include_bytes!("../../assets/DMSans-VariableFont.ttf");
+
+/// The base UI font (Inter), matching the web's `font-family: 'Inter', …`.
+fn ui_font() -> iced::Font {
+    iced::Font::with_name("Inter")
+}
+
+/// The title/logo font (DM Sans Bold), matching the web's "Arbiter" wordmark.
+fn title_font() -> iced::Font {
+    iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::with_name("DM Sans") }
+}
+
 fn main() -> iced::Result {
     // Headless subcommands Claude invokes via our injected --settings: capture
     // its statusLine JSON / hook signals, then exit without starting the GUI.
@@ -1138,6 +1154,9 @@ fn main() -> iced::Result {
     iced::daemon(title, update, view)
         .subscription(subscription)
         .theme(|s: &State, _id| s.theme.clone())
+        .font(INTER_FONT)
+        .font(DMSANS_FONT)
+        .default_font(ui_font())
         .run_with(move || {
             // daemon starts with no windows — open the main one here.
             let (main_id, open) = iced::window::open(iced::window::Settings::default());
