@@ -33,7 +33,21 @@ pub enum SavedNode {
         name: String,
         shell: SavedShell,
         cwd: Option<String>,
+        /// The Claude session id that was running here, if any — restored via
+        /// `claude --resume <id>` so the previous conversation reopens. Defaulted
+        /// so older save files (without it) still load.
+        #[serde(default)]
+        claude: Option<String>,
     },
+}
+
+/// A window's saved size + (optional) position, in logical pixels.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct SavedWindow {
+    pub width: f32,
+    pub height: f32,
+    pub x: Option<f32>,
+    pub y: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +61,12 @@ pub struct SavedWorkspace {
 pub struct SavedState {
     pub active: usize,
     pub workspaces: Vec<SavedWorkspace>,
+    /// Main window geometry; defaulted so older save files still load.
+    #[serde(default)]
+    pub main_window: Option<SavedWindow>,
+    /// Overview popout geometry; defaulted likewise.
+    #[serde(default)]
+    pub overview_window: Option<SavedWindow>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -78,6 +98,8 @@ mod tests {
     fn roundtrips_through_json() {
         let state = SavedState {
             active: 1,
+            main_window: Some(SavedWindow { width: 1200.0, height: 800.0, x: Some(10.0), y: Some(20.0) }),
+            overview_window: None,
             workspaces: vec![
                 SavedWorkspace {
                     name: "Workspace 1".into(),
@@ -89,11 +111,13 @@ mod tests {
                             name: "Terminal 1".into(),
                             shell: SavedShell::PowerShell,
                             cwd: Some("/tmp".into()),
+                            claude: Some("sess-abc-123".into()),
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
                             shell: SavedShell::GitBash,
                             cwd: None,
+                            claude: None,
                         }),
                     },
                 },
@@ -104,6 +128,7 @@ mod tests {
                         name: "Terminal 1".into(),
                         shell: SavedShell::PowerShell,
                         cwd: None,
+                        claude: None,
                     },
                 },
             ],
@@ -114,12 +139,30 @@ mod tests {
         assert_eq!(back.active, 1);
         assert_eq!(back.workspaces.len(), 2);
         assert_eq!(back.workspaces[0].next_term, 3);
+        assert_eq!(back.main_window.unwrap().width, 1200.0);
         match &back.workspaces[0].layout {
-            SavedNode::Split { vertical, ratio, .. } => {
+            SavedNode::Split { vertical, ratio, a, .. } => {
                 assert!(*vertical);
                 assert!((*ratio - 0.4).abs() < 1e-6);
+                match a.as_ref() {
+                    SavedNode::Leaf { claude, .. } => assert_eq!(claude.as_deref(), Some("sess-abc-123")),
+                    _ => panic!("expected a leaf"),
+                }
             }
             _ => panic!("expected a split"),
+        }
+    }
+
+    #[test]
+    fn old_file_without_new_fields_still_loads() {
+        // A save from before window-geometry/claude-resume existed.
+        let json = r#"{"active":0,"workspaces":[{"name":"W","next_term":2,
+            "layout":{"Leaf":{"name":"T","shell":"PowerShell","cwd":null}}}]}"#;
+        let s: SavedState = serde_json::from_str(json).unwrap();
+        assert!(s.main_window.is_none());
+        match &s.workspaces[0].layout {
+            SavedNode::Leaf { claude, .. } => assert!(claude.is_none()),
+            _ => panic!("expected a leaf"),
         }
     }
 }

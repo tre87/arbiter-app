@@ -123,6 +123,12 @@ impl ClaudeHandle {
         self.menu_on_screen.store(on, Ordering::Relaxed);
     }
 
+    /// The bound Claude session id (set once a capture matches this pane), for
+    /// `claude --resume` on restore.
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id.lock().unwrap().clone()
+    }
+
     /// Derived lifecycle: the most recent signal wins; activity counts as
     /// "working" only while fresh, then reverts to ready.
     fn lifecycle(&self) -> Lifecycle {
