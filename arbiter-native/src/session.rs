@@ -42,6 +42,7 @@ pub struct Session {
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude_running: Arc<AtomicBool>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
+    claude: Arc<crate::claude_status::ClaudeHandle>,
     _watcher: Arc<Mutex<Option<GitWatcher>>>,
     _child: Box<dyn Child + Send + Sync>,
 }
@@ -87,6 +88,18 @@ impl Session {
             std::thread::spawn(move || claude_monitor(pid, cmd_epoch, claude_running, shell_idle));
         }
 
+        // Shared Claude status, updated by the capture/hook watcher (registered
+        // here so the watcher can route updates to this pane by cwd / session id).
+        let claude = Arc::new(crate::claude_status::ClaudeHandle {
+            shell_pid,
+            cwd: cwd.clone(),
+            claude_running: claude_running.clone(),
+            status: Mutex::new(crate::claude_status::ClaudeStatus::default()),
+            session_id: Mutex::new(None),
+            last_nonce: Mutex::new(0),
+        });
+        crate::claude_status::register(&claude);
+
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             writer,
@@ -96,9 +109,16 @@ impl Session {
             shell_idle,
             claude_running,
             git,
+            claude,
             _watcher: watcher,
             _child: child,
         })
+    }
+
+    /// Current Claude status for this pane (stats + lifecycle), updated by the
+    /// capture/hook watcher. Cheap clone; read it from the view.
+    pub fn claude_status(&self) -> crate::claude_status::ClaudeStatus {
+        self.claude.status.lock().unwrap().clone()
     }
 
     /// True if a `claude` process is running in this pane right now.
