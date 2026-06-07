@@ -103,6 +103,7 @@ enum Message {
     NewWorkspace,
     SelectWorkspace(usize),
     SwitchShell(pane_grid::Pane),
+    ShiftEnter,
 }
 
 /// Spawn a session running `shell` (None = the platform default / PowerShell;
@@ -123,6 +124,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
                 p.session.write(&bytes);
+            }
+        }
+        Message::ShiftEnter => {
+            // Claude (Ink) wants the kitty Shift+Enter sequence to insert a
+            // newline; a plain shell would echo those bytes as garbage, so send
+            // a normal CR there instead.
+            let ws = state.active_mut();
+            if let Some(p) = ws.panes.get_mut(ws.focus) {
+                let bytes: &[u8] = if p.session.claude_running() { b"\x1b[13;2u" } else { b"\r" };
+                p.session.write(bytes);
             }
         }
         Message::Focus(pane) => state.active_mut().focus = pane,
@@ -361,9 +372,20 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         return None;
     };
     match &key {
-        Key::Named(Named::Enter) => return Some(Message::Input(b"\r".to_vec())),
+        Key::Named(Named::Enter) => {
+            // Shift+Enter → resolved in update() (kitty CSI 13;2u for Claude,
+            // else CR). Ctrl+Enter → LF (Claude multi-line). Plain → CR.
+            if modifiers.shift() {
+                return Some(Message::ShiftEnter);
+            }
+            return Some(Message::Input(if modifiers.control() { b"\n".to_vec() } else { b"\r".to_vec() }));
+        }
         Key::Named(Named::Backspace) => return Some(Message::Input(vec![0x7f])),
-        Key::Named(Named::Tab) => return Some(Message::Input(b"\t".to_vec())),
+        Key::Named(Named::Tab) => {
+            // Shift+Tab → CSI Z (back-tab); Claude cycles its mode with it.
+            let bytes = if modifiers.shift() { b"\x1b[Z".to_vec() } else { b"\t".to_vec() };
+            return Some(Message::Input(bytes));
+        }
         Key::Named(Named::Escape) => return Some(Message::Input(vec![0x1b])),
         Key::Named(Named::ArrowUp) => return Some(Message::Input(b"\x1b[A".to_vec())),
         Key::Named(Named::ArrowDown) => return Some(Message::Input(b"\x1b[B".to_vec())),
