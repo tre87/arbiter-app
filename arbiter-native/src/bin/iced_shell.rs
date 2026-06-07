@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use portable_pty::PtySize;
 
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{
-    button, column, container, horizontal_space, mouse_area, pane_grid, row, shader as shader_widget, svg,
-    text, Space,
+    button, column, container, horizontal_space, mouse_area, pane_grid, row, scrollable,
+    shader as shader_widget, svg, text, Space,
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
@@ -121,6 +121,8 @@ enum Message {
     Pasted(Option<String>),
     /// Toggle the popout overview window.
     ToggleOverview,
+    /// Jump to a pane from the overview (select its workspace + focus it).
+    JumpTo(usize, pane_grid::Pane),
     /// A window was closed (main → exit; overview → forget it).
     WindowClosed(iced::window::Id),
     /// No-op (used to discard a window-open Task's result).
@@ -205,6 +207,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if state.overview_window == Some(id) {
                 state.overview_window = None;
+            }
+        }
+        Message::JumpTo(ws, pane) => {
+            if ws < state.workspaces.len() {
+                state.active = ws;
+                if state.workspaces[ws].panes.get(pane).is_some() {
+                    state.workspaces[ws].focus = pane;
+                }
+                return iced::window::gain_focus(state.main_window);
             }
         }
         Message::Copy(allow_interrupt) => {
@@ -315,12 +326,12 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .height(Length::Fill);
 
         let focused = pane == focus;
-        // Claude status (a dot in the header) while Claude runs in this pane.
-        let claude = data
+        // Claude status indicator in the header while Claude runs in this pane.
+        let status = data
             .session
             .claude_running()
-            .then(|| data.session.claude_status().lifecycle);
-        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, claude);
+            .then(|| pane_dot(true, data.session.claude_status().lifecycle, false));
+        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, status);
         let content = column![header, term, footer_bar(&data.session)]
             .width(Length::Fill)
             .height(Length::Fill);
@@ -372,57 +383,95 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .into()
 }
 
-/// The popout overview window: every terminal across all workspaces with its
-/// live Claude status (dot + label) + stats. Reads the same shared status the
-/// footer does — redrawn each frame, no polling.
+/// Hover-highlight style for a clickable overview row.
+fn overview_row_style(_t: &iced::Theme, status: button::Status) -> button::Style {
+    let mut s = button::Style {
+        background: None,
+        text_color: iced::Color::from_rgb8(0xe8, 0xea, 0xed),
+        border: iced::Border::default(),
+        shadow: Default::default(),
+    };
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        s.background = Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)));
+    }
+    s
+}
+
+/// Git stat counts (●staged ✎unstaged +untracked), matching the footer's colours.
+fn overview_git(session: &Session) -> Element<'static, Message> {
+    let mut r = row![].spacing(6).align_y(iced::Center);
+    if let Some(g) = session.git() {
+        if g.staged > 0 {
+            r = r.push(text(format!("●{}", g.staged)).size(11).color(iced::Color::from_rgb8(0x6a, 0x99, 0x55)));
+        }
+        if g.unstaged > 0 {
+            r = r.push(text(format!("✎{}", g.unstaged)).size(11).color(iced::Color::from_rgb8(0xe5, 0xa0, 0x3c)));
+        }
+        if g.untracked > 0 {
+            r = r.push(text(format!("+{}", g.untracked)).size(11).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)));
+        }
+    }
+    r.into()
+}
+
+/// The popout overview window: workspaces as titles (with terminal counts), each
+/// terminal under it with a Claude icon (when active), git stats, and a live
+/// status indicator (idle/running/ready dot · animated ✻ working · amber
+/// attention). Clicking a row jumps to that pane. Reads the same shared status
+/// the footer does — redrawn each frame, no polling.
 fn overview_view(state: &State) -> Element<'_, Message> {
-    let mut col = column![text("Sessions").size(16).color(iced::Color::from_rgb8(0xcc, 0xcc, 0xcc))]
-        .spacing(6)
-        .padding(14);
-    for ws in &state.workspaces {
-        for (_pane, data) in ws.panes.iter() {
+    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
+    let mut col = column![]
+        .spacing(2)
+        .push(container(text("ARBITER").size(11).color(muted)).padding([8, 12]));
+
+    for (wi, ws) in state.workspaces.iter().enumerate() {
+        let count = ws.panes.iter().count();
+        // Workspace title + terminal count.
+        let header = row![
+            text(ws.name.to_uppercase()).size(10).color(muted),
+            horizontal_space(),
+            text(count.to_string()).size(9).color(muted),
+        ]
+        .padding([3, 12])
+        .align_y(iced::Center);
+        col = col.push(header);
+
+        for (pane, data) in ws.panes.iter() {
             let running = data.session.claude_running();
-            let st = data.session.claude_status();
-            let (dot, label) = if running {
-                match st.lifecycle {
-                    Lifecycle::Attention => ((0xe5u8, 0xa0u8, 0x3cu8), "attention"),
-                    Lifecycle::Working => ((0x33, 0x99, 0xff), "working"),
-                    _ => ((0x4e, 0xc9, 0xb0), "ready"),
-                }
-            } else {
-                ((0x5a, 0x5a, 0x5a), "idle")
-            };
-            let mut r = row![
-                text("●").size(13).color(iced::Color::from_rgb8(dot.0, dot.1, dot.2)),
-                text(format!("{} · {}", ws.name, data.name)).size(13),
+            let lc = data.session.claude_status().lifecycle;
+            let busy = data.session.shell_idle() == Some(false);
+            let dot = pane_dot(running, lc, busy);
+
+            // Left: Claude icon (when active) + terminal name.
+            let mut left = row![].spacing(6).align_y(iced::Center);
+            if running {
+                left = left.push(claude_icon(13.0));
+            }
+            left = left.push(text(data.name.clone()).size(12));
+
+            let r = row![
+                left,
+                horizontal_space(),
+                overview_git(&data.session),
+                container(indicator(dot, 12)).width(Length::Fixed(22.0)).center_x(Length::Fixed(22.0)),
             ]
             .spacing(8)
             .align_y(iced::Center);
-            if running && st.has_stats {
-                if let Some(m) = &st.model {
-                    r = r.push(text(m.clone()).size(11).color(iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)));
-                }
-                if let Some(p) = st.used_percent {
-                    r = r.push(text(format!("ctx {p:.0}%")).size(11).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)));
-                }
-                if st.cost_usd > 0.0 {
-                    r = r.push(text(format!("${:.2}", st.cost_usd)).size(11).color(iced::Color::from_rgb8(0xd7, 0xba, 0x7d)));
-                }
-            } else {
-                r = r.push(text(label).size(11).color(iced::Color::from_rgb8(0x7a, 0x7a, 0x7a)));
-            }
-            col = col.push(container(r).padding([4, 8]).style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
-                border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                ..Default::default()
-            }));
+
+            col = col.push(
+                button(r)
+                    .on_press(Message::JumpTo(wi, *pane))
+                    .padding([5, 12])
+                    .width(Length::Fill)
+                    .style(overview_row_style),
+            );
         }
     }
-    container(col)
-        .width(Length::Fill)
-        .height(Length::Fill)
+
+    container(scrollable(col).width(Length::Fill).height(Length::Fill))
         .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
             ..Default::default()
         })
         .into()
@@ -528,22 +577,89 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
 const ICON_POWERSHELL: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#b0b0b0" d="M21.83,4C22.32,4 22.63,4.4 22.5,4.89L19.34,19.11C19.23,19.6 18.75,20 18.26,20H2.17C1.68,20 1.37,19.6 1.5,19.11L4.66,4.89C4.77,4.4 5.25,4 5.74,4H21.83M15.83,16H11.83C11.37,16 11,16.38 11,16.84C11,17.31 11.37,17.69 11.83,17.69H15.83C16.3,17.69 16.68,17.31 16.68,16.84C16.68,16.38 16.3,16 15.83,16M5.78,16.28C5.38,16.56 5.29,17.11 5.57,17.5C5.85,17.92 6.41,18 6.81,17.73C14.16,12.56 14.21,12.5 14.26,12.47C14.44,12.31 14.53,12.09 14.54,11.87C14.55,11.67 14.5,11.5 14.38,11.31L9.46,6.03C9.13,5.67 8.57,5.65 8.21,6C7.85,6.32 7.83,6.88 8.16,7.24L12.31,11.68L5.78,16.28Z"/></svg>"##;
 const ICON_BASH: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#b0b0b0" d="M5 9H7.31L7.63 6H9.63L9.31 9H11.31L11.63 6H13.63L13.31 9H15V11H13.1L12.9 13H15V15H12.69L12.37 18H10.37L10.69 15H8.69L8.37 18H6.37L6.69 15H5V13H6.9L7.1 11H5V9M9.1 11L8.9 13H10.9L11.1 11M19 6H17V14H19M19 16H17V18H19Z"/></svg>"##;
 
-/// Per-pane header: a centred terminal title (focus shown by colour, azure when
-/// focused) with a shell-switch button on the right when Git Bash is available
-/// (Windows). The button shows the icon of the shell you'd switch to. A matching
-/// left spacer keeps the title centred. Status will join the header later.
-/// A small filled status dot in the pane header.
-fn status_dot(r: u8, g: u8, b: u8) -> Element<'static, Message> {
-    text("●").size(10).color(iced::Color::from_rgb8(r, g, b)).into()
+/// The Claude starburst logo (matches the web's ClaudeIcon, fill #D97757).
+const CLAUDE_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 248"><path fill="#D97757" d="M52.4285 162.873L98.7844 136.879L99.5485 134.602L98.7844 133.334H96.4921L88.7237 132.862L62.2346 132.153L39.3113 131.207L17.0249 130.026L11.4214 128.844L6.2 121.873L6.7094 118.447L11.4214 115.257L18.171 115.847L33.0711 116.911L55.485 118.447L71.6586 119.392L95.728 121.873H99.5485L100.058 120.337L98.7844 119.392L97.7656 118.447L74.5877 102.732L49.4995 86.1905L36.3823 76.62L29.3779 71.7757L25.8121 67.2858L24.2839 57.3608L30.6515 50.2716L39.3113 50.8623L41.4763 51.4531L50.2636 58.1879L68.9842 72.7209L93.4357 90.6804L97.0015 93.6343L98.4374 92.6652L98.6571 91.9801L97.0015 89.2625L83.757 65.2772L69.621 40.8192L63.2534 30.6579L61.5978 24.632C60.9565 22.1032 60.579 20.0111 60.579 17.4246L67.8381 7.49965L71.9133 6.19995L81.7193 7.49965L85.7946 11.0443L91.9074 24.9865L101.714 46.8451L116.996 76.62L121.453 85.4816L123.873 93.6343L124.764 96.1155H126.292V94.6976L127.566 77.9197L129.858 57.3608L132.15 30.8942L132.915 23.4505L136.608 14.4708L143.994 9.62643L149.725 12.344L154.437 19.0788L153.8 23.4505L150.998 41.6463L145.522 70.1215L141.957 89.2625H143.994L146.414 86.7813L156.093 74.0206L172.266 53.698L179.398 45.6635L187.803 36.802L193.152 32.5484H203.34L210.726 43.6549L207.415 55.1159L196.972 68.3492L188.312 79.5739L175.896 96.2095L168.191 109.585L168.882 110.689L170.738 110.53L198.755 104.504L213.91 101.787L231.994 98.7149L240.144 102.496L241.036 106.395L237.852 114.311L218.495 119.037L195.826 123.645L162.07 131.592L161.696 131.893L162.137 132.547L177.36 133.925L183.855 134.279H199.774L229.447 136.524L237.215 141.605L241.8 147.867L241.036 152.711L229.065 158.737L213.019 154.956L175.45 145.977L162.587 142.787H160.805V143.85L171.502 154.366L191.242 172.089L215.82 195.011L217.094 200.682L213.91 205.172L210.599 204.699L188.949 188.394L180.544 181.069L161.696 165.118H160.422V166.772L164.752 173.152L187.803 207.771L188.949 218.405L187.294 221.832L181.308 223.959L174.813 222.777L161.187 203.754L147.305 182.486L136.098 163.345L134.745 164.2L128.075 235.42L125.019 239.082L117.887 241.8L111.902 237.31L108.718 229.984L111.902 215.452L115.722 196.547L118.779 181.541L121.58 162.873L123.291 156.636L123.14 156.219L121.773 156.449L107.699 175.752L86.304 204.699L69.3663 222.777L65.291 224.431L58.2867 220.768L58.9235 214.27L62.8713 208.48L86.304 178.705L100.44 160.155L109.551 149.507L109.462 147.967L108.959 147.924L46.6977 188.512L35.6182 189.93L30.7788 185.44L31.4156 178.115L33.7079 175.752L52.4285 162.873Z"/></svg>"##;
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// The animated Claude "working" glyph (asterisk bloom) — matches the web's
+/// ClaudeWorkingIcon: 12-frame ping-pong at 110ms/frame, per-frame colour.
+fn working_frame() -> (&'static str, iced::Color) {
+    const F: [(&str, (u8, u8, u8)); 12] = [
+        ("·", (0x9c, 0x56, 0x38)), ("·", (0x9c, 0x56, 0x38)), ("✢", (0xb8, 0x6a, 0x45)),
+        ("✳", (0xc9, 0x7a, 0x52)), ("✶", (0xd9, 0x88, 0x5f)), ("✻", (0xe8, 0x98, 0x70)),
+        ("✽", (0xf4, 0xad, 0x88)), ("✽", (0xf4, 0xad, 0x88)), ("✻", (0xe8, 0x98, 0x70)),
+        ("✶", (0xd9, 0x88, 0x5f)), ("✳", (0xc9, 0x7a, 0x52)), ("✢", (0xb8, 0x6a, 0x45)),
+    ];
+    let (g, (r, gn, b)) = F[(now_ms() / 110 % 12) as usize];
+    (g, iced::Color::from_rgb8(r, gn, b))
+}
+
+/// Pulse alpha in [0.5, 1.0] over `period_ms` (0.5 at the ends, 1.0 mid-cycle).
+fn pulse_alpha(period_ms: u64) -> f32 {
+    let t = (now_ms() % period_ms) as f32 / period_ms as f32;
+    0.5 + 0.5 * (std::f32::consts::PI * t).sin()
+}
+
+/// The status a terminal shows (header dot + overview).
+#[derive(Clone, Copy)]
+enum Dot {
+    Idle,
+    Running,
+    Ready,
+    Working,
+    Attention,
+}
+
+/// Resolve a pane's status: Claude lifecycle if it's running, else the shell's
+/// busy/idle state.
+fn pane_dot(claude_running: bool, lc: Lifecycle, shell_busy: bool) -> Dot {
+    if claude_running {
+        match lc {
+            Lifecycle::Working => Dot::Working,
+            Lifecycle::Attention => Dot::Attention,
+            _ => Dot::Ready,
+        }
+    } else if shell_busy {
+        Dot::Running
+    } else {
+        Dot::Idle
+    }
+}
+
+/// The status indicator widget: the animated ✻ for working, else a dot (pulsing
+/// for running/attention). `size` is the dot text size; the glyph is a bit larger.
+fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
+    let rgba = iced::Color::from_rgba8;
+    match dot {
+        Dot::Working => {
+            let (g, c) = working_frame();
+            text(g).size(size + 5).color(c).into()
+        }
+        Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200))).into(),
+        Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, pulse_alpha(1500))).into(),
+        Dot::Ready => text("●").size(size).color(rgba(0x4e, 0xc9, 0xb0, 0.85)).into(),
+        Dot::Idle => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.5)).into(),
+    }
+}
+
+/// The Claude starburst icon at `size` px.
+fn claude_icon(size: f32) -> Element<'static, Message> {
+    svg(svg::Handle::from_memory(CLAUDE_ICON.as_bytes())).width(size).height(size).into()
+}
+
+/// Per-pane header: a centred terminal title (focus shown by colour) with a
+/// shell-switch button on the right (Windows) and a Claude status indicator on
+/// the left while Claude runs. A matching left/right slot keeps the title centred.
 fn pane_header(
     name: &str,
     focused: bool,
     shell: ShellKind,
     has_git_bash: bool,
     pane: pane_grid::Pane,
-    claude: Option<Lifecycle>,
+    status: Option<Dot>,
 ) -> Element<'static, Message> {
     const SLOT: f32 = 26.0;
     let color = if focused {
@@ -551,13 +667,9 @@ fn pane_header(
     } else {
         iced::Color::from_rgb8(0x6b, 0x6b, 0x6b)
     };
-    // Claude status dot in the left slot: attention → amber, working → azure,
-    // ready → teal; nothing when Claude isn't running here.
-    let left: Element<'static, Message> = match claude {
-        Some(Lifecycle::Attention) => status_dot(0xe5, 0xa0, 0x3c),
-        Some(Lifecycle::Working) => status_dot(0x33, 0x99, 0xff),
-        Some(Lifecycle::Ready) => status_dot(0x4e, 0xc9, 0xb0),
-        _ => Space::with_width(Length::Fixed(0.0)).into(),
+    let left: Element<'static, Message> = match status {
+        Some(d) => indicator(d, 11),
+        None => Space::with_width(Length::Fixed(0.0)).into(),
     };
     let title = container(text(name.to_string()).size(12).color(color)).center_x(Length::Fill);
     let right: Element<'static, Message> = if has_git_bash {
