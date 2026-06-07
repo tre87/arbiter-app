@@ -165,6 +165,68 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
     let _ = child.wait();
 }
 
+// ── Reading captures back (the footer's Tier-2 stats) ────────────────────────
+
+/// Parsed Claude statusLine capture: stats + the cwd/session_id used to bind it
+/// to a pane. `used_percent`/token usage are None/0 until the first turn.
+#[derive(Clone, Debug)]
+pub struct Capture {
+    pub session_id: String,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub context_size: Option<u64>,
+    pub used_percent: Option<f64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd: f64,
+}
+
+/// Parse one capture JSON (the shape Claude's statusLine emits).
+pub fn parse_capture(bytes: &[u8]) -> Option<Capture> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let session_id = v.get("session_id")?.as_str()?.to_string();
+    let cwd = v
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .or_else(|| v.pointer("/workspace/current_dir").and_then(|c| c.as_str()))?
+        .to_string();
+    let cw = v.get("context_window");
+    let usage = cw.and_then(|c| c.get("current_usage"));
+    let tok = |k: &str| usage.and_then(|u| u.get(k)).and_then(|n| n.as_u64()).unwrap_or(0);
+    Some(Capture {
+        session_id,
+        cwd,
+        model: v.pointer("/model/display_name").and_then(|m| m.as_str()).map(str::to_string),
+        context_size: cw.and_then(|c| c.get("context_window_size")).and_then(|n| n.as_u64()),
+        used_percent: cw.and_then(|c| c.get("used_percentage")).and_then(|n| n.as_f64()),
+        input_tokens: tok("input_tokens"),
+        output_tokens: tok("output_tokens"),
+        cache_write: tok("cache_creation_input_tokens"),
+        cache_read: tok("cache_read_input_tokens"),
+        cost_usd: v.pointer("/cost/total_cost_usd").and_then(|n| n.as_f64()).unwrap_or(0.0),
+    })
+}
+
+/// Read + parse every `<sid>.json` in the capture dir.
+pub fn read_captures(dir: &Path) -> Vec<Capture> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if let Some(c) = parse_capture(&bytes) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 // ── Spawn-time setup (called from shell.rs) ──────────────────────────────────
 
 /// Everything `shell.rs` needs to wire the spawned shell for interception.
