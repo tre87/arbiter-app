@@ -120,11 +120,11 @@ impl Session {
         self.claude_running.load(Ordering::Relaxed)
     }
 
-    /// The bound Claude session id IF Claude is running here — for persisting and
-    /// `claude --resume <id>` on restore. `None` if Claude isn't running or no
-    /// capture has bound a session yet.
+    /// The Claude session id to resume on restore IF Claude is running here AND a
+    /// real conversation has happened (else `None`, so restore launches a clean
+    /// `claude` rather than `--resume`ing a non-existent empty session).
     pub fn claude_session_id(&self) -> Option<String> {
-        self.claude_running().then(|| self.claude.session_id()).flatten()
+        self.claude_running().then(|| self.claude.resumable_session()).flatten()
     }
 
     /// Basename of the current working directory, if known.
