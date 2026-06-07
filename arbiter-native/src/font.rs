@@ -37,7 +37,6 @@ pub fn load() -> FontSpec {
             .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
             .unwrap_or_else(|| "monospace".to_string());
         let (bytes, index) = db.with_face_data(id, |d, i| (d.to_vec(), i)).expect("font face data");
-        eprintln!("[font] picked: {name:?}");
         // bold = None: CoreText synthesises bold from the installed family.
         FontSpec { name, regular: (bytes, index), bold: None }
     }
