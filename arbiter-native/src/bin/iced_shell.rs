@@ -71,7 +71,15 @@ struct State {
     font: Arc<arbiter_native::font::FontSpec>,
     git_bash: Option<String>,
     theme: iced::Theme,
+    /// The main terminal window; the app exits when it closes.
+    main_window: iced::window::Id,
+    /// The popout overview window, while open.
+    overview_window: Option<iced::window::Id>,
 }
+
+/// The main window id, for routing keyboard input (so typing in the overview
+/// window doesn't reach the terminal). Set once at startup.
+static MAIN_WINDOW: std::sync::OnceLock<iced::window::Id> = std::sync::OnceLock::new();
 
 /// Foundational dark theme matching Arbiter's palette (#121212 bg, azure accent).
 /// The detailed chrome polish comes after the status/footer are functional.
@@ -111,6 +119,12 @@ enum Message {
     Copy(bool),
     Paste,
     Pasted(Option<String>),
+    /// Toggle the popout overview window.
+    ToggleOverview,
+    /// A window was closed (main → exit; overview → forget it).
+    WindowClosed(iced::window::Id),
+    /// No-op (used to discard a window-open Task's result).
+    Noop,
 }
 
 /// Spawn a session running `shell` (None = the platform default / PowerShell;
@@ -171,6 +185,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
+            }
+        }
+        Message::Noop => {}
+        Message::ToggleOverview => {
+            if let Some(id) = state.overview_window.take() {
+                return iced::window::close(id);
+            }
+            let (id, open) = iced::window::open(iced::window::Settings {
+                size: iced::Size::new(720.0, 520.0),
+                ..Default::default()
+            });
+            state.overview_window = Some(id);
+            return open.map(|_| Message::Noop);
+        }
+        Message::WindowClosed(id) => {
+            if id == state.main_window {
+                return iced::exit();
+            }
+            if state.overview_window == Some(id) {
+                state.overview_window = None;
             }
         }
         Message::Copy(allow_interrupt) => {
@@ -239,7 +273,17 @@ fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     }
 }
 
-fn view(state: &State) -> Element<'_, Message> {
+/// Per-window view: the terminal UI for the main window, the session overview
+/// for the popout window.
+fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
+    if Some(window) == state.overview_window {
+        overview_view(state)
+    } else {
+        main_view(state)
+    }
+}
+
+fn main_view(state: &State) -> Element<'_, Message> {
     // Top bar: workspace tabs (left) + split/close actions (right).
     let mut bar = row![].spacing(4);
     for (i, ws) in state.workspaces.iter().enumerate() {
@@ -251,6 +295,7 @@ fn view(state: &State) -> Element<'_, Message> {
     }
     bar = bar.push(button(text("+").size(13)).on_press(Message::NewWorkspace).padding([4, 10]).style(button::secondary));
     bar = bar.push(horizontal_space());
+    bar = bar.push(button(text("⊞ Overview").size(13)).on_press(Message::ToggleOverview).padding([4, 10]).style(button::secondary));
     bar = bar.push(button(text("Split →").size(13)).on_press(Message::SplitRight).padding([4, 10]));
     bar = bar.push(button(text("Split ↓").size(13)).on_press(Message::SplitDown).padding([4, 10]));
     bar = bar.push(button(text("Close").size(13)).on_press(Message::Close).style(button::secondary).padding([4, 10]));
@@ -324,6 +369,62 @@ fn view(state: &State) -> Element<'_, Message> {
     column![container(bar).padding(6), grid]
         .width(Length::Fill)
         .height(Length::Fill)
+        .into()
+}
+
+/// The popout overview window: every terminal across all workspaces with its
+/// live Claude status (dot + label) + stats. Reads the same shared status the
+/// footer does — redrawn each frame, no polling.
+fn overview_view(state: &State) -> Element<'_, Message> {
+    let mut col = column![text("Sessions").size(16).color(iced::Color::from_rgb8(0xcc, 0xcc, 0xcc))]
+        .spacing(6)
+        .padding(14);
+    for ws in &state.workspaces {
+        for (_pane, data) in ws.panes.iter() {
+            let running = data.session.claude_running();
+            let st = data.session.claude_status();
+            let (dot, label) = if running {
+                match st.lifecycle {
+                    Lifecycle::Attention => ((0xe5u8, 0xa0u8, 0x3cu8), "attention"),
+                    Lifecycle::Working => ((0x33, 0x99, 0xff), "working"),
+                    _ => ((0x4e, 0xc9, 0xb0), "ready"),
+                }
+            } else {
+                ((0x5a, 0x5a, 0x5a), "idle")
+            };
+            let mut r = row![
+                text("●").size(13).color(iced::Color::from_rgb8(dot.0, dot.1, dot.2)),
+                text(format!("{} · {}", ws.name, data.name)).size(13),
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            if running && st.has_stats {
+                if let Some(m) = &st.model {
+                    r = r.push(text(m.clone()).size(11).color(iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)));
+                }
+                if let Some(p) = st.used_percent {
+                    r = r.push(text(format!("ctx {p:.0}%")).size(11).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)));
+                }
+                if st.cost_usd > 0.0 {
+                    r = r.push(text(format!("${:.2}", st.cost_usd)).size(11).color(iced::Color::from_rgb8(0xd7, 0xba, 0x7d)));
+                }
+            } else {
+                r = r.push(text(label).size(11).color(iced::Color::from_rgb8(0x7a, 0x7a, 0x7a)));
+            }
+            col = col.push(container(r).padding([4, 8]).style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
+                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            }));
+        }
+    }
+    container(col)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+            ..Default::default()
+        })
         .into()
 }
 
@@ -489,8 +590,12 @@ fn pane_header(
 
 fn subscription(_state: &State) -> Subscription<Message> {
     let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
-    let keys = iced::event::listen_with(|event, _status, _id| handle_key(event));
-    Subscription::batch([tick, keys])
+    // Only the main window's keys drive the terminal (not the overview window).
+    let keys = iced::event::listen_with(|event, _status, id| {
+        (MAIN_WINDOW.get().copied() == Some(id)).then(|| handle_key(event)).flatten()
+    });
+    let closes = iced::window::close_events().map(Message::WindowClosed);
+    Subscription::batch([tick, keys, closes])
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
@@ -886,17 +991,30 @@ fn main() -> iced::Result {
     // dirs updates each Session's shared status (no polling). Lives for the app.
     std::mem::forget(arbiter_native::claude_status::start_watcher());
 
-    iced::application("Arbiter native (Iced shell)", update, view)
+    let title = |state: &State, id: iced::window::Id| {
+        if state.overview_window == Some(id) {
+            "Arbiter — Overview".to_string()
+        } else {
+            "Arbiter native".to_string()
+        }
+    };
+
+    iced::daemon(title, update, view)
         .subscription(subscription)
-        .theme(|s: &State| s.theme.clone())
+        .theme(|s: &State, _id| s.theme.clone())
         .run_with(move || {
+            // daemon starts with no windows — open the main one here.
+            let (main_id, open) = iced::window::open(iced::window::Settings::default());
+            let _ = MAIN_WINDOW.set(main_id);
             let state = State {
                 workspaces: vec![Workspace::new("Workspace 1".to_string())],
                 active: 0,
                 font: font.clone(),
                 git_bash: git_bash.clone(),
                 theme: arbiter_theme(),
+                main_window: main_id,
+                overview_window: None,
             };
-            (state, Task::none())
+            (state, open.map(|_| Message::Noop))
         })
 }
