@@ -11,9 +11,14 @@ use portable_pty::CommandBuilder;
 
 use crate::claude_shim;
 
-/// Arbiter's per-OS data dir — the claude-shim, capture, and hook files live
-/// under here (the watchers read the same dirs).
+/// Arbiter's per-OS data dir — session.json + the claude-shim, capture, and hook
+/// files live under here (the watchers read the same dirs). `ARBITER_DATA_DIR`
+/// overrides it, so a test/dev instance can run fully ISOLATED and never read or
+/// clobber the real session.json.
 pub fn app_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("ARBITER_DATA_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
     Some(dirs::data_dir()?.join("arbiter-native"))
 }
 
