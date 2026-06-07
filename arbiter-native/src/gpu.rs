@@ -67,24 +67,30 @@ fn vs(
   return out;
 }
 
-// Our colours are sRGB and we blend in gamma space (matching the web's canvas +
-// non-sRGB GL framebuffer). When the render target is an sRGB format the GPU
-// re-encodes linear->sRGB on write, which would lighten everything (the
-// 121212 -> 464646 white shade). So when srgb is set we decode the blended
-// colour back to linear, making the GPU's encode a no-op that preserves our exact
-// colours. On a non-sRGB target (the raw spike) we output the sRGB value directly.
+// Antialiasing is blended in LINEAR space (gamma-correct), which makes the
+// edge/partial-coverage pixels fuller — the smooth look macOS terminals
+// (iTerm2/Terminal.app) have. The web blends in gamma space, which is flatter
+// and thinner. fg/bg are sRGB, so decode → blend → re-encode.
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92;
   let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
+fn to_srgb(c: vec3<f32>) -> vec3<f32> {
+  let lo = c * 12.92;
+  let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+  return select(lo, hi, c > vec3<f32>(0.0031308));
+}
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let a = textureSample(atlas, samp, in.uv).r;
-  var col = mix(in.bg, in.fg, a);
-  if (u.srgb > 0.5) { col = to_linear(col); }
-  return vec4<f32>(col, 1.0);
+  let col = mix(to_linear(in.bg), to_linear(in.fg), a);
+  // An sRGB target re-encodes on write, so hand it linear; a non-sRGB target
+  // (the raw spike) needs us to encode to sRGB ourselves.
+  var out = col;
+  if (u.srgb < 0.5) { out = to_srgb(col); }
+  return vec4<f32>(out, 1.0);
 }
 "#;
 
