@@ -633,7 +633,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
     let mut col = column![]
         .spacing(2)
-        .push(container(text("Arbiter").size(13).font(title_font()).color(muted)).padding([8, 12]));
+        .push(container(text("ARBITER").size(11).font(ui_semibold()).color(muted)).padding([8, 12]));
 
     for (wi, ws) in state.workspaces.iter().enumerate() {
         let count = ws.panes.iter().count();
@@ -859,7 +859,7 @@ fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
             let (g, c) = working_frame();
             // The ✻ bloom glyphs live in a symbols font — Iced's default UI font
             // lacks them (renders tofu) and won't fall back.
-            text(g).size(size + 5).color(c).font(symbols_font()).into()
+            text(g).size(size + 1).color(c).font(symbols_font()).into()
         }
         Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200))).into(),
         Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, pulse_alpha(1500))).into(),
@@ -1336,7 +1336,6 @@ impl shader::Primitive for TermPrimitive {
 /// body text, DM Sans for the title/logo. Both are variable fonts (weight axis);
 /// cosmic-text selects the weight. Bundled under assets/ (SIL OFL).
 const INTER_FONT: &[u8] = include_bytes!("../../assets/Inter-VariableFont.ttf");
-const DMSANS_FONT: &[u8] = include_bytes!("../../assets/DMSans-VariableFont.ttf");
 /// 3KB subset of Noto Sans Symbols 2 (the `·✢✳✶✻✽` working-animation dingbats),
 /// renamed "ArbiterSymbols" — bundled so the ✻ is identical on macOS + Windows.
 const ARBITER_SYMBOLS_FONT: &[u8] = include_bytes!("../../assets/ArbiterSymbols.ttf");
@@ -1346,9 +1345,11 @@ fn ui_font() -> iced::Font {
     iced::Font::with_name("Inter")
 }
 
-/// The title/logo font (DM Sans Bold), matching the web's "Arbiter" wordmark.
-fn title_font() -> iced::Font {
-    iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::with_name("DM Sans") }
+/// Inter SemiBold — for the overview's "ARBITER" header (the web's `.overview-title`
+/// is Inter 600, uppercase). The web only used DM Sans for the in-app titlebar
+/// wordmark, which the native (OS titlebar) doesn't have, so Inter is used here.
+fn ui_semibold() -> iced::Font {
+    iced::Font { weight: iced::font::Weight::Semibold, ..iced::Font::with_name("Inter") }
 }
 
 fn main() -> iced::Result {
@@ -1384,7 +1385,6 @@ fn main() -> iced::Result {
         .subscription(subscription)
         .theme(|s: &State, _id| s.theme.clone())
         .font(INTER_FONT)
-        .font(DMSANS_FONT)
         .font(ARBITER_SYMBOLS_FONT)
         .default_font(ui_font())
         .run_with(move || {
