@@ -597,6 +597,23 @@ fn working_frame() -> (&'static str, iced::Color) {
     (g, iced::Color::from_rgb8(r, gn, b))
 }
 
+/// A system font that has the dingbat ✻ glyphs the working animation uses
+/// (Iced's default UI font lacks them and won't fall back to them).
+fn symbols_font() -> iced::Font {
+    #[cfg(target_os = "macos")]
+    {
+        iced::Font::with_name("Apple Symbols")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        iced::Font::with_name("Segoe UI Symbol")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        iced::Font::DEFAULT
+    }
+}
+
 /// Pulse alpha in [0.5, 1.0] over `period_ms` (0.5 at the ends, 1.0 mid-cycle).
 fn pulse_alpha(period_ms: u64) -> f32 {
     let t = (now_ms() % period_ms) as f32 / period_ms as f32;
@@ -636,7 +653,9 @@ fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
     match dot {
         Dot::Working => {
             let (g, c) = working_frame();
-            text(g).size(size + 5).color(c).into()
+            // The ✻ bloom glyphs live in a symbols font — Iced's default UI font
+            // lacks them (renders tofu) and won't fall back.
+            text(g).size(size + 5).color(c).font(symbols_font()).into()
         }
         Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200))).into(),
         Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, pulse_alpha(1500))).into(),

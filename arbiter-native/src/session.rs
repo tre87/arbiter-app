@@ -163,29 +163,14 @@ impl Session {
 
 const MAX_UTF8_REMAINDER: usize = 8;
 
-/// Classify a chunk of Claude's output: approval/menu prompts (no hook covers
-/// them) → attention; a spinner or a run of real output → activity (working).
-fn scan_claude_text(claude: &crate::claude_status::ClaudeHandle, bytes: &[u8]) {
+/// True if a chunk contains Claude's working spinner. Claude's ✻ bloom is in the
+/// Dingbats block (U+2700–27BF); some tools use Braille spinners (U+2800–28FF).
+/// We key working on the spinner ONLY — never on plain output — so the input-box
+/// redraw on each keystroke doesn't read as "working".
+fn chunk_has_spinner(bytes: &[u8]) -> bool {
     let text = unsafe { std::str::from_utf8_unchecked(bytes) };
-    if text.contains("to navigate")
-        || text.contains("Esc to cancel")
-        || text.contains("Would you like to proceed")
-    {
-        claude.note_attention();
-        return;
-    }
-    let mut spinner = false;
-    let mut printable = 0u32;
-    for c in text.chars() {
-        if ('\u{2800}'..='\u{28FF}').contains(&c) || ('\u{2700}'..='\u{27BF}').contains(&c) {
-            spinner = true;
-        } else if !c.is_control() && c != '\u{1b}' {
-            printable += 1;
-        }
-    }
-    if spinner || printable > 10 {
-        claude.note_activity();
-    }
+    text.chars()
+        .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c) || ('\u{2700}'..='\u{27BF}').contains(&c))
 }
 
 fn reader_loop(
@@ -234,11 +219,15 @@ fn reader_loop(
         // Feed the full byte stream to the grid (alacritty parses VT incl. OSC).
         term.lock().unwrap().feed(valid);
 
-        // Tier-3b: while Claude runs here, classify the output (spinner/menu) so
-        // the header dot reflects the live turn — the hooks/transcript can't see
-        // a spinner or an AskUserQuestion menu while it's on screen.
+        // Tier-3b: while Claude runs here, reflect the live turn in the status.
+        // A menu/approval prompt on the visible screen → attention (no hook
+        // covers AskUserQuestion/plan); else Claude's ✻ spinner → working.
         if claude_running.load(Ordering::Relaxed) {
-            scan_claude_text(&claude, valid);
+            if term.lock().unwrap().visible_has_menu() {
+                claude.note_attention();
+            } else if chunk_has_spinner(valid) {
+                claude.note_activity();
+            }
         }
 
         // Separately scan for OSC-7 (cwd) + OSC-133 (busy/idle), which the grid
