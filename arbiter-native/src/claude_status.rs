@@ -129,6 +129,18 @@ impl ClaudeHandle {
         self.session_id.lock().unwrap().clone()
     }
 
+    /// The session id ONLY if at least one turn has happened (so the transcript
+    /// exists and `claude --resume` will find it). A freshly-launched Claude has a
+    /// session id but no conversation yet — resuming it errors ("no conversation
+    /// found"), so we return `None` and let restore launch a clean `claude`.
+    /// (Verified: an idle, just-launched Claude emits no spinner, so activity/stop
+    /// timestamps stay 0 until a real turn.)
+    pub fn resumable_session(&self) -> Option<String> {
+        let had_turn = self.activity_ms.load(Ordering::Relaxed) > 0
+            || self.stop_ms.load(Ordering::Relaxed) > 0;
+        had_turn.then(|| self.session_id.lock().unwrap().clone()).flatten()
+    }
+
     /// Derived lifecycle: the most recent signal wins; activity counts as
     /// "working" only while fresh, then reverts to ready.
     fn lifecycle(&self) -> Lifecycle {
