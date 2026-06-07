@@ -163,6 +163,17 @@ impl Session {
 
 const MAX_UTF8_REMAINDER: usize = 8;
 
+/// True if the chunk contains Claude's working spinner. The animated ✻ bloom
+/// frames are the star/asterisk dingbats U+2722–273F (verified by capturing the
+/// CLI); tool spinners use Braille U+2800–28FF. Deliberately NOT the whole
+/// U+2700–27BF range — that includes the input prompt arrow ❯ (U+276F), which
+/// would make typing read as working. Plain typing/output carries no such glyph.
+fn chunk_has_spinner(bytes: &[u8]) -> bool {
+    let text = unsafe { std::str::from_utf8_unchecked(bytes) };
+    text.chars()
+        .any(|c| ('\u{2722}'..='\u{273F}').contains(&c) || ('\u{2800}'..='\u{28FF}').contains(&c))
+}
+
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     term: SharedTerm,
@@ -215,14 +226,14 @@ fn reader_loop(
         // hook covers AskUserQuestion/plan); Claude's "(esc to interrupt)" status
         // line → working. Plain output (typing, redraws) is neither.
         if claude_running.load(Ordering::Relaxed) {
-            use crate::term::ClaudeScreen;
-            match term.lock().unwrap().claude_screen() {
-                Some(ClaudeScreen::Menu) => claude.set_menu(true),
-                Some(ClaudeScreen::Working) => {
-                    claude.set_menu(false);
-                    claude.note_activity();
-                }
-                None => claude.set_menu(false),
+            // Attention: a menu/approval prompt on the rendered screen (level-based,
+            // so amber clears the instant the prompt leaves). Working: the ✻ spinner
+            // glyph in the *new* bytes (chunk-based like the web — instant, and a
+            // stale star left on screen can't pin it to "working").
+            let menu = term.lock().unwrap().visible_menu();
+            claude.set_menu(menu);
+            if !menu && chunk_has_spinner(valid) {
+                claude.note_activity();
             }
         }
 

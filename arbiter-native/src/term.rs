@@ -135,17 +135,19 @@ impl VtTerm {
     /// so a menu reads as attention only while it's actually on screen — it clears
     /// the instant the user escapes/answers. Returns `None` for plain output
     /// (typing, redraws), which is neither working nor attention.
-    pub fn claude_screen(&self) -> Option<ClaudeScreen> {
-        // Menu markers the web used (AskUserQuestion / plan-mode / proceed prompts).
+    /// True if a menu / approval prompt is currently on the visible screen
+    /// (AskUserQuestion, plan mode, "proceed?"). Level-triggered on the rendered
+    /// grid, so attention clears the instant the prompt leaves (escape/answer).
+    /// Working is NOT detected here — it's keyed off the live byte stream (see
+    /// `session.rs`), so a spinner star left on screen can't pin it to "working".
+    pub fn visible_menu(&self) -> bool {
+        // The exact markers the web used (AskUserQuestion / plan-mode menus).
         const MENU: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
         let mut buf = String::with_capacity(cols);
-        let mut working = false;
-        // Scan the whole live region: Claude's spinner sits several rows above the
-        // bottom (above the input box + mode line), not on the very last line.
         for row in rows.saturating_sub(40)..rows {
             buf.clear();
             let line = &grid[Line(row as i32 - off)];
@@ -153,20 +155,10 @@ impl VtTerm {
                 buf.push(line[Column(col)].c);
             }
             if MENU.iter().any(|m| buf.contains(m)) {
-                return Some(ClaudeScreen::Menu);
-            }
-            // Working = Claude's ✻ spinner is on screen. Verified by capturing the
-            // CLI: the animated frames are the star/asterisk dingbats U+2722–273F
-            // (·✢✳✶✻✽) — there is no "esc to interrupt" text to match. Braille
-            // U+2800–28FF covers tool spinners. Deliberately NOT the whole
-            // U+2700–27BF range, which includes the input prompt arrow ❯ (U+276F).
-            if buf.chars().any(|c| {
-                ('\u{2722}'..='\u{273F}').contains(&c) || ('\u{2800}'..='\u{28FF}').contains(&c)
-            }) {
-                working = true;
+                return true;
             }
         }
-        working.then_some(ClaudeScreen::Working)
+        false
     }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
