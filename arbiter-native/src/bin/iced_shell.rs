@@ -716,72 +716,143 @@ fn fmt_ctx_size(n: u64) -> String {
     }
 }
 
+// ── Footer (matches the web TerminalFooter.vue: same colours + MDI icons) ──────
+
+/// An MDI 24×24 path rendered at `size` px, filled with `color`.
+fn mdi(path: &str, size: f32, color: iced::Color) -> Element<'static, Message> {
+    let b = |v: f32| (v * 255.0).round() as u8;
+    let src = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#{:02x}{:02x}{:02x}" d="{path}"/></svg>"##,
+        b(color.r), b(color.g), b(color.b),
+    );
+    svg(svg::Handle::from_memory(src.into_bytes())).width(size).height(size).into()
+}
+
+/// Per-family model colour (web: `.model-opus`/`.model-sonnet`/…).
+fn model_color(model: &str) -> iced::Color {
+    let l = model.to_ascii_lowercase();
+    if l.contains("opus") {
+        iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)
+    } else if l.contains("sonnet") {
+        iced::Color::from_rgb8(0x9c, 0xdc, 0xfe)
+    } else if l.contains("haiku") {
+        iced::Color::from_rgb8(0xb5, 0xce, 0xa8)
+    } else {
+        iced::Color::from_rgb8(0xe8, 0xea, 0xed)
+    }
+}
+
+mod mdi_path {
+    pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
+    pub const BRANCH: &str = "M13,14C9.64,14 8.54,15.35 8.18,16.24C9.25,16.7 10,17.76 10,19A3,3 0 0,1 7,22A3,3 0 0,1 4,19C4,17.69 4.83,16.58 6,16.17V7.83C4.83,7.42 4,6.31 4,5A3,3 0 0,1 7,2A3,3 0 0,1 10,5C10,6.31 9.17,7.42 8,7.83V13.12C8.88,12.47 10.16,12 12,12C14.67,12 15.56,10.66 15.85,9.77C14.77,9.32 14,8.25 14,7A3,3 0 0,1 17,4A3,3 0 0,1 20,7C20,8.34 19.12,9.5 17.91,9.86C17.65,11.29 16.68,14 13,14M7,18A1,1 0 0,0 6,19A1,1 0 0,0 7,20A1,1 0 0,0 8,19A1,1 0 0,0 7,18M7,4A1,1 0 0,0 6,5A1,1 0 0,0 7,6A1,1 0 0,0 8,5A1,1 0 0,0 7,4M17,6A1,1 0 0,0 16,7A1,1 0 0,0 17,8A1,1 0 0,0 18,7A1,1 0 0,0 17,6Z";
+    pub const ROBOT: &str = "M17.5 15.5C17.5 16.61 16.61 17.5 15.5 17.5S13.5 16.61 13.5 15.5 14.4 13.5 15.5 13.5 17.5 14.4 17.5 15.5M8.5 13.5C7.4 13.5 6.5 14.4 6.5 15.5S7.4 17.5 8.5 17.5 10.5 16.61 10.5 15.5 9.61 13.5 8.5 13.5M23 15V18C23 18.55 22.55 19 22 19H21V20C21 21.11 20.11 22 19 22H5C3.9 22 3 21.11 3 20V19H2C1.45 19 1 18.55 1 18V15C1 14.45 1.45 14 2 14H3C3 10.13 6.13 7 10 7H11V5.73C10.4 5.39 10 4.74 10 4C10 2.9 10.9 2 12 2S14 2.9 14 4C14 4.74 13.6 5.39 13 5.73V7H14C17.87 7 21 10.13 21 14H22C22.55 14 23 14.45 23 15M21 16H19V14C19 11.24 16.76 9 14 9H10C7.24 9 5 11.24 5 14V16H3V17H5V20H19V17H21V16Z";
+    pub const DATABASE: &str = "M12,3C7.58,3 4,4.79 4,7C4,9.21 7.58,11 12,11C16.42,11 20,9.21 20,7C20,4.79 16.42,3 12,3M4,9V12C4,14.21 7.58,16 12,16C16.42,16 20,14.21 20,12V9C20,11.21 16.42,13 12,13C7.58,13 4,11.21 4,9M4,14V17C4,19.21 7.58,21 12,21C16.42,21 20,19.21 20,17V14C20,16.21 16.42,18 12,18C7.58,18 4,16.21 4,14Z";
+    pub const ARROW_DOWN: &str = "M11,4H13V16L18.5,10.5L19.92,11.92L12,19.84L4.08,11.92L5.5,10.5L11,16V4Z";
+    pub const ARROW_UP: &str = "M13,20H11V8L5.5,13.5L4.08,12.08L12,4.16L19.92,12.08L18.5,13.5L13,8V20Z";
+    pub const CACHED: &str = "M19,8L15,12H18A6,6 0 0,1 12,18C11,18 10.03,17.75 9.2,17.3L7.74,18.76C8.97,19.54 10.43,20 12,20A8,8 0 0,0 20,12H23M6,12A6,6 0 0,1 12,6C13,6 13.97,6.25 14.8,6.7L16.26,5.24C15.03,4.46 13.57,4 12,4A8,8 0 0,0 4,12H1L5,16L9,12";
+    pub const BOOK: &str = "M19 2L14 6.5V17.5L19 13V2M6.5 5C4.55 5 2.45 5.4 1 6.5V21.16C1 21.41 1.25 21.66 1.5 21.66C1.6 21.66 1.65 21.59 1.75 21.59C3.1 20.94 5.05 20.5 6.5 20.5C8.45 20.5 10.55 20.9 12 22C13.35 21.15 15.8 20.5 17.5 20.5C19.15 20.5 20.85 20.81 22.25 21.56C22.35 21.61 22.4 21.59 22.5 21.59C22.75 21.59 23 21.34 23 21.09V6.5C22.4 6.05 21.75 5.75 21 5.5V19C19.9 18.65 18.7 18.5 17.5 18.5C15.8 18.5 13.35 19.15 12 20V6.5C10.55 5.4 8.45 5 6.5 5Z";
+    pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
+    pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
+    pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
+}
+
 fn footer_bar(session: &Session) -> Element<'static, Message> {
-    // Claude stats (from the capture/hook watcher) take over the footer while
-    // Claude runs here.
+    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
+    let primary = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
+    let blue = iced::Color::from_rgb8(0x56, 0x9c, 0xd6);
+    let green = iced::Color::from_rgb8(0x6a, 0x99, 0x55);
+    let orange = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
+    let git_orange = iced::Color::from_rgb8(0xf0, 0x50, 0x32);
+    let lbl = |s: String, col: iced::Color| text(s).size(11).color(col);
+    let div = || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a));
+
     let c = session.claude_status();
+    let mut r = row![].spacing(6).align_y(iced::Center);
+
     if session.claude_running() && c.has_stats {
-        let mut r = row![].spacing(12).align_y(iced::Center);
         if let Some(m) = &c.model {
-            r = r.push(text(m.clone()).size(11).color(iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)));
+            let mc = model_color(m);
+            r = r.push(
+                row![mdi(mdi_path::ROBOT, 13.0, mc), text(m.clone()).size(11).color(mc).font(ui_semibold())]
+                    .spacing(3)
+                    .align_y(iced::Center),
+            );
         }
         if let Some(p) = c.used_percent {
             let size = c.context_size.map(fmt_ctx_size).unwrap_or_default();
+            r = r.push(div());
             r = r.push(
-                text(format!("ctx {p:.0}%/{size}")).size(11).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)),
+                row![
+                    mdi(mdi_path::DATABASE, 12.0, blue),
+                    text(format!("{p:.0}%")).size(11).color(blue).font(ui_semibold()),
+                    lbl(format!("/{size}"), muted),
+                ]
+                .spacing(2)
+                .align_y(iced::Center),
             );
         }
+        r = r.push(div());
+        let tin = iced::Color::from_rgb8(0x4e, 0xc9, 0xb0);
+        let tout = iced::Color::from_rgb8(0xc6, 0x78, 0xdd);
+        let tcr = iced::Color::from_rgb8(0xd7, 0xba, 0x7d);
         r = r.push(
-            text(format!(
-                // ↓ input, ↑ output, + cache-write, ↻ cache-read — matching the web's order/arrows.
-                "↓{} ↑{} +{} ↻{}",
-                fmt_k(c.input_tokens),
-                fmt_k(c.output_tokens),
-                fmt_k(c.cache_write),
-                fmt_k(c.cache_read),
-            ))
-            .size(11),
+            row![
+                mdi(mdi_path::ARROW_DOWN, 11.0, tin), lbl(fmt_k(c.input_tokens), tin),
+                mdi(mdi_path::ARROW_UP, 11.0, tout), lbl(fmt_k(c.output_tokens), tout),
+                mdi(mdi_path::CACHED, 11.0, blue), lbl(fmt_k(c.cache_write), blue),
+                mdi(mdi_path::BOOK, 11.0, tcr), lbl(fmt_k(c.cache_read), tcr),
+            ]
+            .spacing(3)
+            .align_y(iced::Center),
         );
-        if c.cost_usd > 0.0 {
+
+        r = r.push(horizontal_space());
+        if let Some(f) = session.folder() {
             r = r.push(
-                text(format!("${:.2}", c.cost_usd)).size(11).color(iced::Color::from_rgb8(0xd7, 0xba, 0x7d)),
+                row![mdi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)].spacing(4).align_y(iced::Center),
             );
         }
+        if let Some(b) = session.git().and_then(|g| g.branch) {
+            r = r.push(div());
+            r = r.push(
+                row![mdi(mdi_path::BRANCH, 13.0, git_orange), text(b).size(11).color(green).font(ui_semibold())]
+                    .spacing(3)
+                    .align_y(iced::Center),
+            );
+        }
+    } else {
+        // Not running: compact git status on the left; folder/branch on the right.
+        if let Some(g) = session.git() {
+            let count = |path, n: u32, col| {
+                row![mdi(path, 14.0, col), text(n.to_string()).size(11).color(col)]
+                    .spacing(2)
+                    .align_y(iced::Center)
+            };
+            if g.staged > 0 {
+                r = r.push(count(mdi_path::CHECK_CIRCLE, g.staged, green));
+            }
+            if g.unstaged > 0 {
+                r = r.push(count(mdi_path::CIRCLE_EDIT, g.unstaged, orange));
+            }
+            if g.untracked > 0 {
+                r = r.push(count(mdi_path::PLUS_CIRCLE, g.untracked, blue));
+            }
+        }
+        r = r.push(horizontal_space());
         if let Some(f) = session.folder() {
-            r = r.push(text(format!("· {f}")).size(11));
-        }
-        return container(r).width(Length::Fill).padding([2, 8]).style(footer_style).into();
-    }
-
-    // Otherwise the git footer (folder · branch · counts).
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(f) = session.folder() {
-        parts.push(f);
-    }
-    if let Some(g) = session.git() {
-        if let Some(b) = &g.branch {
-            parts.push(format!("⎇ {b}"));
-        }
-        let mut counts = String::new();
-        if g.staged > 0 {
-            counts.push_str(&format!("●{} ", g.staged));
-        }
-        if g.unstaged > 0 {
-            counts.push_str(&format!("○{} ", g.unstaged));
-        }
-        if g.untracked > 0 {
-            counts.push_str(&format!("+{}", g.untracked));
-        }
-        let counts = counts.trim();
-        if !counts.is_empty() {
-            parts.push(counts.to_string());
+            let mut fs = row![mdi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)]
+                .spacing(4)
+                .align_y(iced::Center);
+            if let Some(b) = session.git().and_then(|g| g.branch) {
+                fs = fs.push(lbl("[".into(), muted));
+                fs = fs.push(mdi(mdi_path::BRANCH, 12.0, git_orange));
+                fs = fs.push(text(b).size(11).color(green));
+                fs = fs.push(lbl("]".into(), muted));
+            }
+            r = r.push(fs);
         }
     }
-    container(text(parts.join("   ")).size(11))
-        .width(Length::Fill)
-        .padding([2, 8])
-        .style(footer_style)
-        .into()
+    container(r).width(Length::Fill).padding([3, 8]).style(footer_style).into()
 }
 
 // MDI icons (mdiPowershell / mdiBash) for the shell-switch button. The button
