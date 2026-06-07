@@ -505,17 +505,31 @@ fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
 }
 
 /// Left inset of the titlebar content so it clears the macOS traffic lights
-/// (the content extends behind them via fullsize_content_view).
+/// (the content extends behind them via fullsize_content_view). Matches the web's
+/// `--titlebar-pad-left` (88px on macOS, 6px elsewhere).
 #[cfg(target_os = "macos")]
-const TITLEBAR_LEFT_PAD: f32 = 78.0;
+const TITLEBAR_LEFT_PAD: f32 = 88.0;
 #[cfg(not(target_os = "macos"))]
-const TITLEBAR_LEFT_PAD: f32 = 10.0;
+const TITLEBAR_LEFT_PAD: f32 = 8.0;
+
+/// Titlebar background: the web's top-left azure glow (`.app::before` radial
+/// gradient) — iced has no radial gradient, so approximate with a horizontal
+/// linear one fading from azure-tinted chrome (left) to plain chrome (#222222).
+fn titlebar_gradient() -> iced::Gradient {
+    iced::gradient::Linear::new(iced::Degrees(90.0))
+        .add_stop(0.0, iced::Color::from_rgb8(0x29, 0x4b, 0x6e))
+        .add_stop(0.10, iced::Color::from_rgb8(0x25, 0x39, 0x4a))
+        .add_stop(0.22, iced::Color::from_rgb8(0x23, 0x2a, 0x31))
+        .add_stop(0.35, iced::Color::from_rgb8(0x22, 0x22, 0x22))
+        .add_stop(1.0, iced::Color::from_rgb8(0x22, 0x22, 0x22))
+        .into()
+}
 
 fn main_view(state: &State) -> Element<'_, Message> {
     // Unified titlebar: Arbiter logo + animated wordmark, then workspace tabs
     // (left) + actions (right). On macOS this IS the window titlebar (content
     // extends behind it; traffic lights overlay the left pad).
-    let mut bar = row![].spacing(6).align_y(iced::Center);
+    let mut bar = row![].spacing(6).align_y(iced::Center).height(Length::Fill);
     bar = bar.push(
         svg(svg::Handle::from_memory(ARBITER_LOGO))
             .width(Length::Fixed(18.0))
@@ -603,12 +617,14 @@ fn main_view(state: &State) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    // The titlebar (flush at the very top; left-padded for the traffic lights).
+    // The titlebar: web height (40px), left-padded for the traffic lights, with
+    // the top-left azure glow as its background.
     let titlebar = container(bar)
         .width(Length::Fill)
-        .padding(iced::Padding { top: 9.0, right: 8.0, bottom: 7.0, left: TITLEBAR_LEFT_PAD })
+        .height(Length::Fixed(40.0))
+        .padding(iced::Padding { top: 0.0, right: 8.0, bottom: 0.0, left: TITLEBAR_LEFT_PAD })
         .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
+            background: Some(iced::Background::Gradient(titlebar_gradient())),
             ..Default::default()
         });
 
