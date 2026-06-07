@@ -103,6 +103,12 @@ impl VtTerm {
         self.term.selection_to_string().filter(|s| !s.is_empty())
     }
 
+    /// True if the app enabled bracketed-paste mode (paste should be wrapped in
+    /// `ESC[200~` … `ESC[201~`).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
