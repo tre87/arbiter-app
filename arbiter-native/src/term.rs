@@ -39,9 +39,12 @@ impl VtTerm {
         Self {
             term,
             parser: Processor::new(),
-            palette: build_xterm_256_palette(),
-            default_fg: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
-            default_bg: Rgb { r: 0x14, g: 0x14, b: 0x16 },
+            palette: build_palette(),
+            default_fg: default_fg(),
+            // Arbiter's signature terminal background (CUSTOM_TERMINAL_BG in the
+            // web app). The Iced shell's surface is this colour too, so skipped
+            // (empty, default-bg) cells show through seamlessly.
+            default_bg: Rgb { r: 0x12, g: 0x12, b: 0x12 },
         }
     }
 
@@ -64,8 +67,8 @@ impl VtTerm {
         (p.line.0.max(0) as usize, p.column.0, vis)
     }
 
-    /// Walk the visible screen, yielding (row, col, char, fg, bg) per cell.
-    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3])) {
+    /// Walk the visible screen, yielding (row, col, char, fg, bg, bold) per cell.
+    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool)) {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
@@ -81,7 +84,8 @@ impl VtTerm {
                 if cell.flags.contains(Flags::HIDDEN) {
                     fg = bg;
                 }
-                f(row, col, cell.c, rgbf(fg), rgbf(bg));
+                let bold = cell.flags.contains(Flags::BOLD);
+                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold);
             }
         }
     }
@@ -112,13 +116,37 @@ fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
 }
 
-fn build_xterm_256_palette() -> [Rgb; 256] {
+/// Default foreground — the platform terminal default, matching the web themes:
+/// iTerm2 white on macOS, Campbell light-grey on Windows.
+fn default_fg() -> Rgb {
+    #[cfg(windows)]
+    {
+        Rgb { r: 0xcc, g: 0xcc, b: 0xcc }
+    }
+    #[cfg(not(windows))]
+    {
+        Rgb { r: 0xff, g: 0xff, b: 0xff }
+    }
+}
+
+fn build_palette() -> [Rgb; 256] {
     let mut p = [Rgb { r: 0, g: 0, b: 0 }; 256];
+    // ANSI 0-15 = the platform palette the web app uses (iTerm2 on macOS,
+    // Campbell on Windows). Order: black, red, green, yellow, blue, magenta,
+    // cyan, white, then the eight bright variants.
+    #[cfg(not(windows))]
     const ANSI: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00), (0xcd, 0x31, 0x31), (0x0d, 0xbc, 0x79), (0xe5, 0xe5, 0x10),
-        (0x24, 0x72, 0xc8), (0xbc, 0x3f, 0xbc), (0x11, 0xa8, 0xcd), (0xe5, 0xe5, 0xe5),
-        (0x66, 0x66, 0x66), (0xf1, 0x4c, 0x4c), (0x23, 0xd1, 0x8b), (0xf5, 0xf5, 0x43),
-        (0x3b, 0x8e, 0xea), (0xd6, 0x70, 0xd6), (0x29, 0xb8, 0xdb), (0xff, 0xff, 0xff),
+        (0x00, 0x00, 0x00), (0xc9, 0x1b, 0x00), (0x00, 0xc2, 0x00), (0xc7, 0xc4, 0x00),
+        (0x02, 0x25, 0xc7), (0xca, 0x30, 0xc7), (0x00, 0xc5, 0xc7), (0xc7, 0xc7, 0xc7),
+        (0x68, 0x68, 0x68), (0xff, 0x6e, 0x67), (0x5f, 0xfa, 0x68), (0xff, 0xfc, 0x67),
+        (0x68, 0x71, 0xff), (0xff, 0x77, 0xff), (0x60, 0xfd, 0xff), (0xff, 0xff, 0xff),
+    ];
+    #[cfg(windows)]
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0x0c, 0x0c, 0x0c), (0xc5, 0x0f, 0x1f), (0x13, 0xa1, 0x0e), (0xc1, 0x9c, 0x00),
+        (0x00, 0x37, 0xda), (0x88, 0x17, 0x98), (0x3a, 0x96, 0xdd), (0xcc, 0xcc, 0xcc),
+        (0x76, 0x76, 0x76), (0xe7, 0x48, 0x56), (0x16, 0xc6, 0x0c), (0xf9, 0xf1, 0xa5),
+        (0x3b, 0x78, 0xff), (0xb4, 0x00, 0x9e), (0x61, 0xd6, 0xd6), (0xf2, 0xf2, 0xf2),
     ];
     for (i, &(r, g, b)) in ANSI.iter().enumerate() {
         p[i] = Rgb { r, g, b };

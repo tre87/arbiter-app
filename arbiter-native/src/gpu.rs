@@ -10,11 +10,21 @@ use ab_glyph::{Font, FontVec, ScaleFont};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::raster::GlyphBitmap;
 use crate::term::VtTerm;
 
 const ATLAS: u32 = 1024;
 const SLOT_SOLID: u32 = 0; // fully-covered cell (block cursor)
 const SLOT_BLANK: u32 = 1; // empty coverage (bg-only cells)
+
+/// Terminal type metrics — matched to the web (which the webview renders with
+/// `line-height: normal`): a 12px em, and a cell height equal to the font's
+/// natural line box (ascent − descent + line_gap), which for Menlo is ~14px.
+/// `font_px` is multiplied by the DPR (`scale`) and rasterised at that
+/// resolution so text is crisp on retina/HiDPI. LINE_HEIGHT is an extra leading
+/// multiplier on top of the natural box (1.0 = match the web exactly).
+const FONT_PX: f32 = 12.0;
+const LINE_HEIGHT: f32 = 1.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -22,11 +32,12 @@ struct Uniforms {
     canvas: [f32; 2],
     cell: [f32; 2],
     glyph: [f32; 2],
-    _pad: [f32; 2],
+    srgb: f32,
+    _pad: f32,
 }
 
 const SHADER: &str = r#"
-struct Uniforms { canvas: vec2<f32>, cell: vec2<f32>, glyph: vec2<f32> };
+struct Uniforms { canvas: vec2<f32>, cell: vec2<f32>, glyph: vec2<f32>, srgb: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -56,10 +67,24 @@ fn vs(
   return out;
 }
 
+// Our colours are sRGB and we blend in gamma space (matching the web's canvas +
+// non-sRGB GL framebuffer). When the render target is an sRGB format the GPU
+// re-encodes linear->sRGB on write, which would lighten everything (the
+// 121212 -> 464646 white shade). So when srgb is set we decode the blended
+// colour back to linear, making the GPU's encode a no-op that preserves our exact
+// colours. On a non-sRGB target (the raw spike) we output the sRGB value directly.
+fn to_linear(c: vec3<f32>) -> vec3<f32> {
+  let lo = c / 12.92;
+  let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(lo, hi, c > vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let a = textureSample(atlas, samp, in.uv).r;
-  return vec4<f32>(mix(in.bg, in.fg, a), 1.0);
+  var col = mix(in.bg, in.fg, a);
+  if (u.srgb > 0.5) { col = to_linear(col); }
+  return vec4<f32>(col, 1.0);
 }
 "#;
 
@@ -73,13 +98,17 @@ pub struct TermGpu {
     bind_group: wgpu::BindGroup,
     atlas_tex: wgpu::Texture,
 
-    font: FontVec,
-    px: f32,
+    font_name: String,
+    font_data: Vec<u8>,
+    font_index: u32,
+    em_px: f32,
+    scale: f32,
     pub cell_w: u32,
     pub cell_h: u32,
-    ascent: f32,
+    baseline: f32,
+    is_srgb: bool,
     atlas_cpu: Vec<u8>,
-    glyphs: HashMap<char, u32>,
+    glyphs: HashMap<(char, bool), u32>,
     next_slot: u32,
     per_row: u32,
     atlas_dirty: bool,
@@ -88,14 +117,26 @@ pub struct TermGpu {
     count: u32,
 }
 
+/// The ab_glyph `PxScale` that renders `font`'s em square at `em_px` pixels.
+/// ab_glyph sizes text by its ascent..descent height, not the em square like CSS
+/// `Npx`, so passing a raw px gives glyphs ~15% too small. Scaling by
+/// em / (ascent − descent + line_gap) corrects it to match the web's canvas.
+fn abglyph_scale(font: &FontVec, em_px: f32) -> f32 {
+    let upm = font.units_per_em().unwrap_or(1000.0);
+    let h_units = font.ascent_unscaled() - font.descent_unscaled() + font.line_gap_unscaled();
+    em_px * h_units / upm
+}
+
 /// Cell size (device px) for a font at a given scale — so callers (e.g. the
 /// Iced shell) can map a window size to cols/rows without constructing a GPU.
 pub fn measure_cell(font_bytes: &[u8], font_index: u32, scale: f32) -> (u32, u32) {
     let font = FontVec::try_from_vec_and_index(font_bytes.to_vec(), font_index).expect("load font");
-    let px = (14.0 * scale).round().max(8.0);
+    let em_px = (FONT_PX * scale).round().max(8.0);
+    let px = abglyph_scale(&font, em_px);
     let s = font.as_scaled(px);
-    let w = s.h_advance(font.glyph_id('M')).ceil().max(1.0) as u32;
-    let h = (s.ascent() - s.descent() + s.line_gap()).ceil().max(1.0) as u32;
+    let w = s.h_advance(font.glyph_id('M')).round().max(1.0) as u32;
+    let line = s.ascent() - s.descent() + s.line_gap();
+    let h = (line * LINE_HEIGHT).ceil().max(1.0) as u32;
     (w, h)
 }
 
@@ -103,17 +144,29 @@ impl TermGpu {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
+        font_name: String,
         font_bytes: Vec<u8>,
         font_index: u32,
         scale: f32,
     ) -> Self {
         // Glyph atlas (CPU).
-        let font = FontVec::try_from_vec_and_index(font_bytes, font_index).expect("load font");
-        let px = (14.0 * scale).round().max(8.0);
+        // ab_glyph is used only for metrics (cell size + baseline); glyphs are
+        // rasterised by the platform engine (see `crate::raster`).
+        let font = FontVec::try_from_vec_and_index(font_bytes.clone(), font_index).expect("load font");
+        let em_px = (FONT_PX * scale).round().max(8.0);
+        let px = abglyph_scale(&font, em_px);
         let scaled = font.as_scaled(px);
-        let cell_w = scaled.h_advance(font.glyph_id('M')).ceil().max(1.0) as u32;
-        let ascent = scaled.ascent();
-        let cell_h = (scaled.ascent() - scaled.descent() + scaled.line_gap()).ceil().max(1.0) as u32;
+        // Cell width = the rounded glyph advance, matching the web's per-character
+        // spacing (ceil would add ~1px between every character).
+        let cell_w = scaled.h_advance(font.glyph_id('M')).round().max(1.0) as u32;
+        // Cell height = the font's natural line box, matching the web's
+        // `line-height: normal` (≈14px for Menlo at a 12px em). Without this the
+        // rows are too tight and tall content (the Claude box) comes out short.
+        let line = scaled.ascent() - scaled.descent() + scaled.line_gap();
+        let cell_h = (line * LINE_HEIGHT).ceil().max(1.0) as u32;
+        // Baseline = ascent from the cell top (plus any extra leading split
+        // evenly), so glyphs sit on the baseline like the web.
+        let baseline = scaled.ascent() + (cell_h as f32 - line) / 2.0;
         let per_row = (ATLAS / cell_w).max(1);
         let mut atlas_cpu = vec![0u8; (ATLAS * ATLAS) as usize];
         fill_slot(&mut atlas_cpu, SLOT_SOLID, per_row, cell_w, cell_h, 255);
@@ -144,7 +197,7 @@ impl TermGpu {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -244,25 +297,47 @@ impl TermGpu {
 
         Self {
             pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex,
-            font, px, cell_w, cell_h, ascent,
+            font_name, font_data: font_bytes, font_index, em_px, scale, cell_w, cell_h, baseline,
+            is_srgb: format.is_srgb(),
             atlas_cpu, glyphs: HashMap::new(), next_slot: 2, per_row, atlas_dirty: true,
             scratch: Vec::new(), count: 0,
         }
     }
 
-    fn slot_for(&mut self, ch: char) -> u32 {
+    /// The display scale this renderer was built for. The host rebuilds the
+    /// renderer when the window moves to a display with a different scale, so the
+    /// font px / cell size track the new DPI (otherwise text halves/doubles).
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    fn slot_for(&mut self, ch: char, bold: bool) -> u32 {
         if ch == ' ' || ch == '\0' {
             return SLOT_BLANK;
         }
-        if let Some(&s) = self.glyphs.get(&ch) {
+        if let Some(&s) = self.glyphs.get(&(ch, bold)) {
             return s;
         }
         let slot = self.next_slot;
         self.next_slot += 1;
-        self.glyphs.insert(ch, slot);
+        self.glyphs.insert((ch, bold), slot);
         let ox = (slot % self.per_row) * self.cell_w;
         let oy = (slot / self.per_row) * self.cell_h;
-        rasterize_into(&self.font, &mut self.atlas_cpu, self.px, self.ascent, self.cell_w, self.cell_h, ox, oy, ch);
+        let cp = ch as u32;
+        // Block Elements + Box Drawing are drawn programmatically with consistent
+        // stroke centres so lines AND corners tile seamlessly — what the web's
+        // canvas renderer and GPU terminals (Alacritty/Kitty/WezTerm) do.
+        // Font-rendering them leaves sub-pixel gaps and, for rounded corners
+        // Menlo lacks, mismatched glyphs from a fallback font.
+        let drawn = draw_block_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
+            || draw_box_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h);
+        if !drawn {
+            if let Some(bmp) = crate::raster::rasterize(
+                &self.font_name, &self.font_data, self.font_index, self.em_px, ch, bold,
+            ) {
+                blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
+            }
+        }
         self.atlas_dirty = true;
         slot
     }
@@ -282,17 +357,17 @@ impl TermGpu {
         let (cur_row, cur_col, cur_vis) = term.cursor();
 
         // Collect drawable cells, then resolve glyph slots (needs &mut self).
-        let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3])> = Vec::new();
-        term.for_each_cell(|row, col, c, fg, bg| {
+        let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3], bool)> = Vec::new();
+        term.for_each_cell(|row, col, c, fg, bg, bold| {
             if (c == ' ' || c == '\0') && bg == default_bg {
                 return;
             }
-            cells.push((row, col, c, fg, bg));
+            cells.push((row, col, c, fg, bg, bold));
         });
 
         self.scratch.clear();
-        for (row, col, c, fg, bg) in &cells {
-            let slot = self.slot_for(*c);
+        for (row, col, c, fg, bg, bold) in &cells {
+            let slot = self.slot_for(*c, *bold);
             let (u, v) = self.uv(slot);
             self.scratch.extend_from_slice(&[
                 *col as f32 * cw, *row as f32 * ch, u, v,
@@ -301,7 +376,7 @@ impl TermGpu {
         }
         if cur_vis {
             let (u, v) = self.uv(SLOT_SOLID);
-            let cur = [0.76f32, 0.54, 0.14]; // amber block
+            let cur = [0.8f32, 0.8, 0.85]; // #ccccd9 block, matches the web cursor
             self.scratch.extend_from_slice(&[
                 cur_col as f32 * cw, cur_row as f32 * ch, u, v,
                 cur[0], cur[1], cur[2], cur[0], cur[1], cur[2],
@@ -339,7 +414,8 @@ impl TermGpu {
             canvas: [canvas_w.max(1) as f32, canvas_h.max(1) as f32],
             cell: [cw, ch],
             glyph: [cw / ATLAS as f32, ch / ATLAS as f32],
-            _pad: [0.0, 0.0],
+            srgb: if self.is_srgb { 1.0 } else { 0.0 },
+            _pad: 0.0,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
     }
@@ -367,7 +443,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, font_bytes: Vec<u8>, font_index: u32, scale: f32) -> Self {
+    pub async fn new(window: Arc<Window>, font_name: String, font_bytes: Vec<u8>, font_index: u32, scale: f32) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window).expect("create_surface");
@@ -398,7 +474,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let gpu = TermGpu::new(&device, format, font_bytes, font_index, scale);
+        let gpu = TermGpu::new(&device, format, font_name, font_bytes, font_index, scale);
         Self { surface, device, queue, config, gpu }
     }
 
@@ -450,6 +526,144 @@ impl Renderer {
     }
 }
 
+/// Fill a sub-rect of a cell (cell-relative x/y), clamped to the cell, with a
+/// coverage value. Used by the block/box glyph drawers.
+fn fill_rect(atlas: &mut [u8], ox: u32, oy: u32, rx: u32, ry: u32, rw: u32, rh: u32, cell_w: u32, cell_h: u32, val: u8) {
+    let x1 = (rx + rw).min(cell_w);
+    let y1 = (ry + rh).min(cell_h);
+    let mut yy = ry;
+    while yy < y1 {
+        let mut xx = rx;
+        while xx < x1 {
+            atlas[((oy + yy) * ATLAS + (ox + xx)) as usize] = val;
+            xx += 1;
+        }
+        yy += 1;
+    }
+}
+
+/// Block Elements (U+2580–U+259F) as exact filled rectangles, ported from the
+/// web's `drawBlockGlyph`. Returns true if `cp` was handled.
+fn draw_block_glyph(atlas: &mut [u8], cp: u32, ox: u32, oy: u32, w: u32, h: u32) -> bool {
+    if !(0x2580..=0x259f).contains(&cp) {
+        return false;
+    }
+    let wf = w as f32;
+    let hf = h as f32;
+    let r = |v: f32| v.round() as u32;
+    let hx = r(wf / 2.0);
+    let hy = r(hf / 2.0);
+    // Lower partials ▁▂▃▅▆▇ keep the bottom `h - y` band; upper-fraction y.
+    let lower = |frac: f32| -> (u32, u32) {
+        let y = r(hf * frac);
+        (y, h - y)
+    };
+    let mut fill = |rx: u32, ry: u32, rw: u32, rh: u32, val: u8| fill_rect(atlas, ox, oy, rx, ry, rw, rh, w, h, val);
+    match cp {
+        0x2588 => fill(0, 0, w, h, 255),                 // █ full
+        0x2580 => fill(0, 0, w, hy, 255),                // ▀ upper half
+        0x2584 => fill(0, hy, w, h - hy, 255),           // ▄ lower half
+        0x258c => fill(0, 0, hx, h, 255),                // ▌ left half
+        0x2590 => fill(hx, 0, w - hx, h, 255),           // ▐ right half
+        0x2581 => { let (y, rh) = lower(7.0 / 8.0); fill(0, y, w, rh, 255) } // ▁
+        0x2582 => { let (y, rh) = lower(6.0 / 8.0); fill(0, y, w, rh, 255) }
+        0x2583 => { let (y, rh) = lower(5.0 / 8.0); fill(0, y, w, rh, 255) }
+        0x2585 => { let (y, rh) = lower(3.0 / 8.0); fill(0, y, w, rh, 255) }
+        0x2586 => { let (y, rh) = lower(2.0 / 8.0); fill(0, y, w, rh, 255) }
+        0x2587 => { let (y, rh) = lower(1.0 / 8.0); fill(0, y, w, rh, 255) } // ▇
+        0x2589 => fill(0, 0, r(wf * 7.0 / 8.0), h, 255), // ▉
+        0x258a => fill(0, 0, r(wf * 6.0 / 8.0), h, 255),
+        0x258b => fill(0, 0, r(wf * 5.0 / 8.0), h, 255),
+        0x258d => fill(0, 0, r(wf * 3.0 / 8.0), h, 255),
+        0x258e => fill(0, 0, r(wf * 2.0 / 8.0), h, 255),
+        0x258f => fill(0, 0, r(wf / 8.0), h, 255),       // ▏
+        0x2594 => fill(0, 0, w, r(hf / 8.0), 255),       // ▔ upper 1/8
+        0x2595 => { let x = r(wf * 7.0 / 8.0); fill(x, 0, w - x, h, 255) } // ▕ right 1/8
+        0x2591 => fill(0, 0, w, h, 64),                  // ░ 25%
+        0x2592 => fill(0, 0, w, h, 128),                 // ▒ 50%
+        0x2593 => fill(0, 0, w, h, 191),                 // ▓ 75%
+        0x2596 => fill(0, hy, hx, h - hy, 255),          // ▖
+        0x2597 => fill(hx, hy, w - hx, h - hy, 255),     // ▗
+        0x2598 => fill(0, 0, hx, hy, 255),               // ▘
+        0x2599 => { fill(0, 0, hx, hy, 255); fill(0, hy, w, h - hy, 255) } // ▙
+        0x259a => { fill(0, 0, hx, hy, 255); fill(hx, hy, w - hx, h - hy, 255) } // ▚
+        0x259b => { fill(0, 0, w, hy, 255); fill(0, hy, hx, h - hy, 255) } // ▛
+        0x259c => { fill(0, 0, w, hy, 255); fill(hx, hy, w - hx, h - hy, 255) } // ▜
+        0x259d => fill(hx, 0, w - hx, hy, 255),          // ▝
+        0x259e => { fill(hx, 0, w - hx, hy, 255); fill(0, hy, hx, h - hy, 255) } // ▞
+        0x259f => { fill(hx, 0, w - hx, hy, 255); fill(0, hy, w, h - hy, 255) } // ▟
+        _ => return false,
+    }
+    true
+}
+
+/// Direction bitmask (1=left 2=right 4=up 8=down) for Box Drawing chars; heavy
+/// and double variants are treated as light. Ported from the web's `BOX_DIRS`.
+/// Used to know which edges a glyph's strokes should reach when closing gaps.
+fn box_dirs(cp: u32) -> Option<u8> {
+    Some(match cp {
+        0x2500 | 0x2501 => 1 | 2,
+        0x2502 | 0x2503 => 4 | 8,
+        0x250c | 0x250f => 2 | 8,
+        0x2510 | 0x2513 => 1 | 8,
+        0x2514 | 0x2517 => 2 | 4,
+        0x2518 | 0x251b => 1 | 4,
+        0x251c | 0x2523 => 4 | 8 | 2,
+        0x2524 | 0x252b => 4 | 8 | 1,
+        0x252c | 0x2533 => 1 | 2 | 8,
+        0x2534 | 0x253b => 1 | 2 | 4,
+        0x253c | 0x254b => 1 | 2 | 4 | 8,
+        0x2574 => 1,
+        0x2575 => 4,
+        0x2576 => 2,
+        0x2577 => 8,
+        0x256d => 2 | 8,
+        0x256e => 1 | 8,
+        0x256f => 1 | 4,
+        0x2570 => 2 | 4,
+        0x2550 => 1 | 2,
+        0x2551 => 4 | 8,
+        0x2554 => 2 | 8,
+        0x2557 => 1 | 8,
+        0x255a => 2 | 4,
+        0x255d => 1 | 4,
+        0x2560 => 4 | 8 | 2,
+        0x2563 => 4 | 8 | 1,
+        0x2566 => 1 | 2 | 8,
+        0x2569 => 1 | 2 | 4,
+        0x256c => 1 | 2 | 4 | 8,
+        _ => return None,
+    })
+}
+
+/// Box Drawing (U+2500–U+257F) as line segments from the cell centre to its
+/// edges, ported from the web's `drawBoxGlyph`. Returns true if handled. Drawing
+/// programmatically (vs the font) guarantees seamless tiling and aligned corners.
+fn draw_box_glyph(atlas: &mut [u8], cp: u32, ox: u32, oy: u32, w: u32, h: u32) -> bool {
+    let Some(m) = box_dirs(cp) else { return false };
+    let r = |v: f32| v.round() as u32;
+    let t = (r(h as f32 / 10.0)).max(1); // stroke thickness
+    let ht = t / 2;
+    let mid_x = r(w as f32 / 2.0);
+    let mid_y = r(h as f32 / 2.0);
+    let ty = mid_y.saturating_sub(ht);
+    let tx = mid_x.saturating_sub(ht);
+    let mut fill = |rx: u32, ry: u32, rw: u32, rh: u32| fill_rect(atlas, ox, oy, rx, ry, rw, rh, w, h, 255);
+    if m & 1 != 0 {
+        fill(0, ty, mid_x + ht, t); // left → centre
+    }
+    if m & 2 != 0 {
+        fill(tx, ty, w - tx, t); // centre → right
+    }
+    if m & 4 != 0 {
+        fill(tx, 0, t, mid_y + ht); // up → centre
+    }
+    if m & 8 != 0 {
+        fill(tx, ty, t, h - ty); // centre → down
+    }
+    true
+}
+
 fn fill_slot(atlas: &mut [u8], slot: u32, per_row: u32, cell_w: u32, cell_h: u32, value: u8) {
     let ox = (slot % per_row) * cell_w;
     let oy = (slot / per_row) * cell_h;
@@ -460,31 +674,29 @@ fn fill_slot(atlas: &mut [u8], slot: u32, per_row: u32, cell_w: u32, cell_h: u32
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rasterize_into(
-    font: &FontVec,
-    atlas: &mut [u8],
-    px: f32,
-    ascent: f32,
-    cell_w: u32,
-    cell_h: u32,
-    ox: u32,
-    oy: u32,
-    ch: char,
-) {
-    let glyph = font.glyph_id(ch).with_scale_and_position(px, ab_glyph::point(0.0, ascent));
-    if let Some(outlined) = font.outline_glyph(glyph) {
-        let b = outlined.px_bounds();
-        outlined.draw(|gx, gy, c| {
-            let xx = b.min.x as i32 + gx as i32;
-            let yy = b.min.y as i32 + gy as i32;
-            if xx >= 0 && (xx as u32) < cell_w && yy >= 0 && (yy as u32) < cell_h {
-                let idx = ((oy + yy as u32) * ATLAS + (ox + xx as u32)) as usize;
-                let cov = (c * 255.0) as u8;
-                if cov > atlas[idx] {
-                    atlas[idx] = cov;
-                }
+/// Blit a rasterised glyph into the atlas cell at (ox, oy): the bitmap's top is
+/// placed `top` px above `baseline` and its left column at `left` (cell-relative),
+/// clipped to the cell. Coverage is max-combined (cell starts blank).
+fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, cell_h: u32, ox: u32, oy: u32) {
+    let bw = bmp.width as i32;
+    let bh = bmp.height as i32;
+    let base_x = bmp.left;
+    let base_y = baseline.round() as i32 - bmp.top;
+    for gy in 0..bh {
+        let cy = base_y + gy;
+        if cy < 0 || cy >= cell_h as i32 {
+            continue;
+        }
+        for gx in 0..bw {
+            let cx = base_x + gx;
+            if cx < 0 || cx >= cell_w as i32 {
+                continue;
             }
-        });
+            let cov = bmp.coverage[(gy * bw + gx) as usize];
+            let idx = ((oy + cy as u32) * ATLAS + (ox + cx as u32)) as usize;
+            if cov > atlas[idx] {
+                atlas[idx] = cov;
+            }
+        }
     }
 }

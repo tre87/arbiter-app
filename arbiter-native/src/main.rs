@@ -29,6 +29,7 @@ struct App {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
+    font_name: String,
     font_bytes: Vec<u8>,
     font_index: u32,
     mods: ModifiersState,
@@ -68,6 +69,7 @@ impl ApplicationHandler for App {
         let scale = win.scale_factor() as f32;
         let renderer = pollster::block_on(Renderer::new(
             win.clone(),
+            self.font_name.clone(),
             self.font_bytes.clone(),
             self.font_index,
             scale,
@@ -148,8 +150,8 @@ fn shell_command() -> CommandBuilder {
     }
 }
 
-/// Cross-platform monospace font (bytes + collection index).
-fn load_mono_font() -> (Vec<u8>, u32) {
+/// Cross-platform monospace font (family name + bytes + collection index).
+fn load_mono_font() -> (String, Vec<u8>, u32) {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let query = fontdb::Query {
@@ -157,12 +159,18 @@ fn load_mono_font() -> (Vec<u8>, u32) {
         ..Default::default()
     };
     let id = db.query(&query).expect("no monospace system font found");
-    db.with_face_data(id, |data, index| (data.to_vec(), index))
-        .expect("font face data")
+    let name = db
+        .face(id)
+        .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+        .unwrap_or_else(|| "monospace".to_string());
+    let (bytes, index) = db
+        .with_face_data(id, |data, index| (data.to_vec(), index))
+        .expect("font face data");
+    (name, bytes, index)
 }
 
 fn main() {
-    let (font_bytes, font_index) = load_mono_font();
+    let (font_name, font_bytes, font_index) = load_mono_font();
 
     let pty = native_pty_system();
     let pair = pty
@@ -196,6 +204,7 @@ fn main() {
         writer,
         master: pair.master,
         _child: child,
+        font_name,
         font_bytes,
         font_index,
         mods: ModifiersState::empty(),
