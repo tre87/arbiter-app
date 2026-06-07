@@ -23,25 +23,36 @@ use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 
 struct PaneData {
     session: Session,
+    name: String,
 }
 
 struct Workspace {
     panes: pane_grid::State<PaneData>,
     focus: pane_grid::Pane,
     name: String,
+    next_term: usize,
 }
 
 impl Workspace {
     fn new(name: String) -> Self {
-        let (panes, first) = pane_grid::State::new(PaneData { session: spawn_session() });
-        Workspace { panes, focus: first, name }
+        let first_pane = PaneData { session: spawn_session(), name: "Terminal 1".to_string() };
+        let (panes, first) = pane_grid::State::new(first_pane);
+        Workspace { panes, focus: first, name, next_term: 2 }
+    }
+
+    /// Next per-workspace terminal name ("Terminal N"); numbering restarts per
+    /// workspace, matching the web.
+    fn next_name(&mut self) -> String {
+        let n = self.next_term;
+        self.next_term += 1;
+        format!("Terminal {n}")
     }
 }
 
 struct State {
     workspaces: Vec<Workspace>,
     active: usize,
-    font: Arc<(Vec<u8>, u32)>,
+    font: Arc<(Vec<u8>, u32, String)>,
     theme: iced::Theme,
 }
 
@@ -119,7 +130,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 }
 
 fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
-    if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, PaneData { session: spawn_session() }) {
+    let name = ws.next_name();
+    if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, PaneData { session: spawn_session(), name }) {
         ws.focus = new_pane;
     }
 }
@@ -152,23 +164,51 @@ fn view(state: &State) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let content = column![term, footer_bar(&data.session)]
+        let focused = pane == focus;
+        let content = column![pane_header(&data.name, focused), term, footer_bar(&data.session)]
             .width(Length::Fill)
             .height(Length::Fill);
+        // No focus border on the pane body — focus is shown by the header title
+        // colour (like the web). The pane paints its own #121212 background so
+        // empty terminal cells (the renderer skips them) sit on the right colour;
+        // the 2px grid gap shows the divider colour behind the grid.
         let body = mouse_area(content).on_press(Message::Focus(pane));
-        let focused = pane == focus;
-        let busy = data.session.shell_idle() == Some(false); // OSC-133: a command is running
-        let claude = data.session.claude_running();
         let wrapped = container(body)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |theme: &iced::Theme| pane_style(theme, focused, busy, claude));
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+                ..Default::default()
+            });
         pane_grid::Content::new(wrapped)
     })
     .width(Length::Fill)
     .height(Length::Fill)
     .spacing(2)
-    .on_resize(8, Message::Resized);
+    .on_resize(8, Message::Resized)
+    .style(|_t: &iced::Theme| {
+        // Web divider: #2c2c2c, 2px, and no hover highlight (the web tints it
+        // azure on hover; we keep it flat per the design request).
+        let divider = iced::Color::from_rgb8(0x2c, 0x2c, 0x2c);
+        pane_grid::Style {
+            hovered_region: pane_grid::Highlight {
+                background: iced::Background::Color(iced::Color::TRANSPARENT),
+                border: iced::Border { color: divider, width: 0.0, radius: 0.0.into() },
+            },
+            picked_split: pane_grid::Line { color: divider, width: 2.0 },
+            hovered_split: pane_grid::Line { color: divider, width: 2.0 },
+        }
+    });
+
+    // The grid sits on the divider colour so the 2px inter-pane gaps read as
+    // web-style dividers (each pane paints its own #121212 over its area).
+    let grid = container(grid)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+            ..Default::default()
+        });
 
     column![container(bar).padding(6), grid]
         .width(Length::Fill)
@@ -213,21 +253,23 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
         .into()
 }
 
-fn pane_style(theme: &iced::Theme, focused: bool, busy: bool, claude: bool) -> container::Style {
-    let mut s = container::Style::default();
-    // Claude running → green (you can see which panes have Claude); else a
-    // busy command → amber; else the focused pane gets the accent border.
-    let color = if claude {
-        iced::Color::from_rgb(0.20, 0.80, 0.45)
-    } else if busy {
-        iced::Color::from_rgb(0.90, 0.63, 0.16)
-    } else if focused {
-        theme.palette().primary
+/// Per-pane header: a full-width bar with the centred terminal title. Focus is
+/// shown by the title colour (azure when focused, grey otherwise), like the web.
+/// Status (Claude/busy) will live here too in a later phase.
+fn pane_header(name: &str, focused: bool) -> Element<'static, Message> {
+    let color = if focused {
+        iced::Color::from_rgb8(0x4d, 0xa6, 0xff)
     } else {
-        return s;
+        iced::Color::from_rgb8(0x6b, 0x6b, 0x6b)
     };
-    s.border = iced::Border { color, width: 1.5, radius: 0.0.into() };
-    s
+    container(text(name.to_string()).size(12).color(color))
+        .center_x(Length::Fill)
+        .padding([3, 0])
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x16, 0x16, 0x16))),
+            ..Default::default()
+        })
+        .into()
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
@@ -284,7 +326,7 @@ struct TermProgram {
     id: u64,
     term: SharedTerm,
     master: SharedMaster,
-    font: Arc<(Vec<u8>, u32)>,
+    font: Arc<(Vec<u8>, u32, String)>,
 }
 
 impl std::fmt::Debug for TermProgram {
@@ -311,7 +353,7 @@ struct TermPrimitive {
     id: u64,
     term: SharedTerm,
     master: SharedMaster,
-    font: Arc<(Vec<u8>, u32)>,
+    font: Arc<(Vec<u8>, u32, String)>,
 }
 
 impl std::fmt::Debug for TermPrimitive {
@@ -338,7 +380,14 @@ impl shader::Primitive for TermPrimitive {
         let gpu = renderers
             .0
             .entry(self.id)
-            .or_insert_with(|| TermGpu::new(device, format, self.font.0.clone(), self.font.1, scale));
+            .or_insert_with(|| {
+                TermGpu::new(device, format, self.font.2.clone(), self.font.0.clone(), self.font.1, scale)
+            });
+        // Rebuild when the window moves to a display with a different scale, so
+        // the font px / cell size match the new DPI (else text halves/doubles).
+        if (gpu.scale() - scale).abs() > 0.01 {
+            *gpu = TermGpu::new(device, format, self.font.2.clone(), self.font.0.clone(), self.font.1, scale);
+        }
 
         let pw = (bounds.width * scale).max(1.0) as u32;
         let ph = (bounds.height * scale).max(1.0) as u32;
@@ -397,14 +446,38 @@ impl shader::Primitive for TermPrimitive {
     }
 }
 
+/// Pick the terminal font, preferring the same stack the web app used
+/// (`Consolas, 'Cascadia Code', Menlo, 'SF Mono'`) so the look matches across
+/// platforms: Consolas on Windows, Menlo on macOS. Falls back to any monospace.
+fn pick_terminal_font(db: &fontdb::Database) -> fontdb::ID {
+    const PREFERRED: &[&str] = &[
+        "Consolas", "Cascadia Code", "Cascadia Mono", // Windows
+        "Menlo", "SF Mono", "Monaco",                 // macOS
+        "DejaVu Sans Mono", "Liberation Mono",        // Linux
+    ];
+    for name in PREFERRED {
+        let q = fontdb::Query { families: &[fontdb::Family::Name(name)], ..Default::default() };
+        if let Some(id) = db.query(&q) {
+            return id;
+        }
+    }
+    let q = fontdb::Query { families: &[fontdb::Family::Monospace], ..Default::default() };
+    db.query(&q).expect("no monospace font")
+}
+
 fn main() -> iced::Result {
     let font = {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        let q = fontdb::Query { families: &[fontdb::Family::Monospace], ..Default::default() };
-        let id = db.query(&q).expect("no monospace font");
+        let id = pick_terminal_font(&db);
+        // The family name is what CoreText/DirectWrite rasterise by (same font
+        // the webview resolves); the bytes/index drive metrics + the swash path.
+        let name = db
+            .face(id)
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+            .unwrap_or_else(|| "monospace".to_string());
         let (bytes, index) = db.with_face_data(id, |d, i| (d.to_vec(), i)).expect("face data");
-        Arc::new((bytes, index))
+        Arc::new((bytes, index, name))
     };
 
     iced::application("Arbiter native (Iced shell)", update, view)

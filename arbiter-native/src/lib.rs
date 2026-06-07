@@ -4,6 +4,7 @@
 pub mod claude;
 pub mod git;
 pub mod gpu;
+pub mod raster;
 pub mod session;
 pub mod shell;
 pub mod term;
