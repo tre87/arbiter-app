@@ -123,6 +123,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Input(bytes) => {
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
+                // Typing returns the view to the live bottom (like the web).
+                if let Ok(mut t) = p.session.term().lock() {
+                    t.scroll_to_bottom();
+                }
                 p.session.write(&bytes);
             }
         }
@@ -132,6 +136,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // a normal CR there instead.
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
+                if let Ok(mut t) = p.session.term().lock() {
+                    t.scroll_to_bottom();
+                }
                 let bytes: &[u8] = if p.session.claude_running() { b"\x1b[13;2u" } else { b"\r" };
                 p.session.write(bytes);
             }
@@ -496,6 +503,35 @@ impl std::fmt::Debug for TermProgram {
 impl shader::Program<Message> for TermProgram {
     type State = ();
     type Primitive = TermPrimitive;
+
+    fn update(
+        &self,
+        _state: &mut Self::State,
+        event: shader::Event,
+        bounds: Rectangle,
+        cursor: iced::mouse::Cursor,
+        _shell: &mut iced::advanced::Shell<'_, Message>,
+    ) -> (iced::event::Status, Option<Message>) {
+        use iced::mouse::{Event::WheelScrolled, ScrollDelta};
+        // Mouse wheel over this pane scrolls its scrollback. ×3 lines per notch
+        // (matches Alacritty); pixel deltas (trackpads) convert via the cell
+        // height. Typing jumps back to the bottom (handled in update()).
+        if let shader::Event::Mouse(WheelScrolled { delta }) = event {
+            if cursor.position_in(bounds).is_some() {
+                let mut t = self.term.lock().unwrap();
+                let rows = t.size().1.max(1) as f32;
+                let lines = match delta {
+                    ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
+                    ScrollDelta::Pixels { y, .. } => (y / (bounds.height / rows).max(1.0)).round() as i32,
+                };
+                if lines != 0 {
+                    t.scroll(lines);
+                }
+                return (iced::event::Status::Captured, None);
+            }
+        }
+        (iced::event::Status::Ignored, None)
+    }
 
     fn draw(&self, _state: &Self::State, _cursor: iced::mouse::Cursor, _bounds: Rectangle) -> Self::Primitive {
         TermPrimitive {

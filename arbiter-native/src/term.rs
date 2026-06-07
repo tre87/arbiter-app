@@ -2,7 +2,7 @@
 //! Same approach as the shipping app's `termgrid::HeadlessTerm`.
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -56,6 +56,17 @@ impl VtTerm {
         self.term.resize(Size { cols, rows });
     }
 
+    /// Scroll the display by `lines` into scrollback (positive = up/older),
+    /// clamped to the history. The next `for_each_cell` renders the new view.
+    pub fn scroll(&mut self, lines: i32) {
+        self.term.scroll_display(Scroll::Delta(lines));
+    }
+
+    /// Jump back to the live bottom (display offset 0).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
     pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
@@ -72,8 +83,11 @@ impl VtTerm {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
+        // Offset by the scrollback position so a scrolled-up view shows history
+        // (negative line indices address the scrollback).
+        let off = grid.display_offset() as i32;
         for row in 0..rows {
-            let line = &grid[Line(row as i32)];
+            let line = &grid[Line(row as i32 - off)];
             for col in 0..cols {
                 let cell = &line[Column(col)];
                 let mut fg = self.resolve(cell.fg, true);
