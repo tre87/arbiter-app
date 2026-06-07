@@ -142,12 +142,11 @@ impl VtTerm {
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
-        // The spinner lives on the status line at the very bottom; only look for its
-        // glyph in the last few rows so a star in scrolled-up answer text can't fire it.
-        let spin_start = rows.saturating_sub(6);
         let mut buf = String::with_capacity(cols);
         let mut working = false;
-        for row in rows.saturating_sub(24)..rows {
+        // Scan the whole live region: Claude's spinner sits several rows above the
+        // bottom (above the input box + mode line), not on the very last line.
+        for row in rows.saturating_sub(40)..rows {
             buf.clear();
             let line = &grid[Line(row as i32 - off)];
             for col in 0..cols {
@@ -156,19 +155,14 @@ impl VtTerm {
             if MENU.iter().any(|m| buf.contains(m)) {
                 return Some(ClaudeScreen::Menu);
             }
-            // Working is whatever the user sees animating: Claude's "(esc to
-            // interrupt)" status line, or its ✻ spinner glyph. We match the star/
-            // asterisk dingbat block U+2722–273F (·✢✳✶✻✽ and friends) and Braille
-            // spinners U+2800–28FF — deliberately NOT the whole U+2700–27BF range,
-            // which includes the prompt arrow ❯ (U+276F) that made typing read as work.
-            if buf.contains("to interrupt") {
-                working = true;
-            }
-            if row >= spin_start
-                && buf.chars().any(|c| {
-                    ('\u{2722}'..='\u{273F}').contains(&c) || ('\u{2800}'..='\u{28FF}').contains(&c)
-                })
-            {
+            // Working = Claude's ✻ spinner is on screen. Verified by capturing the
+            // CLI: the animated frames are the star/asterisk dingbats U+2722–273F
+            // (·✢✳✶✻✽) — there is no "esc to interrupt" text to match. Braille
+            // U+2800–28FF covers tool spinners. Deliberately NOT the whole
+            // U+2700–27BF range, which includes the input prompt arrow ❯ (U+276F).
+            if buf.chars().any(|c| {
+                ('\u{2722}'..='\u{273F}').contains(&c) || ('\u{2800}'..='\u{28FF}').contains(&c)
+            }) {
                 working = true;
             }
         }
