@@ -9,6 +9,13 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
+/// Selection granularity for a fresh selection (single/double/triple click).
+pub enum SelectKind {
+    Simple,
+    Word,
+    Line,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct NoopListener;
 impl EventListener for NoopListener {}
@@ -74,11 +81,17 @@ impl VtTerm {
     }
 
     /// Begin a selection at a visible (row, col); `right` = cursor in the cell's
-    /// right half (which edge the selection snaps to).
-    pub fn start_selection(&mut self, row: usize, col: usize, right: bool) {
+    /// right half (which edge the selection snaps to). `kind` sets the
+    /// granularity (single/double/triple click → char/word/line).
+    pub fn start_selection(&mut self, row: usize, col: usize, right: bool, kind: SelectKind) {
         let point = Point::new(self.abs_line(row), Column(col));
         let side = if right { Side::Right } else { Side::Left };
-        self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+        let ty = match kind {
+            SelectKind::Simple => SelectionType::Simple,
+            SelectKind::Word => SelectionType::Semantic,
+            SelectKind::Line => SelectionType::Lines,
+        };
+        self.term.selection = Some(Selection::new(ty, point, side));
     }
 
     /// Extend the active selection to a visible (row, col).
