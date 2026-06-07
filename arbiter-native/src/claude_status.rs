@@ -70,10 +70,14 @@ pub struct ClaudeHandle {
     hook_attention: AtomicBool,
 }
 
-/// Working reverts to ready after this long without activity (web parity).
-const WORKING_TTL_MS: u64 = 2000;
-/// After a Stop hook, ignore a trailing spinner frame (the turn's final redraw)
-/// for this long so the turn-end doesn't flicker working→ready→working (web parity).
+/// Working reverts to ready after this long without a spinner frame. Only the
+/// FALLBACK for when no Stop hook arrives — Claude animates the spinner every
+/// ~100-300ms while working, so this comfortably bridges frame gaps while keeping
+/// the post-turn lag short. (Stop, when it fires, ends the turn instantly.)
+const WORKING_TTL_MS: u64 = 900;
+/// After a Stop hook, treat the turn as over: ignore a trailing spinner frame (the
+/// final redraw) and force ready for this long, so the turn-end can't flicker
+/// working→ready→working.
 const STOP_SUPPRESS_MS: u64 = 700;
 
 fn now_ms() -> u64 {
@@ -103,7 +107,14 @@ impl ClaudeHandle {
     /// Reader: Claude's working spinner is on screen. Also resolves any pending
     /// permission attention — Claude has resumed, so it's working, not waiting.
     pub fn note_activity(&self) {
-        self.activity_ms.store(now_ms(), Ordering::Relaxed);
+        let now = now_ms();
+        // A spinner frame inside the post-Stop window is the turn's FINAL redraw —
+        // ignore it so it can't revive "working" after Stop already ended the turn.
+        // (A genuinely new turn's frames land well after the window.)
+        if now.saturating_sub(self.stop_ms.load(Ordering::Relaxed)) < STOP_SUPPRESS_MS {
+            return;
+        }
+        self.activity_ms.store(now, Ordering::Relaxed);
         self.hook_attention.store(false, Ordering::Relaxed);
     }
 
