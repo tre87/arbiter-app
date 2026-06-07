@@ -52,7 +52,7 @@ impl Workspace {
 struct State {
     workspaces: Vec<Workspace>,
     active: usize,
-    font: Arc<(Vec<u8>, u32, String)>,
+    font: Arc<arbiter_native::font::FontSpec>,
     theme: iced::Theme,
 }
 
@@ -326,7 +326,7 @@ struct TermProgram {
     id: u64,
     term: SharedTerm,
     master: SharedMaster,
-    font: Arc<(Vec<u8>, u32, String)>,
+    font: Arc<arbiter_native::font::FontSpec>,
 }
 
 impl std::fmt::Debug for TermProgram {
@@ -353,7 +353,7 @@ struct TermPrimitive {
     id: u64,
     term: SharedTerm,
     master: SharedMaster,
-    font: Arc<(Vec<u8>, u32, String)>,
+    font: Arc<arbiter_native::font::FontSpec>,
 }
 
 impl std::fmt::Debug for TermPrimitive {
@@ -381,12 +381,12 @@ impl shader::Primitive for TermPrimitive {
             .0
             .entry(self.id)
             .or_insert_with(|| {
-                TermGpu::new(device, format, self.font.2.clone(), self.font.0.clone(), self.font.1, scale)
+                TermGpu::new(device, format, &self.font, scale)
             });
         // Rebuild when the window moves to a display with a different scale, so
         // the font px / cell size match the new DPI (else text halves/doubles).
         if (gpu.scale() - scale).abs() > 0.01 {
-            *gpu = TermGpu::new(device, format, self.font.2.clone(), self.font.0.clone(), self.font.1, scale);
+            *gpu = TermGpu::new(device, format, &self.font, scale);
         }
 
         let pw = (bounds.width * scale).max(1.0) as u32;
@@ -446,39 +446,8 @@ impl shader::Primitive for TermPrimitive {
     }
 }
 
-/// Pick the terminal font, preferring the same stack the web app used
-/// (`Consolas, 'Cascadia Code', Menlo, 'SF Mono'`) so the look matches across
-/// platforms: Consolas on Windows, Menlo on macOS. Falls back to any monospace.
-fn pick_terminal_font(db: &fontdb::Database) -> fontdb::ID {
-    const PREFERRED: &[&str] = &[
-        "Consolas", "Cascadia Code", "Cascadia Mono", // Windows
-        "Menlo", "SF Mono", "Monaco",                 // macOS
-        "DejaVu Sans Mono", "Liberation Mono",        // Linux
-    ];
-    for name in PREFERRED {
-        let q = fontdb::Query { families: &[fontdb::Family::Name(name)], ..Default::default() };
-        if let Some(id) = db.query(&q) {
-            return id;
-        }
-    }
-    let q = fontdb::Query { families: &[fontdb::Family::Monospace], ..Default::default() };
-    db.query(&q).expect("no monospace font")
-}
-
 fn main() -> iced::Result {
-    let font = {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
-        let id = pick_terminal_font(&db);
-        // The family name is what CoreText/DirectWrite rasterise by (same font
-        // the webview resolves); the bytes/index drive metrics + the swash path.
-        let name = db
-            .face(id)
-            .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
-            .unwrap_or_else(|| "monospace".to_string());
-        let (bytes, index) = db.with_face_data(id, |d, i| (d.to_vec(), i)).expect("face data");
-        Arc::new((bytes, index, name))
-    };
+    let font = Arc::new(arbiter_native::font::load());
 
     iced::application("Arbiter native (Iced shell)", update, view)
         .subscription(subscription)

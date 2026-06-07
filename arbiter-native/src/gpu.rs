@@ -105,8 +105,8 @@ pub struct TermGpu {
     atlas_tex: wgpu::Texture,
 
     font_name: String,
-    font_data: Vec<u8>,
-    font_index: u32,
+    regular: (Vec<u8>, u32),
+    bold_face: Option<(Vec<u8>, u32)>,
     em_px: f32,
     scale: f32,
     pub cell_w: u32,
@@ -150,15 +150,13 @@ impl TermGpu {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        font_name: String,
-        font_bytes: Vec<u8>,
-        font_index: u32,
+        spec: &crate::font::FontSpec,
         scale: f32,
     ) -> Self {
-        // Glyph atlas (CPU).
-        // ab_glyph is used only for metrics (cell size + baseline); glyphs are
-        // rasterised by the platform engine (see `crate::raster`).
-        let font = FontVec::try_from_vec_and_index(font_bytes.clone(), font_index).expect("load font");
+        // Glyph atlas (CPU). ab_glyph is used only for metrics (cell size +
+        // baseline), from the regular face; glyphs are rasterised by the platform
+        // engine (see `crate::raster`). Bold/regular share metrics (monospace).
+        let font = FontVec::try_from_vec_and_index(spec.regular.0.clone(), spec.regular.1).expect("load font");
         let em_px = (FONT_PX * scale).round().max(8.0);
         let px = abglyph_scale(&font, em_px);
         let scaled = font.as_scaled(px);
@@ -303,7 +301,8 @@ impl TermGpu {
 
         Self {
             pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex,
-            font_name, font_data: font_bytes, font_index, em_px, scale, cell_w, cell_h, baseline,
+            font_name: spec.name.clone(), regular: spec.regular.clone(), bold_face: spec.bold.clone(),
+            em_px, scale, cell_w, cell_h, baseline,
             is_srgb: format.is_srgb(),
             atlas_cpu, glyphs: HashMap::new(), next_slot: 2, per_row, atlas_dirty: true,
             scratch: Vec::new(), count: 0,
@@ -338,9 +337,15 @@ impl TermGpu {
         let drawn = draw_block_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
             || draw_box_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h);
         if !drawn {
-            if let Some(bmp) = crate::raster::rasterize(
-                &self.font_name, &self.font_data, self.font_index, self.em_px, ch, bold,
-            ) {
+            // Pick the bold face when we carry one (swash path); otherwise pass
+            // the regular bytes and let the rasteriser synthesise bold (CoreText).
+            let (data, index) = match (bold, &self.bold_face) {
+                (true, Some(b)) => (b.0.as_slice(), b.1),
+                _ => (self.regular.0.as_slice(), self.regular.1),
+            };
+            if let Some(bmp) =
+                crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold)
+            {
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
             }
         }
@@ -449,7 +454,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, font_name: String, font_bytes: Vec<u8>, font_index: u32, scale: f32) -> Self {
+    pub async fn new(window: Arc<Window>, spec: &crate::font::FontSpec, scale: f32) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window).expect("create_surface");
@@ -480,7 +485,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let gpu = TermGpu::new(&device, format, font_name, font_bytes, font_index, scale);
+        let gpu = TermGpu::new(&device, format, spec, scale);
         Self { surface, device, queue, config, gpu }
     }
 
