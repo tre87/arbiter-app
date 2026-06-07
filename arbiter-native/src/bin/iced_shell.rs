@@ -879,6 +879,21 @@ fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
     }
 }
 
+/// Static status dot for the pane header. The animated ✻ cycles glyph widths/
+/// sizes and jumps the header, so the header shows a plain coloured dot (no glyph
+/// animation, no pulse) — the animation lives in the overview instead.
+fn header_dot(dot: Dot) -> Element<'static, Message> {
+    let rgba = iced::Color::from_rgba8;
+    let c = match dot {
+        Dot::Working => rgba(0x4d, 0xa6, 0xff, 1.0),   // azure — Claude working
+        Dot::Attention => rgba(0xe5, 0xa0, 0x3c, 1.0), // amber — needs input
+        Dot::Running => rgba(0x22, 0xc5, 0x5e, 1.0),   // green — shell busy
+        Dot::Ready => rgba(0x6b, 0x7a, 0x8d, 0.9),     // grey — Claude idle
+        Dot::Idle => rgba(0x6b, 0x7a, 0x8d, 0.5),      // dim grey — no Claude
+    };
+    text("●").size(11).color(c).into()
+}
+
 /// The Claude starburst icon at `size` px.
 fn claude_icon(size: f32) -> Element<'static, Message> {
     svg(svg::Handle::from_memory(CLAUDE_ICON.as_bytes())).width(size).height(size).into()
@@ -902,7 +917,8 @@ fn pane_header(
         iced::Color::from_rgb8(0x6b, 0x6b, 0x6b)
     };
     let left: Element<'static, Message> = match status {
-        Some(d) => indicator(d, 11),
+        // Static dot in the header (no jumpy ✻ animation — that's in the overview).
+        Some(d) => header_dot(d),
         None => Space::with_width(Length::Fixed(0.0)).into(),
     };
     let title = container(text(name.to_string()).size(12).color(color)).center_x(Length::Fill);
