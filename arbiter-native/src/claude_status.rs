@@ -126,6 +126,15 @@ impl ClaudeHandle {
         self.menu_on_screen.store(on, Ordering::Relaxed);
     }
 
+    /// Reader: a menu/prompt just LEFT the screen (answered or escaped) → resolve
+    /// any hook-set attention. AskUserQuestion fires a permission/elicitation hook
+    /// but escaping it produces no spinner/Stop to clear that hook, so it would
+    /// hang amber. Called only on the on→off edge, so a markerless prompt (which
+    /// never sets a menu) is never cleared prematurely.
+    pub fn clear_hook_attention(&self) {
+        self.hook_attention.store(false, Ordering::Relaxed);
+    }
+
     /// The bound Claude session id (set once a capture matches this pane), for
     /// `claude --resume` on restore.
     pub fn session_id(&self) -> Option<String> {

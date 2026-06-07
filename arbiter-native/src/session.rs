@@ -198,6 +198,7 @@ fn reader_loop(
     let mut in_osc = false;
     let mut prev_cwd: Option<String> = None;
     let mut prev_idle: Option<bool> = None;
+    let mut prev_menu = false;
 
     loop {
         let n = match reader.read(&mut buf) {
@@ -239,6 +240,15 @@ fn reader_loop(
             // stale star left on screen can't pin it to "working").
             let menu = term.lock().unwrap().visible_menu();
             claude.set_menu(menu);
+            if prev_menu && !menu {
+                // A menu just LEFT the screen (answered or escaped). AskUserQuestion
+                // fires a permission/elicitation hook, but escaping it produces no
+                // spinner/Stop to clear that sticky hook attention — so clear it on
+                // this on→off edge (markerless prompts never set a menu, so they're
+                // unaffected and still clear via activity/Stop).
+                claude.clear_hook_attention();
+            }
+            prev_menu = menu;
             if !menu && chunk_has_spinner(valid) {
                 claude.note_activity();
             }
