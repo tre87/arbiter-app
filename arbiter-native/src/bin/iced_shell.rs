@@ -21,6 +21,7 @@ use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
+use arbiter_native::term::SelectKind;
 
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).
@@ -559,11 +560,23 @@ struct TermProgram {
     font: Arc<arbiter_native::font::FontSpec>,
 }
 
-/// Per-widget interaction state: whether a left-drag selection is in progress.
+/// Per-widget interaction state for selection + scrolling.
 #[derive(Default)]
 struct TermState {
     dragging: bool,
+    /// Lines/frame to auto-scroll while a drag is past the top/bottom edge
+    /// (signed: + = up into history). Applied each RedrawRequested.
+    autoscroll: i32,
+    /// Clamped (row, col, right-half) the selection extends to during auto-scroll.
+    drag_cell: (usize, usize, bool),
+    /// Multi-click tracking (double = word, triple = line).
+    last_click: Option<std::time::Instant>,
+    last_cell: (usize, usize),
+    clicks: u8,
 }
+
+/// Max gap between clicks to count as a double/triple click.
+const CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 
 impl std::fmt::Debug for TermProgram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -602,26 +615,65 @@ impl shader::Program<Message> for TermProgram {
                 }
                 captured
             }
-            // Left press: focus the pane + begin a selection at the clicked cell.
+            // Left press: focus the pane + begin a selection. Single/double/
+            // triple click selects char/word/line (alacritty Simple/Semantic/
+            // Lines), tracked by click timing + same-cell.
             shader::Event::Mouse(ButtonPressed(Button::Left)) => {
                 if let Some(pos) = cursor.position_in(bounds) {
                     let (row, col, right) = cell_at(pos, bounds, &self.term);
-                    self.term.lock().unwrap().start_selection(row, col, right);
+                    let now = std::time::Instant::now();
+                    let multi = state.last_cell == (row, col)
+                        && state.last_click.is_some_and(|t| now.duration_since(t) < CLICK_THRESHOLD);
+                    state.clicks = if multi { (state.clicks % 3) + 1 } else { 1 };
+                    state.last_click = Some(now);
+                    state.last_cell = (row, col);
+                    let kind = match state.clicks {
+                        2 => SelectKind::Word,
+                        3 => SelectKind::Line,
+                        _ => SelectKind::Simple,
+                    };
+                    self.term.lock().unwrap().start_selection(row, col, right, kind);
                     state.dragging = true;
+                    state.autoscroll = 0;
                     (Captured, Some(Message::Focus(self.pane)))
                 } else {
                     (Ignored, None)
                 }
             }
+            // Drag: extend the selection. Past the top/bottom edge, arm
+            // auto-scroll (applied per frame in RedrawRequested) and clamp the
+            // extension to the edge row.
             shader::Event::Mouse(CursorMoved { .. }) if state.dragging => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    let (row, col, right) = cell_at(pos, bounds, &self.term);
+                if let Some(abs) = cursor.position() {
+                    let (rx, ry) = (abs.x - bounds.x, abs.y - bounds.y);
+                    // Scroll speed grows with distance past the edge (1–8 lines/frame).
+                    let speed = |over: f32| ((over / 12.0).ceil() as i32).clamp(1, 8);
+                    state.autoscroll = if ry < 0.0 {
+                        speed(-ry) // above top → scroll up (positive = into history)
+                    } else if ry > bounds.height {
+                        -speed(ry - bounds.height) // below bottom → scroll down
+                    } else {
+                        0
+                    };
+                    let cx = rx.clamp(0.0, bounds.width - 0.5);
+                    let cy = ry.clamp(0.0, bounds.height - 0.5);
+                    let (row, col, right) = cell_at(iced::Point::new(cx, cy), bounds, &self.term);
+                    state.drag_cell = (row, col, right);
                     self.term.lock().unwrap().update_selection(row, col, right);
                 }
                 captured
             }
+            // Continuous auto-scroll while a drag is held past an edge.
+            shader::Event::RedrawRequested(_) if state.dragging && state.autoscroll != 0 => {
+                let mut t = self.term.lock().unwrap();
+                t.scroll(state.autoscroll);
+                let (r, c, right) = state.drag_cell;
+                t.update_selection(r, c, right);
+                (Ignored, None)
+            }
             shader::Event::Mouse(ButtonReleased(Button::Left)) if state.dragging => {
                 state.dragging = false;
+                state.autoscroll = 0;
                 captured
             }
             _ => (Ignored, None),
