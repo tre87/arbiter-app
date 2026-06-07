@@ -24,7 +24,9 @@ fontdb = "0.18"
 swash = "0.1"
 # Per-OS data dir (zsh shell-integration files) + process-tree scan (Claude detection).
 dirs = "5"
-# Build/parse Claude's statusLine + hook JSON (the Tier-2/3 capture shim).
+# Build/parse Claude's statusLine + hook JSON (the Tier-2/3 capture shim) +
+# (de)serialize the saved session layout for autosave/restore.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Native filesystem watching (FSEvents/ReadDirectoryChangesW/inotify) so the
