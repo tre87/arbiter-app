@@ -364,6 +364,17 @@ fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([tick, keys])
 }
 
+/// xterm cursor/edit-key sequence with modifiers: `CSI <final>` when no
+/// modifiers, else `CSI 1;<code><final>` where code = 1 + shift + 2·alt + 4·ctrl.
+fn csi_mod(m: iced::keyboard::Modifiers, final_byte: char) -> Vec<u8> {
+    let code = 1 + m.shift() as u8 + ((m.alt() as u8) << 1) + ((m.control() as u8) << 2);
+    if code == 1 {
+        format!("\x1b[{final_byte}").into_bytes()
+    } else {
+        format!("\x1b[1;{code}{final_byte}").into_bytes()
+    }
+}
+
 /// Map a keyboard event to PTY bytes. Special keys are hand-mapped; printable
 /// input uses the event's `text` (Shift/symbols/layout already applied).
 fn handle_key(event: iced::Event) -> Option<Message> {
@@ -387,10 +398,31 @@ fn handle_key(event: iced::Event) -> Option<Message> {
             return Some(Message::Input(bytes));
         }
         Key::Named(Named::Escape) => return Some(Message::Input(vec![0x1b])),
-        Key::Named(Named::ArrowUp) => return Some(Message::Input(b"\x1b[A".to_vec())),
-        Key::Named(Named::ArrowDown) => return Some(Message::Input(b"\x1b[B".to_vec())),
-        Key::Named(Named::ArrowRight) => return Some(Message::Input(b"\x1b[C".to_vec())),
-        Key::Named(Named::ArrowLeft) => return Some(Message::Input(b"\x1b[D".to_vec())),
+        // Cursor + editing keys. Arrows/Home/End carry modifiers (Ctrl+→ etc.)
+        // as the xterm `CSI 1;<mod><final>` form.
+        Key::Named(Named::ArrowUp) => return Some(Message::Input(csi_mod(modifiers, 'A'))),
+        Key::Named(Named::ArrowDown) => return Some(Message::Input(csi_mod(modifiers, 'B'))),
+        Key::Named(Named::ArrowRight) => return Some(Message::Input(csi_mod(modifiers, 'C'))),
+        Key::Named(Named::ArrowLeft) => return Some(Message::Input(csi_mod(modifiers, 'D'))),
+        Key::Named(Named::Home) => return Some(Message::Input(csi_mod(modifiers, 'H'))),
+        Key::Named(Named::End) => return Some(Message::Input(csi_mod(modifiers, 'F'))),
+        Key::Named(Named::Insert) => return Some(Message::Input(b"\x1b[2~".to_vec())),
+        Key::Named(Named::Delete) => return Some(Message::Input(b"\x1b[3~".to_vec())),
+        Key::Named(Named::PageUp) => return Some(Message::Input(b"\x1b[5~".to_vec())),
+        Key::Named(Named::PageDown) => return Some(Message::Input(b"\x1b[6~".to_vec())),
+        Key::Named(Named::F1) => return Some(Message::Input(b"\x1bOP".to_vec())),
+        Key::Named(Named::F2) => return Some(Message::Input(b"\x1bOQ".to_vec())),
+        Key::Named(Named::F3) => return Some(Message::Input(b"\x1bOR".to_vec())),
+        Key::Named(Named::F4) => return Some(Message::Input(b"\x1bOS".to_vec())),
+        Key::Named(Named::F5) => return Some(Message::Input(b"\x1b[15~".to_vec())),
+        Key::Named(Named::F6) => return Some(Message::Input(b"\x1b[17~".to_vec())),
+        Key::Named(Named::F7) => return Some(Message::Input(b"\x1b[18~".to_vec())),
+        Key::Named(Named::F8) => return Some(Message::Input(b"\x1b[19~".to_vec())),
+        Key::Named(Named::F9) => return Some(Message::Input(b"\x1b[20~".to_vec())),
+        Key::Named(Named::F10) => return Some(Message::Input(b"\x1b[21~".to_vec())),
+        Key::Named(Named::F11) => return Some(Message::Input(b"\x1b[23~".to_vec())),
+        Key::Named(Named::F12) => return Some(Message::Input(b"\x1b[24~".to_vec())),
+        Key::Named(Named::Space) if modifiers.control() => return Some(Message::Input(vec![0])),
         Key::Character(s) if modifiers.control() => {
             if let Some(c) = s.chars().next() {
                 let lc = c.to_ascii_lowercase();
