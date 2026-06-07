@@ -92,7 +92,12 @@ pub fn run_hook_signal() {
         "Notification" => match ntype {
             // `idle_prompt` is intentionally excluded — it fires after ~60s idle
             // and would turn a merely-idle pane amber (we keep idle grey).
-            "permission_prompt" | "elicitation_dialog" => "attention",
+            //
+            // `elicitation_dialog` (AskUserQuestion) is ALSO excluded: it's detected
+            // level-based from the rendered menu (`VtTerm::visible_menu`), which
+            // clears the instant the user escapes/answers. The hook is edge-only and
+            // would get STUCK on escape (no spinner/Stop follows to clear it).
+            "permission_prompt" => "attention",
             _ => return,
         },
         _ => return,
