@@ -14,16 +14,26 @@ use portable_pty::PtySize;
 
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{
-    button, column, container, horizontal_space, mouse_area, pane_grid, row, shader as shader_widget, text,
+    button, column, container, horizontal_space, mouse_area, pane_grid, row, shader as shader_widget, svg,
+    text, Space,
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 
+/// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
+/// other platforms only ever use the default (so the switch button never shows).
+#[derive(Clone, Copy, PartialEq)]
+enum ShellKind {
+    PowerShell,
+    GitBash,
+}
+
 struct PaneData {
     session: Session,
     name: String,
+    shell: ShellKind,
 }
 
 struct Workspace {
@@ -35,7 +45,11 @@ struct Workspace {
 
 impl Workspace {
     fn new(name: String) -> Self {
-        let first_pane = PaneData { session: spawn_session(), name: "Terminal 1".to_string() };
+        let first_pane = PaneData {
+            session: spawn_session(None, None),
+            name: "Terminal 1".to_string(),
+            shell: ShellKind::PowerShell,
+        };
         let (panes, first) = pane_grid::State::new(first_pane);
         Workspace { panes, focus: first, name, next_term: 2 }
     }
@@ -53,6 +67,7 @@ struct State {
     workspaces: Vec<Workspace>,
     active: usize,
     font: Arc<arbiter_native::font::FontSpec>,
+    git_bash: Option<String>,
     theme: iced::Theme,
 }
 
@@ -87,11 +102,18 @@ enum Message {
     Resized(pane_grid::ResizeEvent),
     NewWorkspace,
     SelectWorkspace(usize),
+    SwitchShell(pane_grid::Pane),
 }
 
-fn spawn_session() -> Session {
-    // OSC-7/OSC-133 emitters injected so the Session can track cwd + busy/idle.
-    Session::spawn(80, 24, arbiter_native::shell::build_shell_command(None)).expect("spawn session")
+/// Spawn a session running `shell` (None = the platform default / PowerShell;
+/// Some(path) = Git Bash) starting in `cwd` if given. OSC-7/OSC-133 emitters are
+/// injected so the Session tracks cwd + busy/idle.
+fn spawn_session(shell: Option<&str>, cwd: Option<&str>) -> Session {
+    let mut cmd = arbiter_native::shell::build_shell_command(shell);
+    if let Some(dir) = cwd {
+        cmd.cwd(dir);
+    }
+    Session::spawn(80, 24, cmd).expect("spawn session")
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -125,13 +147,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.active = i;
             }
         }
+        Message::SwitchShell(pane) => {
+            // Respawn the pane's terminal with the other shell, preserving cwd.
+            // (You can't change a running process's shell, so the scrollback
+            // resets — same as the web.)
+            let git_bash = state.git_bash.clone();
+            let ws = state.active_mut();
+            if let Some(data) = ws.panes.get_mut(pane) {
+                let target = match data.shell {
+                    ShellKind::PowerShell => git_bash.map(|p| (ShellKind::GitBash, Some(p))),
+                    ShellKind::GitBash => Some((ShellKind::PowerShell, None)),
+                };
+                if let Some((kind, shell_arg)) = target {
+                    let cwd = data.session.cwd();
+                    data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref());
+                    data.shell = kind;
+                }
+            }
+        }
     }
     Task::none()
 }
 
 fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     let name = ws.next_name();
-    if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, PaneData { session: spawn_session(), name }) {
+    let pane = PaneData { session: spawn_session(None, None), name, shell: ShellKind::PowerShell };
+    if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, pane) {
         ws.focus = new_pane;
     }
 }
@@ -154,6 +195,7 @@ fn view(state: &State) -> Element<'_, Message> {
 
     let focus = state.active().focus;
     let font = &state.font;
+    let has_git_bash = state.git_bash.is_some();
     let grid = pane_grid::PaneGrid::new(&state.active().panes, |pane, data, _maximized| {
         let term = shader_widget(TermProgram {
             id: data.session.id(),
@@ -165,7 +207,8 @@ fn view(state: &State) -> Element<'_, Message> {
         .height(Length::Fill);
 
         let focused = pane == focus;
-        let content = column![pane_header(&data.name, focused), term, footer_bar(&data.session)]
+        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane);
+        let content = column![header, term, footer_bar(&data.session)]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -253,18 +296,50 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
         .into()
 }
 
-/// Per-pane header: a full-width bar with the centred terminal title. Focus is
-/// shown by the title colour (azure when focused, grey otherwise), like the web.
-/// Status (Claude/busy) will live here too in a later phase.
-fn pane_header(name: &str, focused: bool) -> Element<'static, Message> {
+// MDI icons (mdiPowershell / mdiBash) for the shell-switch button. The button
+// shows the icon of the shell you'd switch *to* (matching the web).
+const ICON_POWERSHELL: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#b0b0b0" d="M21.83,4C22.32,4 22.63,4.4 22.5,4.89L19.34,19.11C19.23,19.6 18.75,20 18.26,20H2.17C1.68,20 1.37,19.6 1.5,19.11L4.66,4.89C4.77,4.4 5.25,4 5.74,4H21.83M15.83,16H11.83C11.37,16 11,16.38 11,16.84C11,17.31 11.37,17.69 11.83,17.69H15.83C16.3,17.69 16.68,17.31 16.68,16.84C16.68,16.38 16.3,16 15.83,16M5.78,16.28C5.38,16.56 5.29,17.11 5.57,17.5C5.85,17.92 6.41,18 6.81,17.73C14.16,12.56 14.21,12.5 14.26,12.47C14.44,12.31 14.53,12.09 14.54,11.87C14.55,11.67 14.5,11.5 14.38,11.31L9.46,6.03C9.13,5.67 8.57,5.65 8.21,6C7.85,6.32 7.83,6.88 8.16,7.24L12.31,11.68L5.78,16.28Z"/></svg>"##;
+const ICON_BASH: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#b0b0b0" d="M5 9H7.31L7.63 6H9.63L9.31 9H11.31L11.63 6H13.63L13.31 9H15V11H13.1L12.9 13H15V15H12.69L12.37 18H10.37L10.69 15H8.69L8.37 18H6.37L6.69 15H5V13H6.9L7.1 11H5V9M9.1 11L8.9 13H10.9L11.1 11M19 6H17V14H19M19 16H17V18H19Z"/></svg>"##;
+
+/// Per-pane header: a centred terminal title (focus shown by colour, azure when
+/// focused) with a shell-switch button on the right when Git Bash is available
+/// (Windows). The button shows the icon of the shell you'd switch to. A matching
+/// left spacer keeps the title centred. Status will join the header later.
+fn pane_header(
+    name: &str,
+    focused: bool,
+    shell: ShellKind,
+    has_git_bash: bool,
+    pane: pane_grid::Pane,
+) -> Element<'static, Message> {
+    const SLOT: f32 = 26.0;
     let color = if focused {
         iced::Color::from_rgb8(0x4d, 0xa6, 0xff)
     } else {
         iced::Color::from_rgb8(0x6b, 0x6b, 0x6b)
     };
-    container(text(name.to_string()).size(12).color(color))
-        .center_x(Length::Fill)
-        .padding([3, 0])
+    let title = container(text(name.to_string()).size(12).color(color)).center_x(Length::Fill);
+    let right: Element<'static, Message> = if has_git_bash {
+        let icon = match shell {
+            ShellKind::PowerShell => ICON_BASH, // click → switch to Git Bash
+            ShellKind::GitBash => ICON_POWERSHELL, // click → switch to PowerShell
+        };
+        button(svg(svg::Handle::from_memory(icon.as_bytes())).width(15).height(15))
+            .on_press(Message::SwitchShell(pane))
+            .padding(2)
+            .style(button::text)
+            .into()
+    } else {
+        Space::with_width(Length::Fixed(0.0)).into()
+    };
+    let header = row![
+        Space::with_width(Length::Fixed(SLOT)),
+        title,
+        container(right).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
+    ]
+    .align_y(iced::Center)
+    .padding([2, 4]);
+    container(header)
         .style(|_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x16, 0x16, 0x16))),
             ..Default::default()
@@ -448,6 +523,7 @@ impl shader::Primitive for TermPrimitive {
 
 fn main() -> iced::Result {
     let font = Arc::new(arbiter_native::font::load());
+    let git_bash = arbiter_native::shell::detect_git_bash();
 
     iced::application("Arbiter native (Iced shell)", update, view)
         .subscription(subscription)
@@ -457,6 +533,7 @@ fn main() -> iced::Result {
                 workspaces: vec![Workspace::new("Workspace 1".to_string())],
                 active: 0,
                 font: font.clone(),
+                git_bash: git_bash.clone(),
                 theme: arbiter_theme(),
             };
             (state, Task::none())
