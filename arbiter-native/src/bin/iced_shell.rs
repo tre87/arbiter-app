@@ -809,23 +809,13 @@ fn working_frame() -> (&'static str, iced::Color) {
     (g, iced::Color::from_rgb8(r, gn, b))
 }
 
-/// A system font that actually contains the dingbat ✻ glyphs the working
-/// animation uses. Iced's default UI font lacks them and won't fall back; even
-/// "Apple Symbols" is missing them — but Menlo (which the terminal uses) has the
-/// full star set (U+2722/2733/2736/273B/273D), as does Segoe UI Symbol on Windows.
+/// The font carrying the working-animation dingbats (`·✢✳✶✻✽`, U+2722–273F +
+/// U+00B7). Bundled (a 3KB subset of Noto Sans Symbols 2, renamed) so the ✻ looks
+/// IDENTICAL on macOS and Windows — the default UI font lacks these glyphs and the
+/// previous per-OS system fonts (Menlo / Segoe UI Symbol) rendered them at
+/// different sizes.
 fn symbols_font() -> iced::Font {
-    #[cfg(target_os = "macos")]
-    {
-        iced::Font::with_name("Menlo")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        iced::Font::with_name("Segoe UI Symbol")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        iced::Font::DEFAULT
-    }
+    iced::Font::with_name("ArbiterSymbols")
 }
 
 /// Pulse alpha in [0.5, 1.0] over `period_ms` (0.5 at the ends, 1.0 mid-cycle).
@@ -1347,6 +1337,9 @@ impl shader::Primitive for TermPrimitive {
 /// cosmic-text selects the weight. Bundled under assets/ (SIL OFL).
 const INTER_FONT: &[u8] = include_bytes!("../../assets/Inter-VariableFont.ttf");
 const DMSANS_FONT: &[u8] = include_bytes!("../../assets/DMSans-VariableFont.ttf");
+/// 3KB subset of Noto Sans Symbols 2 (the `·✢✳✶✻✽` working-animation dingbats),
+/// renamed "ArbiterSymbols" — bundled so the ✻ is identical on macOS + Windows.
+const ARBITER_SYMBOLS_FONT: &[u8] = include_bytes!("../../assets/ArbiterSymbols.ttf");
 
 /// The base UI font (Inter), matching the web's `font-family: 'Inter', …`.
 fn ui_font() -> iced::Font {
@@ -1392,6 +1385,7 @@ fn main() -> iced::Result {
         .theme(|s: &State, _id| s.theme.clone())
         .font(INTER_FONT)
         .font(DMSANS_FONT)
+        .font(ARBITER_SYMBOLS_FONT)
         .default_font(ui_font())
         .run_with(move || {
             // daemon starts with no windows — open the main one here.
