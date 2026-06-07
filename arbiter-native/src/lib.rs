@@ -2,6 +2,7 @@
 //! binary (`main.rs`) and the Iced shell binary (`bin/iced_shell.rs`).
 
 pub mod claude;
+pub mod claude_shim;
 pub mod font;
 pub mod git;
 pub mod gpu;

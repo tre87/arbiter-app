@@ -24,6 +24,8 @@ fontdb = "0.18"
 swash = "0.1"
 # Per-OS data dir (zsh shell-integration files) + process-tree scan (Claude detection).
 dirs = "5"
+# Build/parse Claude's statusLine + hook JSON (the Tier-2/3 capture shim).
+serde_json = "1"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Native filesystem watching (FSEvents/ReadDirectoryChangesW/inotify) so the
 # footer's git refreshes on external edits without polling — like VS Code.
