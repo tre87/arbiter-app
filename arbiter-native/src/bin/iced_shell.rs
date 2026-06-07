@@ -104,6 +104,11 @@ enum Message {
     SelectWorkspace(usize),
     SwitchShell(pane_grid::Pane),
     ShiftEnter,
+    /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
+    /// no selection (plain Ctrl+C).
+    Copy(bool),
+    Paste,
+    Pasted(Option<String>),
 }
 
 /// Spawn a session running `shell` (None = the platform default / PowerShell;
@@ -164,6 +169,42 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
+            }
+        }
+        Message::Copy(allow_interrupt) => {
+            let ws = state.active_mut();
+            if let Some(p) = ws.panes.get_mut(ws.focus) {
+                let text = if let Ok(mut t) = p.session.term().lock() {
+                    let s = t.selection_text();
+                    if s.is_some() {
+                        t.clear_selection();
+                    }
+                    s
+                } else {
+                    None
+                };
+                match text {
+                    Some(text) => return iced::clipboard::write(text),
+                    None if allow_interrupt => p.session.write(b"\x03"),
+                    None => {}
+                }
+            }
+        }
+        Message::Paste => return iced::clipboard::read().map(Message::Pasted),
+        Message::Pasted(text) => {
+            if let Some(text) = text.filter(|t| !t.is_empty()) {
+                let ws = state.active_mut();
+                if let Some(p) = ws.panes.get_mut(ws.focus) {
+                    let bracketed =
+                        p.session.term().lock().map(|t| t.bracketed_paste()).unwrap_or(false);
+                    if bracketed {
+                        p.session.write(b"\x1b[200~");
+                        p.session.write(text.as_bytes());
+                        p.session.write(b"\x1b[201~");
+                    } else {
+                        p.session.write(text.as_bytes());
+                    }
+                }
             }
         }
         Message::SwitchShell(pane) => {
@@ -461,12 +502,20 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         Key::Named(Named::F11) => return Some(Message::Input(csi_tilde(modifiers, 23))),
         Key::Named(Named::F12) => return Some(Message::Input(csi_tilde(modifiers, 24))),
         Key::Named(Named::Space) if modifiers.control() => return Some(Message::Input(vec![0])),
-        Key::Character(s) if modifiers.control() => {
-            if let Some(c) = s.chars().next() {
-                let lc = c.to_ascii_lowercase();
-                if lc.is_ascii_alphabetic() {
+        // Copy/paste: Cmd+C/V (macOS), Ctrl+Shift+C/V, and Ctrl+C/V. Plain Ctrl+C
+        // copies only if there's a selection, else sends interrupt (^C).
+        Key::Character(s) if modifiers.control() || modifiers.logo() => {
+            let lc = s.chars().next().map(|c| c.to_ascii_lowercase());
+            match lc {
+                Some('c') => {
+                    let interrupt = modifiers.control() && !modifiers.shift() && !modifiers.logo();
+                    return Some(Message::Copy(interrupt));
+                }
+                Some('v') => return Some(Message::Paste),
+                Some(lc) if modifiers.control() && !modifiers.logo() && lc.is_ascii_alphabetic() => {
                     return Some(Message::Input(vec![(lc as u8) - b'a' + 1]));
                 }
+                _ => {}
             }
         }
         _ => {}
