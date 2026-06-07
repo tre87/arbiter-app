@@ -599,12 +599,14 @@ fn working_frame() -> (&'static str, iced::Color) {
     (g, iced::Color::from_rgb8(r, gn, b))
 }
 
-/// A system font that has the dingbat ✻ glyphs the working animation uses
-/// (Iced's default UI font lacks them and won't fall back to them).
+/// A system font that actually contains the dingbat ✻ glyphs the working
+/// animation uses. Iced's default UI font lacks them and won't fall back; even
+/// "Apple Symbols" is missing them — but Menlo (which the terminal uses) has the
+/// full star set (U+2722/2733/2736/273B/273D), as does Segoe UI Symbol on Windows.
 fn symbols_font() -> iced::Font {
     #[cfg(target_os = "macos")]
     {
-        iced::Font::with_name("Apple Symbols")
+        iced::Font::with_name("Menlo")
     }
     #[cfg(target_os = "windows")]
     {

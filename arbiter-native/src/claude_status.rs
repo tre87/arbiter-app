@@ -58,9 +58,16 @@ pub struct ClaudeHandle {
     /// Highest hook nonce applied (so a repeated signal still fires once).
     last_nonce: Mutex<u128>,
     /// Last-event times (ms since epoch); 0 = never.
-    activity_ms: AtomicU64,  // spinner / output (working)
-    attention_ms: AtomicU64, // permission hook / menu text
-    stop_ms: AtomicU64,      // Stop hook (turn end)
+    activity_ms: AtomicU64, // spinner / "esc to interrupt" (working)
+    stop_ms: AtomicU64,     // Stop hook (turn end)
+    /// A text menu/approval prompt is currently on the visible screen — level-
+    /// triggered by the reader's grid scan, so it clears the instant the prompt
+    /// leaves (the user escapes/answers). Covers AskUserQuestion / plan / proceed.
+    menu_on_screen: AtomicBool,
+    /// A permission/elicitation hook fired (edge-triggered) — cleared when Claude
+    /// resumes (activity) or the turn ends (Stop). Covers tool-permission prompts
+    /// that don't show a grid marker.
+    hook_attention: AtomicBool,
 }
 
 /// Working reverts to ready after this long without activity (web parity).
@@ -87,44 +94,46 @@ impl ClaudeHandle {
             session_id: Mutex::new(None),
             last_nonce: Mutex::new(0),
             activity_ms: AtomicU64::new(0),
-            attention_ms: AtomicU64::new(0),
             stop_ms: AtomicU64::new(0),
+            menu_on_screen: AtomicBool::new(false),
+            hook_attention: AtomicBool::new(false),
         })
     }
 
-    /// Reader-thread signals (PTY-text scan).
+    /// Reader: Claude's working spinner is on screen. Also resolves any pending
+    /// permission attention — Claude has resumed, so it's working, not waiting.
     pub fn note_activity(&self) {
         self.activity_ms.store(now_ms(), Ordering::Relaxed);
+        self.hook_attention.store(false, Ordering::Relaxed);
     }
-    pub fn note_attention(&self) {
-        self.attention_ms.store(now_ms(), Ordering::Relaxed);
+
+    /// Reader: whether a menu/approval prompt is currently on the visible screen.
+    pub fn set_menu(&self, on: bool) {
+        self.menu_on_screen.store(on, Ordering::Relaxed);
     }
 
     /// Derived lifecycle: the most recent signal wins; activity counts as
     /// "working" only while fresh, then reverts to ready.
     fn lifecycle(&self) -> Lifecycle {
-        let (att, act, stop) = (
-            self.attention_ms.load(Ordering::Relaxed),
-            self.activity_ms.load(Ordering::Relaxed),
-            self.stop_ms.load(Ordering::Relaxed),
-        );
-        let now = now_ms();
-        let latest = att.max(act).max(stop);
-        if latest == 0 {
-            Lifecycle::Ready
-        } else if latest == att {
-            // A permission prompt / menu always wins while it's the latest signal.
-            Lifecycle::Attention
-        } else if now.saturating_sub(stop) < STOP_SUPPRESS_MS {
-            // Just stopped: suppress a trailing spinner frame so the turn-end is clean.
-            Lifecycle::Ready
-        } else if latest == stop {
-            Lifecycle::Ready
-        } else if now.saturating_sub(act) < WORKING_TTL_MS {
-            Lifecycle::Working
-        } else {
-            Lifecycle::Ready
+        // Attention is level-based: a prompt on screen, or an unresolved hook.
+        if self.menu_on_screen.load(Ordering::Relaxed)
+            || self.hook_attention.load(Ordering::Relaxed)
+        {
+            return Lifecycle::Attention;
         }
+        let act = self.activity_ms.load(Ordering::Relaxed);
+        let stop = self.stop_ms.load(Ordering::Relaxed);
+        let now = now_ms();
+        // Just stopped: clean turn-end — ignore a trailing spinner frame so it
+        // doesn't flicker working→ready→working.
+        if stop != 0 && now.saturating_sub(stop) < STOP_SUPPRESS_MS {
+            return Lifecycle::Ready;
+        }
+        // Working while activity is fresh and more recent than the last turn-end.
+        if act > stop && now.saturating_sub(act) < WORKING_TTL_MS {
+            return Lifecycle::Working;
+        }
+        Lifecycle::Ready
     }
 
     /// Snapshot for the view: stats + the currently-derived lifecycle.
@@ -224,8 +233,11 @@ fn process_hooks(dir: &Path) {
         }
         *last = nonce;
         match signal {
-            "attention" => h.attention_ms.store(now_ms(), Ordering::Relaxed),
-            "stop" => h.stop_ms.store(now_ms(), Ordering::Relaxed),
+            "attention" => h.hook_attention.store(true, Ordering::Relaxed),
+            "stop" => {
+                h.stop_ms.store(now_ms(), Ordering::Relaxed);
+                h.hook_attention.store(false, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
