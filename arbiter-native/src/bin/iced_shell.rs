@@ -364,14 +364,41 @@ fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([tick, keys])
 }
 
-/// xterm cursor/edit-key sequence with modifiers: `CSI <final>` when no
-/// modifiers, else `CSI 1;<code><final>` where code = 1 + shift + 2·alt + 4·ctrl.
+/// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
+/// `SequenceModifiers::encode_esc_sequence`).
+fn mod_code(m: iced::keyboard::Modifiers) -> u8 {
+    1 + m.shift() as u8 + ((m.alt() as u8) << 1) + ((m.control() as u8) << 2)
+}
+
+/// Letter-terminated cursor/edit key (arrows, Home, End, F1–F4): `CSI <final>`
+/// unmodified, else `CSI 1;<code><final>`.
 fn csi_mod(m: iced::keyboard::Modifiers, final_byte: char) -> Vec<u8> {
-    let code = 1 + m.shift() as u8 + ((m.alt() as u8) << 1) + ((m.control() as u8) << 2);
+    let code = mod_code(m);
     if code == 1 {
         format!("\x1b[{final_byte}").into_bytes()
     } else {
         format!("\x1b[1;{code}{final_byte}").into_bytes()
+    }
+}
+
+/// Tilde-terminated key (Ins/Del/PgUp/PgDn/F5+): `CSI <n>~` unmodified, else
+/// `CSI <n>;<code>~`.
+fn csi_tilde(m: iced::keyboard::Modifiers, n: u32) -> Vec<u8> {
+    let code = mod_code(m);
+    if code == 1 {
+        format!("\x1b[{n}~").into_bytes()
+    } else {
+        format!("\x1b[{n};{code}~").into_bytes()
+    }
+}
+
+/// F1–F4: the SS3 form unmodified (xterm-256color terminfo), CSI when modified
+/// (SS3 can't carry a modifier).
+fn fkey(m: iced::keyboard::Modifiers, ss3: &str, final_byte: char) -> Vec<u8> {
+    if mod_code(m) == 1 {
+        ss3.as_bytes().to_vec()
+    } else {
+        csi_mod(m, final_byte)
     }
 }
 
@@ -406,22 +433,24 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         Key::Named(Named::ArrowLeft) => return Some(Message::Input(csi_mod(modifiers, 'D'))),
         Key::Named(Named::Home) => return Some(Message::Input(csi_mod(modifiers, 'H'))),
         Key::Named(Named::End) => return Some(Message::Input(csi_mod(modifiers, 'F'))),
-        Key::Named(Named::Insert) => return Some(Message::Input(b"\x1b[2~".to_vec())),
-        Key::Named(Named::Delete) => return Some(Message::Input(b"\x1b[3~".to_vec())),
-        Key::Named(Named::PageUp) => return Some(Message::Input(b"\x1b[5~".to_vec())),
-        Key::Named(Named::PageDown) => return Some(Message::Input(b"\x1b[6~".to_vec())),
-        Key::Named(Named::F1) => return Some(Message::Input(b"\x1bOP".to_vec())),
-        Key::Named(Named::F2) => return Some(Message::Input(b"\x1bOQ".to_vec())),
-        Key::Named(Named::F3) => return Some(Message::Input(b"\x1bOR".to_vec())),
-        Key::Named(Named::F4) => return Some(Message::Input(b"\x1bOS".to_vec())),
-        Key::Named(Named::F5) => return Some(Message::Input(b"\x1b[15~".to_vec())),
-        Key::Named(Named::F6) => return Some(Message::Input(b"\x1b[17~".to_vec())),
-        Key::Named(Named::F7) => return Some(Message::Input(b"\x1b[18~".to_vec())),
-        Key::Named(Named::F8) => return Some(Message::Input(b"\x1b[19~".to_vec())),
-        Key::Named(Named::F9) => return Some(Message::Input(b"\x1b[20~".to_vec())),
-        Key::Named(Named::F10) => return Some(Message::Input(b"\x1b[21~".to_vec())),
-        Key::Named(Named::F11) => return Some(Message::Input(b"\x1b[23~".to_vec())),
-        Key::Named(Named::F12) => return Some(Message::Input(b"\x1b[24~".to_vec())),
+        Key::Named(Named::Insert) => return Some(Message::Input(csi_tilde(modifiers, 2))),
+        Key::Named(Named::Delete) => return Some(Message::Input(csi_tilde(modifiers, 3))),
+        Key::Named(Named::PageUp) => return Some(Message::Input(csi_tilde(modifiers, 5))),
+        Key::Named(Named::PageDown) => return Some(Message::Input(csi_tilde(modifiers, 6))),
+        // F1–F4 use SS3 unmodified (matches xterm-256color terminfo kf1=\EOP);
+        // modified, they fall back to the CSI form like the other keys.
+        Key::Named(Named::F1) => return Some(Message::Input(fkey(modifiers, "\x1bOP", 'P'))),
+        Key::Named(Named::F2) => return Some(Message::Input(fkey(modifiers, "\x1bOQ", 'Q'))),
+        Key::Named(Named::F3) => return Some(Message::Input(fkey(modifiers, "\x1bOR", 'R'))),
+        Key::Named(Named::F4) => return Some(Message::Input(fkey(modifiers, "\x1bOS", 'S'))),
+        Key::Named(Named::F5) => return Some(Message::Input(csi_tilde(modifiers, 15))),
+        Key::Named(Named::F6) => return Some(Message::Input(csi_tilde(modifiers, 17))),
+        Key::Named(Named::F7) => return Some(Message::Input(csi_tilde(modifiers, 18))),
+        Key::Named(Named::F8) => return Some(Message::Input(csi_tilde(modifiers, 19))),
+        Key::Named(Named::F9) => return Some(Message::Input(csi_tilde(modifiers, 20))),
+        Key::Named(Named::F10) => return Some(Message::Input(csi_tilde(modifiers, 21))),
+        Key::Named(Named::F11) => return Some(Message::Input(csi_tilde(modifiers, 23))),
+        Key::Named(Named::F12) => return Some(Message::Input(csi_tilde(modifiers, 24))),
         Key::Named(Named::Space) if modifiers.control() => return Some(Message::Input(vec![0])),
         Key::Character(s) if modifiers.control() => {
             if let Some(c) = s.chars().next() {
