@@ -254,6 +254,28 @@ fn node_to_saved(ws: &Workspace, node: &pane_grid::Node) -> persist::SavedNode {
     }
 }
 
+/// Window settings for the overview popout at a (saved) size + optional position.
+fn overview_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window::Settings {
+    let mut settings = iced::window::Settings { size, ..Default::default() };
+    if let Some(p) = pos {
+        settings.position = iced::window::Position::Specific(p);
+    }
+    settings
+}
+
+/// Open the overview popout at its saved geometry. Opens at the saved size +
+/// position, then issues an explicit `move_to`: the at-creation position is
+/// ignored by winit/macOS for off-primary (e.g. negative/second-display) coords,
+/// but a post-open `set_outer_position` places it there reliably.
+fn open_overview(size: iced::Size, pos: Option<iced::Point>) -> (iced::window::Id, Task<Message>) {
+    let (id, open) = iced::window::open(overview_settings(size, pos));
+    let mut task = open.map(|_| Message::Noop);
+    if let Some(p) = pos {
+        task = Task::batch([task, iced::window::move_to(id, p)]);
+    }
+    (id, task)
+}
+
 /// Build a `SavedWindow` from a tracked size + optional position.
 fn saved_window(size: iced::Size, pos: Option<iced::Point>) -> persist::SavedWindow {
     persist::SavedWindow {
@@ -271,6 +293,7 @@ fn save_session(state: &State) {
         active: state.active,
         main_window: Some(saved_window(state.main_size, state.main_pos)),
         overview_window: Some(saved_window(state.overview_size, state.overview_pos)),
+        overview_visible: state.overview_window.is_some(),
         workspaces: state
             .workspaces
             .iter()
@@ -353,16 +376,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Noop => {}
         Message::ToggleOverview => {
             if let Some(id) = state.overview_window.take() {
+                save_session(state); // persist "overview closed"
                 return iced::window::close(id);
             }
-            let mut settings =
-                iced::window::Settings { size: state.overview_size, ..Default::default() };
-            if let Some(p) = state.overview_pos {
-                settings.position = iced::window::Position::Specific(p);
-            }
-            let (id, open) = iced::window::open(settings);
+            let (id, task) = open_overview(state.overview_size, state.overview_pos);
             state.overview_window = Some(id);
-            return open.map(|_| Message::Noop);
+            save_session(state); // persist "overview open"
+            return task;
         }
         Message::WindowClosed(id) => {
             if id == state.main_window {
@@ -372,6 +392,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if state.overview_window == Some(id) {
                 state.overview_window = None;
+                save_session(state); // persist "overview closed" (e.g. via its own close button)
             }
         }
         Message::WindowMoved(id, p) => {
@@ -1361,6 +1382,7 @@ fn main() -> iced::Result {
             let saved = arbiter_native::persist::load();
             let main_geom = saved.as_ref().and_then(|s| s.main_window);
             let overview_geom = saved.as_ref().and_then(|s| s.overview_window);
+            let overview_was_open = saved.as_ref().map(|s| s.overview_visible).unwrap_or(false);
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
@@ -1381,6 +1403,21 @@ fn main() -> iced::Result {
                 .unwrap_or_else(|| (vec![Workspace::new("Workspace 1".to_string())], 0));
 
             let point = |g: persist::SavedWindow| g.x.zip(g.y).map(|(x, y)| iced::Point::new(x, y));
+            let overview_size = overview_geom
+                .map(|g| iced::Size::new(g.width, g.height))
+                .unwrap_or(iced::Size::new(720.0, 520.0));
+            let overview_pos = overview_geom.and_then(point);
+
+            // Reopen the overview popout if it was open at quit (matches the web).
+            let mut tasks = vec![open.map(|_| Message::Noop)];
+            let overview_window = if overview_was_open {
+                let (ov_id, ov_task) = open_overview(overview_size, overview_pos);
+                tasks.push(ov_task);
+                Some(ov_id)
+            } else {
+                None
+            };
+
             let state = State {
                 workspaces,
                 active,
@@ -1388,14 +1425,12 @@ fn main() -> iced::Result {
                 git_bash: git_bash.clone(),
                 theme: arbiter_theme(),
                 main_window: main_id,
-                overview_window: None,
+                overview_window,
                 main_size,
                 main_pos: main_geom.and_then(point),
-                overview_size: overview_geom
-                    .map(|g| iced::Size::new(g.width, g.height))
-                    .unwrap_or(iced::Size::new(720.0, 520.0)),
-                overview_pos: overview_geom.and_then(point),
+                overview_size,
+                overview_pos,
             };
-            (state, open.map(|_| Message::Noop))
+            (state, iced::Task::batch(tasks))
         })
 }
