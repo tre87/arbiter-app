@@ -22,6 +22,7 @@ use iced::{Element, Length, Rectangle, Subscription, Task};
 use arbiter_native::claude_status::Lifecycle;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
+use arbiter_native::persist;
 use arbiter_native::term::SelectKind;
 
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
@@ -140,6 +141,104 @@ fn spawn_session(shell: Option<&str>, cwd: Option<&str>) -> Session {
     Session::spawn(80, 24, cmd).expect("spawn session")
 }
 
+// ── Session persistence ──────────────────────────────────────────────────────
+// Autosave/restore the workspace layout (web autosave parity). The live PTYs
+// can't be restored, so each saved leaf is respawned in its saved cwd/shell.
+
+/// Spawn a session for a restored leaf, honouring its saved shell + cwd. Falls
+/// back to the default shell/dir if Git Bash is unavailable or the cwd is gone,
+/// so a stale save can never panic the launch.
+fn spawn_restored(
+    shell: persist::SavedShell,
+    cwd: Option<&str>,
+    git_bash: Option<&str>,
+) -> (Session, ShellKind) {
+    let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
+    match shell {
+        persist::SavedShell::GitBash => match git_bash {
+            Some(gb) => (spawn_session(Some(gb), cwd), ShellKind::GitBash),
+            None => (spawn_session(None, cwd), ShellKind::PowerShell),
+        },
+        persist::SavedShell::PowerShell => (spawn_session(None, cwd), ShellKind::PowerShell),
+    }
+}
+
+/// Build a workspace's `pane_grid` from its saved split tree, respawning each leaf.
+fn saved_to_config(
+    node: persist::SavedNode,
+    git_bash: Option<&str>,
+) -> pane_grid::Configuration<PaneData> {
+    match node {
+        persist::SavedNode::Split { vertical, ratio, a, b } => pane_grid::Configuration::Split {
+            axis: if vertical { pane_grid::Axis::Vertical } else { pane_grid::Axis::Horizontal },
+            ratio,
+            a: Box::new(saved_to_config(*a, git_bash)),
+            b: Box::new(saved_to_config(*b, git_bash)),
+        },
+        persist::SavedNode::Leaf { name, shell, cwd } => {
+            let (session, kind) = spawn_restored(shell, cwd.as_deref(), git_bash);
+            pane_grid::Configuration::Pane(PaneData { session, name, shell: kind })
+        }
+    }
+}
+
+/// Rebuild workspaces from a saved session. `None` if nothing usable (→ fresh start).
+fn restore_workspaces(
+    saved: persist::SavedState,
+    git_bash: Option<&str>,
+) -> Option<(Vec<Workspace>, usize)> {
+    let mut workspaces = Vec::new();
+    for sw in saved.workspaces {
+        let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
+        let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
+        workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term });
+    }
+    if workspaces.is_empty() {
+        return None;
+    }
+    let active = saved.active.min(workspaces.len() - 1);
+    Some((workspaces, active))
+}
+
+/// Snapshot one workspace's live split tree into the serialisable form.
+fn node_to_saved(ws: &Workspace, node: &pane_grid::Node) -> persist::SavedNode {
+    match node {
+        pane_grid::Node::Split { axis, ratio, a, b, .. } => persist::SavedNode::Split {
+            vertical: matches!(axis, pane_grid::Axis::Vertical),
+            ratio: *ratio,
+            a: Box::new(node_to_saved(ws, a)),
+            b: Box::new(node_to_saved(ws, b)),
+        },
+        pane_grid::Node::Pane(pane) => {
+            let data = ws.panes.get(*pane);
+            persist::SavedNode::Leaf {
+                name: data.map(|d| d.name.clone()).unwrap_or_default(),
+                shell: match data.map(|d| d.shell) {
+                    Some(ShellKind::GitBash) => persist::SavedShell::GitBash,
+                    _ => persist::SavedShell::PowerShell,
+                },
+                cwd: data.and_then(|d| d.session.cwd()),
+            }
+        }
+    }
+}
+
+/// Persist the current layout (after layout-changing actions + on exit).
+fn save_session(state: &State) {
+    persist::save(&persist::SavedState {
+        active: state.active,
+        workspaces: state
+            .workspaces
+            .iter()
+            .map(|ws| persist::SavedWorkspace {
+                name: ws.name.clone(),
+                next_term: ws.next_term,
+                layout: node_to_saved(ws, ws.panes.layout()),
+            })
+            .collect(),
+    });
+}
+
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {}
@@ -168,13 +267,20 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Focus(pane) => state.active_mut().focus = pane,
-        Message::SplitRight => split(state.active_mut(), pane_grid::Axis::Vertical),
-        Message::SplitDown => split(state.active_mut(), pane_grid::Axis::Horizontal),
+        Message::SplitRight => {
+            split(state.active_mut(), pane_grid::Axis::Vertical);
+            save_session(state);
+        }
+        Message::SplitDown => {
+            split(state.active_mut(), pane_grid::Axis::Horizontal);
+            save_session(state);
+        }
         Message::Close => {
             let ws = state.active_mut();
             if let Some((_, sibling)) = ws.panes.close(ws.focus) {
                 ws.focus = sibling;
             }
+            save_session(state);
         }
         Message::Resized(pane_grid::ResizeEvent { split, ratio }) => {
             state.active_mut().panes.resize(split, ratio);
@@ -183,10 +289,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let n = state.workspaces.len() + 1;
             state.workspaces.push(Workspace::new(format!("Workspace {n}")));
             state.active = state.workspaces.len() - 1;
+            save_session(state);
         }
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
+                save_session(state);
             }
         }
         Message::Noop => {}
@@ -203,6 +311,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::WindowClosed(id) => {
             if id == state.main_window {
+                // Capture the final layout (incl. each terminal's current cwd) on exit.
+                save_session(state);
                 return iced::exit();
             }
             if state.overview_window == Some(id) {
@@ -271,6 +381,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     data.shell = kind;
                 }
             }
+            save_session(state);
         }
     }
     Task::none()
@@ -1161,9 +1272,14 @@ fn main() -> iced::Result {
             // daemon starts with no windows — open the main one here.
             let (main_id, open) = iced::window::open(iced::window::Settings::default());
             let _ = MAIN_WINDOW.set(main_id);
+            // Restore the saved layout (respawning each terminal in its cwd/shell);
+            // fall back to a single fresh workspace if there's nothing valid saved.
+            let (workspaces, active) = arbiter_native::persist::load()
+                .and_then(|saved| restore_workspaces(saved, git_bash.as_deref()))
+                .unwrap_or_else(|| (vec![Workspace::new("Workspace 1".to_string())], 0));
             let state = State {
-                workspaces: vec![Workspace::new("Workspace 1".to_string())],
-                active: 0,
+                workspaces,
+                active,
                 font: font.clone(),
                 git_bash: git_bash.clone(),
                 theme: arbiter_theme(),

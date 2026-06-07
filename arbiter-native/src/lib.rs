@@ -7,6 +7,7 @@ pub mod claude_status;
 pub mod font;
 pub mod git;
 pub mod gpu;
+pub mod persist;
 pub mod raster;
 pub mod session;
 pub mod shell;
