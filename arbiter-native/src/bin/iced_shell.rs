@@ -788,6 +788,20 @@ impl shader::Primitive for TermPrimitive {
 }
 
 fn main() -> iced::Result {
+    // Headless subcommands Claude invokes via our injected --settings: capture
+    // its statusLine JSON / hook signals, then exit without starting the GUI.
+    match std::env::args().nth(1).as_deref() {
+        Some("claude-statusline") => {
+            arbiter_native::claude_shim::run_statusline_capture();
+            return Ok(());
+        }
+        Some("claude-hook") => {
+            arbiter_native::claude_shim::run_hook_signal();
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();
 

@@ -5,7 +5,52 @@
 //! PATH/statusLine setup comes with the statusLine work later). Tauri-free:
 //! the zsh integration dir lives under the per-OS data dir via `dirs`.
 
+use std::sync::OnceLock;
+
 use portable_pty::CommandBuilder;
+
+use crate::claude_shim;
+
+/// Arbiter's per-OS data dir — the claude-shim, capture, and hook files live
+/// under here (the watchers read the same dirs).
+pub fn app_data_dir() -> Option<std::path::PathBuf> {
+    Some(dirs::data_dir()?.join("arbiter-native"))
+}
+
+static SHIM: OnceLock<Option<claude_shim::ShimSetup>> = OnceLock::new();
+
+/// Lazily set up the claude shim (idempotent file writes) on first shell spawn.
+fn shim() -> Option<&'static claude_shim::ShimSetup> {
+    SHIM.get_or_init(|| {
+        let data_dir = app_data_dir()?;
+        let path = std::env::var("PATH").unwrap_or_default();
+        let exe = std::env::current_exe().ok()?;
+        claude_shim::setup(&data_dir, &path, &exe)
+    })
+    .as_ref()
+}
+
+/// Prepend the shim `bin/` to PATH and export the shim env, so `claude` in the
+/// spawned shell resolves to our launcher (which runs the real claude with our
+/// generated `--settings` → statusLine/hook capture). Best-effort; a missing
+/// shim just means no Claude stats, never a broken shell.
+fn apply_claude_shim(cmd: &mut CommandBuilder) {
+    let Some(s) = shim() else { return };
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let path = std::env::var("PATH").unwrap_or_default();
+    cmd.env("PATH", format!("{}{sep}{path}", s.bin_dir.display()));
+    // zsh re-applies this last, after sourcing the user's rc (see ZSH_ZSHRC).
+    cmd.env("ARBITER_SHIM_BIN", s.bin_dir.display().to_string());
+    if let Some(rc) = &s.real_claude {
+        cmd.env(claude_shim::REAL_CLAUDE_ENV, rc.display().to_string());
+    }
+    cmd.env(claude_shim::SETTINGS_ENV, s.settings_file.display().to_string());
+    cmd.env(claude_shim::CAPTURE_DIR_ENV, s.capture_dir.display().to_string());
+    cmd.env(claude_shim::HOOKS_DIR_ENV, s.hooks_dir.display().to_string());
+    if let Some(orig) = &s.orig_statusline {
+        cmd.env(claude_shim::ORIG_STATUSLINE_ENV, orig);
+    }
+}
 
 // zsh ignores PROMPT_COMMAND, so we inject precmd/preexec hooks via a ZDOTDIR
 // whose .z* files source the user's real startup files then add the emitters.
@@ -105,6 +150,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                 ),
             );
             cmd.env("PS0", "\x1b]133;C\x07");
+            apply_claude_shim(&mut cmd);
             cmd
         } else {
             let mut cmd = CommandBuilder::new("powershell.exe");
@@ -129,6 +175,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     "}"
                 ),
             ]);
+            apply_claude_shim(&mut cmd);
             cmd
         }
     }
@@ -158,6 +205,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
             );
             cmd.env("PS0", "\x1b]133;C\x07");
         }
+        apply_claude_shim(&mut cmd);
         cmd
     }
 }
