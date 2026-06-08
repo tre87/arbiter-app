@@ -160,6 +160,9 @@ enum Message {
     WinMaximizeToggle,
     #[cfg(target_os = "windows")]
     WinClose,
+    /// Begin an interactive edge/corner resize (carries a Win32 HT* hit-test code).
+    #[cfg(target_os = "windows")]
+    WinResize(usize),
     /// No-op (used to discard a window-open Task's result).
     Noop,
 }
@@ -516,6 +519,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         #[cfg(target_os = "windows")]
         Message::WinClose => return iced::window::close(state.main_window),
+        #[cfg(target_os = "windows")]
+        Message::WinResize(ht) => winresize::begin(ht),
         Message::JumpTo(ws, pane) => {
             if ws < state.workspaces.len() {
                 state.active = ws;
@@ -776,7 +781,13 @@ fn main_view(state: &State) -> Element<'_, Message> {
 
     // App-wide chrome background carrying the top-left azure glow, so it's
     // continuous across the titlebar and the content spacing (no hard #222222 edge).
-    container(column![titlebar, framed].width(Length::Fill).height(Length::Fill))
+    let body = column![titlebar, framed].width(Length::Fill).height(Length::Fill);
+    // Windows: wrap the chrome in a thin resize border. A decorations-off winit
+    // window has no OS resize hit-zones and iced 0.13 exposes no drag-resize, so
+    // edge/corner mouse_areas initiate a native resize via WM_NCLBUTTONDOWN.
+    #[cfg(target_os = "windows")]
+    let body = with_resize_border(body.into());
+    container(body)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_t: &iced::Theme| container::Style {
@@ -784,6 +795,52 @@ fn main_view(state: &State) -> Element<'_, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// Wrap the window chrome in a thin (4px) border of resize hit-zones (Windows).
+/// Each edge/corner is a transparent `mouse_area` that, on press, hands the OS a
+/// synthetic non-client button-down (`WM_NCLBUTTONDOWN` + the matching `HT*`
+/// code) so it runs its native modal resize — the same trick winit uses for the
+/// drag-to-move that already works here.
+#[cfg(target_os = "windows")]
+fn with_resize_border<'a>(inner: Element<'a, Message>) -> Element<'a, Message> {
+    use iced::mouse::Interaction;
+    const T: f32 = 4.0;
+    // Win32 HT* hit-test codes.
+    const HTLEFT: usize = 10;
+    const HTRIGHT: usize = 11;
+    const HTTOP: usize = 12;
+    const HTTOPLEFT: usize = 13;
+    const HTTOPRIGHT: usize = 14;
+    const HTBOTTOM: usize = 15;
+    const HTBOTTOMLEFT: usize = 16;
+    const HTBOTTOMRIGHT: usize = 17;
+    let zone = |w: Length, h: Length, ht: usize, cur: Interaction| -> Element<'a, Message> {
+        mouse_area(Space::new(w, h)).on_press(Message::WinResize(ht)).interaction(cur).into()
+    };
+    column![
+        row![
+            zone(Length::Fixed(T), Length::Fixed(T), HTTOPLEFT, Interaction::ResizingDiagonallyDown),
+            zone(Length::Fill, Length::Fixed(T), HTTOP, Interaction::ResizingVertically),
+            zone(Length::Fixed(T), Length::Fixed(T), HTTOPRIGHT, Interaction::ResizingDiagonallyUp),
+        ]
+        .height(Length::Fixed(T)),
+        row![
+            zone(Length::Fixed(T), Length::Fill, HTLEFT, Interaction::ResizingHorizontally),
+            container(inner).width(Length::Fill).height(Length::Fill),
+            zone(Length::Fixed(T), Length::Fill, HTRIGHT, Interaction::ResizingHorizontally),
+        ]
+        .height(Length::Fill),
+        row![
+            zone(Length::Fixed(T), Length::Fixed(T), HTBOTTOMLEFT, Interaction::ResizingDiagonallyUp),
+            zone(Length::Fill, Length::Fixed(T), HTBOTTOM, Interaction::ResizingVertically),
+            zone(Length::Fixed(T), Length::Fixed(T), HTBOTTOMRIGHT, Interaction::ResizingDiagonallyDown),
+        ]
+        .height(Length::Fixed(T)),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// Hover-highlight style for a clickable overview row.
@@ -1087,6 +1144,47 @@ mod winround {
         }
         unsafe {
             EnumWindows(enum_cb, 0);
+        }
+    }
+}
+
+/// Interactive edge/corner resize for the borderless Windows window. winit/iced
+/// give a decorations-off window no resize hit-zones, so we drive the OS's own
+/// modal resize loop directly: `ReleaseCapture()` then post a non-client
+/// button-down (`WM_NCLBUTTONDOWN`) with the edge's `HT*` code to the foreground
+/// window (the one whose edge was just clicked).
+#[cfg(target_os = "windows")]
+mod winresize {
+    use std::ffi::c_void;
+    type Hwnd = *mut c_void;
+    const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> Hwnd;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn ReleaseCapture() -> i32;
+        fn SendMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    /// Begin a native resize in the direction given by a Win32 `HT*` code.
+    pub fn begin(ht: usize) {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != GetCurrentProcessId() {
+                return;
+            }
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, ht, 0);
         }
     }
 }
