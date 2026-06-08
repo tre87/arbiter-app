@@ -135,6 +135,15 @@ enum Message {
     /// A window was moved/resized — track its geometry for persistence.
     WindowMoved(iced::window::Id, iced::Point),
     WindowResized(iced::window::Id, iced::Size),
+    /// Custom titlebar (Windows, decorations off): drag the window + window controls.
+    #[cfg(target_os = "windows")]
+    DragWindow,
+    #[cfg(target_os = "windows")]
+    WinMinimize,
+    #[cfg(target_os = "windows")]
+    WinMaximizeToggle,
+    #[cfg(target_os = "windows")]
+    WinClose,
     /// No-op (used to discard a window-open Task's result).
     Noop,
 }
@@ -418,6 +427,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 save_session(state);
             }
         }
+        #[cfg(target_os = "windows")]
+        Message::DragWindow => return iced::window::drag(state.main_window),
+        #[cfg(target_os = "windows")]
+        Message::WinMinimize => return iced::window::minimize(state.main_window, true),
+        #[cfg(target_os = "windows")]
+        Message::WinMaximizeToggle => return iced::window::toggle_maximize(state.main_window),
+        #[cfg(target_os = "windows")]
+        Message::WinClose => return iced::window::close(state.main_window),
         Message::JumpTo(ws, pane) => {
             if ws < state.workspaces.len() {
                 state.active = ws;
@@ -532,12 +549,18 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // (left) + actions (right). On macOS this IS the window titlebar (content
     // extends behind it; traffic lights overlay the left pad).
     let mut bar = row![].spacing(6).align_y(iced::Center).height(Length::Fill);
-    bar = bar.push(
+    // Brand: logo + animated wordmark. On Windows (no OS titlebar) it's a drag handle.
+    let brand = row![
         svg(svg::Handle::from_memory(ARBITER_LOGO))
             .width(Length::Fixed(26.0))
             .height(Length::Fixed(26.0)),
-    );
-    bar = bar.push(arbiter_wordmark());
+        arbiter_wordmark(),
+    ]
+    .spacing(6)
+    .align_y(iced::Center);
+    #[cfg(target_os = "windows")]
+    let brand = mouse_area(brand).on_press(Message::DragWindow);
+    bar = bar.push(brand);
     bar = bar.push(Space::with_width(Length::Fixed(12.0)));
     for (i, ws) in state.workspaces.iter().enumerate() {
         let mut b = button(text(ws.name.clone()).size(12)).on_press(Message::SelectWorkspace(i)).padding([3, 8]);
@@ -547,11 +570,28 @@ fn main_view(state: &State) -> Element<'_, Message> {
         bar = bar.push(b);
     }
     bar = bar.push(button(text("+").size(12)).on_press(Message::NewWorkspace).padding([3, 8]).style(button::secondary));
-    bar = bar.push(horizontal_space());
+    // Flexible middle: a drag region on Windows (no OS titlebar); a plain spacer
+    // on macOS (the OS handles dragging the transparent titlebar).
+    #[cfg(target_os = "windows")]
+    {
+        bar = bar.push(mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragWindow));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        bar = bar.push(horizontal_space());
+    }
     bar = bar.push(button(text("⊞ Overview").size(12)).on_press(Message::ToggleOverview).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Split ↓").size(12)).on_press(Message::SplitDown).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Close").size(12)).on_press(Message::Close).style(button::secondary).padding([3, 8]));
+    // Window controls (Windows only) on the far right, since there's no OS titlebar.
+    #[cfg(target_os = "windows")]
+    {
+        bar = bar.push(Space::with_width(Length::Fixed(6.0)));
+        bar = bar.push(button(text("—").size(13)).on_press(Message::WinMinimize).style(button::text).padding([2, 10]));
+        bar = bar.push(button(text("▢").size(12)).on_press(Message::WinMaximizeToggle).style(button::text).padding([2, 10]));
+        bar = bar.push(button(text("✕").size(13)).on_press(Message::WinClose).style(button::text).padding([2, 10]));
+    }
 
     let focus = state.active().focus;
     let font = &state.font;
@@ -1569,6 +1609,12 @@ fn main() -> iced::Result {
                 settings.platform_specific.title_hidden = true;
                 settings.platform_specific.titlebar_transparent = true;
                 settings.platform_specific.fullsize_content_view = true;
+            }
+            // Windows: drop the OS titlebar entirely — the app draws its own
+            // unified titlebar (drag region + min/max/close). Stays resizable.
+            #[cfg(target_os = "windows")]
+            {
+                settings.decorations = false;
             }
             if let Some(g) = main_geom {
                 settings.size = iced::Size::new(g.width, g.height);
