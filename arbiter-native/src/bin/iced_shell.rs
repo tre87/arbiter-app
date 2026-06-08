@@ -1864,7 +1864,13 @@ fn main() -> iced::Result {
             if let Some(g) = main_geom {
                 settings.size = iced::Size::new(g.width, g.height);
                 if let (Some(x), Some(y)) = (g.x, g.y) {
-                    settings.position = iced::window::Position::Specific(iced::Point::new(x, y));
+                    let p = iced::Point::new(x, y);
+                    // Ignore a saved off-screen sentinel (older builds could persist
+                    // the -32000 minimized position) — let the WM place the window so
+                    // it can't open invisible. Heals an already-corrupted session.json.
+                    if on_screen_ish(p) {
+                        settings.position = iced::window::Position::Specific(p);
+                    }
                 }
             }
             let main_size = settings.size;
@@ -1877,7 +1883,11 @@ fn main() -> iced::Result {
                 .and_then(|saved| restore_workspaces(saved, git_bash.as_deref()))
                 .unwrap_or_else(|| (vec![Workspace::new("Workspace 1".to_string())], 0));
 
-            let point = |g: persist::SavedWindow| g.x.zip(g.y).map(|(x, y)| iced::Point::new(x, y));
+            // Drop a saved off-screen sentinel so neither window starts tracking
+            // (and re-persisting) an invisible position.
+            let point = |g: persist::SavedWindow| {
+                g.x.zip(g.y).map(|(x, y)| iced::Point::new(x, y)).filter(|p| on_screen_ish(*p))
+            };
             let overview_size = overview_geom
                 .map(|g| iced::Size::new(g.width, g.height))
                 .unwrap_or(iced::Size::new(720.0, 520.0));
