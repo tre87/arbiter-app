@@ -44,4 +44,9 @@ iced = { version = "0.13", features = ["wgpu", "advanced", "tokio", "svg"] }
 core-foundation = "0.9"
 core-graphics = "0.23"
 core-text = "20"
+# Reposition the macOS traffic lights to match the web (Tauri trafficLightPosition
+# {14,22}); iced/winit expose no API. objc2 versions pinned to those already in the
+# tree (via winit) to avoid duplicate crates.
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
 
