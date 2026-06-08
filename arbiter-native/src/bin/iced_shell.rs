@@ -1348,7 +1348,7 @@ fn arbiter_wordmark() -> Element<'static, Message> {
     let mut r = row![].spacing(0.9).align_y(iced::Center);
     for (i, ch) in WORD.chars().enumerate() {
         let col = azure_at(phase * 0.6 + (i as f32 / n) * 0.6);
-        r = r.push(text(ch.to_string()).size(15).color(col).font(dmsans_bold()));
+        r = r.push(text(ch.to_string()).size(15).color(col).font(wordmark_font()));
     }
     r.into()
 }
@@ -1892,9 +1892,13 @@ impl shader::Primitive for TermPrimitive {
 /// body text, DM Sans for the title/logo. Both are variable fonts (weight axis);
 /// cosmic-text selects the weight. Bundled under assets/ (SIL OFL).
 const INTER_FONT: &[u8] = include_bytes!("../../assets/Inter-VariableFont.ttf");
-/// DM Sans — the web's titlebar wordmark font (`.titlebar-title`, 700). Variable
-/// weight axis; cosmic-text selects the weight.
-const DMSANS_FONT: &[u8] = include_bytes!("../../assets/DMSans-VariableFont.ttf");
+/// The titlebar "Arbiter" wordmark font: DM Sans, but pinned to a STATIC instance
+/// at optical-size 15 + weight 700 and renamed "DM Sans Arbiter". The web's
+/// `.titlebar-title` is DM Sans 700/15px, and browsers auto-apply optical sizing
+/// (opsz≈15) at that size — but cosmic-text uses a variable font's DEFAULT opsz
+/// (9pt, designed for tiny text), which rendered visibly wrong. Pinning opsz=15
+/// at build time makes native match the web's "Arbiter" width (~58.5px) exactly.
+const ARBITER_WORDMARK_FONT: &[u8] = include_bytes!("../../assets/DMSans-Arbiter.ttf");
 /// 3KB subset of Noto Sans Symbols 2 (the `·✢✳✶✻✽` working-animation dingbats),
 /// renamed "ArbiterSymbols" — bundled so the ✻ is identical on macOS + Windows.
 const ARBITER_SYMBOLS_FONT: &[u8] = include_bytes!("../../assets/ArbiterSymbols.ttf");
@@ -1910,10 +1914,11 @@ fn ui_semibold() -> iced::Font {
     iced::Font { weight: iced::font::Weight::Semibold, ..iced::Font::with_name("Inter") }
 }
 
-/// DM Sans Bold (700) — the titlebar "Arbiter" wordmark, matching the web's
-/// `.titlebar-title { font-family: 'DM Sans'; font-weight: 700 }`.
-fn dmsans_bold() -> iced::Font {
-    iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::with_name("DM Sans") }
+/// The titlebar "Arbiter" wordmark font — our pinned DM Sans instance (700,
+/// opsz 15), matching the web's `.titlebar-title`. Weight is baked into the
+/// instance; the explicit Bold keeps cosmic-text's face matching exact.
+fn wordmark_font() -> iced::Font {
+    iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::with_name("DM Sans Arbiter") }
 }
 
 fn main() -> iced::Result {
@@ -1949,7 +1954,7 @@ fn main() -> iced::Result {
         .subscription(subscription)
         .theme(|s: &State, _id| s.theme.clone())
         .font(INTER_FONT)
-        .font(DMSANS_FONT)
+        .font(ARBITER_WORDMARK_FONT)
         .font(ARBITER_SYMBOLS_FONT)
         .default_font(ui_font())
         .run_with(move || {
