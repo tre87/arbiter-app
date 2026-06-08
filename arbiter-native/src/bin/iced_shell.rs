@@ -2127,7 +2127,11 @@ fn main() -> iced::Result {
             let mut tasks = vec![open.map(|_| Message::Noop)];
             let overview_window = if overview_was_open {
                 let (ov_id, ov_task) = open_overview(overview_size, overview_pos);
-                tasks.push(ov_task);
+                // The overview opens after the main window and grabs focus on
+                // startup; chain a focus-back so the MAIN window is active (and its
+                // traffic lights coloured) — chained (not batched) so it runs after
+                // the overview has actually opened, winning the focus race.
+                tasks.push(ov_task.chain(iced::window::gain_focus(main_id)));
                 Some(ov_id)
             } else {
                 None
