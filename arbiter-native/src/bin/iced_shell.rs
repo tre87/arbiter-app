@@ -662,9 +662,10 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let mut bar = row![].spacing(6).align_y(iced::Center).height(Length::Fill);
     // Brand: logo + animated wordmark. On Windows (no OS titlebar) it's a drag handle.
     let brand = row![
-        svg(svg::Handle::from_memory(ARBITER_LOGO))
+        iced::widget::image(iced::widget::image::Handle::from_bytes(ARBITER_LOGO_PNG))
             .width(Length::Fixed(28.0))
-            .height(Length::Fixed(28.0)),
+            .height(Length::Fixed(28.0))
+            .filter_method(iced::widget::image::FilterMethod::Linear),
         arbiter_wordmark(),
     ]
     .spacing(8)
@@ -1387,7 +1388,10 @@ fn now_ms() -> u64 {
 }
 
 /// The Arbiter "A" mark (blue-gradient SVG, the web's assets/logo.svg).
-const ARBITER_LOGO: &[u8] = include_bytes!("../../assets/logo.svg");
+/// The Arbiter mark, pre-rasterized to a high-res PNG (see examples/rasterize_logo.rs)
+/// and drawn with linear filtering — iced nearest-samples SVGs, which pixelates the
+/// logo; a PNG downscales smoothly and stays crisp.
+const ARBITER_LOGO_PNG: &[u8] = include_bytes!("../../assets/logo.png");
 
 /// Sample the titlebar azure gradient at `t` (wrapped to [0,1)) — the web's
 /// `title-shimmer` stops: baby→azure→deep→tropical→baby.

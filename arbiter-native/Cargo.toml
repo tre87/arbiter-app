@@ -35,11 +35,17 @@ notify-debouncer-mini = "0.4"
 # App shell / chrome (tabs, splits, settings, …). The terminal renderer is
 # hosted inside Iced via its custom `shader` widget (needs the wgpu + advanced
 # features). Used by the `iced` binary; the raw winit spike (default bin) doesn't.
-iced = { version = "0.13", features = ["wgpu", "advanced", "tokio", "svg"] }
+iced = { version = "0.13", features = ["wgpu", "advanced", "tokio", "svg", "image"] }
 
 # Platform-native glyph rasterisation so terminal text matches the OS's own text
 # rendering (and thus the webview): CoreText on macOS. Versions pinned to those
 # already in the tree (via winit) to avoid duplicate Apple crates.
+[dev-dependencies]
+# One-shot rasterizer (examples/rasterize_logo.rs) to bake the logo SVG into a
+# high-res PNG — drawn with linear filtering it stays crisp, unlike iced's
+# nearest-sampled SVG. Same engine iced uses; already in the tree.
+resvg = "0.42"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
 core-graphics = "0.23"
