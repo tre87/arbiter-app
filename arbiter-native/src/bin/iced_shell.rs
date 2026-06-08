@@ -512,15 +512,17 @@ const TITLEBAR_LEFT_PAD: f32 = 88.0;
 #[cfg(not(target_os = "macos"))]
 const TITLEBAR_LEFT_PAD: f32 = 8.0;
 
-/// Titlebar background: the web's top-left azure glow (`.app::before` radial
-/// gradient) — iced has no radial gradient, so approximate with a horizontal
-/// linear one fading from azure-tinted chrome (left) to plain chrome (#222222).
-fn titlebar_gradient() -> iced::Gradient {
-    iced::gradient::Linear::new(iced::Degrees(90.0))
+/// The web's top-left azure glow (`.app::before` radial gradient over the WHOLE
+/// app chrome). iced has no radial gradient, so approximate with a diagonal
+/// linear one (135° = top-left→bottom-right) fading azure-tinted chrome (#294b6e)
+/// → plain chrome (#222222). Used as the app-wide background so the glow flows
+/// continuously through the (transparent) titlebar AND the content spacing.
+fn app_glow_gradient() -> iced::Gradient {
+    iced::gradient::Linear::new(iced::Degrees(135.0))
         .add_stop(0.0, iced::Color::from_rgb8(0x29, 0x4b, 0x6e))
         .add_stop(0.10, iced::Color::from_rgb8(0x25, 0x39, 0x4a))
-        .add_stop(0.22, iced::Color::from_rgb8(0x23, 0x2a, 0x31))
-        .add_stop(0.35, iced::Color::from_rgb8(0x22, 0x22, 0x22))
+        .add_stop(0.20, iced::Color::from_rgb8(0x23, 0x2a, 0x31))
+        .add_stop(0.32, iced::Color::from_rgb8(0x22, 0x22, 0x22))
         .add_stop(1.0, iced::Color::from_rgb8(0x22, 0x22, 0x22))
         .into()
 }
@@ -532,8 +534,8 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let mut bar = row![].spacing(6).align_y(iced::Center).height(Length::Fill);
     bar = bar.push(
         svg(svg::Handle::from_memory(ARBITER_LOGO))
-            .width(Length::Fixed(18.0))
-            .height(Length::Fixed(18.0)),
+            .width(Length::Fixed(26.0))
+            .height(Length::Fixed(26.0)),
     );
     bar = bar.push(arbiter_wordmark());
     bar = bar.push(Space::with_width(Length::Fixed(12.0)));
@@ -617,29 +619,30 @@ fn main_view(state: &State) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    // The titlebar: web height (40px), left-padded for the traffic lights, with
-    // the top-left azure glow as its background.
+    // Titlebar: web height (40px), left-padded for the traffic lights. Transparent
+    // so the app-wide azure glow shows through it.
     let titlebar = container(bar)
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
-        .padding(iced::Padding { top: 0.0, right: 8.0, bottom: 0.0, left: TITLEBAR_LEFT_PAD })
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Gradient(titlebar_gradient())),
-            ..Default::default()
-        });
+        .padding(iced::Padding { top: 0.0, right: 8.0, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
 
-    // The terminal area, inset from the window edges with a chrome-coloured frame
-    // (#222222, like the web's --color-bg-chrome behind its panels).
+    // Terminal area, inset from the window edges. The frame is transparent so the
+    // glow flows into the spacing (the grid paints its own divider/pane colours).
     let framed = container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 })
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x22, 0x22, 0x22))),
-            ..Default::default()
-        });
+        .padding(6);
 
-    column![titlebar, framed].width(Length::Fill).height(Length::Fill).into()
+    // App-wide chrome background carrying the top-left azure glow, so it's
+    // continuous across the titlebar and the content spacing (no hard #222222 edge).
+    container(column![titlebar, framed].width(Length::Fill).height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Gradient(app_glow_gradient())),
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Hover-highlight style for a clickable overview row.
