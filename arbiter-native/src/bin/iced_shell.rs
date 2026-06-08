@@ -90,6 +90,11 @@ struct State {
     /// between the maximize square and the restore (double-square) glyph.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     main_maximized: bool,
+    /// One-shot guard: apply the Windows rounded-corner attribute once the window
+    /// is actually up (first frame), since the main window's Opened event can fire
+    /// before our subscription is listening.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    corners_rounded: bool,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -354,6 +359,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 save_session(state);
+            }
+            // Round the window's corners once it's actually on screen (the Opened
+            // event can fire before the subscription is active at startup).
+            #[cfg(target_os = "windows")]
+            if !state.corners_rounded {
+                state.corners_rounded = true;
+                winround::round_our_windows();
             }
         }
         Message::Input(bytes) => {
@@ -781,31 +793,35 @@ fn main_view(state: &State) -> Element<'_, Message> {
 
     // App-wide chrome background carrying the top-left azure glow, so it's
     // continuous across the titlebar and the content spacing (no hard #222222 edge).
-    let body = column![titlebar, framed].width(Length::Fill).height(Length::Fill);
-    // Windows: wrap the chrome in a thin resize border. A decorations-off winit
-    // window has no OS resize hit-zones and iced 0.13 exposes no drag-resize, so
-    // edge/corner mouse_areas initiate a native resize via WM_NCLBUTTONDOWN.
-    #[cfg(target_os = "windows")]
-    let body = with_resize_border(body.into());
-    container(body)
+    let chrome = container(column![titlebar, framed].width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Gradient(app_glow_gradient())),
             ..Default::default()
-        })
-        .into()
+        });
+    // Windows: overlay thin resize hit-zones at the window edges via a stack so
+    // the content layout/spacing stays byte-identical to macOS (no extra inset).
+    // The stack delivers a press to the top layer first and stops if it captures,
+    // so an edge press resizes without also triggering the titlebar drag beneath.
+    #[cfg(target_os = "windows")]
+    return iced::widget::stack([chrome.into(), resize_overlay()]).into();
+    #[cfg(not(target_os = "windows"))]
+    return chrome.into();
 }
 
-/// Wrap the window chrome in a thin (4px) border of resize hit-zones (Windows).
-/// Each edge/corner is a transparent `mouse_area` that, on press, hands the OS a
-/// synthetic non-client button-down (`WM_NCLBUTTONDOWN` + the matching `HT*`
-/// code) so it runs its native modal resize — the same trick winit uses for the
-/// drag-to-move that already works here.
+/// A full-window overlay of thin resize hit-zones for the borderless Windows
+/// window (a decorations-off winit window has no OS resize hit-zones and iced
+/// 0.13 exposes no drag-resize). Edge/corner `mouse_area`s sit at the window
+/// edges (within the existing 6px content border, so no layout shift); the centre
+/// is a non-interactive `Space` that lets presses fall through to the content
+/// beneath in the stack. On press each zone hands the OS a synthetic
+/// `WM_NCLBUTTONDOWN` + `HT*` code (see `winresize`) — the same trick as drag.
 #[cfg(target_os = "windows")]
-fn with_resize_border<'a>(inner: Element<'a, Message>) -> Element<'a, Message> {
+fn resize_overlay<'a>() -> Element<'a, Message> {
     use iced::mouse::Interaction;
-    const T: f32 = 4.0;
+    const T: f32 = 4.0; // edge grab thickness (inside the 6px content border)
+    const C: f32 = 16.0; // corner grab length
     // Win32 HT* hit-test codes.
     const HTLEFT: usize = 10;
     const HTRIGHT: usize = 11;
@@ -820,21 +836,21 @@ fn with_resize_border<'a>(inner: Element<'a, Message>) -> Element<'a, Message> {
     };
     column![
         row![
-            zone(Length::Fixed(T), Length::Fixed(T), HTTOPLEFT, Interaction::ResizingDiagonallyDown),
+            zone(Length::Fixed(C), Length::Fixed(T), HTTOPLEFT, Interaction::ResizingDiagonallyDown),
             zone(Length::Fill, Length::Fixed(T), HTTOP, Interaction::ResizingVertically),
-            zone(Length::Fixed(T), Length::Fixed(T), HTTOPRIGHT, Interaction::ResizingDiagonallyUp),
+            zone(Length::Fixed(C), Length::Fixed(T), HTTOPRIGHT, Interaction::ResizingDiagonallyUp),
         ]
         .height(Length::Fixed(T)),
         row![
             zone(Length::Fixed(T), Length::Fill, HTLEFT, Interaction::ResizingHorizontally),
-            container(inner).width(Length::Fill).height(Length::Fill),
+            Space::new(Length::Fill, Length::Fill),
             zone(Length::Fixed(T), Length::Fill, HTRIGHT, Interaction::ResizingHorizontally),
         ]
         .height(Length::Fill),
         row![
-            zone(Length::Fixed(T), Length::Fixed(T), HTBOTTOMLEFT, Interaction::ResizingDiagonallyUp),
+            zone(Length::Fixed(C), Length::Fixed(T), HTBOTTOMLEFT, Interaction::ResizingDiagonallyUp),
             zone(Length::Fill, Length::Fixed(T), HTBOTTOM, Interaction::ResizingVertically),
-            zone(Length::Fixed(T), Length::Fixed(T), HTBOTTOMRIGHT, Interaction::ResizingDiagonallyDown),
+            zone(Length::Fixed(C), Length::Fixed(T), HTBOTTOMRIGHT, Interaction::ResizingDiagonallyDown),
         ]
         .height(Length::Fixed(T)),
     ]
@@ -1095,10 +1111,19 @@ mod winround {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: u32 = 2;
 
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, l: isize) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -1129,7 +1154,13 @@ mod winround {
                     std::mem::size_of::<u32>() as u32,
                 );
                 if debug() {
-                    eprintln!("winround: hwnd={hwnd:p} DwmSetWindowAttribute(ROUND) hr={hr:#010x}");
+                    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+                    GetWindowRect(hwnd, &mut r);
+                    eprintln!(
+                        "winround: hwnd={hwnd:p} size={}x{} DwmSetWindowAttribute(ROUND) hr={hr:#010x}",
+                        r.right - r.left,
+                        r.bottom - r.top,
+                    );
                 }
             }
         }
@@ -2024,6 +2055,7 @@ fn main() -> iced::Result {
                 overview_pos,
                 main_focused: true,
                 main_maximized: false,
+                corners_rounded: false,
             };
             (state, iced::Task::batch(tasks))
         })
