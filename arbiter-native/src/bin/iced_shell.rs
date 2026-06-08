@@ -584,13 +584,30 @@ fn main_view(state: &State) -> Element<'_, Message> {
     bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Split ↓").size(12)).on_press(Message::SplitDown).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Close").size(12)).on_press(Message::Close).style(button::secondary).padding([3, 8]));
-    // Window controls (Windows only) on the far right, since there's no OS titlebar.
+    // Window controls (Windows only, no OS titlebar): icon buttons, flush together
+    // on the far right, with hover washes (red for close) like native controls.
     #[cfg(target_os = "windows")]
     {
-        bar = bar.push(Space::with_width(Length::Fixed(6.0)));
-        bar = bar.push(button(text("—").size(13)).on_press(Message::WinMinimize).style(button::text).padding([2, 10]));
-        bar = bar.push(button(text("▢").size(12)).on_press(Message::WinMaximizeToggle).style(button::text).padding([2, 10]));
-        bar = bar.push(button(text("✕").size(13)).on_press(Message::WinClose).style(button::text).padding([2, 10]));
+        let ico = iced::Color::from_rgb8(0xd0, 0xd0, 0xd0);
+        bar = bar.push(Space::with_width(Length::Fixed(4.0)));
+        bar = bar.push(
+            row![
+                button(mdi(mdi_path::WIN_MINIMIZE, 15.0, ico))
+                    .on_press(Message::WinMinimize)
+                    .padding([12, 16])
+                    .style(winctl_style(false)),
+                button(mdi(mdi_path::WIN_MAXIMIZE, 14.0, ico))
+                    .on_press(Message::WinMaximizeToggle)
+                    .padding([13, 16])
+                    .style(winctl_style(false)),
+                button(mdi(mdi_path::WIN_CLOSE, 15.0, ico))
+                    .on_press(Message::WinClose)
+                    .padding([12, 16])
+                    .style(winctl_style(true)),
+            ]
+            .spacing(0)
+            .align_y(iced::Center),
+        );
     }
 
     let focus = state.active().focus;
@@ -846,6 +863,30 @@ mod mdi_path {
     pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
     pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
     pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
+    // Window controls (Windows custom titlebar).
+    #[cfg(target_os = "windows")]
+    pub const WIN_MINIMIZE: &str = "M19,13H5V11H19V13Z";
+    #[cfg(target_os = "windows")]
+    pub const WIN_MAXIMIZE: &str = "M4,4H20V20H4V4M6,8V18H18V8H6Z";
+    #[cfg(target_os = "windows")]
+    pub const WIN_CLOSE: &str = "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z";
+}
+
+/// Style for a Windows titlebar control button: no chrome until hover, then a
+/// grey wash — or Windows' red for the close button.
+#[cfg(target_os = "windows")]
+fn winctl_style(close: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_t, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let bg = hovered.then(|| {
+            iced::Background::Color(if close {
+                iced::Color::from_rgb8(0xc4, 0x2b, 0x1c)
+            } else {
+                iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)
+            })
+        });
+        button::Style { background: bg, ..Default::default() }
+    }
 }
 
 fn footer_bar(session: &Session) -> Element<'static, Message> {
@@ -1615,6 +1656,9 @@ fn main() -> iced::Result {
             #[cfg(target_os = "windows")]
             {
                 settings.decorations = false;
+                // Drop shadow for the borderless window — on Windows 11 this also
+                // tends to restore the DWM rounded corners.
+                settings.platform_specific.undecorated_shadow = true;
             }
             if let Some(g) = main_geom {
                 settings.size = iced::Size::new(g.width, g.height);
