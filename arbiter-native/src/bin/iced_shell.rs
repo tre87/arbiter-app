@@ -135,6 +135,9 @@ enum Message {
     /// A window was moved/resized — track its geometry for persistence.
     WindowMoved(iced::window::Id, iced::Point),
     WindowResized(iced::window::Id, iced::Size),
+    /// A window finished opening — seed its geometry and (Windows) round its
+    /// corners now that the HWND exists.
+    WindowOpened(iced::window::Id, Option<iced::Point>, iced::Size),
     /// Custom titlebar (Windows, decorations off): drag the window + window controls.
     #[cfg(target_os = "windows")]
     DragWindow,
@@ -427,6 +430,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 save_session(state);
             }
         }
+        Message::WindowOpened(id, pos, size) => {
+            let known = id == state.main_window || state.overview_window == Some(id);
+            if id == state.main_window {
+                if let Some(p) = pos {
+                    state.main_pos = Some(p);
+                }
+                state.main_size = size;
+            } else if state.overview_window == Some(id) {
+                if let Some(p) = pos {
+                    state.overview_pos = Some(p);
+                }
+                state.overview_size = size;
+            }
+            if known {
+                save_session(state);
+            }
+            // The HWND now exists — give our borderless window Win11 rounded corners.
+            #[cfg(target_os = "windows")]
+            winround::round_our_windows();
+        }
         #[cfg(target_os = "windows")]
         Message::DragWindow => return iced::window::drag(state.main_window),
         #[cfg(target_os = "windows")]
@@ -529,6 +552,14 @@ const TITLEBAR_LEFT_PAD: f32 = 88.0;
 #[cfg(not(target_os = "macos"))]
 const TITLEBAR_LEFT_PAD: f32 = 8.0;
 
+/// Right inset of the titlebar content. Zero on Windows so the custom caption
+/// buttons sit flush in the top-right corner like native controls; a small gap
+/// elsewhere (macOS controls live on the left).
+#[cfg(target_os = "windows")]
+const TITLEBAR_RIGHT_PAD: f32 = 0.0;
+#[cfg(not(target_os = "windows"))]
+const TITLEBAR_RIGHT_PAD: f32 = 8.0;
+
 /// The web's top-left azure glow (`.app::before` radial gradient over the WHOLE
 /// app chrome). iced has no radial gradient, so approximate with a diagonal
 /// linear one (135° = top-left→bottom-right) fading azure-tinted chrome (#294b6e)
@@ -584,29 +615,18 @@ fn main_view(state: &State) -> Element<'_, Message> {
     bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Split ↓").size(12)).on_press(Message::SplitDown).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Close").size(12)).on_press(Message::Close).style(button::secondary).padding([3, 8]));
-    // Window controls (Windows only, no OS titlebar): icon buttons, flush together
-    // on the far right, with hover washes (red for close) like native controls.
+    // Window controls (Windows only, no OS titlebar): native-proportioned caption
+    // buttons (minimize / maximize / close), flush together at the top-right
+    // corner, with Win11 hover washes (red for close).
     #[cfg(target_os = "windows")]
     {
-        let ico = iced::Color::from_rgb8(0xd0, 0xd0, 0xd0);
-        bar = bar.push(Space::with_width(Length::Fixed(4.0)));
         bar = bar.push(
             row![
-                button(mdi(mdi_path::WIN_MINIMIZE, 15.0, ico))
-                    .on_press(Message::WinMinimize)
-                    .padding([12, 16])
-                    .style(winctl_style(false)),
-                button(mdi(mdi_path::WIN_MAXIMIZE, 14.0, ico))
-                    .on_press(Message::WinMaximizeToggle)
-                    .padding([13, 16])
-                    .style(winctl_style(false)),
-                button(mdi(mdi_path::WIN_CLOSE, 15.0, ico))
-                    .on_press(Message::WinClose)
-                    .padding([12, 16])
-                    .style(winctl_style(true)),
+                caption_button(caption_glyph::MINIMIZE, Message::WinMinimize, false),
+                caption_button(caption_glyph::MAXIMIZE, Message::WinMaximizeToggle, false),
+                caption_button(caption_glyph::CLOSE, Message::WinClose, true),
             ]
-            .spacing(0)
-            .align_y(iced::Center),
+            .spacing(0),
         );
     }
 
@@ -681,7 +701,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let titlebar = container(bar)
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
-        .padding(iced::Padding { top: 0.0, right: 8.0, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
+        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
 
     // Terminal area, inset from the window edges. The frame is transparent so the
     // glow flows into the spacing (the grid paints its own divider/pane colours).
@@ -863,17 +883,11 @@ mod mdi_path {
     pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
     pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
     pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
-    // Window controls (Windows custom titlebar).
-    #[cfg(target_os = "windows")]
-    pub const WIN_MINIMIZE: &str = "M19,13H5V11H19V13Z";
-    #[cfg(target_os = "windows")]
-    pub const WIN_MAXIMIZE: &str = "M4,4H20V20H4V4M6,8V18H18V8H6Z";
-    #[cfg(target_os = "windows")]
-    pub const WIN_CLOSE: &str = "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
-/// grey wash — or Windows' red for the close button.
+/// grey wash — or Windows' red for the close button. Square corners + flush so
+/// the row reads as one native caption-control strip.
 #[cfg(target_os = "windows")]
 fn winctl_style(close: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_t, status| {
@@ -886,6 +900,105 @@ fn winctl_style(close: bool) -> impl Fn(&iced::Theme, button::Status) -> button:
             })
         });
         button::Style { background: bg, ..Default::default() }
+    }
+}
+
+// Win11 caption glyphs (Segoe Fluent Icons ChromeMinimize/Maximize/Close) are
+// trivial 1px geometry — reproduce them exactly as thin-stroked SVG so they
+// match pixel-for-pixel without depending on the system icon font: a centred
+// horizontal line, a plain square outline (no title-bar notch), and an X.
+#[cfg(target_os = "windows")]
+mod caption_glyph {
+    pub const MINIMIZE: &str = "M0.5,5 H9.5";
+    pub const MAXIMIZE: &str = "M0.5,0.5 H9.5 V9.5 H0.5 Z";
+    pub const CLOSE: &str = "M0.5,0.5 L9.5,9.5 M9.5,0.5 L0.5,9.5";
+}
+
+/// A thin-stroked Win11 caption glyph (10×10 viewBox), stroked in `color`.
+#[cfg(target_os = "windows")]
+fn caption_icon(d: &str, color: iced::Color) -> Element<'static, Message> {
+    let b = |v: f32| (v * 255.0).round() as u8;
+    let src = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="{d}" fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="1"/></svg>"##,
+        b(color.r), b(color.g), b(color.b),
+    );
+    svg(svg::Handle::from_memory(src.into_bytes()))
+        .width(Length::Fixed(10.0))
+        .height(Length::Fixed(10.0))
+        .into()
+}
+
+/// A native-proportioned Windows caption button: a 46×40 hit-area (Win11 sizing)
+/// with a centred 10px glyph, square corners, hover wash via `winctl_style`.
+#[cfg(target_os = "windows")]
+fn caption_button(d: &str, msg: Message, close: bool) -> Element<'static, Message> {
+    let color = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
+    button(
+        container(caption_icon(d, color))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(46.0))
+    .height(Length::Fixed(40.0))
+    .padding(0)
+    .on_press(msg)
+    .style(winctl_style(close))
+    .into()
+}
+
+/// Force Windows 11 rounded corners on our borderless top-level windows.
+///
+/// iced/winit run the window as `decorations(false)` (no OS frame), and Win11
+/// only auto-rounds framed windows — so a borderless window comes out square.
+/// iced exposes no HWND, so we find our process's visible top-level windows via
+/// `EnumWindows` and set `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`. Called
+/// once per window `Opened` event (event-driven; no polling). Raw FFI to keep
+/// the dependency surface unchanged.
+#[cfg(target_os = "windows")]
+mod winround {
+    use std::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, l: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: Hwnd) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(hwnd: Hwnd, attr: u32, val: *const c_void, sz: u32) -> i32;
+    }
+
+    extern "system" fn enum_cb(hwnd: Hwnd, _l: isize) -> i32 {
+        unsafe {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() && IsWindowVisible(hwnd) != 0 {
+                let pref: u32 = DWMWCP_ROUND;
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &pref as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+        1 // keep enumerating
+    }
+
+    /// Round every visible top-level window owned by this process. Idempotent.
+    pub fn round_our_windows() {
+        unsafe {
+            EnumWindows(enum_cb, 0);
+        }
     }
 }
 
@@ -1197,10 +1310,7 @@ fn subscription(_state: &State) -> Subscription<Message> {
     let geom = iced::window::events().map(|(id, ev)| match ev {
         iced::window::Event::Moved(p) => Message::WindowMoved(id, p),
         iced::window::Event::Resized(s) => Message::WindowResized(id, s),
-        iced::window::Event::Opened { position, size } => match position {
-            Some(p) => Message::WindowMoved(id, p),
-            None => Message::WindowResized(id, size),
-        },
+        iced::window::Event::Opened { position, size } => Message::WindowOpened(id, position, size),
         _ => Message::Noop,
     });
     Subscription::batch([tick, keys, closes, geom])
