@@ -650,11 +650,11 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // Brand: logo + animated wordmark. On Windows (no OS titlebar) it's a drag handle.
     let brand = row![
         svg(svg::Handle::from_memory(ARBITER_LOGO))
-            .width(Length::Fixed(26.0))
-            .height(Length::Fixed(26.0)),
+            .width(Length::Fixed(28.0))
+            .height(Length::Fixed(28.0)),
         arbiter_wordmark(),
     ]
-    .spacing(6)
+    .spacing(8)
     .align_y(iced::Center);
     #[cfg(target_os = "windows")]
     let brand = mouse_area(brand).on_press(Message::DragWindow);
@@ -778,10 +778,12 @@ fn main_view(state: &State) -> Element<'_, Message> {
 
     // Terminal area, inset from the window edges. The frame is transparent so the
     // glow flows into the spacing (the grid paints its own divider/pane colours).
+    // Matches the web `.terminal-workspace { padding: 0 6px 6px }` — no gap under
+    // the titlebar (terminals start flush below it), 6px on the other three sides.
     let framed = container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(6);
+        .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
 
     // App-wide chrome background carrying the top-left azure glow, so it's
     // continuous across the titlebar and the content spacing (no hard #222222 edge).
@@ -1340,10 +1342,13 @@ fn arbiter_wordmark() -> Element<'static, Message> {
     let phase = tri * tri * (3.0 - 2.0 * tri); // smoothstep (ease-in-out)
     const WORD: &str = "Arbiter";
     let n = WORD.chars().count() as f32;
-    let mut r = row![].align_y(iced::Center);
+    // Match the web `.titlebar-title`: DM Sans 700, 15px, letter-spacing 0.06em
+    // (≈0.9px at 15px → the per-letter row gap). Per-letter is required because
+    // iced can't gradient-fill a single text run.
+    let mut r = row![].spacing(0.9).align_y(iced::Center);
     for (i, ch) in WORD.chars().enumerate() {
         let col = azure_at(phase * 0.6 + (i as f32 / n) * 0.6);
-        r = r.push(text(ch.to_string()).size(15).color(col).font(ui_semibold()));
+        r = r.push(text(ch.to_string()).size(15).color(col).font(dmsans_bold()));
     }
     r.into()
 }
@@ -1887,6 +1892,9 @@ impl shader::Primitive for TermPrimitive {
 /// body text, DM Sans for the title/logo. Both are variable fonts (weight axis);
 /// cosmic-text selects the weight. Bundled under assets/ (SIL OFL).
 const INTER_FONT: &[u8] = include_bytes!("../../assets/Inter-VariableFont.ttf");
+/// DM Sans — the web's titlebar wordmark font (`.titlebar-title`, 700). Variable
+/// weight axis; cosmic-text selects the weight.
+const DMSANS_FONT: &[u8] = include_bytes!("../../assets/DMSans-VariableFont.ttf");
 /// 3KB subset of Noto Sans Symbols 2 (the `·✢✳✶✻✽` working-animation dingbats),
 /// renamed "ArbiterSymbols" — bundled so the ✻ is identical on macOS + Windows.
 const ARBITER_SYMBOLS_FONT: &[u8] = include_bytes!("../../assets/ArbiterSymbols.ttf");
@@ -1897,10 +1905,15 @@ fn ui_font() -> iced::Font {
 }
 
 /// Inter SemiBold — for the overview's "ARBITER" header (the web's `.overview-title`
-/// is Inter 600, uppercase). The web only used DM Sans for the in-app titlebar
-/// wordmark, which the native (OS titlebar) doesn't have, so Inter is used here.
+/// is Inter 600, uppercase).
 fn ui_semibold() -> iced::Font {
     iced::Font { weight: iced::font::Weight::Semibold, ..iced::Font::with_name("Inter") }
+}
+
+/// DM Sans Bold (700) — the titlebar "Arbiter" wordmark, matching the web's
+/// `.titlebar-title { font-family: 'DM Sans'; font-weight: 700 }`.
+fn dmsans_bold() -> iced::Font {
+    iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::with_name("DM Sans") }
 }
 
 fn main() -> iced::Result {
@@ -1936,6 +1949,7 @@ fn main() -> iced::Result {
         .subscription(subscription)
         .theme(|s: &State, _id| s.theme.clone())
         .font(INTER_FONT)
+        .font(DMSANS_FONT)
         .font(ARBITER_SYMBOLS_FONT)
         .default_font(ui_font())
         .run_with(move || {
