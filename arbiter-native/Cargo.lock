@@ -153,6 +153,7 @@ dependencies = [
  "notify-debouncer-mini",
  "pollster",
  "portable-pty",
+ "serde",
  "serde_json",
  "swash",
  "sysinfo",
