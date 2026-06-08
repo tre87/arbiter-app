@@ -1181,9 +1181,18 @@ mod winround {
 
 /// Interactive edge/corner resize for the borderless Windows window. winit/iced
 /// give a decorations-off window no resize hit-zones, so we drive the OS's own
-/// modal resize loop directly: `ReleaseCapture()` then post a non-client
-/// button-down (`WM_NCLBUTTONDOWN`) with the edge's `HT*` code to the foreground
-/// window (the one whose edge was just clicked).
+/// modal resize loop directly: `ReleaseCapture()` then a non-client button-down
+/// (`WM_NCLBUTTONDOWN`) with the edge's `HT*` code to the foreground window (the
+/// one whose edge was just clicked).
+///
+/// We **POST** the message rather than SEND it. SendMessage would run the OS
+/// modal resize loop *synchronously, nested inside iced's `update()`* — iced is
+/// then mid-event (renderer/surface borrowed) and can't run its own
+/// resize-render path re-entrantly, so the GPU surface never repaints and the
+/// content visibly stretches until release. PostMessage returns immediately;
+/// iced finishes the event, and the modal loop runs in winit's *next* dispatch
+/// (fresh stack), where iced's per-`Resized` redraw (it emulates an `AboutToWait`
+/// after each resize on Windows) repaints every step — smooth resize.
 #[cfg(target_os = "windows")]
 mod winresize {
     use std::ffi::c_void;
@@ -1195,7 +1204,7 @@ mod winresize {
         fn GetForegroundWindow() -> Hwnd;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
         fn ReleaseCapture() -> i32;
-        fn SendMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize;
+        fn PostMessageW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -1215,7 +1224,7 @@ mod winresize {
                 return;
             }
             ReleaseCapture();
-            SendMessageW(hwnd, WM_NCLBUTTONDOWN, ht, 0);
+            PostMessageW(hwnd, WM_NCLBUTTONDOWN, ht, 0);
         }
     }
 }
