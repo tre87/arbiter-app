@@ -1184,14 +1184,30 @@ mod trafficlights {
         if app.is_null() {
             return;
         }
-        // Our main content window (the key/main window at startup).
-        let mut window: *mut AnyObject = msg_send![app, mainWindow];
-        if window.is_null() {
-            window = msg_send![app, keyWindow];
-        }
-        if window.is_null() {
+        // Enumerate ALL our windows — NOT `mainWindow`/`keyWindow`, which are nil
+        // while the app is inactive (e.g. launched unfocused), so the startup
+        // positioning would no-op until first click. The `windows` array is always
+        // available. Target our main window by its transparent titlebar (set via
+        // platform_specific.titlebar_transparent) — that skips the overview popout
+        // (a normal-titlebar window that shouldn't be inset).
+        let windows: *mut AnyObject = msg_send![app, windows];
+        if windows.is_null() {
             return;
         }
+        let count: usize = msg_send![windows, count];
+        for i in 0..count {
+            let window: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+            if window.is_null() {
+                continue;
+            }
+            let transparent: bool = msg_send![window, titlebarAppearsTransparent];
+            if transparent {
+                inset_window(window);
+            }
+        }
+    }
+
+    unsafe fn inset_window(window: *mut AnyObject) {
         // NSWindowButton: Close = 0, Miniaturize = 1, Zoom = 2.
         let close: *mut AnyObject = msg_send![window, standardWindowButton: 0usize];
         let mini: *mut AnyObject = msg_send![window, standardWindowButton: 1usize];
