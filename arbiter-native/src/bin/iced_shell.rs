@@ -294,6 +294,23 @@ fn node_to_saved(ws: &Workspace, node: &pane_grid::Node) -> persist::SavedNode {
     }
 }
 
+/// The leaf pane at one corner of the grid: at each split, descend into the half
+/// that owns this corner (`right` picks the right of a vertical split, `bottom`
+/// the bottom of a horizontal one). Used to round ONLY the grid's outer corners
+/// (a pane can own up to two of them, e.g. a full-height edge pane).
+fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::Pane {
+    match node {
+        pane_grid::Node::Split { axis, a, b, .. } => {
+            let pick_b = match axis {
+                pane_grid::Axis::Vertical => right,   // vertical divider: a=left, b=right
+                pane_grid::Axis::Horizontal => bottom, // horizontal divider: a=top, b=bottom
+            };
+            corner_pane(if pick_b { b } else { a }, right, bottom)
+        }
+        pane_grid::Node::Pane(p) => *p,
+    }
+}
+
 /// Window settings for the overview popout at a (saved) size + optional position.
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
@@ -742,7 +759,13 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let focus = state.active().focus;
     let font = &state.font;
     let has_git_bash = state.git_bash.is_some();
-    let grid = pane_grid::PaneGrid::new(&state.active().panes, |pane, data, _maximized| {
+    // The terminal area's four OUTER corners are rounded (web
+    // `.terminal-workspace-card` border-radius: 8px). Find the leaf pane owning
+    // each corner so only those round — never interior corners where panes meet.
+    let layout = state.active().panes.layout();
+    let (c_tl, c_tr) = (corner_pane(layout, false, false), corner_pane(layout, true, false));
+    let (c_bl, c_br) = (corner_pane(layout, false, true), corner_pane(layout, true, true));
+    let grid = pane_grid::PaneGrid::new(&state.active().panes, move |pane, data, _maximized| {
         let term = shader_widget(TermProgram {
             id: data.session.id(),
             pane,
@@ -754,13 +777,37 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .height(Length::Fill);
 
         let focused = pane == focus;
+        // Which of the grid's outer corners this pane owns → round those. The
+        // header covers the top corners, the footer the bottom, and the pane's own
+        // #121212 background must round to match so the glow shows through.
+        let pick = |yes: bool| if yes { 8.0_f32 } else { 0.0 };
+        let (rtl, rtr) = (pane == c_tl, pane == c_tr);
+        let (rbl, rbr) = (pane == c_bl, pane == c_br);
+        let header_round = iced::border::Radius {
+            top_left: pick(rtl),
+            top_right: pick(rtr),
+            bottom_right: 0.0,
+            bottom_left: 0.0,
+        };
+        let footer_round = iced::border::Radius {
+            top_left: 0.0,
+            top_right: 0.0,
+            bottom_right: pick(rbr),
+            bottom_left: pick(rbl),
+        };
+        let pane_round = iced::border::Radius {
+            top_left: pick(rtl),
+            top_right: pick(rtr),
+            bottom_right: pick(rbr),
+            bottom_left: pick(rbl),
+        };
         // Claude status indicator in the header while Claude runs in this pane.
         let status = data
             .session
             .claude_running()
             .then(|| pane_dot(true, data.session.claude_status().lifecycle, false));
-        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, status);
-        let content = column![header, term, footer_bar(&data.session)]
+        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, status, header_round);
+        let content = column![header, term, footer_bar(&data.session, footer_round)]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -771,8 +818,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
         let wrapped = container(body)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
+            .style(move |_t: &iced::Theme| container::Style {
                 background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+                border: iced::Border { radius: pane_round, ..Default::default() },
                 ..Default::default()
             });
         pane_grid::Content::new(wrapped)
@@ -802,6 +850,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .height(Length::Fill)
         .style(|_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+            // Round the whole grid's outer rect (radius 8) so the corner panes'
+            // rounded corners reveal the glow behind, not this divider colour.
+            border: iced::Border { radius: 8.0.into(), ..Default::default() },
             ..Default::default()
         });
 
@@ -1314,7 +1365,7 @@ mod winresize {
     }
 }
 
-fn footer_bar(session: &Session) -> Element<'static, Message> {
+fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static, Message> {
     let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
     let primary = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
     let blue = iced::Color::from_rgb8(0x56, 0x9c, 0xd6);
@@ -1410,7 +1461,14 @@ fn footer_bar(session: &Session) -> Element<'static, Message> {
             r = r.push(fs);
         }
     }
-    container(r).width(Length::Fill).padding([3, 8]).style(footer_style).into()
+    container(r)
+        .width(Length::Fill)
+        .padding([3, 8])
+        .style(move |t: &iced::Theme| container::Style {
+            border: iced::Border { radius: round, ..Default::default() },
+            ..footer_style(t)
+        })
+        .into()
 }
 
 // MDI icons (mdiPowershell / mdiBash) for the shell-switch button. The button
@@ -1605,6 +1663,7 @@ fn pane_header(
     has_git_bash: bool,
     pane: pane_grid::Pane,
     status: Option<Dot>,
+    round: iced::border::Radius,
 ) -> Element<'static, Message> {
     const SLOT: f32 = 26.0;
     let color = if focused {
@@ -1639,8 +1698,9 @@ fn pane_header(
     .align_y(iced::Center)
     .padding([2, 4]);
     container(header)
-        .style(|_t: &iced::Theme| container::Style {
+        .style(move |_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x16, 0x16, 0x16))),
+            border: iced::Border { radius: round, ..Default::default() },
             ..Default::default()
         })
         .into()
