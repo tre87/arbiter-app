@@ -151,6 +151,8 @@ dependencies = [
  "fontdb 0.18.0",
  "iced",
  "notify-debouncer-mini",
+ "objc2 0.5.2",
+ "objc2-foundation 0.2.2",
  "pollster",
  "portable-pty",
  "serde",

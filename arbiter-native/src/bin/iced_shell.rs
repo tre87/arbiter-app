@@ -90,11 +90,11 @@ struct State {
     /// between the maximize square and the restore (double-square) glyph.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     main_maximized: bool,
-    /// One-shot guard: apply the Windows rounded-corner attribute once the window
-    /// is actually up (first frame), since the main window's Opened event can fire
-    /// before our subscription is listening.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    corners_rounded: bool,
+    /// One-shot guard: apply platform window-chrome tweaks once the window is
+    /// actually up (first frame) — Win11 rounded corners on Windows, traffic-light
+    /// repositioning on macOS. The startup Opened event can fire before our
+    /// subscription is listening, so the first Tick is the reliable hook.
+    chrome_init: bool,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -360,13 +360,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 save_session(state);
             }
-            // Apply Win11 rounded corners once, on the first frame — by now the
-            // window's HWND exists (its startup Opened event may have fired before
-            // our subscription was even listening). The DWM attribute is persistent.
-            #[cfg(target_os = "windows")]
-            if !state.corners_rounded {
-                state.corners_rounded = true;
+            // Apply platform window-chrome once, on the first frame — by now the
+            // native window exists (its startup Opened event may have fired before
+            // our subscription was listening). Win11 corner attribute is persistent;
+            // macOS traffic lights also get re-applied on resize/focus below.
+            if !state.chrome_init {
+                state.chrome_init = true;
+                #[cfg(target_os = "windows")]
                 winround::round_our_windows();
+                #[cfg(target_os = "macos")]
+                trafficlights::position();
             }
         }
         Message::Input(bytes) => {
@@ -476,6 +479,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     save_session(state);
                 }
             }
+            // macOS resets the traffic-light buttons on resize — re-inset them.
+            #[cfg(target_os = "macos")]
+            if id == state.main_window {
+                trafficlights::position();
+            }
             // Maximize/restore always produces a resize — refresh the flag so the
             // Windows caption glyph swaps between maximize and restore. Catches
             // every path (button, double-click, Win+Up, snap).
@@ -504,6 +512,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::WindowFocusChanged(id, focused) => {
             if id == state.main_window {
                 state.main_focused = focused;
+                // macOS can reset the traffic-light buttons on focus changes.
+                #[cfg(target_os = "macos")]
+                if focused {
+                    trafficlights::position();
+                }
             }
         }
         #[cfg(target_os = "windows")]
@@ -1143,6 +1156,71 @@ mod winround {
     pub fn round_our_windows() {
         unsafe {
             EnumWindows(enum_cb, 0);
+        }
+    }
+}
+
+/// Reposition the macOS traffic lights to match the web (Tauri's
+/// `trafficLightPosition: { x: 14, y: 22 }`). iced/winit expose no API, so we
+/// reach the NSWindow via `NSApplication` and inset the standard buttons — the
+/// same algorithm tao uses. Must be re-applied after layout changes (resize /
+/// focus), since macOS resets the buttons. No-op until the window exists.
+#[cfg(target_os = "macos")]
+mod trafficlights {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    use objc2_foundation::NSRect;
+
+    // Web parity: Tauri `trafficLightPosition { x: 14, y: 22 }`.
+    const INSET_X: f64 = 14.0;
+    const INSET_Y: f64 = 22.0;
+
+    pub fn position() {
+        unsafe { position_inner() }
+    }
+
+    unsafe fn position_inner() {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        // Our main content window (the key/main window at startup).
+        let mut window: *mut AnyObject = msg_send![app, mainWindow];
+        if window.is_null() {
+            window = msg_send![app, keyWindow];
+        }
+        if window.is_null() {
+            return;
+        }
+        // NSWindowButton: Close = 0, Miniaturize = 1, Zoom = 2.
+        let close: *mut AnyObject = msg_send![window, standardWindowButton: 0usize];
+        let mini: *mut AnyObject = msg_send![window, standardWindowButton: 1usize];
+        let zoom: *mut AnyObject = msg_send![window, standardWindowButton: 2usize];
+        if close.is_null() || mini.is_null() || zoom.is_null() {
+            return;
+        }
+        // The titlebar container is two superviews above the close button.
+        let sv: *mut AnyObject = msg_send![close, superview];
+        if sv.is_null() {
+            return;
+        }
+        let titlebar: *mut AnyObject = msg_send![sv, superview];
+        if titlebar.is_null() {
+            return;
+        }
+        let close_rect: NSRect = msg_send![close, frame];
+        let win_rect: NSRect = msg_send![window, frame];
+        let tb_height = close_rect.size.height + INSET_Y;
+        let mut tb_rect: NSRect = msg_send![titlebar, frame];
+        tb_rect.size.height = tb_height;
+        tb_rect.origin.y = win_rect.size.height - tb_height;
+        let _: () = msg_send![titlebar, setFrame: tb_rect];
+
+        let mini_rect: NSRect = msg_send![mini, frame];
+        let space = mini_rect.origin.x - close_rect.origin.x;
+        for (i, btn) in [close, mini, zoom].into_iter().enumerate() {
+            let mut r: NSRect = msg_send![btn, frame];
+            r.origin.x = INSET_X + (i as f64) * space;
+            let _: () = msg_send![btn, setFrameOrigin: r.origin];
         }
     }
 }
@@ -2049,7 +2127,7 @@ fn main() -> iced::Result {
                 overview_pos,
                 main_focused: true,
                 main_maximized: false,
-                corners_rounded: false,
+                chrome_init: false,
             };
             (state, iced::Task::batch(tasks))
         })
