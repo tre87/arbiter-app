@@ -1861,8 +1861,16 @@ fn main() -> iced::Result {
                 // tends to restore the DWM rounded corners.
                 settings.platform_specific.undecorated_shadow = true;
             }
+            // Enforce a sane minimum so the window can never be stuck tiny (and so
+            // a future drag-resize can't shrink it past usability).
+            settings.min_size = Some(iced::Size::new(720.0, 480.0));
             if let Some(g) = main_geom {
-                settings.size = iced::Size::new(g.width, g.height);
+                // Reject a degenerate saved size (older builds could persist a
+                // minimized window's bogus dimensions, which opened it tiny) — keep
+                // the 1024x768 default instead.
+                if g.width >= 200.0 && g.height >= 150.0 {
+                    settings.size = iced::Size::new(g.width, g.height);
+                }
                 if let (Some(x), Some(y)) = (g.x, g.y) {
                     let p = iced::Point::new(x, y);
                     // Ignore a saved off-screen sentinel (older builds could persist
@@ -1890,6 +1898,7 @@ fn main() -> iced::Result {
             };
             let overview_size = overview_geom
                 .map(|g| iced::Size::new(g.width, g.height))
+                .filter(|s| s.width >= 200.0 && s.height >= 150.0)
                 .unwrap_or(iced::Size::new(720.0, 520.0));
             let overview_pos = overview_geom.and_then(point);
 
