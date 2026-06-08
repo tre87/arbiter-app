@@ -360,8 +360,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 save_session(state);
             }
-            // Round the window's corners once it's actually on screen (the Opened
-            // event can fire before the subscription is active at startup).
+            // Apply Win11 rounded corners once, on the first frame — by now the
+            // window's HWND exists (its startup Opened event may have fired before
+            // our subscription was even listening). The DWM attribute is persistent.
             #[cfg(target_os = "windows")]
             if !state.corners_rounded {
                 state.corners_rounded = true;
@@ -499,19 +500,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if known {
                 save_session(state);
             }
-            // The HWND now exists — give our borderless window Win11 rounded corners.
-            #[cfg(target_os = "windows")]
-            winround::round_our_windows();
         }
         Message::WindowFocusChanged(id, focused) => {
             if id == state.main_window {
                 state.main_focused = focused;
-                // Re-apply rounding on first focus too — covers the case where the
-                // window wasn't yet shown (so skippable) at the Opened event.
-                #[cfg(target_os = "windows")]
-                if focused {
-                    winround::round_our_windows();
-                }
             }
         }
         #[cfg(target_os = "windows")]
@@ -1097,12 +1089,13 @@ fn caption_button(glyph: (&str, f32, f32), msg: Message, close: bool, focused: b
 
 /// Force Windows 11 rounded corners on our borderless top-level windows.
 ///
-/// iced/winit run the window as `decorations(false)` (no OS frame), and Win11
-/// only auto-rounds framed windows — so a borderless window comes out square.
-/// iced exposes no HWND, so we find our process's visible top-level windows via
-/// `EnumWindows` and set `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`. Called
-/// once per window `Opened` event (event-driven; no polling). Raw FFI to keep
-/// the dependency surface unchanged.
+/// iced/winit run the window as `decorations(false)`, so Win11 doesn't auto-round
+/// it. iced exposes no HWND, so we find our process's top-level windows via
+/// `EnumWindows` and set `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND` — a
+/// persistent attribute, so a single call (on the first frame) is enough; DWM
+/// keeps it across maximize/restore. Raw FFI to keep the dependency surface
+/// unchanged. (Effect needs a real compositor — it shows on hardware but a VM
+/// with software DWM may stay square.)
 #[cfg(target_os = "windows")]
 mod winround {
     use std::ffi::c_void;
@@ -1111,19 +1104,10 @@ mod winround {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: u32 = 2;
 
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-
     #[link(name = "user32")]
     extern "system" {
         fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, l: isize) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
-        fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -1134,45 +1118,27 @@ mod winround {
         fn DwmSetWindowAttribute(hwnd: Hwnd, attr: u32, val: *const c_void, sz: u32) -> i32;
     }
 
-    fn debug() -> bool {
-        std::env::var_os("ARBITER_WINROUND_DEBUG").is_some()
-    }
-
     extern "system" fn enum_cb(hwnd: Hwnd, _l: isize) -> i32 {
         unsafe {
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            // Match by process only — NOT visibility: winit emits `Opened` before
-            // the window may be shown, so a visibility gate would skip our window
-            // and we'd never round it. Rounding any hidden helper window is a no-op.
+            // Match by process only (rounding a hidden helper window is a harmless
+            // no-op); don't gate on visibility — the window may not be shown yet.
             if pid == GetCurrentProcessId() {
                 let pref: u32 = DWMWCP_ROUND;
-                let hr = DwmSetWindowAttribute(
+                DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_WINDOW_CORNER_PREFERENCE,
                     &pref as *const u32 as *const c_void,
                     std::mem::size_of::<u32>() as u32,
                 );
-                if debug() {
-                    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
-                    GetWindowRect(hwnd, &mut r);
-                    eprintln!(
-                        "winround: hwnd={hwnd:p} size={}x{} DwmSetWindowAttribute(ROUND) hr={hr:#010x}",
-                        r.right - r.left,
-                        r.bottom - r.top,
-                    );
-                }
             }
         }
         1 // keep enumerating
     }
 
-    /// Round every top-level window owned by this process. Idempotent; safe to
-    /// call on each window Opened/Focused event.
+    /// Round every top-level window owned by this process. Idempotent.
     pub fn round_our_windows() {
-        if debug() {
-            eprintln!("winround: round_our_windows() (pid={})", unsafe { GetCurrentProcessId() });
-        }
         unsafe {
             EnumWindows(enum_cb, 0);
         }
