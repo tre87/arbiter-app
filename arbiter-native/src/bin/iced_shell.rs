@@ -82,6 +82,10 @@ struct State {
     main_pos: Option<iced::Point>,
     overview_size: iced::Size,
     overview_pos: Option<iced::Point>,
+    /// Whether the main window is focused — drives the Windows caption-button
+    /// glyph colour (white when active, dimmed when not), like native controls.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    main_focused: bool,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -138,6 +142,8 @@ enum Message {
     /// A window finished opening — seed its geometry and (Windows) round its
     /// corners now that the HWND exists.
     WindowOpened(iced::window::Id, Option<iced::Point>, iced::Size),
+    /// A window gained/lost focus — drives the Windows caption-button dimming.
+    WindowFocusChanged(iced::window::Id, bool),
     /// Custom titlebar (Windows, decorations off): drag the window + window controls.
     #[cfg(target_os = "windows")]
     DragWindow,
@@ -450,6 +456,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             #[cfg(target_os = "windows")]
             winround::round_our_windows();
         }
+        Message::WindowFocusChanged(id, focused) => {
+            if id == state.main_window {
+                state.main_focused = focused;
+                // Re-apply rounding on first focus too — covers the case where the
+                // window wasn't yet shown (so skippable) at the Opened event.
+                #[cfg(target_os = "windows")]
+                if focused {
+                    winround::round_our_windows();
+                }
+            }
+        }
         #[cfg(target_os = "windows")]
         Message::DragWindow => return iced::window::drag(state.main_window),
         #[cfg(target_os = "windows")]
@@ -620,11 +637,12 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // corner, with Win11 hover washes (red for close).
     #[cfg(target_os = "windows")]
     {
+        let f = state.main_focused;
         bar = bar.push(
             row![
-                caption_button(caption_glyph::MINIMIZE, Message::WinMinimize, false),
-                caption_button(caption_glyph::MAXIMIZE, Message::WinMaximizeToggle, false),
-                caption_button(caption_glyph::CLOSE, Message::WinClose, true),
+                caption_button(caption_glyph::MINIMIZE, Message::WinMinimize, false, f),
+                caption_button(caption_glyph::MAXIMIZE, Message::WinMaximizeToggle, false, f),
+                caption_button(caption_glyph::CLOSE, Message::WinClose, true, f),
             ]
             .spacing(0),
         );
@@ -906,35 +924,43 @@ fn winctl_style(close: bool) -> impl Fn(&iced::Theme, button::Status) -> button:
 // Win11 caption glyphs (Segoe Fluent Icons ChromeMinimize/Maximize/Close) are
 // trivial 1px geometry — reproduce them exactly as thin-stroked SVG so they
 // match pixel-for-pixel without depending on the system icon font: a centred
-// horizontal line, a plain square outline (no title-bar notch), and an X.
+// horizontal line, a plain square outline (no title-bar notch), and an X. Drawn
+// in a padded 0–12 viewBox so end-caps never clip. Each entry is
+// `(path, render_px, stroke_width)` — easy knobs to tune the on-screen size.
 #[cfg(target_os = "windows")]
 mod caption_glyph {
-    pub const MINIMIZE: &str = "M0.5,5 H9.5";
-    pub const MAXIMIZE: &str = "M0.5,0.5 H9.5 V9.5 H0.5 Z";
-    pub const CLOSE: &str = "M0.5,0.5 L9.5,9.5 M9.5,0.5 L0.5,9.5";
+    pub const MINIMIZE: (&str, f32, f32) = ("M1,6 H11", 12.0, 1.0);
+    pub const MAXIMIZE: (&str, f32, f32) = ("M1.5,1.5 H10.5 V10.5 H1.5 Z", 12.0, 1.15);
+    pub const CLOSE: (&str, f32, f32) = ("M1.5,1.5 L10.5,10.5 M10.5,1.5 L1.5,10.5", 12.0, 1.0);
 }
 
-/// A thin-stroked Win11 caption glyph (10×10 viewBox), stroked in `color`.
+/// A thin-stroked Win11 caption glyph (0–12 viewBox), stroked in `color`.
 #[cfg(target_os = "windows")]
-fn caption_icon(d: &str, color: iced::Color) -> Element<'static, Message> {
+fn caption_icon(d: &str, color: iced::Color, render: f32, stroke: f32) -> Element<'static, Message> {
     let b = |v: f32| (v * 255.0).round() as u8;
     let src = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="{d}" fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="1"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="{d}" fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="{stroke}"/></svg>"##,
         b(color.r), b(color.g), b(color.b),
     );
     svg(svg::Handle::from_memory(src.into_bytes()))
-        .width(Length::Fixed(10.0))
-        .height(Length::Fixed(10.0))
+        .width(Length::Fixed(render))
+        .height(Length::Fixed(render))
         .into()
 }
 
 /// A native-proportioned Windows caption button: a 46×40 hit-area (Win11 sizing)
-/// with a centred 10px glyph, square corners, hover wash via `winctl_style`.
+/// with a centred glyph, square corners, hover wash via `winctl_style`. The glyph
+/// is white when the window is focused and dimmed when it isn't, like native.
 #[cfg(target_os = "windows")]
-fn caption_button(d: &str, msg: Message, close: bool) -> Element<'static, Message> {
-    let color = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
+fn caption_button(glyph: (&str, f32, f32), msg: Message, close: bool, focused: bool) -> Element<'static, Message> {
+    let color = if focused {
+        iced::Color::from_rgb8(0xff, 0xff, 0xff)
+    } else {
+        iced::Color::from_rgb8(0x6e, 0x6e, 0x6e)
+    };
+    let (d, render, stroke) = glyph;
     button(
-        container(caption_icon(d, color))
+        container(caption_icon(d, color, render, stroke))
             .center_x(Length::Fill)
             .center_y(Length::Fill),
     )
@@ -966,7 +992,6 @@ mod winround {
     extern "system" {
         fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, l: isize) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
-        fn IsWindowVisible(hwnd: Hwnd) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -977,25 +1002,39 @@ mod winround {
         fn DwmSetWindowAttribute(hwnd: Hwnd, attr: u32, val: *const c_void, sz: u32) -> i32;
     }
 
+    fn debug() -> bool {
+        std::env::var_os("ARBITER_WINROUND_DEBUG").is_some()
+    }
+
     extern "system" fn enum_cb(hwnd: Hwnd, _l: isize) -> i32 {
         unsafe {
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid == GetCurrentProcessId() && IsWindowVisible(hwnd) != 0 {
+            // Match by process only — NOT visibility: winit emits `Opened` before
+            // the window may be shown, so a visibility gate would skip our window
+            // and we'd never round it. Rounding any hidden helper window is a no-op.
+            if pid == GetCurrentProcessId() {
                 let pref: u32 = DWMWCP_ROUND;
-                DwmSetWindowAttribute(
+                let hr = DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_WINDOW_CORNER_PREFERENCE,
                     &pref as *const u32 as *const c_void,
                     std::mem::size_of::<u32>() as u32,
                 );
+                if debug() {
+                    eprintln!("winround: hwnd={hwnd:p} DwmSetWindowAttribute(ROUND) hr={hr:#010x}");
+                }
             }
         }
         1 // keep enumerating
     }
 
-    /// Round every visible top-level window owned by this process. Idempotent.
+    /// Round every top-level window owned by this process. Idempotent; safe to
+    /// call on each window Opened/Focused event.
     pub fn round_our_windows() {
+        if debug() {
+            eprintln!("winround: round_our_windows() (pid={})", unsafe { GetCurrentProcessId() });
+        }
         unsafe {
             EnumWindows(enum_cb, 0);
         }
@@ -1311,6 +1350,8 @@ fn subscription(_state: &State) -> Subscription<Message> {
         iced::window::Event::Moved(p) => Message::WindowMoved(id, p),
         iced::window::Event::Resized(s) => Message::WindowResized(id, s),
         iced::window::Event::Opened { position, size } => Message::WindowOpened(id, position, size),
+        iced::window::Event::Focused => Message::WindowFocusChanged(id, true),
+        iced::window::Event::Unfocused => Message::WindowFocusChanged(id, false),
         _ => Message::Noop,
     });
     Subscription::batch([tick, keys, closes, geom])
@@ -1814,6 +1855,7 @@ fn main() -> iced::Result {
                 main_pos: main_geom.and_then(point),
                 overview_size,
                 overview_pos,
+                main_focused: true,
             };
             (state, iced::Task::batch(tasks))
         })
