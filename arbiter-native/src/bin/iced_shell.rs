@@ -86,6 +86,10 @@ struct State {
     /// glyph colour (white when active, dimmed when not), like native controls.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     main_focused: bool,
+    /// Whether the main window is maximized — swaps the Windows caption button
+    /// between the maximize square and the restore (double-square) glyph.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    main_maximized: bool,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -144,6 +148,9 @@ enum Message {
     WindowOpened(iced::window::Id, Option<iced::Point>, iced::Size),
     /// A window gained/lost focus — drives the Windows caption-button dimming.
     WindowFocusChanged(iced::window::Id, bool),
+    /// Result of querying the main window's maximized state (Windows caption glyph).
+    #[cfg(target_os = "windows")]
+    SetMaximized(bool),
     /// Custom titlebar (Windows, decorations off): drag the window + window controls.
     #[cfg(target_os = "windows")]
     DragWindow,
@@ -294,6 +301,16 @@ fn open_overview(size: iced::Size, pos: Option<iced::Point>) -> (iced::window::I
     (id, task)
 }
 
+/// Whether a window position looks like a real on-screen spot. Windows parks a
+/// minimized window's top-left at the documented sentinel `(-32000, -32000)`
+/// (and the OS only reveals the real spot via `GetWindowPlacement`, which iced
+/// doesn't surface). Persisting/restoring that sentinel left the window opening
+/// off-screen — visible only as a taskbar icon. Guard against it (and any other
+/// absurd coordinate) so we keep the last real position instead.
+fn on_screen_ish(p: iced::Point) -> bool {
+    p.x > -30000.0 && p.y > -30000.0 && p.x < 30000.0 && p.y < 30000.0
+}
+
 /// Build a `SavedWindow` from a tracked size + optional position.
 fn saved_window(size: iced::Size, pos: Option<iced::Point>) -> persist::SavedWindow {
     persist::SavedWindow {
@@ -414,37 +431,52 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::WindowMoved(id, p) => {
-            let known = id == state.main_window || state.overview_window == Some(id);
-            if id == state.main_window {
-                state.main_pos = Some(p);
-            } else if state.overview_window == Some(id) {
-                state.overview_pos = Some(p);
-            }
-            // Persist geometry as it changes, so it survives any exit path.
-            if known {
-                save_session(state);
+            // Ignore the minimized/off-screen sentinel so we don't persist (and
+            // later restore to) an invisible position. Keep the last real one.
+            if on_screen_ish(p) {
+                let known = id == state.main_window || state.overview_window == Some(id);
+                if id == state.main_window {
+                    state.main_pos = Some(p);
+                } else if state.overview_window == Some(id) {
+                    state.overview_pos = Some(p);
+                }
+                // Persist geometry as it changes, so it survives any exit path.
+                if known {
+                    save_session(state);
+                }
             }
         }
         Message::WindowResized(id, s) => {
-            let known = id == state.main_window || state.overview_window == Some(id);
-            if id == state.main_window {
-                state.main_size = s;
-            } else if state.overview_window == Some(id) {
-                state.overview_size = s;
+            // Skip the degenerate size a minimized window reports, so the saved
+            // (restored) size isn't clobbered.
+            if s.width >= 100.0 && s.height >= 100.0 {
+                let known = id == state.main_window || state.overview_window == Some(id);
+                if id == state.main_window {
+                    state.main_size = s;
+                } else if state.overview_window == Some(id) {
+                    state.overview_size = s;
+                }
+                if known {
+                    save_session(state);
+                }
             }
-            if known {
-                save_session(state);
+            // Maximize/restore always produces a resize — refresh the flag so the
+            // Windows caption glyph swaps between maximize and restore. Catches
+            // every path (button, double-click, Win+Up, snap).
+            #[cfg(target_os = "windows")]
+            if id == state.main_window {
+                return iced::window::get_maximized(state.main_window).map(Message::SetMaximized);
             }
         }
         Message::WindowOpened(id, pos, size) => {
             let known = id == state.main_window || state.overview_window == Some(id);
             if id == state.main_window {
-                if let Some(p) = pos {
+                if let Some(p) = pos.filter(|p| on_screen_ish(*p)) {
                     state.main_pos = Some(p);
                 }
                 state.main_size = size;
             } else if state.overview_window == Some(id) {
-                if let Some(p) = pos {
+                if let Some(p) = pos.filter(|p| on_screen_ish(*p)) {
                     state.overview_pos = Some(p);
                 }
                 state.overview_size = size;
@@ -472,7 +504,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         #[cfg(target_os = "windows")]
         Message::WinMinimize => return iced::window::minimize(state.main_window, true),
         #[cfg(target_os = "windows")]
-        Message::WinMaximizeToggle => return iced::window::toggle_maximize(state.main_window),
+        Message::WinMaximizeToggle => {
+            // Flip optimistically so the glyph swaps instantly; the resize-driven
+            // get_maximized query reconciles it.
+            state.main_maximized = !state.main_maximized;
+            return iced::window::toggle_maximize(state.main_window);
+        }
+        #[cfg(target_os = "windows")]
+        Message::SetMaximized(m) => {
+            state.main_maximized = m;
+        }
         #[cfg(target_os = "windows")]
         Message::WinClose => return iced::window::close(state.main_window),
         Message::JumpTo(ws, pane) => {
@@ -638,10 +679,15 @@ fn main_view(state: &State) -> Element<'_, Message> {
     #[cfg(target_os = "windows")]
     {
         let f = state.main_focused;
+        let mid = if state.main_maximized {
+            caption_glyph::RESTORE
+        } else {
+            caption_glyph::MAXIMIZE
+        };
         bar = bar.push(
             row![
                 caption_button(caption_glyph::MINIMIZE, Message::WinMinimize, false, f),
-                caption_button(caption_glyph::MAXIMIZE, Message::WinMaximizeToggle, false, f),
+                caption_button(mid, Message::WinMaximizeToggle, false, f),
                 caption_button(caption_glyph::CLOSE, Message::WinClose, true, f),
             ]
             .spacing(0),
@@ -931,6 +977,10 @@ fn winctl_style(close: bool) -> impl Fn(&iced::Theme, button::Status) -> button:
 mod caption_glyph {
     pub const MINIMIZE: (&str, f32, f32) = ("M1,6 H11", 12.0, 1.0);
     pub const MAXIMIZE: (&str, f32, f32) = ("M1.5,1.5 H10.5 V10.5 H1.5 Z", 12.0, 1.15);
+    // Restore (shown when maximized): a front square + the visible L of a square
+    // offset behind it, top-right — matches Segoe Fluent's ChromeRestore.
+    pub const RESTORE: (&str, f32, f32) =
+        ("M1.5,4 H8 V10.5 H1.5 Z M4,4 V1.5 H10.5 V8 H8", 12.0, 1.0);
     pub const CLOSE: (&str, f32, f32) = ("M1.5,1.5 L10.5,10.5 M10.5,1.5 L1.5,10.5", 12.0, 1.0);
 }
 
@@ -1856,6 +1906,7 @@ fn main() -> iced::Result {
                 overview_size,
                 overview_pos,
                 main_focused: true,
+                main_maximized: false,
             };
             (state, iced::Task::batch(tasks))
         })
