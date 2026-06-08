@@ -95,6 +95,11 @@ struct State {
     /// repositioning on macOS. The startup Opened event can fire before our
     /// subscription is listening, so the first Tick is the reliable hook.
     chrome_init: bool,
+    /// Display scale the logo was rasterized for, and the resulting handle. The
+    /// logo is rendered at the exact physical pixel size (1:1) so it stays crisp;
+    /// re-rendered when the scale changes (see [`render_logo`]).
+    logo_scale: f32,
+    logo: iced::widget::image::Handle,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -153,6 +158,8 @@ enum Message {
     WindowOpened(iced::window::Id, Option<iced::Point>, iced::Size),
     /// A window gained/lost focus — drives the Windows caption-button dimming.
     WindowFocusChanged(iced::window::Id, bool),
+    /// The main window's display scale (re-renders the logo at the exact pixel size).
+    ScaleChanged(f32),
     /// Result of querying the main window's maximized state (Windows caption glyph).
     #[cfg(target_os = "windows")]
     SetMaximized(bool),
@@ -484,12 +491,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if id == state.main_window {
                 trafficlights::position();
             }
-            // Maximize/restore always produces a resize — refresh the flag so the
-            // Windows caption glyph swaps between maximize and restore. Catches
-            // every path (button, double-click, Win+Up, snap).
-            #[cfg(target_os = "windows")]
             if id == state.main_window {
-                return iced::window::get_maximized(state.main_window).map(Message::SetMaximized);
+                // Re-check the display scale (the window may have moved to a
+                // different-DPI monitor) so the logo re-rasterizes 1:1.
+                let scale = iced::window::get_scale_factor(state.main_window).map(Message::ScaleChanged);
+                // Maximize/restore always produces a resize — refresh the caption
+                // glyph (maximize ↔ restore). Catches button/double-click/Win+Up/snap.
+                #[cfg(target_os = "windows")]
+                return iced::Task::batch([
+                    scale,
+                    iced::window::get_maximized(state.main_window).map(Message::SetMaximized),
+                ]);
+                #[cfg(not(target_os = "windows"))]
+                return scale;
             }
         }
         Message::WindowOpened(id, pos, size) => {
@@ -517,6 +531,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 if focused {
                     trafficlights::position();
                 }
+            }
+        }
+        Message::ScaleChanged(s) => {
+            // Re-rasterize the logo at the new exact physical size so it stays 1:1
+            // crisp (e.g. when the window moves to a display with a different DPI).
+            if s > 0.0 && (s - state.logo_scale).abs() > 0.01 {
+                state.logo_scale = s;
+                state.logo = render_logo((LOGO_LOGICAL * s).round() as u32);
             }
         }
         #[cfg(target_os = "windows")]
@@ -662,9 +684,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let mut bar = row![].spacing(6).align_y(iced::Center).height(Length::Fill);
     // Brand: logo + animated wordmark. On Windows (no OS titlebar) it's a drag handle.
     let brand = row![
-        iced::widget::image(iced::widget::image::Handle::from_bytes(ARBITER_LOGO_PNG))
-            .width(Length::Fixed(28.0))
-            .height(Length::Fixed(28.0))
+        iced::widget::image(state.logo.clone())
+            .width(Length::Fixed(LOGO_LOGICAL))
+            .height(Length::Fixed(LOGO_LOGICAL))
             .filter_method(iced::widget::image::FilterMethod::Linear),
         arbiter_wordmark(),
     ]
@@ -1404,10 +1426,39 @@ fn now_ms() -> u64 {
 }
 
 /// The Arbiter "A" mark (blue-gradient SVG, the web's assets/logo.svg).
-/// The Arbiter mark, pre-rasterized to a high-res PNG (see examples/rasterize_logo.rs)
-/// and drawn with linear filtering — iced nearest-samples SVGs, which pixelates the
-/// logo; a PNG downscales smoothly and stays crisp.
-const ARBITER_LOGO_PNG: &[u8] = include_bytes!("../../assets/logo.png");
+const ARBITER_LOGO_SVG: &[u8] = include_bytes!("../../assets/logo.svg");
+
+/// Rasterize the logo SVG to RGBA at an exact pixel size using resvg (the same
+/// engine iced uses internally). iced rasterizes its `svg` widget at `ceil(scale·
+/// size)` and then draws it with the NEAREST-neighbour sampler, so it only looks
+/// crisp when the raster exactly matches the on-screen pixels — otherwise it
+/// aliases ("pixelated"). By rendering at the window's exact physical pixel size
+/// and displaying it 1:1, there's no resampling at all: crisp + anti-aliased like
+/// the browser, regardless of iced's sampler. Re-render when the scale changes.
+fn render_logo(px: u32) -> iced::widget::image::Handle {
+    use resvg::{tiny_skia, usvg};
+    let px = px.max(1);
+    let tree = usvg::Tree::from_data(ARBITER_LOGO_SVG, &usvg::Options::default())
+        .expect("logo.svg parses");
+    let mut pm = tiny_skia::Pixmap::new(px, px).expect("pixmap");
+    let s = tree.size();
+    let scale = (px as f32 / s.width()).min(px as f32 / s.height());
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
+    // tiny_skia produces premultiplied RGBA; iced expects straight RGBA.
+    let mut rgba = pm.data().to_vec();
+    for p in rgba.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 {
+            p[0] = (p[0] as u32 * 255 / a) as u8;
+            p[1] = (p[1] as u32 * 255 / a) as u8;
+            p[2] = (p[2] as u32 * 255 / a) as u8;
+        }
+    }
+    iced::widget::image::Handle::from_rgba(px, px, rgba)
+}
+
+/// Logical size of the titlebar logo (web `.titlebar-logo` = 28px).
+const LOGO_LOGICAL: f32 = 28.0;
 
 /// Sample the titlebar azure gradient at `t` (wrapped to [0,1)) — the web's
 /// `title-shimmer` stops: baby→azure→deep→tropical→baby.
@@ -2136,6 +2187,8 @@ fn main() -> iced::Result {
             } else {
                 None
             };
+            // Learn the real display scale so the logo is rasterized 1:1 for it.
+            tasks.push(iced::window::get_scale_factor(main_id).map(Message::ScaleChanged));
 
             let state = State {
                 workspaces,
@@ -2152,6 +2205,10 @@ fn main() -> iced::Result {
                 main_focused: true,
                 main_maximized: false,
                 chrome_init: false,
+                // Render for a 2× display initially (the common Mac case); the
+                // startup get_scale_factor query corrects it for the real display.
+                logo_scale: 2.0,
+                logo: render_logo((LOGO_LOGICAL * 2.0).round() as u32),
             };
             (state, iced::Task::batch(tasks))
         })
