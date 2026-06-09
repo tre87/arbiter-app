@@ -1657,31 +1657,75 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
     pb.finish().unwrap()
 }
 
-/// A deterministic 64×64 avatar drawn from `seed`: a little robot-ish face whose
-/// colours come from the seed's hash, with rounded corners (the rest transparent).
-/// No network/asset — drawn with tiny-skia, then un-premultiplied (iced's image
-/// pipeline expects straight alpha, but tiny-skia outputs premultiplied).
-fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
-    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
-    // FNV-1a hash of the seed.
+/// Number of pre-rendered frames in the working-Claude avatar animation.
+const ANIM_FRAMES: u32 = 8;
+
+/// Linear interpolate between two RGB colours (t in 0..1).
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    (l(a.0, b.0), l(a.1, b.1), l(a.2, b.2))
+}
+
+/// A closed polygon path through `pts`.
+fn poly(pts: &[(f32, f32)]) -> tiny_skia::Path {
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(pts[0].0, pts[0].1);
+    for p in &pts[1..] {
+        pb.line_to(p.0, p.1);
+    }
+    pb.close();
+    pb.finish().unwrap()
+}
+
+/// A deterministic 64×64 robot avatar drawn from `seed`, at animation `frame`
+/// (0 = the neutral/static pose; higher frames bob + pulse the "thinking" LED).
+/// Every part — head shape, eye style/count, antenna, mouth, side bolts, and the
+/// background pattern — is selected from a distinct slice of the seed's hash, so
+/// branches differ in shape, not just colour. Rounded corners; the rest is
+/// transparent. tiny-skia outputs premultiplied RGBA, so it's un-premultiplied to
+/// match iced's straight-alpha expectation (same as `render_logo`).
+fn worktree_avatar(seed: &str, frame: u32) -> iced::widget::image::Handle {
+    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+    // FNV-1a hash, then carve feature selectors from different bit ranges.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in seed.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    let pick = |shift: u32, n: u64| ((h >> shift) % n) as usize;
     let hue = (h % 360) as f32;
-    let (br, bg, bb) = hsl_to_rgb(hue, 0.50, 0.26); // background (dark)
-    let (fr, fg, fb) = hsl_to_rgb((hue + 25.0) % 360.0, 0.55, 0.62); // head (light)
-    let (er, eg, eb) = hsl_to_rgb((hue + 180.0) % 360.0, 0.62, 0.62); // features (complementary)
+    let head_shape = pick(8, 4); // 0 square · 1 rounded · 2 pill · 3 hexagon
+    let eye_style = pick(16, 3); // 0 round · 1 square · 2 visor bar
+    let eye_count = [2usize, 2, 1, 3, 2][pick(24, 5)]; // mostly 2, sometimes 1 or 3
+    let antenna = pick(33, 4); // 0 none · 1 single · 2 twin · 3 dish
+    let mouth = pick(41, 4); // 0 line · 1 teeth · 2 dots · 3 smile
+    let bolts = pick(49, 3); // 0 none · 1 bolts · 2 ears
+    let bg_pat = pick(53, 4); // 0 solid · 1 rings · 2 frame · 3 corner dots
+
+    let bg = hsl_to_rgb(hue, 0.50, 0.26);
+    let bg_accent = hsl_to_rgb(hue, 0.45, 0.36);
+    let head = hsl_to_rgb((hue + 25.0) % 360.0, 0.52, 0.62);
+    let head_dark = hsl_to_rgb((hue + 25.0) % 360.0, 0.45, 0.46);
+    let eye_dim = hsl_to_rgb((hue + 185.0) % 360.0, 0.45, 0.42);
+    let eye_glow = hsl_to_rgb((hue + 185.0) % 360.0, 0.80, 0.70);
+
+    // Animation: vertical bob + "thinking" LED/eye pulse (both neutral at frame 0).
+    let tau = std::f32::consts::TAU;
+    let t = frame as f32 / ANIM_FRAMES as f32;
+    let oy = (t * tau).sin() * 2.0;
+    let glow = 0.55 + 0.45 * (t * tau).cos();
+    let eye = lerp_rgb(eye_dim, eye_glow, glow);
 
     const N: u32 = 64;
-    let mut pm = Pixmap::new(N, N).unwrap(); // transparent
+    let mut pm = Pixmap::new(N, N).unwrap();
     let mut paint = Paint::default();
     paint.anti_alias = true;
-    // Rounded-rect background (corners stay transparent → rounded avatar).
-    paint.set_color_rgba8(br, bg, bb, 255);
-    pm.fill_path(&rounded_rect(0.0, 0.0, 64.0, 64.0, 12.0), &paint, FillRule::Winding, Transform::identity(), None);
-
+    let id = Transform::identity();
+    let set = |paint: &mut Paint, c: (u8, u8, u8)| paint.set_color_rgba8(c.0, c.1, c.2, 255);
+    let fill = |pm: &mut Pixmap, paint: &Paint, path: &tiny_skia::Path| {
+        pm.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
+    };
     let rect = |pm: &mut Pixmap, paint: &Paint, x, y, w, hh| {
         if let Some(r) = Rect::from_xywh(x, y, w, hh) {
             pm.fill_path(&PathBuilder::from_rect(r), paint, FillRule::Winding, Transform::identity(), None);
@@ -1692,18 +1736,144 @@ fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
             pm.fill_path(&p, paint, FillRule::Winding, Transform::identity(), None);
         }
     };
-    // Head + antenna in the light colour.
-    paint.set_color_rgba8(fr, fg, fb, 255);
-    rect(&mut pm, &paint, 30.0, 7.0, 4.0, 9.0);
-    circle(&mut pm, &paint, 32.0, 7.0, 4.0);
-    rect(&mut pm, &paint, 14.0, 16.0, 36.0, 34.0);
-    // Eyes + mouth in the complementary colour.
-    paint.set_color_rgba8(er, eg, eb, 255);
-    circle(&mut pm, &paint, 24.0, 30.0, 4.5);
-    circle(&mut pm, &paint, 40.0, 30.0, 4.5);
-    rect(&mut pm, &paint, 23.0, 40.0, 18.0, 4.0);
 
-    // Un-premultiply (tiny-skia stores premultiplied RGBA; iced expects straight).
+    // 1. Rounded-rect background (corners stay transparent).
+    set(&mut paint, bg);
+    fill(&mut pm, &paint, &rounded_rect(0.0, 0.0, 64.0, 64.0, 12.0));
+
+    // 2. Background pattern (accent colour, mostly visible as a frame around the head).
+    set(&mut paint, bg_accent);
+    match bg_pat {
+        1 => {
+            if let Some(p) = PathBuilder::from_circle(32.0, 32.0, 27.0) {
+                pm.stroke_path(&p, &paint, &Stroke { width: 2.0, ..Default::default() }, id, None);
+            }
+        }
+        2 => {
+            rect(&mut pm, &paint, 6.0, 6.0, 52.0, 1.5);
+            rect(&mut pm, &paint, 6.0, 56.5, 52.0, 1.5);
+            rect(&mut pm, &paint, 6.0, 6.0, 1.5, 52.0);
+            rect(&mut pm, &paint, 56.5, 6.0, 1.5, 52.0);
+        }
+        3 => {
+            for (cx, cy) in [(11.0, 11.0), (53.0, 11.0), (11.0, 53.0), (53.0, 53.0)] {
+                circle(&mut pm, &paint, cx, cy, 2.5);
+            }
+        }
+        _ => {}
+    }
+
+    // 3. Antenna (light; tip is the pulsing eye colour).
+    set(&mut paint, head);
+    match antenna {
+        1 => {
+            rect(&mut pm, &paint, 30.5, 6.0 + oy, 3.0, 10.0);
+            set(&mut paint, eye);
+            circle(&mut pm, &paint, 32.0, 6.0 + oy, 3.5);
+            set(&mut paint, head);
+        }
+        2 => {
+            rect(&mut pm, &paint, 22.0, 7.0 + oy, 2.5, 9.0);
+            rect(&mut pm, &paint, 39.5, 7.0 + oy, 2.5, 9.0);
+            set(&mut paint, eye);
+            circle(&mut pm, &paint, 23.0, 7.5 + oy, 2.5);
+            circle(&mut pm, &paint, 41.0, 7.5 + oy, 2.5);
+            set(&mut paint, head);
+        }
+        3 => {
+            rect(&mut pm, &paint, 30.5, 9.0 + oy, 3.0, 7.0);
+            rect(&mut pm, &paint, 25.0, 6.0 + oy, 14.0, 3.5);
+        }
+        _ => {}
+    }
+
+    // 4. Side bolts / ears.
+    match bolts {
+        1 => {
+            set(&mut paint, eye);
+            circle(&mut pm, &paint, 12.0, 33.0 + oy, 3.0);
+            circle(&mut pm, &paint, 52.0, 33.0 + oy, 3.0);
+        }
+        2 => {
+            set(&mut paint, head_dark);
+            rect(&mut pm, &paint, 9.0, 28.0 + oy, 4.0, 12.0);
+            rect(&mut pm, &paint, 51.0, 28.0 + oy, 4.0, 12.0);
+        }
+        _ => {}
+    }
+
+    // 5. Head.
+    set(&mut paint, head);
+    let (hx, hy, hw, hh) = (14.0, 16.0 + oy, 36.0, 34.0);
+    match head_shape {
+        0 => rect(&mut pm, &paint, hx, hy, hw, hh),
+        1 => fill(&mut pm, &paint, &rounded_rect(hx, hy, hw, hh, 8.0)),
+        2 => fill(&mut pm, &paint, &rounded_rect(hx, hy, hw, hh, 16.0)),
+        _ => {
+            let midy = hy + hh / 2.0;
+            fill(
+                &mut pm,
+                &paint,
+                &poly(&[
+                    (hx, midy),
+                    (hx + 9.0, hy),
+                    (hx + hw - 9.0, hy),
+                    (hx + hw, midy),
+                    (hx + hw - 9.0, hy + hh),
+                    (hx + 9.0, hy + hh),
+                ]),
+            );
+        }
+    }
+
+    // 6. Eyes.
+    set(&mut paint, eye);
+    let ey = 31.0 + oy;
+    if eye_style == 2 {
+        fill(&mut pm, &paint, &rounded_rect(20.0, ey - 4.0, 24.0, 8.0, 3.5));
+    } else {
+        let xs: &[f32] = match eye_count {
+            1 => &[32.0],
+            3 => &[22.0, 32.0, 42.0],
+            _ => &[25.0, 39.0],
+        };
+        let r = if eye_count == 3 { 3.4 } else { 4.6 };
+        for &ex in xs {
+            if eye_style == 1 {
+                rect(&mut pm, &paint, ex - r, ey - r, r * 2.0, r * 2.0);
+            } else {
+                circle(&mut pm, &paint, ex, ey, r);
+            }
+        }
+    }
+
+    // 7. Mouth.
+    let my = 41.0 + oy;
+    match mouth {
+        0 => rect(&mut pm, &paint, 24.0, my, 16.0, 3.0),
+        1 => {
+            rect(&mut pm, &paint, 24.0, my - 1.0, 16.0, 5.0);
+            set(&mut paint, bg);
+            rect(&mut pm, &paint, 28.0, my - 1.0, 1.5, 5.0);
+            rect(&mut pm, &paint, 31.5, my - 1.0, 1.5, 5.0);
+            rect(&mut pm, &paint, 35.0, my - 1.0, 1.5, 5.0);
+        }
+        2 => {
+            for ex in [27.0, 32.0, 37.0] {
+                circle(&mut pm, &paint, ex, my + 1.5, 1.6);
+            }
+        }
+        _ => {
+            let mut pb = PathBuilder::new();
+            pb.move_to(25.0, my);
+            pb.quad_to(32.0, my + 5.0, 39.0, my);
+            if let Some(p) = pb.finish() {
+                pm.stroke_path(&p, &paint, &Stroke { width: 2.5, ..Default::default() }, id, None);
+            }
+        }
+    }
+
+    // Un-premultiply (tiny-skia premultiplied → iced straight alpha).
     let mut data = pm.data().to_vec();
     for px in data.chunks_exact_mut(4) {
         let a = px[3] as u32;
@@ -1716,17 +1886,20 @@ fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
     iced::widget::image::Handle::from_rgba(N, N, data)
 }
 
-/// Cached [`worktree_avatar`] — drawn once per unique seed.
-fn avatar_for(seed: &str) -> iced::widget::image::Handle {
-    static CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, iced::widget::image::Handle>>> =
-        std::sync::Mutex::new(None);
+/// Cached [`worktree_avatar`], keyed by (seed, frame) — each frame is drawn once
+/// and the GPU texture is reused as the working animation cycles through frames.
+fn avatar_for(seed: &str, frame: u32) -> iced::widget::image::Handle {
+    static CACHE: std::sync::Mutex<
+        Option<std::collections::HashMap<(String, u32), iced::widget::image::Handle>>,
+    > = std::sync::Mutex::new(None);
     let mut guard = CACHE.lock().unwrap();
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(h) = map.get(seed) {
+    let key = (seed.to_string(), frame);
+    if let Some(h) = map.get(&key) {
         return h.clone();
     }
-    let handle = worktree_avatar(seed);
-    map.insert(seed.to_string(), handle.clone());
+    let handle = worktree_avatar(seed, frame);
+    map.insert(key, handle.clone());
     handle
 }
 
@@ -1847,8 +2020,14 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
         }
 
         // Card body: a deterministic avatar (left, vertically centred) + the info
-        // column. Avatar dims for merged worktrees to match their greyed treatment.
-        let avatar = iced::widget::image(avatar_for(&avatar_seed(&w.branch, w.avatar_salt)))
+        // column. It animates while a Claude here is working, and dims for merged
+        // worktrees to match their greyed treatment.
+        let frame = if wc.working > 0 {
+            ((now_ms() / 110) % ANIM_FRAMES as u64) as u32
+        } else {
+            0
+        };
+        let avatar = iced::widget::image(avatar_for(&avatar_seed(&w.branch, w.avatar_salt), frame))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
             .opacity(if w.merged { 0.45 } else { 1.0 })
@@ -3690,10 +3869,14 @@ mod tests {
 
     #[test]
     fn worktree_avatar_draws_without_panic() {
-        // Exercises the tiny-skia draw + RGBA handoff (the GUI smoke test starts
-        // with no project, so this path is otherwise unexercised).
-        let _ = worktree_avatar("swift-otter");
-        let _ = worktree_avatar(""); // empty seed must not panic
+        // Exercises every feature branch + each animation frame (the GUI smoke test
+        // starts with no project, so this path is otherwise unexercised). A handful
+        // of varied seeds covers the different head/eye/antenna/mouth selectors.
+        for seed in ["swift-otter", "brave-fox", "lucky-koala", "main", "", "a"] {
+            for frame in 0..super::ANIM_FRAMES {
+                let _ = worktree_avatar(seed, frame);
+            }
+        }
         // HSL endpoints map into range.
         assert_eq!(hsl_to_rgb(0.0, 0.0, 0.0), (0, 0, 0));
         assert_eq!(hsl_to_rgb(0.0, 0.0, 1.0), (255, 255, 255));
