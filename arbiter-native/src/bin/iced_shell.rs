@@ -52,7 +52,6 @@ struct Workspace {
 }
 
 /// A project workspace: a git repo, its worktrees, and the file-explorer state.
-#[allow(dead_code)] // fields consumed by phases 3–5 (layout, switching, sidebars)
 struct Project {
     root: String,
     active: usize,
@@ -62,7 +61,6 @@ struct Project {
 
 /// One worktree of a project. The ACTIVE worktree's pane grid lives in
 /// `Workspace.panes` (so `stash` is None); inactive worktrees keep theirs here.
-#[allow(dead_code)] // fields consumed by phases 3–5
 struct Worktree {
     branch: String,
     path: String,
@@ -261,6 +259,10 @@ enum Message {
     SwitchWorktree(usize),
     /// Expand/collapse a directory in the file explorer.
     ExplorerToggle(String),
+    /// Add a worktree to the active project (random branch off the current one).
+    NewWorktree,
+    /// Remove worktree `i` from the active project (git worktree remove --force).
+    RemoveWorktree(usize),
     SwitchShell(pane_grid::Pane),
     ShiftEnter,
     /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
@@ -642,6 +644,67 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         let children = read_dir_entries(&path);
                         p.explorer.entries.insert(path, children);
                     }
+                }
+            }
+        }
+        Message::NewWorktree => {
+            let ws = state.active_mut();
+            let Some((root, base)) = ws.project.as_ref().map(|p| {
+                (p.root.clone(), p.worktrees.get(p.active).map(|w| w.branch.clone()))
+            }) else {
+                return iced::Task::none();
+            };
+            let name = random_worktree_name();
+            match arbiter_native::git::worktree_add(&root, &name, base.as_deref()) {
+                Ok(info) => {
+                    // Build + activate the new worktree (stash the current active one).
+                    let (ng, nf) = build_worktree_grid(&info.path);
+                    let og = std::mem::replace(&mut ws.panes, ng);
+                    let of = std::mem::replace(&mut ws.focus, nf);
+                    if let Some(p) = ws.project.as_mut() {
+                        let old = p.active;
+                        p.worktrees[old].stash = Some((og, of));
+                        p.worktrees.push(Worktree {
+                            branch: info.branch.unwrap_or(name),
+                            path: info.path,
+                            stash: None,
+                            merged: false,
+                        });
+                        p.active = p.worktrees.len() - 1;
+                        p.explorer = Explorer::default();
+                        load_explorer(p);
+                    }
+                }
+                Err(e) => {
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Couldn't create worktree")
+                        .set_description(e)
+                        .show();
+                }
+            }
+        }
+        Message::RemoveWorktree(i) => {
+            let ws = state.active_mut();
+            let Some(p) = ws.project.as_mut() else { return iced::Task::none() };
+            if i == 0 || i == p.active || i >= p.worktrees.len() {
+                return iced::Task::none(); // never the main or the active worktree
+            }
+            let root = p.root.clone();
+            let path = p.worktrees[i].path.clone();
+            match arbiter_native::git::worktree_remove(&root, &path, true) {
+                Ok(()) => {
+                    p.worktrees.remove(i); // drops its stashed grid → sessions close
+                    if p.active > i {
+                        p.active -= 1;
+                    }
+                }
+                Err(e) => {
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Couldn't remove worktree")
+                        .set_description(e)
+                        .show();
                 }
             }
         }
@@ -1036,40 +1099,135 @@ fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
     .into()
 }
 
-/// Right sidebar: the worktree list. Phase 3 = clickable cards (branch + active
-/// highlight) to switch worktrees; phase 5 adds status/stats/context menu/new.
-fn worktree_sidebar(project: &Project) -> Element<'static, Message> {
+/// The "Claude" pane's session within a worktree grid (the 80% top pane), if any.
+fn worktree_claude(grid: &pane_grid::State<PaneData>) -> Option<&Session> {
+    grid.iter().find(|(_, d)| d.name == "Claude").map(|(_, d)| &d.session)
+}
+
+/// A random `adjective-noun` worktree branch name (web WorktreeNewDialog), seeded
+/// off the clock (no rand dep).
+fn random_worktree_name() -> String {
+    const ADJ: &[&str] = &[
+        "swift", "brave", "clever", "witty", "lucky", "mighty", "silent", "bold", "eager", "jolly",
+        "nimble", "quirky", "sunny", "wild", "cosmic", "frosty", "golden", "lunar", "misty", "zesty",
+    ];
+    const NOUN: &[&str] = &[
+        "otter", "falcon", "panda", "tiger", "wolf", "fox", "lynx", "hawk", "badger", "cobra",
+        "dragon", "eagle", "gecko", "koala", "narwhal", "octopus", "penguin", "raven", "shark", "whale",
+    ];
+    let t = now_ms() as usize;
+    format!("{}-{}", ADJ[t % ADJ.len()], NOUN[(t / 7) % NOUN.len()])
+}
+
+/// Right sidebar: worktree cards with Claude stats (status / model / context),
+/// a "+" to add a worktree, and "×" to remove a non-main one. Click → switch.
+fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
+    let project = ws.project.as_ref().expect("worktree_sidebar called on a project workspace");
     let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
     let azure = iced::Color::from_rgb8(0x33, 0x99, 0xff);
-    let mut col = column![container(
-        text("WORKTREES").size(11).font(ui_semibold()).color(muted)
-    )
-    .padding([8, 10])]
-    .spacing(2)
-    .padding([0, 6]);
+    let orange = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
+    let purple = iced::Color::from_rgb8(0xa3, 0x71, 0xf7);
+
+    let header = row![
+        text("WORKTREES").size(11).font(ui_semibold()).color(muted),
+        horizontal_space(),
+        button(text("+").size(14).color(muted))
+            .padding([0, 6])
+            .on_press(Message::NewWorktree)
+            .style(button::text),
+    ]
+    .align_y(iced::Center)
+    .padding([8, 10]);
+
+    let mut col = column![header].spacing(2).padding([0, 6]);
     for (i, w) in project.worktrees.iter().enumerate() {
         let active = i == project.active;
-        let name = if w.merged { format!("{} (merged)", w.branch) } else { w.branch.clone() };
-        let color = if active { azure } else { muted };
-        let card = button(text(name).size(13).color(color))
-            .width(Length::Fill)
-            .padding([8, 10])
-            .on_press(Message::SwitchWorktree(i))
-            .style(move |_t: &iced::Theme, status| {
-                let hover = matches!(status, button::Status::Hovered);
-                let bg = if active {
-                    Some(iced::Background::Color(iced::Color::from_rgba8(0x56, 0x9c, 0xd6, 0.12)))
-                } else if hover {
-                    Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25)))
+        let sess: Option<&Session> = if active {
+            worktree_claude(&ws.panes)
+        } else {
+            w.stash.as_ref().and_then(|(g, _)| worktree_claude(g))
+        };
+        let running = sess.map(|s| s.claude_running()).unwrap_or(false);
+        let cs = sess.map(|s| s.claude_status());
+
+        // Status badge.
+        let (badge, bcolor) = if w.merged {
+            ("Merged".to_string(), purple)
+        } else if !running {
+            ("Terminal".to_string(), iced::Color::from_rgba8(0x6b, 0x7a, 0x8d, 0.7))
+        } else {
+            match cs.as_ref().map(|c| c.lifecycle) {
+                Some(arbiter_native::claude_status::Lifecycle::Working) => ("Working…".to_string(), azure),
+                Some(arbiter_native::claude_status::Lifecycle::Attention) => ("Needs attention".to_string(), orange),
+                _ => ("Idle".to_string(), muted),
+            }
+        };
+
+        let branch_color = if active { azure } else { iced::Color::from_rgb8(0x9c, 0x9c, 0x9c) };
+        let mut info = column![
+            text(w.branch.clone()).size(13).font(ui_semibold()).color(branch_color),
+            text(badge).size(11).color(bcolor),
+        ]
+        .spacing(2);
+
+        // Model + context (only when Claude has captured stats).
+        if let Some(c) = cs.as_ref().filter(|c| c.has_stats && running) {
+            if let Some(m) = &c.model {
+                info = info.push(text(m.clone()).size(11).color(model_color(m)));
+            }
+            if let Some(pct) = c.used_percent {
+                let p = (pct.round() as u16).min(100);
+                let fill = if pct > 80.0 {
+                    iced::Color::from_rgb8(0xef, 0x44, 0x44)
+                } else if pct > 60.0 {
+                    iced::Color::from_rgb8(0xf5, 0x9e, 0x0b)
                 } else {
-                    None
+                    iced::Color::from_rgb8(0x22, 0xc5, 0x5e)
                 };
-                button::Style {
-                    background: bg,
+                let ctx = c.context_size.map(fmt_ctx_size).unwrap_or_default();
+                info = info.push(
+                    text(format!("{p}% / {ctx}")).size(10).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)),
+                );
+                let bar = row![
+                    container(Space::new(Length::Fill, Length::Fixed(3.0)))
+                        .width(Length::FillPortion(p.max(1)))
+                        .style(move |_t: &iced::Theme| container::Style {
+                            background: Some(iced::Background::Color(fill)),
+                            ..Default::default()
+                        }),
+                    container(Space::new(Length::Fill, Length::Fixed(3.0)))
+                        .width(Length::FillPortion((100 - p).max(1)))
+                        .style(|_t: &iced::Theme| container::Style {
+                            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+                            ..Default::default()
+                        }),
+                ]
+                .height(Length::Fixed(3.0));
+                info = info.push(bar);
+            }
+        }
+
+        // Remove "×" for non-main, non-active worktrees.
+        let mut body = row![info.width(Length::Fill)].align_y(iced::Center);
+        if i != 0 && !active {
+            body = body.push(
+                button(text("×").size(14).color(muted))
+                    .padding([0, 4])
+                    .on_press(Message::RemoveWorktree(i))
+                    .style(button::text),
+            );
+        }
+        let card = mouse_area(
+            container(body).width(Length::Fill).padding([8, 10]).style(move |_t: &iced::Theme| {
+                container::Style {
+                    background: active
+                        .then(|| iced::Background::Color(iced::Color::from_rgba8(0x56, 0x9c, 0xd6, 0.12))),
                     border: iced::Border { radius: 6.0.into(), ..Default::default() },
                     ..Default::default()
                 }
-            });
+            }),
+        )
+        .on_press(Message::SwitchWorktree(i));
         col = col.push(card);
     }
     container(scrollable(col).width(Length::Fill).height(Length::Fill))
@@ -1272,7 +1430,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // just the grid; a project workspace is explorer | grid | worktrees (6px gaps,
     // matching the web `.project-workspace`).
     let inner: Element<Message> = match state.active().project.as_ref() {
-        Some(project) => row![explorer_sidebar(project), grid, worktree_sidebar(project)]
+        Some(project) => row![explorer_sidebar(project), grid, worktree_sidebar(state.active())]
             .spacing(6)
             .width(Length::Fill)
             .height(Length::Fill)
