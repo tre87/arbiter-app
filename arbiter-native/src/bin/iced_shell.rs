@@ -3064,9 +3064,12 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
             r = r.push(fs);
         }
     }
+    // Web `.terminal-footer`: 26px tall, 0 8px padding. `center_y` fixes the height
+    // AND vertically centres the content (matching the header's treatment).
     container(r)
         .width(Length::Fill)
-        .padding([3, 8])
+        .center_y(Length::Fixed(26.0))
+        .padding([0, 8])
         .style(move |t: &iced::Theme| container::Style {
             border: iced::Border { radius: round, ..Default::default() },
             ..footer_style(t)
@@ -3299,12 +3302,13 @@ fn pane_header(
         container(right).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
     ]
     .align_y(iced::Center)
-    .height(Length::Fill)
     .padding([0, 6]);
     // Web `.pane-toolbar`: 34px tall, #181818, 1px #2c2c2c bottom border (the
     // border is the `hline()` added below the header in the pane's content column).
+    // `center_y` fixes the height AND vertically centres the content.
     container(header)
-        .height(Length::Fixed(34.0))
+        .width(Length::Fill)
+        .center_y(Length::Fixed(34.0))
         .style(move |_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x18, 0x18, 0x18))),
             border: iced::Border { radius: round, ..Default::default() },
