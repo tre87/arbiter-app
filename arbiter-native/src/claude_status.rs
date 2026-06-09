@@ -49,6 +49,9 @@ pub struct ClaudeStatus {
 /// menu) and the watcher thread (hooks) never fight over a single field — each
 /// just stamps its latest event time.
 pub struct ClaudeHandle {
+    /// This pane's id (== `Session.id`), set as `PANE_ID_ENV` on its shell — the
+    /// primary key a capture binds by (exact, robust under load / shared cwds).
+    pub pane_id: u64,
     pub shell_pid: Option<u32>,
     pub cwd: Arc<Mutex<Option<String>>>,
     pub claude_running: Arc<AtomicBool>,
@@ -89,11 +92,13 @@ fn now_ms() -> u64 {
 
 impl ClaudeHandle {
     pub fn new(
+        pane_id: u64,
         shell_pid: Option<u32>,
         cwd: Arc<Mutex<Option<String>>>,
         claude_running: Arc<AtomicBool>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            pane_id,
             shell_pid,
             cwd,
             claude_running,
@@ -240,28 +245,13 @@ pub fn start_watcher() -> Option<Watcher> {
     Some(deb)
 }
 
-/// Compare two cwd strings for binding a capture to a pane. On Windows the two
-/// sources differ (the pane cwd round-trips through an OSC-7 `file://` URI;
-/// Claude reports `process.cwd()`), so normalise separators + case; elsewhere
-/// paths are case-sensitive and compared exactly.
-fn same_cwd(a: &str, b: &str) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
-        norm(a) == norm(b)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        a == b
-    }
-}
-
-/// Bind each pane to the NEWEST capture whose cwd matches (and where Claude is
-/// running), filling its stats + session id. Iterating PANES (not captures) and
-/// picking the newest by mtime is essential: a cwd accumulates one capture file
-/// per past session, and binding the last one in filesystem order would lock the
-/// footer onto a stale, frozen session (this is why it "worked" on a fresh macOS
-/// dir but not on a Windows dir with ~19 old sessions).
+/// Bind each pane to ITS capture by pane id: the capture file is named
+/// `<pane_id>.json` (the `PANE_ID_ENV` we set on the shell, which rides through
+/// to Claude's statusLine subcommand exactly like `CAPTURE_DIR` does). So a
+/// capture binds to the EXACT pane that launched Claude — correct even when
+/// several panes share a cwd or many launch at once. No cwd matching: cwd can't
+/// disambiguate same-folder panes, and a cwd fallback could briefly cross-bind a
+/// sibling's session during a launch race.
 fn process_captures(dir: &Path) {
     let handles = live_handles();
     let caps = crate::claude_shim::read_captures(dir);
@@ -270,19 +260,13 @@ fn process_captures(dir: &Path) {
         if !h.claude_running.load(Ordering::Relaxed) {
             continue;
         }
-        let Some(hcwd) = h.cwd.lock().unwrap().clone() else {
-            continue;
-        };
-        let Some(c) = caps
-            .iter()
-            .filter(|c| same_cwd(&hcwd, &c.cwd))
-            .max_by_key(|c| c.mtime)
-        else {
+        let pid = h.pane_id.to_string();
+        let Some(c) = caps.iter().find(|c| c.key == pid) else {
             continue;
         };
         crate::claude_shim::debug_log(&format!(
-            "process_captures: pane cwd={hcwd:?} -> session={} (newest of matches)",
-            c.session_id
+            "process_captures: pane {pid} -> capture key={} session={}",
+            c.key, c.session_id
         ));
         {
             // Bind the session id; flag a save only when it's NEWLY bound (not on

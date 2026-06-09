@@ -48,7 +48,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn spawn(cols: u16, rows: u16, cmd: CommandBuilder) -> std::io::Result<Self> {
+    pub fn spawn(cols: u16, rows: u16, mut cmd: CommandBuilder) -> std::io::Result<Self> {
+        // Unique pane id, tagged onto the shell env so the statusLine/hook
+        // subcommand (claude → our shim) keys its capture to THIS pane — robust
+        // when many Claudes launch at once or several share a cwd.
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        cmd.env(crate::claude_shim::PANE_ID_ENV, id.to_string());
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -70,7 +75,8 @@ impl Session {
         // Shared Claude status, updated by the capture/hook watcher (registered
         // here so it routes by cwd / session id) + the reader (spinner/menu →
         // activity/attention). Created before the reader so it gets a clone.
-        let claude = crate::claude_status::ClaudeHandle::new(shell_pid, cwd.clone(), claude_running.clone());
+        let claude =
+            crate::claude_status::ClaudeHandle::new(id, shell_pid, cwd.clone(), claude_running.clone());
         crate::claude_status::register(&claude);
 
         {
@@ -95,7 +101,7 @@ impl Session {
         }
 
         Ok(Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             writer,
             master: Arc::new(Mutex::new(pair.master)),
             term,
