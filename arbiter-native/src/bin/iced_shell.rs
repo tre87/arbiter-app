@@ -1447,10 +1447,10 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'stati
         } else {
             mdi_path::CHEVRON_RIGHT
         };
-        mdi(path, 14.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
+        mdi(path, 16.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
     } else {
         let (path, (r, g, b)) = file_icons::file_icon(&entry.name);
-        mdi(path, 14.0, iced::Color::from_rgb8(r, g, b))
+        mdi(path, 16.0, iced::Color::from_rgb8(r, g, b))
     };
     let content = row![
         Space::with_width(Length::Fixed(indent)),
