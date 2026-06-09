@@ -41,13 +41,15 @@ pub const CAPTURE_SUBDIR: &str = "claude-sessions";
 /// Subdir (under app-data) that holds per-session hook signal files.
 pub const HOOKS_SUBDIR: &str = "claude-hooks";
 
-/// Append a diagnostic line to `<temp>/arbiter-claude-debug.log`. TEMPORARY,
-/// always-on tracer for the Claude-stats footer: the statusLine/hook subcommands
-/// run as separate processes (spawned by Claude) whose stderr the user never
-/// sees and whose env may not carry a debug flag, so route diagnostics to a
-/// fixed temp file every process can find + append to. The temp dir is shared
-/// down the shell→claude→subcommand chain, so all steps land in one log.
+/// Append a diagnostic line to `<temp>/arbiter-claude-debug.log` when
+/// `ARBITER_CLAUDE_DEBUG` is set. Off by default (it would otherwise grow
+/// unbounded — the statusLine fires on every render). The temp dir is shared
+/// down the shell→claude→subcommand chain, so all steps land in one findable
+/// file even though the subcommands' stderr is invisible.
 pub fn debug_log(msg: &str) {
+    if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_none() {
+        return;
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -207,6 +209,9 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
 pub struct Capture {
     pub session_id: String,
     pub cwd: String,
+    /// The capture file's last-modified time — used to pick the LIVE session when
+    /// several stale captures share a cwd (the live one is written most recently).
+    pub mtime: std::time::SystemTime,
     pub model: Option<String>,
     pub context_size: Option<u64>,
     pub used_percent: Option<f64>,
@@ -232,6 +237,7 @@ pub fn parse_capture(bytes: &[u8]) -> Option<Capture> {
     Some(Capture {
         session_id,
         cwd,
+        mtime: std::time::SystemTime::UNIX_EPOCH, // filled in by read_captures
         model: v.pointer("/model/display_name").and_then(|m| m.as_str()).map(str::to_string),
         context_size: cw.and_then(|c| c.get("context_window_size")).and_then(|n| n.as_u64()),
         used_percent: cw.and_then(|c| c.get("used_percentage")).and_then(|n| n.as_f64()),
@@ -251,7 +257,11 @@ pub fn read_captures(dir: &Path) -> Vec<Capture> {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Ok(bytes) = std::fs::read(&p) {
-                    if let Some(c) = parse_capture(&bytes) {
+                    if let Some(mut c) = parse_capture(&bytes) {
+                        c.mtime = entry
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         out.push(c);
                     }
                 }
