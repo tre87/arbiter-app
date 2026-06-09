@@ -52,11 +52,34 @@ pub struct SavedWindow {
     pub y: Option<f32>,
 }
 
+/// One worktree of a saved project workspace: its branch, path, and split tree.
+#[derive(Serialize, Deserialize)]
+pub struct SavedWorktree {
+    pub branch: String,
+    pub path: String,
+    pub layout: SavedNode,
+}
+
+/// A saved project workspace (git repo + its worktrees + explorer state).
+#[derive(Serialize, Deserialize)]
+pub struct SavedProject {
+    pub root: String,
+    pub active: usize,
+    pub worktrees: Vec<SavedWorktree>,
+    #[serde(default)]
+    pub expanded: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SavedWorkspace {
     pub name: String,
     pub next_term: usize,
+    /// The active worktree's split tree (project) or the workspace's tree (terminal).
     pub layout: SavedNode,
+    /// Present → this is a project workspace; restore its sidebars + worktrees.
+    /// Defaulted so older save files (terminal-only) still load.
+    #[serde(default)]
+    pub project: Option<SavedProject>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,6 +151,7 @@ mod tests {
                             claude_session: None,
                         }),
                     },
+                    project: None,
                 },
                 SavedWorkspace {
                     name: "Workspace 2".into(),
@@ -139,6 +163,7 @@ mod tests {
                         claude_running: false,
                         claude_session: None,
                     },
+                    project: None,
                 },
             ],
         };
