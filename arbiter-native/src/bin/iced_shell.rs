@@ -67,6 +67,9 @@ struct Worktree {
     stash: Option<(pane_grid::State<PaneData>, pane_grid::Pane)>,
     /// Whether this worktree's branch has been merged into its parent (strikethrough).
     merged: bool,
+    /// Bumped by "New robot" to reroll the avatar; mixed into the avatar seed so a
+    /// new (still deterministic) face is drawn. Persisted so it survives restart.
+    avatar_salt: u32,
 }
 
 impl Workspace {
@@ -169,7 +172,7 @@ fn new_project(root: String, infos: Vec<arbiter_native::git::WorktreeInfo>) -> W
         } else {
             Some((grid, focus))
         };
-        worktrees.push(Worktree { branch, path: info.path.clone(), stash, merged: false });
+        worktrees.push(Worktree { branch, path: info.path.clone(), stash, merged: false, avatar_salt: 0 });
     }
     let (panes, focus) = active.expect("project has a main worktree");
     let name = std::path::Path::new(&root)
@@ -300,6 +303,8 @@ enum Message {
     WorktreeAskClaudeMerge(usize),
     /// Discard all uncommitted changes in worktree `i` (reset --hard + clean).
     WorktreeDiscard(usize),
+    /// Reroll worktree `i`'s avatar (bump its salt → a new deterministic robot).
+    RegenerateAvatar(usize),
     /// Remove worktree `i` from the active project (git worktree remove --force).
     RemoveWorktree(usize),
     SwitchShell(pane_grid::Pane),
@@ -453,7 +458,13 @@ fn restore_workspaces(
                     } else {
                         Some((grid, focus))
                     };
-                    worktrees.push(Worktree { branch: swt.branch, path: swt.path, stash, merged: false });
+                    worktrees.push(Worktree {
+                        branch: swt.branch,
+                        path: swt.path,
+                        stash,
+                        merged: false,
+                        avatar_salt: swt.avatar_salt,
+                    });
                 }
                 let Some((panes, focus)) = active else { continue };
                 let mut ws = Workspace {
@@ -607,6 +618,7 @@ fn save_session(state: &State) {
                                 branch: w.branch.clone(),
                                 path: w.path.clone(),
                                 layout: node_to_saved(grid, grid.layout()),
+                                avatar_salt: w.avatar_salt,
                             }
                         })
                         .collect(),
@@ -803,6 +815,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             path: info.path,
                             stash: None,
                             merged: false,
+                            avatar_salt: 0,
                         });
                         p.active = p.worktrees.len() - 1;
                         p.explorer = Explorer::default();
@@ -838,6 +851,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let feature_branch = feature.branch.clone();
             let main_path = main.path.clone();
             let main_branch = main.branch.clone();
+            if !confirm(
+                "Merge worktree?",
+                &format!("Merge '{feature_branch}' into '{main_branch}'? The worktree is kept (marked merged)."),
+            ) {
+                return iced::Task::none();
+            }
             match arbiter_native::git::merge_branch(&main_path, &feature_branch) {
                 Ok(_) => {
                     // Web parity: a plain merge keeps the worktree but marks it
@@ -880,6 +899,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let main_path = main.path.clone();
             let feature_path = feature.path.clone();
             let root = p.root.clone();
+            if !confirm(
+                "Merge & delete worktree?",
+                &format!(
+                    "Merge '{feature_branch}' into '{main_branch}', then delete the worktree? Any \
+                     uncommitted changes in it will be lost.",
+                    main_branch = main.branch
+                ),
+            ) {
+                return iced::Task::none();
+            }
             // 1. Merge the feature branch into the main worktree's branch.
             if let Err(e) = arbiter_native::git::merge_branch(&main_path, &feature_branch) {
                 let _ = rfd::MessageDialog::new()
@@ -954,13 +983,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::WorktreeDiscard(i) => {
             state.worktree_menu = None;
-            let path = state
+            let info = state
                 .active()
                 .project
                 .as_ref()
                 .and_then(|p| p.worktrees.get(i))
-                .map(|w| w.path.clone());
-            if let Some(path) = path {
+                .map(|w| (w.path.clone(), w.branch.clone()));
+            if let Some((path, branch)) = info {
+                if !confirm(
+                    "Discard changes?",
+                    &format!("Discard ALL uncommitted changes in '{branch}'? This cannot be undone."),
+                ) {
+                    return iced::Task::none();
+                }
                 match arbiter_native::git::discard_changes(&path) {
                     Ok(()) => {
                         if let Some(p) = state.active_mut().project.as_mut() {
@@ -977,12 +1012,45 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::RegenerateAvatar(i) => {
+            state.worktree_menu = None;
+            if let Some(p) = state.active_mut().project.as_mut() {
+                if let Some(w) = p.worktrees.get_mut(i) {
+                    w.avatar_salt = w.avatar_salt.wrapping_add(1);
+                }
+            }
+            save_session(state);
+        }
         Message::RemoveWorktree(i) => {
             state.worktree_menu = None;
+            if i == 0 {
+                return iced::Task::none(); // never the main worktree
+            }
+            // Confirm (it discards any uncommitted changes; the branch is kept).
+            let branch = state
+                .active()
+                .project
+                .as_ref()
+                .and_then(|p| p.worktrees.get(i))
+                .map(|w| w.branch.clone());
+            let Some(branch) = branch else { return iced::Task::none() };
+            if !confirm(
+                "Delete worktree?",
+                &format!(
+                    "Delete the worktree for '{branch}'? Any uncommitted changes are lost; the \
+                     branch itself is kept (no merge)."
+                ),
+            ) {
+                return iced::Task::none();
+            }
+            // Can't remove the live worktree — switch to main first if it's active.
+            if state.active().project.as_ref().map(|p| p.active) == Some(i) {
+                activate_worktree(state.active_mut(), 0);
+            }
             let ws = state.active_mut();
             let Some(p) = ws.project.as_mut() else { return iced::Task::none() };
-            if i == 0 || i == p.active || i >= p.worktrees.len() {
-                return iced::Task::none(); // never the main or the active worktree
+            if i >= p.worktrees.len() {
+                return iced::Task::none();
             }
             let root = p.root.clone();
             let path = p.worktrees[i].path.clone();
@@ -999,8 +1067,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         .set_title("Couldn't remove worktree")
                         .set_description(e)
                         .show();
+                    return iced::Task::none();
                 }
             }
+            save_session(state); // the `ws`/`p` borrow has ended
         }
         Message::CloseWorkspace(i) => {
             if state.workspaces.len() > 1 && i < state.workspaces.len() {
@@ -1484,6 +1554,17 @@ fn worktree_claude(grid: &pane_grid::State<PaneData>) -> WorktreeClaude {
     wc
 }
 
+/// A blocking native Yes/No confirmation. Returns true only on "Yes".
+fn confirm(title: &str, body: &str) -> bool {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(title)
+        .set_description(body)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
+}
+
 /// Write `bytes` to the first pane in `grid` running a Claude that's accepting
 /// input (Ready or Attention — i.e. not mid-task), matching the web's gate.
 /// Returns false if there's no such pane (caller warns the user).
@@ -1551,10 +1632,35 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     (to(r1), to(g1), to(b1))
 }
 
-/// A deterministic 64×64 avatar drawn from `seed` (the branch name): a little
-/// robot-ish face whose colours come from the seed's hash. No network/asset —
-/// drawn with tiny-skia into an RGBA buffer (all pixels opaque, so tiny-skia's
-/// premultiplied output equals straight RGBA, which iced expects).
+/// The avatar cache key for a worktree: its branch, plus the reroll salt when set.
+fn avatar_seed(branch: &str, salt: u32) -> String {
+    if salt == 0 {
+        branch.to_string()
+    } else {
+        format!("{branch}#{salt}")
+    }
+}
+
+/// A rounded-rect path (x,y,w,h with corner radius r).
+fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.quad_to(x + w, y, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.quad_to(x + w, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.quad_to(x, y + h, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.quad_to(x, y, x + r, y);
+    pb.close();
+    pb.finish().unwrap()
+}
+
+/// A deterministic 64×64 avatar drawn from `seed`: a little robot-ish face whose
+/// colours come from the seed's hash, with rounded corners (the rest transparent).
+/// No network/asset — drawn with tiny-skia, then un-premultiplied (iced's image
+/// pipeline expects straight alpha, but tiny-skia outputs premultiplied).
 fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
     use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
     // FNV-1a hash of the seed.
@@ -1569,10 +1675,13 @@ fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
     let (er, eg, eb) = hsl_to_rgb((hue + 180.0) % 360.0, 0.62, 0.62); // features (complementary)
 
     const N: u32 = 64;
-    let mut pm = Pixmap::new(N, N).unwrap();
-    pm.fill(tiny_skia::Color::from_rgba8(br, bg, bb, 255));
+    let mut pm = Pixmap::new(N, N).unwrap(); // transparent
     let mut paint = Paint::default();
     paint.anti_alias = true;
+    // Rounded-rect background (corners stay transparent → rounded avatar).
+    paint.set_color_rgba8(br, bg, bb, 255);
+    pm.fill_path(&rounded_rect(0.0, 0.0, 64.0, 64.0, 12.0), &paint, FillRule::Winding, Transform::identity(), None);
+
     let rect = |pm: &mut Pixmap, paint: &Paint, x, y, w, hh| {
         if let Some(r) = Rect::from_xywh(x, y, w, hh) {
             pm.fill_path(&PathBuilder::from_rect(r), paint, FillRule::Winding, Transform::identity(), None);
@@ -1594,10 +1703,20 @@ fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
     circle(&mut pm, &paint, 40.0, 30.0, 4.5);
     rect(&mut pm, &paint, 23.0, 40.0, 18.0, 4.0);
 
-    iced::widget::image::Handle::from_rgba(N, N, pm.data().to_vec())
+    // Un-premultiply (tiny-skia stores premultiplied RGBA; iced expects straight).
+    let mut data = pm.data().to_vec();
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+            px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+            px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+    iced::widget::image::Handle::from_rgba(N, N, data)
 }
 
-/// Cached [`worktree_avatar`] — drawn once per unique branch name.
+/// Cached [`worktree_avatar`] — drawn once per unique seed.
 fn avatar_for(seed: &str) -> iced::widget::image::Handle {
     static CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, iced::widget::image::Handle>>> =
         std::sync::Mutex::new(None);
@@ -1727,16 +1846,14 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
             info = info.push(bar);
         }
 
-        // Card body: a deterministic avatar (left) + the info column. Avatar is
-        // dimmed for merged worktrees to match their greyed-out treatment.
-        let avatar = iced::widget::image(avatar_for(&w.branch))
+        // Card body: a deterministic avatar (left, vertically centred) + the info
+        // column. Avatar dims for merged worktrees to match their greyed treatment.
+        let avatar = iced::widget::image(avatar_for(&avatar_seed(&w.branch, w.avatar_salt)))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
             .opacity(if w.merged { 0.45 } else { 1.0 })
             .filter_method(iced::widget::image::FilterMethod::Linear);
-        let body = row![avatar, info.width(Length::Fill)]
-            .spacing(8)
-            .align_y(iced::alignment::Vertical::Top);
+        let body = row![avatar, info.width(Length::Fill)].spacing(8).align_y(iced::Center);
         let card = mouse_area(
             container(body).width(Length::Fill).padding([8, 10]).style(move |_t: &iced::Theme| {
                 container::Style {
@@ -1849,7 +1966,6 @@ fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
     let branch = wt.branch.clone();
     let main_branch = p.worktrees.first().map(|w| w.branch.clone()).unwrap_or_default();
     let is_main = i == 0;
-    let is_active = i == p.active;
 
     let item = |lbl: String, msg: Message, danger: bool| -> Element<'static, Message> {
         let color = if danger {
@@ -1884,8 +2000,9 @@ fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
             false,
         ));
     }
+    items = items.push(item("New robot".into(), Message::RegenerateAvatar(i), false));
     items = items.push(item("Discard changes".into(), Message::WorktreeDiscard(i), false));
-    if !is_main && !is_active {
+    if !is_main {
         items = items.push(item("Delete worktree".into(), Message::RemoveWorktree(i), true));
     }
 

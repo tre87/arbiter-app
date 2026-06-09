@@ -58,6 +58,9 @@ pub struct SavedWorktree {
     pub branch: String,
     pub path: String,
     pub layout: SavedNode,
+    /// Avatar reroll counter (see `Worktree::avatar_salt`); defaulted for back-compat.
+    #[serde(default)]
+    pub avatar_salt: u32,
 }
 
 /// A saved project workspace (git repo + its worktrees + explorer state).
