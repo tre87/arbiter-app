@@ -404,8 +404,15 @@ fn claude_monitor(
             last = *guard;
         }
         // A command started — scan for Claude, retrying through its exec delay.
+        crate::claude_shim::debug_log(&format!(
+            "claude_monitor: busy edge on shell_pid={shell_pid}, scanning"
+        ));
         for i in 0..8 {
-            if crate::claude::running_under(shell_pid) {
+            let found = crate::claude::running_under(shell_pid);
+            crate::claude_shim::debug_log(&format!(
+                "claude_monitor: scan {i} shell_pid={shell_pid} running_under={found}"
+            ));
+            if found {
                 claude_running.store(true, Ordering::Relaxed);
                 // Persist that Claude is now running here (even before a session
                 // binds), so a restore relaunches it.

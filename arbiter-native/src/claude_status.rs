@@ -261,23 +261,21 @@ fn same_cwd(a: &str, b: &str) -> bool {
 fn process_captures(dir: &Path) {
     let handles = live_handles();
     let caps = crate::claude_shim::read_captures(dir);
-    if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some() {
-        let panes: Vec<String> = handles
-            .iter()
-            .map(|h| {
-                format!(
-                    "(running={} cwd={:?})",
-                    h.claude_running.load(Ordering::Relaxed),
-                    h.cwd.lock().unwrap().clone()
-                )
-            })
-            .collect();
-        crate::claude_shim::debug_log(&format!(
-            "process_captures: {} capture(s); panes: {}",
-            caps.len(),
-            panes.join(" ")
-        ));
-    }
+    let panes: Vec<String> = handles
+        .iter()
+        .map(|h| {
+            format!(
+                "(running={} cwd={:?})",
+                h.claude_running.load(Ordering::Relaxed),
+                h.cwd.lock().unwrap().clone()
+            )
+        })
+        .collect();
+    crate::claude_shim::debug_log(&format!(
+        "process_captures: {} capture(s); panes: {}",
+        caps.len(),
+        panes.join(" ")
+    ));
     for c in caps {
         let matched = handles.iter().find(|h| {
             h.claude_running.load(Ordering::Relaxed)
