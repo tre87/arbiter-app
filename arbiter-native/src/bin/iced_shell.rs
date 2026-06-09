@@ -230,6 +230,8 @@ struct State {
     worktree_dialog: Option<WorktreeDialog>,
     /// The index of the worktree whose right-click context menu is open, if any.
     worktree_menu: Option<usize>,
+    /// Whether the "+" new-workspace dropdown (Terminal / Project) is open.
+    new_ws_menu: bool,
 }
 
 /// State of the "new worktree" modal: the branch name being typed, the chosen
@@ -275,6 +277,10 @@ enum Message {
     Close,
     Resized(pane_grid::ResizeEvent),
     NewWorkspace,
+    /// Toggle the "+" dropdown (choose Terminal vs Project workspace).
+    ToggleNewWsMenu,
+    /// Dismiss the "+" dropdown.
+    CloseNewWsMenu,
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -704,12 +710,20 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.active_mut().panes.resize(split, ratio);
         }
         Message::NewWorkspace => {
+            state.new_ws_menu = false;
             let n = state.workspaces.len() + 1;
             state.workspaces.push(Workspace::new(format!("Workspace {n}")));
             state.active = state.workspaces.len() - 1;
             save_session(state);
         }
+        Message::ToggleNewWsMenu => {
+            state.new_ws_menu = !state.new_ws_menu;
+        }
+        Message::CloseNewWsMenu => {
+            state.new_ws_menu = false;
+        }
         Message::NewProjectWorkspace => {
+            state.new_ws_menu = false;
             // Pick a folder off-thread (native dialog), then validate as a repo.
             return iced::Task::perform(
                 async {
@@ -2065,6 +2079,9 @@ const WT_NAME_INPUT: &str = "wt-name-input";
 /// The modal layer over the whole window, if a worktree dialog or context menu is
 /// open: the new-worktree form, or the right-click actions for a worktree.
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
+    if state.new_ws_menu {
+        return Some(new_ws_menu_view());
+    }
     if let Some(dlg) = &state.worktree_dialog {
         return Some(worktree_dialog_view(dlg));
     }
@@ -2194,6 +2211,236 @@ fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
     modal_scrim(modal_panel(panel.into()), Message::WorktreeMenuClose)
 }
 
+// ── Titlebar pieces (web parity: WorkspaceTabs.vue + StatsBar.vue + btn-icon) ──
+
+/// Translucent white at alpha `a` — the tab / "+" chrome uses white borders/fills.
+fn white_a(a: f32) -> iced::Color {
+    iced::Color::from_rgba8(0xff, 0xff, 0xff, a)
+}
+
+const TXT_SECONDARY: iced::Color = iced::Color { r: 0xa0 as f32 / 255.0, g: 0xaa as f32 / 255.0, b: 0xb8 as f32 / 255.0, a: 1.0 };
+const TXT_PRIMARY: iced::Color = iced::Color { r: 0xe8 as f32 / 255.0, g: 0xea as f32 / 255.0, b: 0xed as f32 / 255.0, a: 1.0 };
+const TXT_MUTED: iced::Color = iced::Color { r: 0x6b as f32 / 255.0, g: 0x7a as f32 / 255.0, b: 0x8d as f32 / 255.0, a: 1.0 };
+const AZURE: iced::Color = iced::Color { r: 0x33 as f32 / 255.0, g: 0x99 as f32 / 255.0, b: 0xff as f32 / 255.0, a: 1.0 };
+
+/// One workspace tab pill (web `.tab`): type icon + name + (×) close, 26px tall,
+/// translucent-white border, tinted bg when active. The close is a nested button
+/// (it captures its own clicks, so the tab's select fires only elsewhere).
+fn tab_pill(i: usize, ws: &Workspace, active: bool, show_close: bool) -> Element<'static, Message> {
+    let icon = if ws.project.is_some() { mdi_path::FOLDER } else { mdi_path::CONSOLE };
+    let mut content = row![mdi(icon, 12.0, TXT_MUTED), text(ws.name.clone()).size(12)]
+        .spacing(4)
+        .align_y(iced::Center)
+        .height(Length::Fixed(26.0));
+    if show_close {
+        content = content.push(
+            button(mdi(mdi_path::CLOSE, 12.0, TXT_MUTED))
+                .padding(2)
+                .on_press(Message::CloseWorkspace(i))
+                .style(|_t: &iced::Theme, s| button::Style {
+                    background: matches!(s, button::Status::Hovered)
+                        .then(|| iced::Background::Color(white_a(0.10))),
+                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    ..Default::default()
+                }),
+        );
+    }
+    button(content)
+        .padding([0, 6])
+        .on_press(Message::SelectWorkspace(i))
+        .style(move |_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered);
+            let (bg, bc, tc) = if active {
+                (Some(white_a(0.08)), white_a(0.14), TXT_PRIMARY)
+            } else if hovered {
+                (Some(white_a(0.04)), white_a(0.10), TXT_PRIMARY)
+            } else {
+                (None, white_a(0.05), TXT_SECONDARY)
+            };
+            button::Style {
+                background: bg.map(iced::Background::Color),
+                text_color: tc,
+                border: iced::Border { color: bc, width: 1.0, radius: 6.0.into() },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// The square "+" new-workspace button (web `.tab-add`).
+fn tab_add_button() -> Element<'static, Message> {
+    button(
+        container(text("+").size(16))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(26.0))
+    .height(Length::Fixed(26.0))
+    .padding(0)
+    .on_press(Message::ToggleNewWsMenu)
+    .style(|_t: &iced::Theme, s| {
+        let hovered = matches!(s, button::Status::Hovered);
+        let (bg, bc, tc) =
+            if hovered { (Some(white_a(0.04)), white_a(0.10), TXT_PRIMARY) } else { (None, white_a(0.05), TXT_SECONDARY) };
+        button::Style {
+            background: bg.map(iced::Background::Color),
+            text_color: tc,
+            border: iced::Border { color: bc, width: 1.0, radius: 6.0.into() },
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+/// A 1px translucent-white vertical divider (web `.stat` border-right).
+fn vsep() -> Element<'static, Message> {
+    container(Space::new(Length::Fixed(1.0), Length::Fixed(18.0)))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(white_a(0.18))),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// One usage meter (web `.stat`): label + 72×18 bar (track #121212, coloured fill,
+/// centred % text) + reset-time text.
+fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<'static, Message> {
+    let p = pct.min(100);
+    let bar_row: Element<Message> = row![
+        container(Space::new(Length::Fill, Length::Fill))
+            .width(Length::FillPortion(p.max(1)))
+            .height(Length::Fill)
+            .style(move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(fill)),
+                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                ..Default::default()
+            }),
+        Space::with_width(Length::FillPortion((100 - p).max(1))),
+    ]
+    .height(Length::Fill)
+    .into();
+    let pct_text: Element<Message> =
+        container(text(format!("{p}%")).size(10).font(ui_semibold()).color(iced::Color::WHITE))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+    let track = container(iced::widget::stack([bar_row, pct_text]))
+        .width(Length::Fixed(72.0))
+        .height(Length::Fixed(18.0))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            ..Default::default()
+        });
+    row![
+        text(label.to_string()).size(11).color(TXT_SECONDARY),
+        track,
+        text(reset.to_string()).size(11).color(TXT_SECONDARY),
+    ]
+    .spacing(5)
+    .align_y(iced::Center)
+    .into()
+}
+
+/// The usage refresh button (web `.refresh-btn`): a static "1:22" for now.
+fn refresh_btn() -> Element<'static, Message> {
+    button(
+        row![mdi(mdi_path::REFRESH, 12.0, TXT_MUTED), text("1:22").size(11).color(TXT_SECONDARY)]
+            .spacing(4)
+            .align_y(iced::Center),
+    )
+    .padding([5, 7])
+    .on_press(Message::Noop)
+    .style(|_t: &iced::Theme, s| button::Style {
+        background: None,
+        border: iced::Border {
+            color: if matches!(s, button::Status::Hovered) {
+                AZURE
+            } else {
+                iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)
+            },
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// A right-side action icon button (web `.btn-icon`): 16px icon, transparent until
+/// hover; `active` shows the azure-dim selected wash (used for the overview toggle).
+fn action_icon_btn(path: &'static str, msg: Message, active: bool) -> Element<'static, Message> {
+    let color = if active { AZURE } else { TXT_SECONDARY };
+    button(mdi(path, 16.0, color))
+        .padding([4, 6])
+        .on_press(msg)
+        .style(move |_t: &iced::Theme, s| {
+            let (bg, bc) = if active {
+                (Some(iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.15)), iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.35))
+            } else if matches!(s, button::Status::Hovered) {
+                (Some(iced::Color::from_rgb8(0x25, 0x25, 0x25)), iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))
+            } else {
+                (None, iced::Color::TRANSPARENT)
+            };
+            button::Style {
+                background: bg.map(iced::Background::Color),
+                border: iced::Border { color: bc, width: 1.0, radius: 6.0.into() },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// One item in the "+" dropdown (web `.new-menu-item`): icon + label, azure hover.
+fn new_ws_menu_item(icon: &'static str, label: &str, msg: Message) -> Element<'static, Message> {
+    button(
+        row![mdi(icon, 14.0, TXT_SECONDARY), text(label.to_string()).size(12)]
+            .spacing(8)
+            .align_y(iced::Center),
+    )
+    .width(Length::Fill)
+    .padding([6, 12])
+    .on_press(msg)
+    .style(|_t: &iced::Theme, s| {
+        let hovered = matches!(s, button::Status::Hovered);
+        button::Style {
+            background: hovered.then(|| iced::Background::Color(AZURE)),
+            text_color: if hovered { iced::Color::WHITE } else { TXT_SECONDARY },
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+/// The "+" dropdown overlay (web `.new-menu`): pick Terminal or Project workspace.
+/// Anchored below the titlebar near the tab area (iced can't read the +'s screen
+/// position, so the left inset is a fixed approximation).
+fn new_ws_menu_view() -> Element<'static, Message> {
+    let menu = container(
+        column![
+            new_ws_menu_item(mdi_path::CONSOLE, "Terminal Workspace", Message::NewWorkspace),
+            new_ws_menu_item(mdi_path::FOLDER, "Project Workspace", Message::NewProjectWorkspace),
+        ]
+        .spacing(0),
+    )
+    .width(Length::Fixed(180.0))
+    .padding([4, 0])
+    .style(|_t: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+        border: iced::Border {
+            color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    });
+    let anchored = container(mouse_area(menu).on_press(Message::Noop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding { top: 42.0, right: 0.0, bottom: 0.0, left: TITLEBAR_LEFT_PAD + 110.0 });
+    mouse_area(anchored).on_press(Message::CloseNewWsMenu).into()
+}
+
 fn main_view(state: &State) -> Element<'_, Message> {
     // Unified titlebar: Arbiter logo + animated wordmark, then workspace tabs
     // (left) + actions (right). On macOS this IS the window titlebar (content
@@ -2213,43 +2460,14 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let brand = mouse_area(brand).on_press(Message::DragWindow);
     bar = bar.push(brand);
     bar = bar.push(Space::with_width(Length::Fixed(12.0)));
+    // Workspace tabs (web `.tab` pills) + the "+" new-workspace button, gap 3.
+    let multi = state.workspaces.len() > 1;
+    let mut tabs = row![].spacing(3).align_y(iced::Center);
     for (i, ws) in state.workspaces.iter().enumerate() {
-        // Project workspaces get a folder glyph so they're distinct from terminal tabs.
-        let label: Element<Message> = if ws.project.is_some() {
-            row![
-                mdi(mdi_path::FOLDER, 13.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
-                text(ws.name.clone()).size(12),
-            ]
-            .spacing(5)
-            .align_y(iced::Center)
-            .into()
-        } else {
-            text(ws.name.clone()).size(12).into()
-        };
-        let mut b = button(label).on_press(Message::SelectWorkspace(i)).padding([3, 8]);
-        if i != state.active {
-            b = b.style(button::secondary);
-        }
-        // A close "×" per tab (hidden when only one workspace remains — can't close
-        // the last). Its own button captures the click, so the tab doesn't select.
-        if state.workspaces.len() > 1 {
-            let close = button(text("×").size(12).color(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)))
-                .padding([3, 5])
-                .on_press(Message::CloseWorkspace(i))
-                .style(button::text);
-            bar = bar.push(row![b, close].spacing(0).align_y(iced::Center));
-        } else {
-            bar = bar.push(b);
-        }
+        tabs = tabs.push(tab_pill(i, ws, i == state.active, multi));
     }
-    bar = bar.push(button(text("+").size(12)).on_press(Message::NewWorkspace).padding([3, 8]).style(button::secondary));
-    // New project workspace (folder + git worktrees).
-    bar = bar.push(
-        button(mdi(mdi_path::FOLDER, 14.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)))
-            .on_press(Message::NewProjectWorkspace)
-            .padding([3, 8])
-            .style(button::secondary),
-    );
+    tabs = tabs.push(tab_add_button());
+    bar = bar.push(tabs);
     // Flexible middle: a drag region on Windows (no OS titlebar); a plain spacer
     // on macOS (the OS handles dragging the transparent titlebar).
     #[cfg(target_os = "windows")]
@@ -2260,10 +2478,33 @@ fn main_view(state: &State) -> Element<'_, Message> {
     {
         bar = bar.push(horizontal_space());
     }
-    bar = bar.push(button(text("⊞ Overview").size(12)).on_press(Message::ToggleOverview).padding([3, 8]).style(button::secondary));
-    bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
-    bar = bar.push(button(text("Split ↓").size(12)).on_press(Message::SplitDown).padding([3, 8]).style(button::secondary));
-    bar = bar.push(button(text("Close").size(12)).on_press(Message::Close).style(button::secondary).padding([3, 8]));
+    // Usage meters + refresh (web StatsBar). Static values for now — wiring later.
+    let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
+    bar = bar.push(
+        row![
+            usage_stat("5h", 50, AZURE, "1h 41m"),
+            vsep(),
+            usage_stat("7d", 50, green, "1d 22h"),
+            vsep(),
+            refresh_btn(),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    );
+    // Action buttons (web btn-icon): overview (live), keyboard + settings (no-op
+    // for now), then the terminal split extras (right / down arrows).
+    bar = bar.push(
+        row![
+            action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()),
+            action_icon_btn(mdi_path::KEYBOARD, Message::Noop, false),
+            action_icon_btn(mdi_path::COG, Message::Noop, false),
+            action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
+            action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
+            action_icon_btn(mdi_path::CLOSE, Message::Close, false),
+        ]
+        .spacing(4)
+        .align_y(iced::Center),
+    );
     // Window controls (Windows only, no OS titlebar): native-proportioned caption
     // buttons (minimize / maximize / close), flush together at the top-right
     // corner, with Win11 hover washes (red for close).
@@ -2704,6 +2945,15 @@ mod mdi_path {
     // File-explorer expand/collapse chevrons (the ▸/▾ glyphs tofu in the UI font).
     pub const CHEVRON_RIGHT: &str = "M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z";
     pub const CHEVRON_DOWN: &str = "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z";
+    // Titlebar: tab type icon (terminal), tab close, new-workspace dropdown items,
+    // usage-bar refresh, and the right-side action buttons.
+    pub const CONSOLE: &str = "M20,19V7H4V19H20M20,3A2,2 0 0,1 22,5V19A2,2 0 0,1 20,21H4A2,2 0 0,1 2,19V5C2,3.89 2.9,3 4,3H20M13,17V15H18V17H13M9.58,13L5.57,9H8.4L11.7,12.3C12.09,12.69 12.09,13.33 11.7,13.72L8.42,17H5.59L9.58,13Z";
+    pub const CLOSE: &str = "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z";
+    pub const REFRESH: &str = "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z";
+    pub const VIEW_DASHBOARD: &str = "M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z";
+    pub const KEYBOARD: &str = "M4,5A2,2 0 0,0 2,7V17A2,2 0 0,0 4,19H20A2,2 0 0,0 22,17V7A2,2 0 0,0 20,5H4M4,7H20V17H4V7M5,8V10H7V8H5M8,8V10H10V8H8M11,8V10H13V8H11M14,8V10H16V8H14M17,8V10H19V8H17M5,11V13H7V11H5M8,11V13H10V11H8M11,11V13H13V11H11M14,11V13H16V11H14M17,11V13H19V11H17M8,14V16H16V14H8Z";
+    pub const COG: &str = "M12,8A4,4 0 0,1 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12A4,4 0 0,1 12,8M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10M10,22C9.75,22 9.54,21.82 9.5,21.58L9.13,18.93C8.5,18.68 7.96,18.34 7.44,17.94L4.95,18.95C4.73,19.03 4.46,18.95 4.34,18.73L2.34,15.27C2.21,15.05 2.27,14.78 2.46,14.63L4.57,12.97L4.5,12L4.57,11L2.46,9.37C2.27,9.22 2.21,8.95 2.34,8.73L4.34,5.27C4.46,5.05 4.73,4.96 4.95,5.05L7.44,6.05C7.96,5.66 8.5,5.32 9.13,5.07L9.5,2.42C9.54,2.18 9.75,2 10,2H14C14.25,2 14.46,2.18 14.5,2.42L14.87,5.07C15.5,5.32 16.04,5.66 16.56,6.05L19.05,5.05C19.27,4.96 19.54,5.05 19.66,5.27L21.66,8.73C21.79,8.95 21.73,9.22 21.54,9.37L19.43,11L19.5,12L19.43,13L21.54,14.63C21.73,14.78 21.79,15.05 21.66,15.27L19.66,18.73C19.54,18.95 19.27,19.04 19.05,18.95L16.56,17.95C16.04,18.34 15.5,18.68 14.87,18.93L14.5,21.58C14.46,21.82 14.25,22 14,22H10M11.25,4L10.88,6.61C9.68,6.86 8.62,7.5 7.85,8.39L5.44,7.35L4.69,8.65L6.8,10.2C6.4,11.37 6.4,12.64 6.8,13.8L4.68,15.36L5.43,16.66L7.86,15.62C8.63,16.5 9.68,17.14 10.87,17.38L11.24,20H12.76L13.13,17.39C14.32,17.14 15.37,16.5 16.14,15.62L18.57,16.66L19.32,15.36L17.2,13.81C17.6,12.64 17.6,11.37 17.2,10.2L19.31,8.65L18.56,7.35L16.15,8.39C15.38,7.5 14.32,6.86 13.12,6.62L12.75,4H11.25Z";
+    pub const ARROW_RIGHT: &str = "M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -3905,6 +4155,7 @@ fn main() -> iced::Result {
                 logo: render_logo((LOGO_LOGICAL * 2.0).round() as u32),
                 worktree_dialog: None,
                 worktree_menu: None,
+                new_ws_menu: false,
             };
             (state, iced::Task::batch(tasks))
         })
