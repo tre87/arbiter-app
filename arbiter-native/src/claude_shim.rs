@@ -33,6 +33,11 @@ pub const CAPTURE_DIR_ENV: &str = "ARBITER_CAPTURE_DIR";
 pub const ORIG_STATUSLINE_ENV: &str = "ARBITER_ORIG_STATUSLINE";
 /// Directory where the hook subcommand writes per-session attention/stop signals.
 pub const HOOKS_DIR_ENV: &str = "ARBITER_HOOKS_DIR";
+/// Unique-per-pane id set on each spawned shell. It rides through
+/// shell→claude→statusLine/hook subcommand, so a capture/hook can be keyed to the
+/// EXACT pane that launched Claude — robust under many simultaneous launches and
+/// when several panes share a cwd (cwd alone can't disambiguate).
+pub const PANE_ID_ENV: &str = "ARBITER_PANE_ID";
 
 /// Subdir (under app-data) that holds the shim `bin/` and generated settings.
 const SHIM_SUBDIR: &str = "claude-shim";
@@ -74,18 +79,23 @@ pub fn run_statusline_capture() {
     }
 
     let sid = extract_session_id(&buf);
+    // Key the capture by our pane id (so it binds to the EXACT pane that launched
+    // Claude — robust when several panes share a cwd / launch at once). Falls back
+    // to the session id when Claude wasn't launched in one of our shells.
+    let key = std::env::var(PANE_ID_ENV)
+        .ok()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        .or_else(|| sid.clone());
     debug_log(&format!(
-        "statusline: invoked session={:?} CAPTURE_DIR={:?} bytes={} cwd={:?}",
+        "statusline: invoked key={:?} session={:?} CAPTURE_DIR={:?} bytes={}",
+        key,
         sid,
         std::env::var(CAPTURE_DIR_ENV).ok(),
         buf.len(),
-        serde_json::from_slice::<serde_json::Value>(&buf)
-            .ok()
-            .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string)),
     ));
-    if let (Ok(dir), Some(session_id)) = (std::env::var(CAPTURE_DIR_ENV), sid) {
-        write_capture(Path::new(&dir), &session_id, &buf);
-        debug_log(&format!("statusline: wrote capture to {dir}/{session_id}.json"));
+    if let (Ok(dir), Some(key)) = (std::env::var(CAPTURE_DIR_ENV), key) {
+        write_capture(Path::new(&dir), &key, &buf);
+        debug_log(&format!("statusline: wrote capture to {dir}/{key}.json"));
     }
 
     if let Ok(orig) = std::env::var(ORIG_STATUSLINE_ENV) {
@@ -209,8 +219,12 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
 pub struct Capture {
     pub session_id: String,
     pub cwd: String,
-    /// The capture file's last-modified time — used to pick the LIVE session when
-    /// several stale captures share a cwd (the live one is written most recently).
+    /// The capture file's stem — the pane id (`PANE_ID_ENV`) when Claude ran in one
+    /// of our shells, so a capture binds to the exact pane; else the session id
+    /// (legacy / Claude launched outside our shell). The primary bind key.
+    pub key: String,
+    /// The capture file's last-modified time — fallback to pick the LIVE session
+    /// when binding by cwd (the live one is written most recently).
     pub mtime: std::time::SystemTime,
     pub model: Option<String>,
     pub context_size: Option<u64>,
@@ -237,6 +251,7 @@ pub fn parse_capture(bytes: &[u8]) -> Option<Capture> {
     Some(Capture {
         session_id,
         cwd,
+        key: String::new(),                       // filled in by read_captures (file stem)
         mtime: std::time::SystemTime::UNIX_EPOCH, // filled in by read_captures
         model: v.pointer("/model/display_name").and_then(|m| m.as_str()).map(str::to_string),
         context_size: cw.and_then(|c| c.get("context_window_size")).and_then(|n| n.as_u64()),
@@ -258,6 +273,7 @@ pub fn read_captures(dir: &Path) -> Vec<Capture> {
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Ok(bytes) = std::fs::read(&p) {
                     if let Some(mut c) = parse_capture(&bytes) {
+                        c.key = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
                         c.mtime = entry
                             .metadata()
                             .and_then(|m| m.modified())
