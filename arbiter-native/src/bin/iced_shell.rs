@@ -93,7 +93,6 @@ impl Workspace {
 
 /// File-explorer state for a project workspace (lazy tree; phase 4 fills cache).
 #[derive(Default)]
-#[allow(dead_code)] // fields consumed by phase 4 (file explorer)
 struct Explorer {
     /// Directory paths the user has expanded.
     expanded: std::collections::HashSet<String>,
@@ -107,7 +106,6 @@ struct Explorer {
 
 /// One file-explorer row.
 #[derive(Clone)]
-#[allow(dead_code)] // fields consumed by phase 4 (file explorer)
 struct DirEntry {
     name: String,
     path: String,
@@ -261,6 +259,8 @@ enum Message {
     ProjectFolderPicked(Option<String>),
     /// Switch the active project workspace to worktree `i` (swaps its pane grid in).
     SwitchWorktree(usize),
+    /// Expand/collapse a directory in the file explorer.
+    ExplorerToggle(String),
     SwitchShell(pane_grid::Pane),
     ShiftEnter,
     /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
@@ -589,6 +589,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let infos = arbiter_native::git::worktree_list(&root);
                     state.workspaces.push(new_project(root, infos));
                     state.active = state.workspaces.len() - 1;
+                    if let Some(p) = state.active_mut().project.as_mut() {
+                        load_explorer(p);
+                    }
                     save_session(state);
                 }
                 None => {
@@ -624,6 +627,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     p.worktrees[old].stash = Some((og, of));
                     p.active = i;
                     p.explorer = Explorer::default(); // tree reflects the new worktree
+                    load_explorer(p);
+                }
+            }
+        }
+        Message::ExplorerToggle(path) => {
+            if let Some(p) = state.active_mut().project.as_mut() {
+                let ex = &mut p.explorer;
+                if ex.expanded.remove(&path) {
+                    // collapsed
+                } else {
+                    ex.expanded.insert(path.clone());
+                    if std::path::Path::new(&path).is_dir() {
+                        let children = read_dir_entries(&path);
+                        p.explorer.entries.insert(path, children);
+                    }
                 }
             }
         }
@@ -876,6 +894,111 @@ fn app_glow_gradient() -> iced::Gradient {
         .into()
 }
 
+/// Text colour for a file/dir by its git status (web FileExplorerNode), or the
+/// default explorer text colour when clean/untracked-by-status.
+fn git_status_color(status: Option<&str>) -> iced::Color {
+    match status {
+        Some("modified") => iced::Color::from_rgb8(0xe2, 0xc0, 0x8d),
+        Some("added") | Some("untracked") | Some("renamed") => iced::Color::from_rgb8(0x73, 0xc9, 0x91),
+        Some("deleted") => iced::Color::from_rgb8(0xc7, 0x4e, 0x39),
+        Some("conflicted") => iced::Color::from_rgb8(0xe5, 0xc0, 0x7b),
+        _ => iced::Color::from_rgb8(0xc8, 0xcc, 0xd4),
+    }
+}
+
+/// Read a directory for the explorer: dirs first then files, alpha
+/// (case-insensitive), skipping `.git` and dotfiles. Matches the web `read_directory`.
+fn read_dir_entries(dir: &str) -> Vec<DirEntry> {
+    let mut out: Vec<DirEntry> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue; // .git + dotfiles
+        }
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        out.push(DirEntry { name, path: e.path().to_string_lossy().into_owned(), is_dir });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
+    out
+}
+
+/// (Re)load the active worktree's explorer cache: root + expanded dirs + git
+/// status (keyed by absolute path). Called when the cache is stale or files change.
+fn load_explorer(project: &mut Project) {
+    let Some(wt) = project.worktrees.get(project.active).map(|w| w.path.clone()) else {
+        return;
+    };
+    let ex = &mut project.explorer;
+    ex.cached_for = wt.clone();
+    ex.entries.clear();
+    ex.entries.insert(wt.clone(), read_dir_entries(&wt));
+    let expanded: Vec<String> = ex.expanded.iter().cloned().collect();
+    for d in expanded {
+        if std::path::Path::new(&d).is_dir() {
+            ex.entries.insert(d.clone(), read_dir_entries(&d));
+        }
+    }
+    ex.git_status.clear();
+    let wtp = std::path::Path::new(&wt);
+    for (rel, status) in arbiter_native::git::file_status(&wt) {
+        let abs = wtp.join(&rel).to_string_lossy().into_owned();
+        ex.git_status.insert(abs, status);
+    }
+}
+
+/// Flatten the visible tree (root children, recursing into expanded dirs) into
+/// (entry, depth) rows for rendering.
+fn flatten_tree(ex: &Explorer, dir: &str, depth: usize, out: &mut Vec<(DirEntry, usize)>) {
+    if depth > 40 {
+        return;
+    }
+    if let Some(children) = ex.entries.get(dir) {
+        for e in children {
+            out.push((e.clone(), depth));
+            if e.is_dir && ex.expanded.contains(&e.path) {
+                flatten_tree(ex, &e.path, depth + 1, out);
+            }
+        }
+    }
+}
+
+/// One file-explorer row: indent + chevron (dirs) + name, git-status coloured.
+/// Dir rows toggle expand; file rows are inert (open/reveal come with the menu).
+fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'static, Message> {
+    let color = git_status_color(ex.git_status.get(&entry.path).map(String::as_str));
+    let indent = depth as f32 * 16.0;
+    let chevron = if entry.is_dir {
+        if ex.expanded.contains(&entry.path) { "\u{25be} " } else { "\u{25b8} " } // ▾ ▸
+    } else {
+        "   " // align with chevron width
+    };
+    let content = row![
+        Space::with_width(Length::Fixed(indent)),
+        text(format!("{chevron}{}", entry.name)).size(13).color(color),
+    ]
+    .align_y(iced::Center);
+    if entry.is_dir {
+        button(content)
+            .width(Length::Fill)
+            .padding([2, 8])
+            .on_press(Message::ExplorerToggle(entry.path.clone()))
+            .style(|_t: &iced::Theme, status| button::Style {
+                background: matches!(status, button::Status::Hovered)
+                    .then(|| iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            })
+            .into()
+    } else {
+        container(content).width(Length::Fill).padding([2, 8]).into()
+    }
+}
+
 /// Project-workspace sidebar container chrome: web `.panel` (bg #1c1c1c, radius 8).
 fn sidebar_style(_t: &iced::Theme) -> container::Style {
     container::Style {
@@ -894,11 +1017,23 @@ fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
     )
     .width(Length::Fill)
     .padding([8, 10]);
-    container(column![header].width(Length::Fill).height(Length::Fill))
-        .width(Length::Fixed(220.0))
-        .height(Length::Fill)
-        .style(sidebar_style)
-        .into()
+    let mut rows: Vec<(DirEntry, usize)> = Vec::new();
+    if let Some(wt) = project.worktrees.get(project.active) {
+        flatten_tree(&project.explorer, &wt.path, 0, &mut rows);
+    }
+    let mut tree = column![].spacing(0);
+    for (entry, depth) in rows {
+        tree = tree.push(explorer_row(&project.explorer, &entry, depth));
+    }
+    container(
+        column![header, scrollable(tree).width(Length::Fill).height(Length::Fill)]
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fixed(220.0))
+    .height(Length::Fill)
+    .style(sidebar_style)
+    .into()
 }
 
 /// Right sidebar: the worktree list. Phase 3 = clickable cards (branch + active
