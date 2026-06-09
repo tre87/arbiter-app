@@ -40,10 +40,19 @@ fn shim() -> Option<&'static claude_shim::ShimSetup> {
 /// generated `--settings` → statusLine/hook capture). Best-effort; a missing
 /// shim just means no Claude stats, never a broken shell.
 fn apply_claude_shim(cmd: &mut CommandBuilder) {
-    let Some(s) = shim() else { return };
+    let Some(s) = shim() else {
+        claude_shim::debug_log("apply_claude_shim: shim() returned None (no shim set up)");
+        return;
+    };
     let sep = if cfg!(windows) { ";" } else { ":" };
     let path = std::env::var("PATH").unwrap_or_default();
     cmd.env("PATH", format!("{}{sep}{path}", s.bin_dir.display()));
+    claude_shim::debug_log(&format!(
+        "apply_claude_shim: PATH prepend bin={} real_claude={:?} settings={}",
+        s.bin_dir.display(),
+        s.real_claude,
+        s.settings_file.display(),
+    ));
     // zsh re-applies this last, after sourcing the user's rc (see ZSH_ZSHRC).
     cmd.env("ARBITER_SHIM_BIN", s.bin_dir.display().to_string());
     if let Some(rc) = &s.real_claude {

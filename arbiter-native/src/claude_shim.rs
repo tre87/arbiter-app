@@ -41,22 +41,21 @@ pub const CAPTURE_SUBDIR: &str = "claude-sessions";
 /// Subdir (under app-data) that holds per-session hook signal files.
 pub const HOOKS_SUBDIR: &str = "claude-hooks";
 
-/// Append a diagnostic line to `<data>/claude-debug.log` when
-/// `ARBITER_CLAUDE_DEBUG` is set. The statusLine/hook subcommands run as separate
-/// processes (spawned by Claude) whose stderr the user never sees, so route
-/// diagnostics to a file both they and the GUI can append to. Used to trace why
-/// the Claude-stats footer fails on a given platform.
+/// Append a diagnostic line to `<temp>/arbiter-claude-debug.log`. TEMPORARY,
+/// always-on tracer for the Claude-stats footer: the statusLine/hook subcommands
+/// run as separate processes (spawned by Claude) whose stderr the user never
+/// sees and whose env may not carry a debug flag, so route diagnostics to a
+/// fixed temp file every process can find + append to. The temp dir is shared
+/// down the shell→claude→subcommand chain, so all steps land in one log.
 pub fn debug_log(msg: &str) {
-    if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_none() {
-        return;
-    }
-    if let Some(dir) = crate::shell::app_data_dir() {
-        if let Ok(mut f) =
-            std::fs::OpenOptions::new().create(true).append(true).open(dir.join("claude-debug.log"))
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{msg}");
-        }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join("arbiter-claude-debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "[{ts}] {msg}");
     }
 }
 
