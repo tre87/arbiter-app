@@ -256,40 +256,34 @@ fn same_cwd(a: &str, b: &str) -> bool {
     }
 }
 
-/// Re-read captures and route each to the pane whose cwd matches (and where
-/// Claude is running), filling its stats + binding its session id.
+/// Bind each pane to the NEWEST capture whose cwd matches (and where Claude is
+/// running), filling its stats + session id. Iterating PANES (not captures) and
+/// picking the newest by mtime is essential: a cwd accumulates one capture file
+/// per past session, and binding the last one in filesystem order would lock the
+/// footer onto a stale, frozen session (this is why it "worked" on a fresh macOS
+/// dir but not on a Windows dir with ~19 old sessions).
 fn process_captures(dir: &Path) {
     let handles = live_handles();
     let caps = crate::claude_shim::read_captures(dir);
-    let panes: Vec<String> = handles
-        .iter()
-        .map(|h| {
-            format!(
-                "(running={} cwd={:?})",
-                h.claude_running.load(Ordering::Relaxed),
-                h.cwd.lock().unwrap().clone()
-            )
-        })
-        .collect();
-    crate::claude_shim::debug_log(&format!(
-        "process_captures: {} capture(s); panes: {}",
-        caps.len(),
-        panes.join(" ")
-    ));
-    for c in caps {
-        let matched = handles.iter().find(|h| {
-            h.claude_running.load(Ordering::Relaxed)
-                && h.cwd.lock().unwrap().as_deref().is_some_and(|w| same_cwd(w, &c.cwd))
-        });
-        crate::claude_shim::debug_log(&format!(
-            "process_captures: capture cwd={:?} session={} -> matched={}",
-            c.cwd,
-            c.session_id,
-            matched.is_some()
-        ));
-        let Some(h) = matched else {
+    crate::claude_shim::debug_log(&format!("process_captures: {} capture(s)", caps.len()));
+    for h in &handles {
+        if !h.claude_running.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Some(hcwd) = h.cwd.lock().unwrap().clone() else {
             continue;
         };
+        let Some(c) = caps
+            .iter()
+            .filter(|c| same_cwd(&hcwd, &c.cwd))
+            .max_by_key(|c| c.mtime)
+        else {
+            continue;
+        };
+        crate::claude_shim::debug_log(&format!(
+            "process_captures: pane cwd={hcwd:?} -> session={} (newest of matches)",
+            c.session_id
+        ));
         {
             // Bind the session id; flag a save only when it's NEWLY bound (not on
             // every statusline refresh), so the restored layout knows to resume it.
