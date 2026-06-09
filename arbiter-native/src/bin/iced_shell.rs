@@ -1044,12 +1044,12 @@ fn footer_style(_t: &iced::Theme) -> container::Style {
     }
 }
 
-/// Compact token count: 4200 → "4.2K". Rounds to one decimal (half away from
-/// zero) so it matches what Claude's own status line shows, e.g. 26150 → "26.2K"
-/// (we previously truncated → "26.1K", off by 0.1K vs Claude).
+/// Compact token count: 4200 → "4.2K". TRUNCATES to one decimal (NOT round) to
+/// match Claude's status line, which formats via `bc scale=1` (e.g. 20450 →
+/// "20.4K", not "20.5K") — same as the web's `fmtK`.
 fn fmt_k(n: u64) -> String {
     if n >= 1000 {
-        format!("{:.1}K", (n as f64 / 100.0).round() / 10.0)
+        format!("{:.1}K", (n / 100) as f64 / 10.0)
     } else {
         n.to_string()
     }
