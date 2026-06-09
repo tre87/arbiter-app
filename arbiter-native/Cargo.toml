@@ -42,6 +42,9 @@ iced = { version = "0.13", features = ["wgpu", "advanced", "tokio", "svg", "imag
 resvg = "0.42"
 # Native folder picker + message box for creating project workspaces.
 rfd = "0.15"
+# Procedural worktree avatars: draw a deterministic glyph from the branch name to
+# an RGBA buffer. Pinned to resvg 0.42's tiny-skia so no duplicate crate is added.
+tiny-skia = "0.11"
 
 # Platform-native glyph rasterisation so terminal text matches the OS's own text
 # rendering (and thus the webview): CoreText on macOS. Versions pinned to those
