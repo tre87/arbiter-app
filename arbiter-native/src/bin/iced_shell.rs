@@ -2984,8 +2984,14 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
         container(mdi(path, size, col)).center_y(Length::Fixed(LINE)).into()
     };
     let lbl = move |s: String, col: iced::Color| text(s).size(11).color(col).line_height(lh);
-    let sbl =
-        move |s: String, col: iced::Color| text(s).size(11).color(col).font(ui_semibold()).line_height(lh);
+    // Inter Semibold renders ~1px higher than regular in the same line box; wrap it
+    // in a LINE-tall box with 1px top padding to nudge it back down to match `lbl`
+    // (the box stays LINE tall, so the row height / icons don't move).
+    let sbl = move |s: String, col: iced::Color| {
+        container(text(s).size(11).color(col).font(ui_semibold()).line_height(lh))
+            .height(Length::Fixed(LINE))
+            .padding(iced::Padding { top: 1.0, right: 0.0, bottom: 0.0, left: 0.0 })
+    };
     let div = move || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)).line_height(lh);
 
     let c = session.claude_status();
@@ -3020,7 +3026,12 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
                 fi(mdi_path::ARROW_DOWN, 11.0, tin), lbl(fmt_k(c.input_tokens), tin),
                 fi(mdi_path::ARROW_UP, 11.0, tout), lbl(fmt_k(c.output_tokens), tout),
                 fi(mdi_path::CACHED, 11.0, blue), lbl(fmt_k(c.cache_write), blue),
-                fi(mdi_path::BOOK, 11.0, tcr), lbl(fmt_k(c.cache_read), tcr),
+                // The book glyph has a small left side-bearing → +1px left padding
+                // restores its gap from the preceding number to match the others.
+                container(mdi(mdi_path::BOOK, 11.0, tcr))
+                    .center_y(Length::Fixed(LINE))
+                    .padding(iced::Padding { left: 1.0, ..iced::Padding::ZERO }),
+                lbl(fmt_k(c.cache_read), tcr),
             ]
             .spacing(3)
             .align_y(iced::Center),
