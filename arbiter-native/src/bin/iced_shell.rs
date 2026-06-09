@@ -259,6 +259,8 @@ enum Message {
     /// New project workspace: pick a folder, then validate it's a git repo.
     NewProjectWorkspace,
     ProjectFolderPicked(Option<String>),
+    /// Switch the active project workspace to worktree `i` (swaps its pane grid in).
+    SwitchWorktree(usize),
     SwitchShell(pane_grid::Pane),
     ShiftEnter,
     /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
@@ -604,6 +606,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::ProjectFolderPicked(None) => {} // dialog cancelled
+        Message::SwitchWorktree(i) => {
+            let ws = state.active_mut();
+            // 1. Validate + take the target worktree's stashed grid (brief project borrow).
+            let taken = ws.project.as_mut().and_then(|p| {
+                if i != p.active && i < p.worktrees.len() {
+                    p.worktrees.get_mut(i).and_then(|w| w.stash.take()).map(|g| (p.active, g))
+                } else {
+                    None
+                }
+            });
+            if let Some((old, (ng, nf))) = taken {
+                // 2. Swap it into the live grid, stashing the outgoing one.
+                let og = std::mem::replace(&mut ws.panes, ng);
+                let of = std::mem::replace(&mut ws.focus, nf);
+                if let Some(p) = ws.project.as_mut() {
+                    p.worktrees[old].stash = Some((og, of));
+                    p.active = i;
+                    p.explorer = Explorer::default(); // tree reflects the new worktree
+                }
+            }
+        }
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
@@ -853,6 +876,74 @@ fn app_glow_gradient() -> iced::Gradient {
         .into()
 }
 
+/// Project-workspace sidebar container chrome: web `.panel` (bg #1c1c1c, radius 8).
+fn sidebar_style(_t: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
+        border: iced::Border { radius: 8.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// Left sidebar: file explorer for the active worktree. Phase 3 = header only
+/// (branch name); phase 4 fills in the git-coloured file tree.
+fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
+    let branch = project.worktrees.get(project.active).map(|w| w.branch.clone()).unwrap_or_default();
+    let header = container(
+        text(branch.to_uppercase()).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
+    )
+    .width(Length::Fill)
+    .padding([8, 10]);
+    container(column![header].width(Length::Fill).height(Length::Fill))
+        .width(Length::Fixed(220.0))
+        .height(Length::Fill)
+        .style(sidebar_style)
+        .into()
+}
+
+/// Right sidebar: the worktree list. Phase 3 = clickable cards (branch + active
+/// highlight) to switch worktrees; phase 5 adds status/stats/context menu/new.
+fn worktree_sidebar(project: &Project) -> Element<'static, Message> {
+    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
+    let azure = iced::Color::from_rgb8(0x33, 0x99, 0xff);
+    let mut col = column![container(
+        text("WORKTREES").size(11).font(ui_semibold()).color(muted)
+    )
+    .padding([8, 10])]
+    .spacing(2)
+    .padding([0, 6]);
+    for (i, w) in project.worktrees.iter().enumerate() {
+        let active = i == project.active;
+        let name = if w.merged { format!("{} (merged)", w.branch) } else { w.branch.clone() };
+        let color = if active { azure } else { muted };
+        let card = button(text(name).size(13).color(color))
+            .width(Length::Fill)
+            .padding([8, 10])
+            .on_press(Message::SwitchWorktree(i))
+            .style(move |_t: &iced::Theme, status| {
+                let hover = matches!(status, button::Status::Hovered);
+                let bg = if active {
+                    Some(iced::Background::Color(iced::Color::from_rgba8(0x56, 0x9c, 0xd6, 0.12)))
+                } else if hover {
+                    Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25)))
+                } else {
+                    None
+                };
+                button::Style {
+                    background: bg,
+                    border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                    ..Default::default()
+                }
+            });
+        col = col.push(card);
+    }
+    container(scrollable(col).width(Length::Fill).height(Length::Fill))
+        .width(Length::Fixed(260.0))
+        .height(Length::Fill)
+        .style(sidebar_style)
+        .into()
+}
+
 fn main_view(state: &State) -> Element<'_, Message> {
     // Unified titlebar: Arbiter logo + animated wordmark, then workspace tabs
     // (left) + actions (right). On macOS this IS the window titlebar (content
@@ -1041,11 +1132,19 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .height(Length::Fixed(40.0))
         .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
 
-    // Terminal area, inset from the window edges. The frame is transparent so the
-    // glow flows into the spacing (the grid paints its own divider/pane colours).
-    // Matches the web `.terminal-workspace { padding: 0 6px 6px }` — no gap under
-    // the titlebar (terminals start flush below it), 6px on the other three sides.
-    let framed = container(grid)
+    // Workspace body, inset from the window edges (web padding `0 6px 6px` — flush
+    // under the titlebar, 6px on the other three sides). A terminal workspace is
+    // just the grid; a project workspace is explorer | grid | worktrees (6px gaps,
+    // matching the web `.project-workspace`).
+    let inner: Element<Message> = match state.active().project.as_ref() {
+        Some(project) => row![explorer_sidebar(project), grid, worktree_sidebar(project)]
+            .spacing(6)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        None => grid.into(),
+    };
+    let framed = container(inner)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
