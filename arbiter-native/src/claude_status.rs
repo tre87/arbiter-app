@@ -240,15 +240,56 @@ pub fn start_watcher() -> Option<Watcher> {
     Some(deb)
 }
 
+/// Compare two cwd strings for binding a capture to a pane. On Windows the two
+/// sources differ (the pane cwd round-trips through an OSC-7 `file://` URI;
+/// Claude reports `process.cwd()`), so normalise separators + case; elsewhere
+/// paths are case-sensitive and compared exactly.
+fn same_cwd(a: &str, b: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+        norm(a) == norm(b)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        a == b
+    }
+}
+
 /// Re-read captures and route each to the pane whose cwd matches (and where
 /// Claude is running), filling its stats + binding its session id.
 fn process_captures(dir: &Path) {
     let handles = live_handles();
-    for c in crate::claude_shim::read_captures(dir) {
-        let Some(h) = handles.iter().find(|h| {
+    let caps = crate::claude_shim::read_captures(dir);
+    if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some() {
+        let panes: Vec<String> = handles
+            .iter()
+            .map(|h| {
+                format!(
+                    "(running={} cwd={:?})",
+                    h.claude_running.load(Ordering::Relaxed),
+                    h.cwd.lock().unwrap().clone()
+                )
+            })
+            .collect();
+        crate::claude_shim::debug_log(&format!(
+            "process_captures: {} capture(s); panes: {}",
+            caps.len(),
+            panes.join(" ")
+        ));
+    }
+    for c in caps {
+        let matched = handles.iter().find(|h| {
             h.claude_running.load(Ordering::Relaxed)
-                && h.cwd.lock().unwrap().as_deref() == Some(c.cwd.as_str())
-        }) else {
+                && h.cwd.lock().unwrap().as_deref().is_some_and(|w| same_cwd(w, &c.cwd))
+        });
+        crate::claude_shim::debug_log(&format!(
+            "process_captures: capture cwd={:?} session={} -> matched={}",
+            c.cwd,
+            c.session_id,
+            matched.is_some()
+        ));
+        let Some(h) = matched else {
             continue;
         };
         {

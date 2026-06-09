@@ -41,6 +41,25 @@ pub const CAPTURE_SUBDIR: &str = "claude-sessions";
 /// Subdir (under app-data) that holds per-session hook signal files.
 pub const HOOKS_SUBDIR: &str = "claude-hooks";
 
+/// Append a diagnostic line to `<data>/claude-debug.log` when
+/// `ARBITER_CLAUDE_DEBUG` is set. The statusLine/hook subcommands run as separate
+/// processes (spawned by Claude) whose stderr the user never sees, so route
+/// diagnostics to a file both they and the GUI can append to. Used to trace why
+/// the Claude-stats footer fails on a given platform.
+pub fn debug_log(msg: &str) {
+    if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_none() {
+        return;
+    }
+    if let Some(dir) = crate::shell::app_data_dir() {
+        if let Ok(mut f) =
+            std::fs::OpenOptions::new().create(true).append(true).open(dir.join("claude-debug.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
 // ── Capture subcommand (`arbiter claude-statusline`) ─────────────────────────
 
 /// Entry point for `claude-statusline`, invoked by Claude as its statusLine
@@ -53,8 +72,19 @@ pub fn run_statusline_capture() {
         return;
     }
 
-    if let (Ok(dir), Some(session_id)) = (std::env::var(CAPTURE_DIR_ENV), extract_session_id(&buf)) {
+    let sid = extract_session_id(&buf);
+    debug_log(&format!(
+        "statusline: invoked session={:?} CAPTURE_DIR={:?} bytes={} cwd={:?}",
+        sid,
+        std::env::var(CAPTURE_DIR_ENV).ok(),
+        buf.len(),
+        serde_json::from_slice::<serde_json::Value>(&buf)
+            .ok()
+            .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string)),
+    ));
+    if let (Ok(dir), Some(session_id)) = (std::env::var(CAPTURE_DIR_ENV), sid) {
         write_capture(Path::new(&dir), &session_id, &buf);
+        debug_log(&format!("statusline: wrote capture to {dir}/{session_id}.json"));
     }
 
     if let Ok(orig) = std::env::var(ORIG_STATUSLINE_ENV) {
@@ -263,6 +293,14 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
     let settings_file = shim_dir.join("settings.json");
     write_settings(&settings_file, arbiter_bin)?;
     write_launchers(&bin_dir)?;
+
+    debug_log(&format!(
+        "setup: bin_dir={} real_claude={:?} settings={} arbiter_bin={}",
+        bin_dir.display(),
+        real_claude,
+        settings_file.display(),
+        arbiter_bin.display(),
+    ));
 
     Some(ShimSetup {
         bin_dir,
