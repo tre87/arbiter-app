@@ -14,8 +14,8 @@ use portable_pty::PtySize;
 
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{
-    button, column, container, horizontal_space, mouse_area, pane_grid, row, scrollable,
-    shader as shader_widget, svg, text, Space,
+    button, column, container, horizontal_space, mouse_area, pane_grid, pick_list, row, scrollable,
+    shader as shader_widget, svg, text, text_input, Space,
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
@@ -215,6 +215,19 @@ struct State {
     /// re-rendered when the scale changes (see [`render_logo`]).
     logo_scale: f32,
     logo: iced::widget::image::Handle,
+    /// The "new worktree" modal, while open (branch name + base-branch dropdown).
+    worktree_dialog: Option<WorktreeDialog>,
+    /// The index of the worktree whose right-click context menu is open, if any.
+    worktree_menu: Option<usize>,
+}
+
+/// State of the "new worktree" modal: the branch name being typed, the chosen
+/// base branch, and the repo's branches (for the dropdown).
+#[derive(Default)]
+struct WorktreeDialog {
+    name: String,
+    base: Option<String>,
+    branches: Vec<String>,
 }
 
 /// The main window id, for routing keyboard input (so typing in the overview
@@ -252,6 +265,8 @@ enum Message {
     Resized(pane_grid::ResizeEvent),
     NewWorkspace,
     SelectWorkspace(usize),
+    /// Close workspace tab `i` (never the last one).
+    CloseWorkspace(usize),
     /// New project workspace: pick a folder, then validate it's a git repo.
     NewProjectWorkspace,
     ProjectFolderPicked(Option<String>),
@@ -259,8 +274,25 @@ enum Message {
     SwitchWorktree(usize),
     /// Expand/collapse a directory in the file explorer.
     ExplorerToggle(String),
-    /// Add a worktree to the active project (random branch off the current one).
+    /// Open the "new worktree" dialog (branch name + base-branch dropdown).
     NewWorktree,
+    /// Live edits in the new-worktree dialog.
+    WtDialogName(String),
+    WtDialogPickBase(String),
+    /// Dismiss the new-worktree dialog without creating.
+    WtDialogCancel,
+    /// Create the worktree from the dialog's current name + base.
+    WtDialogCreate,
+    /// Open the right-click context menu for worktree `i`.
+    WorktreeMenu(usize),
+    /// Dismiss the worktree context menu.
+    WorktreeMenuClose,
+    /// Merge worktree `i`'s branch into the main worktree's branch (manual git merge).
+    WorktreeMerge(usize),
+    /// Ask Claude (the main worktree's first idle session) to merge worktree `i`.
+    WorktreeAskClaudeMerge(usize),
+    /// Discard all uncommitted changes in worktree `i` (reset --hard + clean).
+    WorktreeDiscard(usize),
     /// Remove worktree `i` from the active project (git worktree remove --force).
     RemoveWorktree(usize),
     SwitchShell(pane_grid::Pane),
@@ -716,13 +748,44 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::NewWorktree => {
+            // Open the dialog, pre-filled with a random name + the current branch as
+            // the base, and the repo's branch list for the dropdown.
+            if let Some(p) = state.active().project.as_ref() {
+                let base = p.worktrees.get(p.active).map(|w| w.branch.clone());
+                let branches = arbiter_native::git::list_branches(&p.root);
+                state.worktree_dialog =
+                    Some(WorktreeDialog { name: random_worktree_name(), base, branches });
+                return text_input::focus(text_input::Id::new(WT_NAME_INPUT));
+            }
+        }
+        Message::WtDialogName(s) => {
+            if let Some(d) = state.worktree_dialog.as_mut() {
+                d.name = s;
+            }
+        }
+        Message::WtDialogPickBase(b) => {
+            if let Some(d) = state.worktree_dialog.as_mut() {
+                d.base = Some(b);
+            }
+        }
+        Message::WtDialogCancel => {
+            state.worktree_dialog = None;
+        }
+        Message::WtDialogCreate => {
+            // The branch name must be non-empty; otherwise keep the dialog open.
+            let name = state
+                .worktree_dialog
+                .as_ref()
+                .map(|d| d.name.trim().to_string())
+                .unwrap_or_default();
+            if name.is_empty() {
+                return iced::Task::none();
+            }
+            let base = state.worktree_dialog.as_ref().and_then(|d| d.base.clone());
             let ws = state.active_mut();
-            let Some((root, base)) = ws.project.as_ref().map(|p| {
-                (p.root.clone(), p.worktrees.get(p.active).map(|w| w.branch.clone()))
-            }) else {
+            let Some(root) = ws.project.as_ref().map(|p| p.root.clone()) else {
                 return iced::Task::none();
             };
-            let name = random_worktree_name();
             match arbiter_native::git::worktree_add(&root, &name, base.as_deref()) {
                 Ok(info) => {
                     // Build + activate the new worktree (stash the current active one).
@@ -744,15 +807,117 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
                 Err(e) => {
+                    // Keep the dialog open so the name/base can be corrected.
                     let _ = rfd::MessageDialog::new()
                         .set_level(rfd::MessageLevel::Error)
                         .set_title("Couldn't create worktree")
                         .set_description(e)
                         .show();
+                    return iced::Task::none();
+                }
+            }
+            // Success: close the dialog + persist (the `ws` borrow has ended).
+            state.worktree_dialog = None;
+            save_session(state);
+        }
+        Message::WorktreeMenu(i) => {
+            state.worktree_menu = Some(i);
+        }
+        Message::WorktreeMenuClose => {
+            state.worktree_menu = None;
+        }
+        Message::WorktreeMerge(i) => {
+            state.worktree_menu = None;
+            let Some(p) = state.active().project.as_ref() else { return iced::Task::none() };
+            let (Some(feature), Some(main)) = (p.worktrees.get(i), p.worktrees.first()) else {
+                return iced::Task::none();
+            };
+            let feature_branch = feature.branch.clone();
+            let main_path = main.path.clone();
+            let main_branch = main.branch.clone();
+            match arbiter_native::git::merge_branch(&main_path, &feature_branch) {
+                Ok(_) => {
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Info)
+                        .set_title("Merge complete")
+                        .set_description(format!("Merged '{feature_branch}' into '{main_branch}'."))
+                        .show();
+                    if let Some(p) = state.active_mut().project.as_mut() {
+                        load_explorer(p);
+                    }
+                }
+                Err(e) => {
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Merge failed")
+                        .set_description(e)
+                        .show();
+                }
+            }
+        }
+        Message::WorktreeAskClaudeMerge(i) => {
+            state.worktree_menu = None;
+            let ws = state.active_mut();
+            let (feature, main_branch, main_active) = {
+                let Some(p) = ws.project.as_ref() else { return iced::Task::none() };
+                (
+                    p.worktrees.get(i).map(|w| w.branch.clone()).unwrap_or_default(),
+                    p.worktrees.first().map(|w| w.branch.clone()).unwrap_or_default(),
+                    p.active == 0,
+                )
+            };
+            let cmd = format!(
+                "Please merge the '{feature}' branch into '{main_branch}', resolving any conflicts.\r"
+            );
+            // The main worktree's grid is `ws.panes` when it's active, else its stash.
+            let sent = if main_active {
+                send_to_idle_claude(&mut ws.panes, cmd.as_bytes())
+            } else if let Some((grid, _)) =
+                ws.project.as_mut().and_then(|p| p.worktrees.first_mut()).and_then(|w| w.stash.as_mut())
+            {
+                send_to_idle_claude(grid, cmd.as_bytes())
+            } else {
+                false
+            };
+            if !sent {
+                let _ = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("No idle Claude available")
+                    .set_description(
+                        "Couldn't send the merge request: the main worktree has no idle Claude \
+                         session. Open Claude in the main worktree (and wait for it to finish its \
+                         current task) before asking it to merge.",
+                    )
+                    .show();
+            }
+        }
+        Message::WorktreeDiscard(i) => {
+            state.worktree_menu = None;
+            let path = state
+                .active()
+                .project
+                .as_ref()
+                .and_then(|p| p.worktrees.get(i))
+                .map(|w| w.path.clone());
+            if let Some(path) = path {
+                match arbiter_native::git::discard_changes(&path) {
+                    Ok(()) => {
+                        if let Some(p) = state.active_mut().project.as_mut() {
+                            load_explorer(p);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = rfd::MessageDialog::new()
+                            .set_level(rfd::MessageLevel::Error)
+                            .set_title("Couldn't discard changes")
+                            .set_description(e)
+                            .show();
+                    }
                 }
             }
         }
         Message::RemoveWorktree(i) => {
+            state.worktree_menu = None;
             let ws = state.active_mut();
             let Some(p) = ws.project.as_mut() else { return iced::Task::none() };
             if i == 0 || i == p.active || i >= p.worktrees.len() {
@@ -774,6 +939,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         .set_description(e)
                         .show();
                 }
+            }
+        }
+        Message::CloseWorkspace(i) => {
+            if state.workspaces.len() > 1 && i < state.workspaces.len() {
+                state.workspaces.remove(i); // drops it → its sessions close
+                if state.active >= i {
+                    state.active = state.active.saturating_sub(1);
+                }
+                state.active = state.active.min(state.workspaces.len() - 1);
+                save_session(state);
             }
         }
         Message::SelectWorkspace(i) => {
@@ -1103,15 +1278,23 @@ fn flatten_tree(ex: &Explorer, dir: &str, depth: usize, out: &mut Vec<(DirEntry,
 fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'static, Message> {
     let color = git_status_color(ex.git_status.get(&entry.path).map(String::as_str));
     let indent = depth as f32 * 16.0;
-    let chevron = if entry.is_dir {
-        if ex.expanded.contains(&entry.path) { "\u{25be} " } else { "\u{25b8} " } // ▾ ▸
+    // Chevron drawn as an MDI SVG (the ▸/▾ glyphs aren't in the UI font → tofu).
+    let chevron: Element<Message> = if entry.is_dir {
+        let path = if ex.expanded.contains(&entry.path) {
+            mdi_path::CHEVRON_DOWN
+        } else {
+            mdi_path::CHEVRON_RIGHT
+        };
+        mdi(path, 14.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
     } else {
-        "   " // align with chevron width
+        Space::with_width(Length::Fixed(14.0)).into()
     };
     let content = row![
         Space::with_width(Length::Fixed(indent)),
-        text(format!("{chevron}{}", entry.name)).size(13).color(color),
+        chevron,
+        text(entry.name.clone()).size(13).color(color),
     ]
+    .spacing(2)
     .align_y(iced::Center);
     if entry.is_dir {
         button(content)
@@ -1130,24 +1313,30 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'stati
     }
 }
 
-/// Project-workspace sidebar container chrome: web `.panel` (bg #1c1c1c, radius 8).
+/// Project-workspace sidebar container chrome: same #121212 as the terminals,
+/// radius 8.
 fn sidebar_style(_t: &iced::Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
         border: iced::Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
+}
+
+/// Uppercase sidebar section header (File explorer branch / "WORKTREES") — shared
+/// size/weight/colour so both panels match.
+fn sidebar_header(label: String) -> Element<'static, Message> {
+    container(text(label).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)))
+        .width(Length::Fill)
+        .padding([8, 10])
+        .into()
 }
 
 /// Left sidebar: file explorer for the active worktree. Phase 3 = header only
 /// (branch name); phase 4 fills in the git-coloured file tree.
 fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
     let branch = project.worktrees.get(project.active).map(|w| w.branch.clone()).unwrap_or_default();
-    let header = container(
-        text(branch.to_uppercase()).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
-    )
-    .width(Length::Fill)
-    .padding([8, 10]);
+    let header = sidebar_header(branch.to_uppercase());
     let mut rows: Vec<(DirEntry, usize)> = Vec::new();
     if let Some(wt) = project.worktrees.get(project.active) {
         flatten_tree(&project.explorer, &wt.path, 0, &mut rows);
@@ -1167,9 +1356,66 @@ fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
     .into()
 }
 
-/// The "Claude" pane's session within a worktree grid (the 80% top pane), if any.
-fn worktree_claude(grid: &pane_grid::State<PaneData>) -> Option<&Session> {
-    grid.iter().find(|(_, d)| d.name == "Claude").map(|(_, d)| &d.session)
+/// Aggregate Claude state across ALL panes of a worktree grid (a worktree can
+/// run several Claude instances): counts per lifecycle + the stats of the first
+/// one with a capture (for the model + context display).
+struct WorktreeClaude {
+    working: usize,
+    attention: usize,
+    idle: usize,
+    model: Option<String>,
+    percent: Option<f64>,
+}
+
+fn worktree_claude(grid: &pane_grid::State<PaneData>) -> WorktreeClaude {
+    use arbiter_native::claude_status::Lifecycle;
+    let mut wc = WorktreeClaude { working: 0, attention: 0, idle: 0, model: None, percent: None };
+    for (_, d) in grid.iter() {
+        if !d.session.claude_running() {
+            continue;
+        }
+        let cs = d.session.claude_status();
+        match cs.lifecycle {
+            Lifecycle::Working => wc.working += 1,
+            Lifecycle::Attention => wc.attention += 1,
+            _ => wc.idle += 1,
+        }
+        if wc.model.is_none() && cs.has_stats {
+            wc.model = cs.model.clone();
+            wc.percent = cs.used_percent;
+        }
+    }
+    wc
+}
+
+/// Write `bytes` to the first pane in `grid` running an *idle* (Ready) Claude.
+/// Returns false if there's no such pane (caller warns the user).
+fn send_to_idle_claude(grid: &mut pane_grid::State<PaneData>, bytes: &[u8]) -> bool {
+    let target = grid
+        .iter()
+        .find(|(_, d)| {
+            d.session.claude_running()
+                && matches!(d.session.claude_status().lifecycle, Lifecycle::Ready)
+        })
+        .map(|(p, _)| *p);
+    match target.and_then(|p| grid.get_mut(p)) {
+        Some(d) => {
+            d.session.write(bytes);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A small filled status dot (drawn, not a glyph) of the given colour.
+fn status_dot(color: iced::Color) -> Element<'static, Message> {
+    container(Space::new(Length::Fixed(8.0), Length::Fixed(8.0)))
+        .style(move |_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(color)),
+            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// A random `adjective-noun` worktree branch name (web WorktreeNewDialog), seeded
@@ -1197,7 +1443,7 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
     let purple = iced::Color::from_rgb8(0xa3, 0x71, 0xf7);
 
     let header = row![
-        text("WORKTREES").size(11).font(ui_semibold()).color(muted),
+        text("WORKTREES").size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
         horizontal_space(),
         button(text("+").size(14).color(muted))
             .padding([0, 6])
@@ -1210,81 +1456,100 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
     let mut col = column![header].spacing(2).padding([0, 6]);
     for (i, w) in project.worktrees.iter().enumerate() {
         let active = i == project.active;
-        let sess: Option<&Session> = if active {
+        let empty = WorktreeClaude { working: 0, attention: 0, idle: 0, model: None, percent: None };
+        let wc = if active {
             worktree_claude(&ws.panes)
         } else {
-            w.stash.as_ref().and_then(|(g, _)| worktree_claude(g))
+            w.stash.as_ref().map(|(g, _)| worktree_claude(g)).unwrap_or(empty)
         };
-        let running = sess.map(|s| s.claude_running()).unwrap_or(false);
-        let cs = sess.map(|s| s.claude_status());
-
-        // Status badge.
-        let (badge, bcolor) = if w.merged {
-            ("Merged".to_string(), purple)
-        } else if !running {
-            ("Terminal".to_string(), iced::Color::from_rgba8(0x6b, 0x7a, 0x8d, 0.7))
-        } else {
-            match cs.as_ref().map(|c| c.lifecycle) {
-                Some(arbiter_native::claude_status::Lifecycle::Working) => ("Working…".to_string(), azure),
-                Some(arbiter_native::claude_status::Lifecycle::Attention) => ("Needs attention".to_string(), orange),
-                _ => ("Idle".to_string(), muted),
-            }
-        };
+        let total = wc.working + wc.attention + wc.idle;
 
         let branch_color = if active { azure } else { iced::Color::from_rgb8(0x9c, 0x9c, 0x9c) };
         let mut info = column![
             text(w.branch.clone()).size(13).font(ui_semibold()).color(branch_color),
-            text(badge).size(11).color(bcolor),
         ]
-        .spacing(2);
+        .spacing(3);
 
-        // Model + context (only when Claude has captured stats).
-        if let Some(c) = cs.as_ref().filter(|c| c.has_stats && running) {
-            if let Some(m) = &c.model {
-                info = info.push(text(m.clone()).size(11).color(model_color(m)));
-            }
-            if let Some(pct) = c.used_percent {
-                let p = (pct.round() as u16).min(100);
-                let fill = if pct > 80.0 {
-                    iced::Color::from_rgb8(0xef, 0x44, 0x44)
-                } else if pct > 60.0 {
-                    iced::Color::from_rgb8(0xf5, 0x9e, 0x0b)
-                } else {
-                    iced::Color::from_rgb8(0x22, 0xc5, 0x5e)
-                };
-                let ctx = c.context_size.map(fmt_ctx_size).unwrap_or_default();
-                info = info.push(
-                    text(format!("{p}% / {ctx}")).size(10).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)),
+        // Status line: one dot+count group per lifecycle (working glyph is the
+        // shared animated ✻; attention amber; idle muted). Merged/no-Claude special.
+        if w.merged {
+            info = info.push(text("Merged").size(11).color(purple));
+        } else if total == 0 {
+            info = info
+                .push(text("Terminal").size(11).color(iced::Color::from_rgba8(0x6b, 0x7a, 0x8d, 0.7)));
+        } else {
+            let mut status = row![].spacing(8).align_y(iced::Center);
+            if wc.working > 0 {
+                let (g, c) = working_frame();
+                status = status.push(
+                    row![
+                        text(g).font(symbols_font()).size(13).color(c),
+                        text(wc.working.to_string()).size(11).color(azure),
+                    ]
+                    .spacing(3)
+                    .align_y(iced::Center),
                 );
-                let bar = row![
-                    container(Space::new(Length::Fill, Length::Fixed(3.0)))
-                        .width(Length::FillPortion(p.max(1)))
-                        .style(move |_t: &iced::Theme| container::Style {
-                            background: Some(iced::Background::Color(fill)),
-                            ..Default::default()
-                        }),
-                    container(Space::new(Length::Fill, Length::Fixed(3.0)))
-                        .width(Length::FillPortion((100 - p).max(1)))
-                        .style(|_t: &iced::Theme| container::Style {
-                            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
-                            ..Default::default()
-                        }),
-                ]
-                .height(Length::Fixed(3.0));
-                info = info.push(bar);
             }
+            if wc.attention > 0 {
+                status = status.push(
+                    row![status_dot(orange), text(wc.attention.to_string()).size(11).color(orange)]
+                        .spacing(4)
+                        .align_y(iced::Center),
+                );
+            }
+            if wc.idle > 0 {
+                status = status.push(
+                    row![status_dot(muted), text(wc.idle.to_string()).size(11).color(muted)]
+                        .spacing(4)
+                        .align_y(iced::Center),
+                );
+            }
+            info = info.push(status);
         }
 
-        // Remove "×" for non-main, non-active worktrees.
-        let mut body = row![info.width(Length::Fill)].align_y(iced::Center);
-        if i != 0 && !active {
-            body = body.push(
-                button(text("×").size(14).color(muted))
-                    .padding([0, 4])
-                    .on_press(Message::RemoveWorktree(i))
-                    .style(button::text),
-            );
+        // Model + context of the first Claude instance with captured stats.
+        if let Some(m) = &wc.model {
+            info = info.push(text(m.clone()).size(11).color(model_color(m)));
         }
+        if let Some(pct) = wc.percent {
+            let p = (pct.round() as u16).min(100);
+            let fill = if pct > 80.0 {
+                iced::Color::from_rgb8(0xef, 0x44, 0x44)
+            } else if pct > 60.0 {
+                iced::Color::from_rgb8(0xf5, 0x9e, 0x0b)
+            } else {
+                iced::Color::from_rgb8(0x22, 0xc5, 0x5e)
+            };
+            // Just the percentage — the context size ("1M"/"200k") is too wide.
+            info = info
+                .push(text(format!("{p}%")).size(10).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)));
+            let bar = row![
+                container(Space::new(Length::Fill, Length::Fixed(3.0)))
+                    .width(Length::FillPortion(p.max(1)))
+                    .style(move |_t: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(fill)),
+                        ..Default::default()
+                    }),
+                container(Space::new(Length::Fill, Length::Fixed(3.0)))
+                    .width(Length::FillPortion((100 - p).max(1)))
+                    .style(|_t: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+                        ..Default::default()
+                    }),
+            ]
+            .height(Length::Fixed(3.0));
+            info = info.push(bar);
+        }
+
+        // A "⋯" button opens the context menu (also reachable by right-click).
+        let body = row![
+            info.width(Length::Fill),
+            button(mdi(mdi_path::DOTS_VERTICAL, 16.0, muted))
+                .padding([0, 2])
+                .on_press(Message::WorktreeMenu(i))
+                .style(button::text),
+        ]
+        .align_y(iced::Center);
         let card = mouse_area(
             container(body).width(Length::Fill).padding([8, 10]).style(move |_t: &iced::Theme| {
                 container::Style {
@@ -1295,7 +1560,8 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
                 }
             }),
         )
-        .on_press(Message::SwitchWorktree(i));
+        .on_press(Message::SwitchWorktree(i))
+        .on_right_press(Message::WorktreeMenu(i));
         col = col.push(card);
     }
     container(scrollable(col).width(Length::Fill).height(Length::Fill))
@@ -1303,6 +1569,136 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
         .height(Length::Fill)
         .style(sidebar_style)
         .into()
+}
+
+/// The text_input id of the new-worktree dialog's branch-name field (for autofocus).
+const WT_NAME_INPUT: &str = "wt-name-input";
+
+/// The modal layer over the whole window, if a worktree dialog or context menu is
+/// open: the new-worktree form, or the right-click actions for a worktree.
+fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
+    if let Some(dlg) = &state.worktree_dialog {
+        return Some(worktree_dialog_view(dlg));
+    }
+    state.worktree_menu.map(|i| worktree_menu_view(state, i))
+}
+
+/// A full-window dimming scrim centring `panel`; a click on the scrim (outside the
+/// panel) sends `dismiss`.
+fn modal_scrim<'a>(panel: Element<'a, Message>, dismiss: Message) -> Element<'a, Message> {
+    mouse_area(
+        container(panel).center(Length::Fill).style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba8(0x00, 0x00, 0x00, 0.5))),
+            ..Default::default()
+        }),
+    )
+    .on_press(dismiss)
+    .into()
+}
+
+/// Wrap modal `content` in the panel card (bg #1c1c1c, hairline border, radius 10).
+/// A `Noop`-pressing mouse_area swallows clicks so they don't dismiss the scrim.
+fn modal_panel<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+    mouse_area(container(content).style(|_t: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
+        border: iced::Border {
+            color: iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.08),
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..Default::default()
+    }))
+    .on_press(Message::Noop)
+    .into()
+}
+
+fn worktree_dialog_view(dlg: &WorktreeDialog) -> Element<'_, Message> {
+    let label = |s: &str| {
+        text(s.to_string()).size(12).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8))
+    };
+    let name_input = text_input("branch-name", &dlg.name)
+        .id(text_input::Id::new(WT_NAME_INPUT))
+        .on_input(Message::WtDialogName)
+        .on_submit(Message::WtDialogCreate)
+        .padding([7, 9])
+        .size(13);
+    let base = pick_list(dlg.branches.as_slice(), dlg.base.clone(), Message::WtDialogPickBase)
+        .placeholder("HEAD (current)")
+        .padding([7, 9])
+        .text_size(13)
+        .width(Length::Fill);
+    let actions = row![
+        horizontal_space(),
+        button(text("Cancel").size(13))
+            .on_press(Message::WtDialogCancel)
+            .style(button::secondary)
+            .padding([6, 14]),
+        button(text("Create").size(13))
+            .on_press(Message::WtDialogCreate)
+            .style(button::primary)
+            .padding([6, 14]),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    let panel = column![
+        text("New worktree").size(15).font(ui_semibold()),
+        column![label("Branch name"), name_input].spacing(5),
+        column![label("Base branch"), base].spacing(5),
+        actions,
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(360.0));
+    modal_scrim(modal_panel(panel.into()), Message::WtDialogCancel)
+}
+
+fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
+    let Some(p) = state.active().project.as_ref() else {
+        return modal_scrim(Space::new(0.0, 0.0).into(), Message::WorktreeMenuClose);
+    };
+    let Some(wt) = p.worktrees.get(i) else {
+        return modal_scrim(Space::new(0.0, 0.0).into(), Message::WorktreeMenuClose);
+    };
+    let branch = wt.branch.clone();
+    let main_branch = p.worktrees.first().map(|w| w.branch.clone()).unwrap_or_default();
+    let is_main = i == 0;
+    let is_active = i == p.active;
+
+    let item = |lbl: String, msg: Message, danger: bool| -> Element<'static, Message> {
+        let color = if danger {
+            iced::Color::from_rgb8(0xe5, 0x4a, 0x4a)
+        } else {
+            iced::Color::from_rgb8(0xcc, 0xcc, 0xcc)
+        };
+        button(text(lbl).size(13).color(color))
+            .width(Length::Fill)
+            .padding([7, 12])
+            .on_press(msg)
+            .style(button::text)
+            .into()
+    };
+
+    let mut items = column![
+        text(branch).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0x6b, 0x7a, 0x8d)),
+    ]
+    .spacing(2)
+    .padding(iced::Padding { top: 4.0, right: 4.0, bottom: 6.0, left: 12.0 });
+
+    if !is_main {
+        items = items.push(item(
+            format!("Ask Claude to merge into {main_branch}"),
+            Message::WorktreeAskClaudeMerge(i),
+            false,
+        ));
+        items = items.push(item(format!("Merge into {main_branch}"), Message::WorktreeMerge(i), false));
+    }
+    items = items.push(item("Discard changes".into(), Message::WorktreeDiscard(i), false));
+    if !is_main && !is_active {
+        items = items.push(item("Delete worktree".into(), Message::RemoveWorktree(i), true));
+    }
+
+    let panel = container(items).padding(8).width(Length::Fixed(280.0));
+    modal_scrim(modal_panel(panel.into()), Message::WorktreeMenuClose)
 }
 
 fn main_view(state: &State) -> Element<'_, Message> {
@@ -1341,7 +1737,17 @@ fn main_view(state: &State) -> Element<'_, Message> {
         if i != state.active {
             b = b.style(button::secondary);
         }
-        bar = bar.push(b);
+        // A close "×" per tab (hidden when only one workspace remains — can't close
+        // the last). Its own button captures the click, so the tab doesn't select.
+        if state.workspaces.len() > 1 {
+            let close = button(text("×").size(12).color(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)))
+                .padding([3, 5])
+                .on_press(Message::CloseWorkspace(i))
+                .style(button::text);
+            bar = bar.push(row![b, close].spacing(0).align_y(iced::Center));
+        } else {
+            bar = bar.push(b);
+        }
     }
     bar = bar.push(button(text("+").size(12)).on_press(Message::NewWorkspace).padding([3, 8]).style(button::secondary));
     // New project workspace (folder + git worktrees).
@@ -1360,6 +1766,20 @@ fn main_view(state: &State) -> Element<'_, Message> {
     #[cfg(not(target_os = "windows"))]
     {
         bar = bar.push(horizontal_space());
+    }
+    // Active Claude's model (focused pane), shown top-right. The "(1M context)"
+    // suffix Claude's statusLine sometimes appends is stripped — too wide here.
+    if let Some(d) = state.active().panes.get(state.active().focus) {
+        if d.session.claude_running() {
+            let cs = d.session.claude_status();
+            if let Some(m) = cs.model.as_deref().filter(|_| cs.has_stats) {
+                let cleaned = clean_model(m);
+                if !cleaned.is_empty() {
+                    bar = bar.push(text(cleaned.clone()).size(12).color(model_color(&cleaned)));
+                    bar = bar.push(Space::with_width(Length::Fixed(10.0)));
+                }
+            }
+        }
     }
     bar = bar.push(button(text("⊞ Overview").size(12)).on_press(Message::ToggleOverview).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
@@ -1524,9 +1944,15 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // The stack delivers a press to the top layer first and stops if it captures,
     // so an edge press resizes without also triggering the titlebar drag beneath.
     #[cfg(target_os = "windows")]
-    return iced::widget::stack([chrome.into(), resize_overlay()]).into();
+    let base: Element<Message> = iced::widget::stack([chrome.into(), resize_overlay()]).into();
     #[cfg(not(target_os = "windows"))]
-    return chrome.into();
+    let base: Element<Message> = chrome.into();
+
+    // A worktree dialog / context menu, if open, layers over everything else.
+    match modal_overlay(state) {
+        Some(modal) => iced::widget::stack([base, modal]).into(),
+        None => base,
+    }
 }
 
 /// A full-window overlay of thin resize hit-zones for the borderless Windows
@@ -1728,8 +2154,48 @@ fn model_color(model: &str) -> iced::Color {
     }
 }
 
+/// The model display name without any context-window suffix Claude's statusLine
+/// may append — "Opus 4.8 (1M context)" / "Opus 4.8 · 1M context" → "Opus 4.8".
+/// Too wide for the titlebar otherwise. A model name with no such suffix is kept
+/// verbatim (the trailing size-token drop only runs once a "context" word is seen).
+fn clean_model(m: &str) -> String {
+    let mut s = m.trim();
+    let mut had_context = false;
+    // Parenthetical form: "Opus 4.8 (1M context)".
+    if let Some(i) = s.find('(') {
+        if s[i..].to_ascii_lowercase().contains("context") {
+            s = s[..i].trim_end();
+            had_context = true;
+        }
+    }
+    // Inline form: "Opus 4.8 · 1M context".
+    if !had_context {
+        let lower = s.to_ascii_lowercase();
+        if let Some(i) = lower.find("context") {
+            s = s[..i].trim_end();
+            had_context = true;
+        }
+    }
+    if !had_context {
+        return s.to_string();
+    }
+    // Drop a trailing size token left behind (e.g. "1M"/"200k").
+    let mut toks: Vec<&str> =
+        s.split(|c: char| matches!(c, ' ' | '·' | '•' | '|')).filter(|t| !t.is_empty()).collect();
+    if let Some(last) = toks.last() {
+        let l = last.to_ascii_lowercase();
+        let is_size =
+            last.chars().any(|c| c.is_ascii_digit()) && (l.ends_with('m') || l.ends_with('k') || l.ends_with('g'));
+        if is_size {
+            toks.pop();
+        }
+    }
+    toks.join(" ")
+}
+
 mod mdi_path {
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
+    pub const DOTS_VERTICAL: &str = "M12,16A2,2 0 0,1 14,18A2,2 0 0,1 12,20A2,2 0 0,1 10,18A2,2 0 0,1 12,16M12,10A2,2 0 0,1 14,12A2,2 0 0,1 12,14A2,2 0 0,1 10,12A2,2 0 0,1 12,10M12,4A2,2 0 0,1 14,6A2,2 0 0,1 12,8A2,2 0 0,1 10,6A2,2 0 0,1 12,4Z";
     pub const BRANCH: &str = "M13,14C9.64,14 8.54,15.35 8.18,16.24C9.25,16.7 10,17.76 10,19A3,3 0 0,1 7,22A3,3 0 0,1 4,19C4,17.69 4.83,16.58 6,16.17V7.83C4.83,7.42 4,6.31 4,5A3,3 0 0,1 7,2A3,3 0 0,1 10,5C10,6.31 9.17,7.42 8,7.83V13.12C8.88,12.47 10.16,12 12,12C14.67,12 15.56,10.66 15.85,9.77C14.77,9.32 14,8.25 14,7A3,3 0 0,1 17,4A3,3 0 0,1 20,7C20,8.34 19.12,9.5 17.91,9.86C17.65,11.29 16.68,14 13,14M7,18A1,1 0 0,0 6,19A1,1 0 0,0 7,20A1,1 0 0,0 8,19A1,1 0 0,0 7,18M7,4A1,1 0 0,0 6,5A1,1 0 0,0 7,6A1,1 0 0,0 8,5A1,1 0 0,0 7,4M17,6A1,1 0 0,0 16,7A1,1 0 0,0 17,8A1,1 0 0,0 18,7A1,1 0 0,0 17,6Z";
     pub const ROBOT: &str = "M17.5 15.5C17.5 16.61 16.61 17.5 15.5 17.5S13.5 16.61 13.5 15.5 14.4 13.5 15.5 13.5 17.5 14.4 17.5 15.5M8.5 13.5C7.4 13.5 6.5 14.4 6.5 15.5S7.4 17.5 8.5 17.5 10.5 16.61 10.5 15.5 9.61 13.5 8.5 13.5M23 15V18C23 18.55 22.55 19 22 19H21V20C21 21.11 20.11 22 19 22H5C3.9 22 3 21.11 3 20V19H2C1.45 19 1 18.55 1 18V15C1 14.45 1.45 14 2 14H3C3 10.13 6.13 7 10 7H11V5.73C10.4 5.39 10 4.74 10 4C10 2.9 10.9 2 12 2S14 2.9 14 4C14 4.74 13.6 5.39 13 5.73V7H14C17.87 7 21 10.13 21 14H22C22.55 14 23 14.45 23 15M21 16H19V14C19 11.24 16.76 9 14 9H10C7.24 9 5 11.24 5 14V16H3V17H5V20H19V17H21V16Z";
     pub const DATABASE: &str = "M12,3C7.58,3 4,4.79 4,7C4,9.21 7.58,11 12,11C16.42,11 20,9.21 20,7C20,4.79 16.42,3 12,3M4,9V12C4,14.21 7.58,16 12,16C16.42,16 20,14.21 20,12V9C20,11.21 16.42,13 12,13C7.58,13 4,11.21 4,9M4,14V17C4,19.21 7.58,21 12,21C16.42,21 20,19.21 20,17V14C20,16.21 16.42,18 12,18C7.58,18 4,16.21 4,14Z";
@@ -1740,6 +2206,9 @@ mod mdi_path {
     pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
     pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
     pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
+    // File-explorer expand/collapse chevrons (the ▸/▾ glyphs tofu in the UI font).
+    pub const CHEVRON_RIGHT: &str = "M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z";
+    pub const CHEVRON_DOWN: &str = "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -2347,8 +2816,13 @@ fn pane_header(
 
 fn subscription(_state: &State) -> Subscription<Message> {
     let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
-    // Only the main window's keys drive the terminal (not the overview window).
-    let keys = iced::event::listen_with(|event, _status, id| {
+    // Only the main window's keys drive the terminal (not the overview window),
+    // and not when a widget already consumed the key — e.g. a focused text input
+    // in the new-worktree modal (else the branch name leaks into the terminal).
+    let keys = iced::event::listen_with(|event, status, id| {
+        if status == iced::event::Status::Captured {
+            return None;
+        }
         (MAIN_WINDOW.get().copied() == Some(id)).then(|| handle_key(event)).flatten()
     });
     let closes = iced::window::close_events().map(Message::WindowClosed);
@@ -2908,7 +3382,29 @@ fn main() -> iced::Result {
                 // startup get_scale_factor query corrects it for the real display.
                 logo_scale: 2.0,
                 logo: render_logo((LOGO_LOGICAL * 2.0).round() as u32),
+                worktree_dialog: None,
+                worktree_menu: None,
             };
             (state, iced::Task::batch(tasks))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_model;
+
+    #[test]
+    fn clean_model_strips_context_suffix() {
+        // Plain names pass through untouched.
+        assert_eq!(clean_model("Opus 4.8"), "Opus 4.8");
+        assert_eq!(clean_model("Claude Sonnet 4.6"), "Claude Sonnet 4.6");
+        // Parenthetical "(… context)" forms.
+        assert_eq!(clean_model("Opus 4.8 (1M context)"), "Opus 4.8");
+        assert_eq!(clean_model("Sonnet 4.6 (200k context)"), "Sonnet 4.6");
+        // Inline forms, with and without a separator.
+        assert_eq!(clean_model("Opus 4.8 · 1M context"), "Opus 4.8");
+        assert_eq!(clean_model("Opus 4.8 1M context"), "Opus 4.8");
+        // The trailing-size drop must not eat a real version token (no "context").
+        assert_eq!(clean_model("Haiku 4.5"), "Haiku 4.5");
+    }
 }

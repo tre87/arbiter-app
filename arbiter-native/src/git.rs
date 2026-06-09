@@ -232,6 +232,20 @@ pub fn file_status(worktree_path: &str) -> HashMap<String, String> {
     map
 }
 
+/// Merge `branch` into whatever is checked out in `at` (a worktree dir). Returns
+/// git's stdout on success, or its stderr (e.g. conflict text) on failure.
+pub fn merge_branch(at: &str, branch: &str) -> Result<String, String> {
+    git_checked(at, &["merge", "--no-edit", branch])
+}
+
+/// Discard ALL uncommitted changes in `at` (tracked + untracked): `reset --hard`
+/// then `clean -fd`. Irreversible — the caller should have confirmed.
+pub fn discard_changes(at: &str) -> Result<(), String> {
+    git_checked(at, &["reset", "--hard"])?;
+    git_checked(at, &["clean", "-fd"])?;
+    Ok(())
+}
+
 /// Local + remote branch names (locals short, remotes as `origin/<x>`), deduped.
 pub fn list_branches(repo: &str) -> Vec<String> {
     let mut out = Vec::new();
