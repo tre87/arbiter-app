@@ -2975,8 +2975,18 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
     let green = iced::Color::from_rgb8(0x6a, 0x99, 0x55);
     let orange = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
     let git_orange = iced::Color::from_rgb8(0xf0, 0x50, 0x32);
-    let lbl = |s: String, col: iced::Color| text(s).size(11).color(col);
-    let div = || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a));
+    // Icons and text are each placed in an identical LINE-tall, vertically-centred
+    // box, so their contents land on the same line (iced's default 1.3× text line
+    // height otherwise rides the glyph lower than a centred icon of the same size).
+    const LINE: f32 = 16.0;
+    let lh = iced::widget::text::LineHeight::Absolute(iced::Pixels(LINE));
+    let fi = move |path: &'static str, size: f32, col: iced::Color| -> Element<'static, Message> {
+        container(mdi(path, size, col)).center_y(Length::Fixed(LINE)).into()
+    };
+    let lbl = move |s: String, col: iced::Color| text(s).size(11).color(col).line_height(lh);
+    let sbl =
+        move |s: String, col: iced::Color| text(s).size(11).color(col).font(ui_semibold()).line_height(lh);
+    let div = move || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)).line_height(lh);
 
     let c = session.claude_status();
     let mut r = row![].spacing(6).align_y(iced::Center);
@@ -2985,9 +2995,7 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
         if let Some(m) = &c.model {
             let mc = model_color(m);
             r = r.push(
-                row![mdi(mdi_path::ROBOT, 13.0, mc), text(m.clone()).size(11).color(mc).font(ui_semibold())]
-                    .spacing(3)
-                    .align_y(iced::Center),
+                row![fi(mdi_path::ROBOT, 13.0, mc), sbl(m.clone(), mc)].spacing(3).align_y(iced::Center),
             );
         }
         if let Some(p) = c.used_percent {
@@ -2995,8 +3003,8 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
             r = r.push(div());
             r = r.push(
                 row![
-                    mdi(mdi_path::DATABASE, 12.0, blue),
-                    text(format!("{p:.0}%")).size(11).color(blue).font(ui_semibold()),
+                    fi(mdi_path::DATABASE, 12.0, blue),
+                    sbl(format!("{p:.0}%"), blue),
                     lbl(format!("/{size}"), muted),
                 ]
                 .spacing(2)
@@ -3009,10 +3017,10 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
         let tcr = iced::Color::from_rgb8(0xd7, 0xba, 0x7d);
         r = r.push(
             row![
-                mdi(mdi_path::ARROW_DOWN, 11.0, tin), lbl(fmt_k(c.input_tokens), tin),
-                mdi(mdi_path::ARROW_UP, 11.0, tout), lbl(fmt_k(c.output_tokens), tout),
-                mdi(mdi_path::CACHED, 11.0, blue), lbl(fmt_k(c.cache_write), blue),
-                mdi(mdi_path::BOOK, 11.0, tcr), lbl(fmt_k(c.cache_read), tcr),
+                fi(mdi_path::ARROW_DOWN, 11.0, tin), lbl(fmt_k(c.input_tokens), tin),
+                fi(mdi_path::ARROW_UP, 11.0, tout), lbl(fmt_k(c.output_tokens), tout),
+                fi(mdi_path::CACHED, 11.0, blue), lbl(fmt_k(c.cache_write), blue),
+                fi(mdi_path::BOOK, 11.0, tcr), lbl(fmt_k(c.cache_read), tcr),
             ]
             .spacing(3)
             .align_y(iced::Center),
@@ -3021,13 +3029,13 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
         r = r.push(horizontal_space());
         if let Some(f) = session.folder() {
             r = r.push(
-                row![mdi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)].spacing(4).align_y(iced::Center),
+                row![fi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)].spacing(4).align_y(iced::Center),
             );
         }
         if let Some(b) = session.git().and_then(|g| g.branch) {
             r = r.push(div());
             r = r.push(
-                row![mdi(mdi_path::BRANCH, 13.0, git_orange), text(b).size(11).color(green).font(ui_semibold())]
+                row![fi(mdi_path::BRANCH, 13.0, git_orange), sbl(b, green)]
                     .spacing(3)
                     .align_y(iced::Center),
             );
@@ -3036,9 +3044,7 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
         // Not running: compact git status on the left; folder/branch on the right.
         if let Some(g) = session.git() {
             let count = |path, n: u32, col| {
-                row![mdi(path, 14.0, col), text(n.to_string()).size(11).color(col)]
-                    .spacing(2)
-                    .align_y(iced::Center)
+                row![fi(path, 14.0, col), lbl(n.to_string(), col)].spacing(2).align_y(iced::Center)
             };
             if g.staged > 0 {
                 r = r.push(count(mdi_path::CHECK_CIRCLE, g.staged, green));
@@ -3052,13 +3058,12 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
         }
         r = r.push(horizontal_space());
         if let Some(f) = session.folder() {
-            let mut fs = row![mdi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)]
-                .spacing(4)
-                .align_y(iced::Center);
+            let mut fs =
+                row![fi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)].spacing(4).align_y(iced::Center);
             if let Some(b) = session.git().and_then(|g| g.branch) {
                 fs = fs.push(lbl("[".into(), muted));
-                fs = fs.push(mdi(mdi_path::BRANCH, 12.0, git_orange));
-                fs = fs.push(text(b).size(11).color(green));
+                fs = fs.push(fi(mdi_path::BRANCH, 12.0, git_orange));
+                fs = fs.push(lbl(b, green));
                 fs = fs.push(lbl("]".into(), muted));
             }
             r = r.push(fs);
