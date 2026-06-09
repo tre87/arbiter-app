@@ -115,8 +115,13 @@ struct DirEntry {
 /// web. Further-splittable like any pane.
 fn build_worktree_grid(path: &str) -> (pane_grid::State<PaneData>, pane_grid::Pane) {
     use pane_grid::Configuration;
+    // The "Claude" pane auto-launches Claude (queued in the PTY; runs at the shell's
+    // first prompt once rc sets the shim PATH) so the worktree's status, model, and
+    // "ask Claude to merge" have a live Claude — like the web's Claude pane.
+    let mut claude_session = spawn_session(None, Some(path));
+    claude_session.write(b"claude\r");
     let claude = PaneData {
-        session: spawn_session(None, Some(path)),
+        session: claude_session,
         name: "Claude".to_string(),
         shell: ShellKind::PowerShell,
     };
@@ -289,6 +294,8 @@ enum Message {
     WorktreeMenuClose,
     /// Merge worktree `i`'s branch into the main worktree's branch (manual git merge).
     WorktreeMerge(usize),
+    /// Merge worktree `i` into main, then remove the worktree (web "merge & delete").
+    WorktreeMergeDelete(usize),
     /// Ask Claude (the main worktree's first idle session) to merge worktree `i`.
     WorktreeAskClaudeMerge(usize),
     /// Discard all uncommitted changes in worktree `i` (reset --hard + clean).
@@ -358,11 +365,17 @@ fn spawn_session(shell: Option<&str>, cwd: Option<&str>) -> Session {
 fn spawn_restored(
     shell: persist::SavedShell,
     cwd: Option<&str>,
+    fallback_cwd: Option<&str>,
     git_bash: Option<&str>,
     claude_running: bool,
     claude_session: Option<&str>,
 ) -> (Session, ShellKind) {
-    let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
+    // Prefer the saved cwd; if it's missing or gone, fall back (a project worktree
+    // passes its path, so its terminals reopen in the worktree even when the saved
+    // cwd was never captured — e.g. before the shell first emitted OSC-7).
+    let cwd = cwd
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .or_else(|| fallback_cwd.filter(|d| std::path::Path::new(d).is_dir()));
     let (mut session, kind) = match shell {
         persist::SavedShell::GitBash => match git_bash {
             Some(gb) => (spawn_session(Some(gb), cwd), ShellKind::GitBash),
@@ -388,18 +401,20 @@ fn spawn_restored(
 fn saved_to_config(
     node: persist::SavedNode,
     git_bash: Option<&str>,
+    fallback_cwd: Option<&str>,
 ) -> pane_grid::Configuration<PaneData> {
     match node {
         persist::SavedNode::Split { vertical, ratio, a, b } => pane_grid::Configuration::Split {
             axis: if vertical { pane_grid::Axis::Vertical } else { pane_grid::Axis::Horizontal },
             ratio,
-            a: Box::new(saved_to_config(*a, git_bash)),
-            b: Box::new(saved_to_config(*b, git_bash)),
+            a: Box::new(saved_to_config(*a, git_bash, fallback_cwd)),
+            b: Box::new(saved_to_config(*b, git_bash, fallback_cwd)),
         },
         persist::SavedNode::Leaf { name, shell, cwd, claude_running, claude_session } => {
             let (session, kind) = spawn_restored(
                 shell,
                 cwd.as_deref(),
+                fallback_cwd,
                 git_bash,
                 claude_running,
                 claude_session.as_deref(),
@@ -424,7 +439,13 @@ fn restore_workspaces(
                 let mut worktrees = Vec::new();
                 let mut active: Option<(pane_grid::State<PaneData>, pane_grid::Pane)> = None;
                 for (i, swt) in sp.worktrees.into_iter().enumerate() {
-                    let grid = pane_grid::State::with_configuration(saved_to_config(swt.layout, git_bash));
+                    // Worktree terminals fall back to the worktree path if their saved
+                    // cwd is gone/empty, so they reopen in the right folder.
+                    let grid = pane_grid::State::with_configuration(saved_to_config(
+                        swt.layout,
+                        git_bash,
+                        Some(swt.path.as_str()),
+                    ));
                     let Some(focus) = grid.iter().next().map(|(p, _)| *p) else { continue };
                     let stash = if i == active_idx {
                         active = Some((grid, focus));
@@ -456,7 +477,8 @@ fn restore_workspaces(
                 workspaces.push(ws);
             }
             None => {
-                let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
+                let panes =
+                    pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash, None));
                 let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
                 workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term, project: None });
             }
@@ -712,26 +734,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ProjectFolderPicked(None) => {} // dialog cancelled
         Message::SwitchWorktree(i) => {
-            let ws = state.active_mut();
-            // 1. Validate + take the target worktree's stashed grid (brief project borrow).
-            let taken = ws.project.as_mut().and_then(|p| {
-                if i != p.active && i < p.worktrees.len() {
-                    p.worktrees.get_mut(i).and_then(|w| w.stash.take()).map(|g| (p.active, g))
-                } else {
-                    None
-                }
-            });
-            if let Some((old, (ng, nf))) = taken {
-                // 2. Swap it into the live grid, stashing the outgoing one.
-                let og = std::mem::replace(&mut ws.panes, ng);
-                let of = std::mem::replace(&mut ws.focus, nf);
-                if let Some(p) = ws.project.as_mut() {
-                    p.worktrees[old].stash = Some((og, of));
-                    p.active = i;
-                    p.explorer = Explorer::default(); // tree reflects the new worktree
-                    load_explorer(p);
-                }
-            }
+            activate_worktree(state.active_mut(), i);
         }
         Message::ExplorerToggle(path) => {
             if let Some(p) = state.active_mut().project.as_mut() {
@@ -837,19 +840,77 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let main_branch = main.branch.clone();
             match arbiter_native::git::merge_branch(&main_path, &feature_branch) {
                 Ok(_) => {
+                    // Web parity: a plain merge keeps the worktree but marks it
+                    // "merged" (greyed). Use "Merge & delete" to remove it.
+                    if let Some(p) = state.active_mut().project.as_mut() {
+                        if let Some(w) = p.worktrees.get_mut(i) {
+                            w.merged = true;
+                        }
+                        load_explorer(p);
+                    }
+                    save_session(state);
                     let _ = rfd::MessageDialog::new()
                         .set_level(rfd::MessageLevel::Info)
                         .set_title("Merge complete")
-                        .set_description(format!("Merged '{feature_branch}' into '{main_branch}'."))
+                        .set_description(format!(
+                            "Merged '{feature_branch}' into '{main_branch}'. The worktree is kept \
+                             and marked merged — use \"Merge & delete\" to remove it."
+                        ))
                         .show();
-                    if let Some(p) = state.active_mut().project.as_mut() {
-                        load_explorer(p);
-                    }
                 }
                 Err(e) => {
                     let _ = rfd::MessageDialog::new()
                         .set_level(rfd::MessageLevel::Error)
                         .set_title("Merge failed")
+                        .set_description(e)
+                        .show();
+                }
+            }
+        }
+        Message::WorktreeMergeDelete(i) => {
+            state.worktree_menu = None;
+            if i == 0 {
+                return iced::Task::none(); // never the main worktree
+            }
+            let Some(p) = state.active().project.as_ref() else { return iced::Task::none() };
+            let (Some(feature), Some(main)) = (p.worktrees.get(i), p.worktrees.first()) else {
+                return iced::Task::none();
+            };
+            let feature_branch = feature.branch.clone();
+            let main_path = main.path.clone();
+            let feature_path = feature.path.clone();
+            let root = p.root.clone();
+            // 1. Merge the feature branch into the main worktree's branch.
+            if let Err(e) = arbiter_native::git::merge_branch(&main_path, &feature_branch) {
+                let _ = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Merge failed")
+                    .set_description(format!("{e}\n\nThe worktree was NOT deleted."))
+                    .show();
+                return iced::Task::none();
+            }
+            // 2. Switch off it if it's active (can't remove the live worktree), then
+            //    remove it (force: the branch is merged, the working copy is expendable).
+            if state.active().project.as_ref().map(|p| p.active) == Some(i) {
+                activate_worktree(state.active_mut(), 0);
+            }
+            match arbiter_native::git::worktree_remove(&root, &feature_path, true) {
+                Ok(()) => {
+                    if let Some(p) = state.active_mut().project.as_mut() {
+                        if i < p.worktrees.len() {
+                            p.worktrees.remove(i);
+                            if p.active > i {
+                                p.active -= 1;
+                            }
+                        }
+                        load_explorer(p);
+                    }
+                    save_session(state);
+                }
+                Err(e) => {
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Merged, but couldn't remove worktree")
                         .set_description(e)
                         .show();
                 }
@@ -1151,9 +1212,36 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     Task::none()
 }
 
+/// Make worktree `target` the active one: swap its stashed grid into the live
+/// `panes`/`focus`, stashing the outgoing grid. No-op if already active / invalid.
+fn activate_worktree(ws: &mut Workspace, target: usize) {
+    let taken = ws.project.as_mut().and_then(|p| {
+        if target != p.active && target < p.worktrees.len() {
+            p.worktrees.get_mut(target).and_then(|w| w.stash.take()).map(|g| (p.active, g))
+        } else {
+            None
+        }
+    });
+    if let Some((old, (ng, nf))) = taken {
+        let og = std::mem::replace(&mut ws.panes, ng);
+        let of = std::mem::replace(&mut ws.focus, nf);
+        if let Some(p) = ws.project.as_mut() {
+            p.worktrees[old].stash = Some((og, of));
+            p.active = target;
+            p.explorer = Explorer::default(); // tree reflects the new worktree
+            load_explorer(p);
+        }
+    }
+}
+
 fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     let name = ws.next_name();
-    let pane = PaneData { session: spawn_session(None, None), name, shell: ShellKind::PowerShell };
+    // In a project workspace, new terminals open in the active worktree's folder
+    // (the web sets the split's cwd to the worktree path); plain workspaces default.
+    let cwd =
+        ws.project.as_ref().and_then(|p| p.worktrees.get(p.active)).map(|w| w.path.clone());
+    let pane =
+        PaneData { session: spawn_session(None, cwd.as_deref()), name, shell: ShellKind::PowerShell };
     if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, pane) {
         ws.focus = new_pane;
     }
@@ -1323,20 +1411,28 @@ fn sidebar_style(_t: &iced::Theme) -> container::Style {
     }
 }
 
-/// Uppercase sidebar section header (File explorer branch / "WORKTREES") — shared
-/// size/weight/colour so both panels match.
-fn sidebar_header(label: String) -> Element<'static, Message> {
-    container(text(label).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)))
-        .width(Length::Fill)
-        .padding([8, 10])
-        .into()
+/// Uppercase sidebar section header (File explorer branch / "WORKTREES") with an
+/// optional trailing widget (e.g. the "+" button). Shared size/weight/colour AND a
+/// fixed height so both panels' titles line up identically.
+fn sidebar_header<'a>(label: String, trailing: Option<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut r = row![
+        text(label).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
+        horizontal_space(),
+    ]
+    .align_y(iced::Center)
+    .height(Length::Fixed(34.0))
+    .padding([0, 10]);
+    if let Some(t) = trailing {
+        r = r.push(t);
+    }
+    r.into()
 }
 
 /// Left sidebar: file explorer for the active worktree. Phase 3 = header only
 /// (branch name); phase 4 fills in the git-coloured file tree.
 fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
     let branch = project.worktrees.get(project.active).map(|w| w.branch.clone()).unwrap_or_default();
-    let header = sidebar_header(branch.to_uppercase());
+    let header = sidebar_header(branch.to_uppercase(), None);
     let mut rows: Vec<(DirEntry, usize)> = Vec::new();
     if let Some(wt) = project.worktrees.get(project.active) {
         flatten_tree(&project.explorer, &wt.path, 0, &mut rows);
@@ -1388,14 +1484,18 @@ fn worktree_claude(grid: &pane_grid::State<PaneData>) -> WorktreeClaude {
     wc
 }
 
-/// Write `bytes` to the first pane in `grid` running an *idle* (Ready) Claude.
+/// Write `bytes` to the first pane in `grid` running a Claude that's accepting
+/// input (Ready or Attention — i.e. not mid-task), matching the web's gate.
 /// Returns false if there's no such pane (caller warns the user).
 fn send_to_idle_claude(grid: &mut pane_grid::State<PaneData>, bytes: &[u8]) -> bool {
     let target = grid
         .iter()
         .find(|(_, d)| {
             d.session.claude_running()
-                && matches!(d.session.claude_status().lifecycle, Lifecycle::Ready)
+                && matches!(
+                    d.session.claude_status().lifecycle,
+                    Lifecycle::Ready | Lifecycle::Attention
+                )
         })
         .map(|(p, _)| *p);
     match target.and_then(|p| grid.get_mut(p)) {
@@ -1433,6 +1533,84 @@ fn random_worktree_name() -> String {
     format!("{}-{}", ADJ[t % ADJ.len()], NOUN[(t / 7) % NOUN.len()])
 }
 
+/// HSL → RGB (h in degrees, s/l in 0..1).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
+    (to(r1), to(g1), to(b1))
+}
+
+/// A deterministic 64×64 avatar drawn from `seed` (the branch name): a little
+/// robot-ish face whose colours come from the seed's hash. No network/asset —
+/// drawn with tiny-skia into an RGBA buffer (all pixels opaque, so tiny-skia's
+/// premultiplied output equals straight RGBA, which iced expects).
+fn worktree_avatar(seed: &str) -> iced::widget::image::Handle {
+    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+    // FNV-1a hash of the seed.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let hue = (h % 360) as f32;
+    let (br, bg, bb) = hsl_to_rgb(hue, 0.50, 0.26); // background (dark)
+    let (fr, fg, fb) = hsl_to_rgb((hue + 25.0) % 360.0, 0.55, 0.62); // head (light)
+    let (er, eg, eb) = hsl_to_rgb((hue + 180.0) % 360.0, 0.62, 0.62); // features (complementary)
+
+    const N: u32 = 64;
+    let mut pm = Pixmap::new(N, N).unwrap();
+    pm.fill(tiny_skia::Color::from_rgba8(br, bg, bb, 255));
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    let rect = |pm: &mut Pixmap, paint: &Paint, x, y, w, hh| {
+        if let Some(r) = Rect::from_xywh(x, y, w, hh) {
+            pm.fill_path(&PathBuilder::from_rect(r), paint, FillRule::Winding, Transform::identity(), None);
+        }
+    };
+    let circle = |pm: &mut Pixmap, paint: &Paint, cx, cy, rad| {
+        if let Some(p) = PathBuilder::from_circle(cx, cy, rad) {
+            pm.fill_path(&p, paint, FillRule::Winding, Transform::identity(), None);
+        }
+    };
+    // Head + antenna in the light colour.
+    paint.set_color_rgba8(fr, fg, fb, 255);
+    rect(&mut pm, &paint, 30.0, 7.0, 4.0, 9.0);
+    circle(&mut pm, &paint, 32.0, 7.0, 4.0);
+    rect(&mut pm, &paint, 14.0, 16.0, 36.0, 34.0);
+    // Eyes + mouth in the complementary colour.
+    paint.set_color_rgba8(er, eg, eb, 255);
+    circle(&mut pm, &paint, 24.0, 30.0, 4.5);
+    circle(&mut pm, &paint, 40.0, 30.0, 4.5);
+    rect(&mut pm, &paint, 23.0, 40.0, 18.0, 4.0);
+
+    iced::widget::image::Handle::from_rgba(N, N, pm.data().to_vec())
+}
+
+/// Cached [`worktree_avatar`] — drawn once per unique branch name.
+fn avatar_for(seed: &str) -> iced::widget::image::Handle {
+    static CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, iced::widget::image::Handle>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap();
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(h) = map.get(seed) {
+        return h.clone();
+    }
+    let handle = worktree_avatar(seed);
+    map.insert(seed.to_string(), handle.clone());
+    handle
+}
+
 /// Right sidebar: worktree cards with Claude stats (status / model / context),
 /// a "+" to add a worktree, and "×" to remove a non-main one. Click → switch.
 fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
@@ -1442,16 +1620,11 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
     let orange = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
     let purple = iced::Color::from_rgb8(0xa3, 0x71, 0xf7);
 
-    let header = row![
-        text("WORKTREES").size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
-        horizontal_space(),
-        button(text("+").size(14).color(muted))
-            .padding([0, 6])
-            .on_press(Message::NewWorktree)
-            .style(button::text),
-    ]
-    .align_y(iced::Center)
-    .padding([8, 10]);
+    let plus = button(text("+").size(14).color(muted))
+        .padding([0, 6])
+        .on_press(Message::NewWorktree)
+        .style(button::text);
+    let header = sidebar_header("WORKTREES".to_string(), Some(plus.into()));
 
     let mut col = column![header].spacing(2).padding([0, 6]);
     for (i, w) in project.worktrees.iter().enumerate() {
@@ -1465,10 +1638,26 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
         let total = wc.working + wc.attention + wc.idle;
 
         let branch_color = if active { azure } else { iced::Color::from_rgb8(0x9c, 0x9c, 0x9c) };
-        let mut info = column![
-            text(w.branch.clone()).size(13).font(ui_semibold()).color(branch_color),
-        ]
-        .spacing(3);
+        // Top row: branch (left) · model (top-right) · "⋯" menu. The model is only
+        // shown once a Claude here has captured stats.
+        let mut top = row![text(w.branch.clone())
+            .size(13)
+            .font(ui_semibold())
+            .color(branch_color)
+            .width(Length::Fill)]
+        .spacing(6)
+        .align_y(iced::Center);
+        if let Some(m) = &wc.model {
+            let c = clean_model(m);
+            top = top.push(text(c.clone()).size(11).color(model_color(&c)));
+        }
+        top = top.push(
+            button(mdi(mdi_path::DOTS_VERTICAL, 16.0, muted))
+                .padding([0, 2])
+                .on_press(Message::WorktreeMenu(i))
+                .style(button::text),
+        );
+        let mut info = column![top].spacing(3);
 
         // Status line: one dot+count group per lifecycle (working glyph is the
         // shared animated ✻; attention amber; idle muted). Merged/no-Claude special.
@@ -1507,10 +1696,7 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
             info = info.push(status);
         }
 
-        // Model + context of the first Claude instance with captured stats.
-        if let Some(m) = &wc.model {
-            info = info.push(text(m.clone()).size(11).color(model_color(m)));
-        }
+        // Context bar of the first Claude instance with captured stats.
         if let Some(pct) = wc.percent {
             let p = (pct.round() as u16).min(100);
             let fill = if pct > 80.0 {
@@ -1541,15 +1727,16 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
             info = info.push(bar);
         }
 
-        // A "⋯" button opens the context menu (also reachable by right-click).
-        let body = row![
-            info.width(Length::Fill),
-            button(mdi(mdi_path::DOTS_VERTICAL, 16.0, muted))
-                .padding([0, 2])
-                .on_press(Message::WorktreeMenu(i))
-                .style(button::text),
-        ]
-        .align_y(iced::Center);
+        // Card body: a deterministic avatar (left) + the info column. Avatar is
+        // dimmed for merged worktrees to match their greyed-out treatment.
+        let avatar = iced::widget::image(avatar_for(&w.branch))
+            .width(Length::Fixed(32.0))
+            .height(Length::Fixed(32.0))
+            .opacity(if w.merged { 0.45 } else { 1.0 })
+            .filter_method(iced::widget::image::FilterMethod::Linear);
+        let body = row![avatar, info.width(Length::Fill)]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Top);
         let card = mouse_area(
             container(body).width(Length::Fill).padding([8, 10]).style(move |_t: &iced::Theme| {
                 container::Style {
@@ -1691,6 +1878,11 @@ fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
             false,
         ));
         items = items.push(item(format!("Merge into {main_branch}"), Message::WorktreeMerge(i), false));
+        items = items.push(item(
+            format!("Merge into {main_branch} & delete"),
+            Message::WorktreeMergeDelete(i),
+            false,
+        ));
     }
     items = items.push(item("Discard changes".into(), Message::WorktreeDiscard(i), false));
     if !is_main && !is_active {
@@ -1766,20 +1958,6 @@ fn main_view(state: &State) -> Element<'_, Message> {
     #[cfg(not(target_os = "windows"))]
     {
         bar = bar.push(horizontal_space());
-    }
-    // Active Claude's model (focused pane), shown top-right. The "(1M context)"
-    // suffix Claude's statusLine sometimes appends is stripped — too wide here.
-    if let Some(d) = state.active().panes.get(state.active().focus) {
-        if d.session.claude_running() {
-            let cs = d.session.claude_status();
-            if let Some(m) = cs.model.as_deref().filter(|_| cs.has_stats) {
-                let cleaned = clean_model(m);
-                if !cleaned.is_empty() {
-                    bar = bar.push(text(cleaned.clone()).size(12).color(model_color(&cleaned)));
-                    bar = bar.push(Space::with_width(Length::Fixed(10.0)));
-                }
-            }
-        }
     }
     bar = bar.push(button(text("⊞ Overview").size(12)).on_press(Message::ToggleOverview).padding([3, 8]).style(button::secondary));
     bar = bar.push(button(text("Split →").size(12)).on_press(Message::SplitRight).padding([3, 8]).style(button::secondary));
@@ -3391,7 +3569,18 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_model;
+    use super::{clean_model, hsl_to_rgb, worktree_avatar};
+
+    #[test]
+    fn worktree_avatar_draws_without_panic() {
+        // Exercises the tiny-skia draw + RGBA handoff (the GUI smoke test starts
+        // with no project, so this path is otherwise unexercised).
+        let _ = worktree_avatar("swift-otter");
+        let _ = worktree_avatar(""); // empty seed must not panic
+        // HSL endpoints map into range.
+        assert_eq!(hsl_to_rgb(0.0, 0.0, 0.0), (0, 0, 0));
+        assert_eq!(hsl_to_rgb(0.0, 0.0, 1.0), (255, 255, 255));
+    }
 
     #[test]
     fn clean_model_strips_context_suffix() {
