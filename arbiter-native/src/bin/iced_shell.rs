@@ -1441,8 +1441,8 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize, scale: f32) -> El
     let indent = depth as f32 * 16.0;
     // The icon slot: a chevron for directories (the ▸/▾ glyphs aren't in the UI
     // font → tofu), a file-type icon (coloured by type, like the web) for files.
-    // Rasterised crisp at the display scale (16px × scale) and shown 1:1.
-    let px = (16.0 * scale).round().max(1.0) as u32;
+    // Rasterised crisp at the display scale (14px × scale) and shown 1:1.
+    let px = (14.0 * scale).round().max(1.0) as u32;
     let (path, icon_color) = if entry.is_dir {
         let p = if ex.expanded.contains(&entry.path) {
             mdi_path::CHEVRON_DOWN
@@ -1455,8 +1455,8 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize, scale: f32) -> El
         (p, iced::Color::from_rgb8(r, g, b))
     };
     let icon: Element<Message> = iced::widget::image(raster_mdi(path, icon_color, px))
-        .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
         .filter_method(iced::widget::image::FilterMethod::Linear)
         .into();
     let content = row![
