@@ -3302,7 +3302,9 @@ fn pane_header(
         container(right).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
     ]
     .align_y(iced::Center)
-    .padding([0, 6]);
+    // 2px top / 0 bottom nudges the content (dot + title + shell button) down 1px:
+    // `center_y` below absorbs half the 2px asymmetry, netting +1px at any height.
+    .padding(iced::Padding { top: 2.0, right: 6.0, bottom: 0.0, left: 6.0 });
     // Web `.pane-toolbar`: 34px tall, #181818, 1px #2c2c2c bottom border (the
     // border is the `hline()` added below the header in the pane's content column).
     // `center_y` fixes the height AND vertically centres the content.
