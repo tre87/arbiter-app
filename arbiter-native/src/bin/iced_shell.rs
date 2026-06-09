@@ -1436,29 +1436,22 @@ fn flatten_tree(ex: &Explorer, dir: &str, depth: usize, out: &mut Vec<(DirEntry,
 
 /// One file-explorer row: indent + chevron (dirs) + name, git-status coloured.
 /// Dir rows toggle expand; file rows are inert (open/reveal come with the menu).
-fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize, scale: f32) -> Element<'static, Message> {
+fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'static, Message> {
     let color = git_status_color(ex.git_status.get(&entry.path).map(String::as_str));
     let indent = depth as f32 * 16.0;
     // The icon slot: a chevron for directories (the ▸/▾ glyphs aren't in the UI
     // font → tofu), a file-type icon (coloured by type, like the web) for files.
-    // Rasterised crisp at the display scale (14px × scale) and shown 1:1.
-    let px = (14.0 * scale).round().max(1.0) as u32;
-    let (path, icon_color) = if entry.is_dir {
-        let p = if ex.expanded.contains(&entry.path) {
+    let icon: Element<Message> = if entry.is_dir {
+        let path = if ex.expanded.contains(&entry.path) {
             mdi_path::CHEVRON_DOWN
         } else {
             mdi_path::CHEVRON_RIGHT
         };
-        (p, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
+        mdi(path, 14.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
     } else {
-        let (p, (r, g, b)) = file_icons::file_icon(&entry.name);
-        (p, iced::Color::from_rgb8(r, g, b))
+        let (path, (r, g, b)) = file_icons::file_icon(&entry.name);
+        mdi(path, 14.0, iced::Color::from_rgb8(r, g, b))
     };
-    let icon: Element<Message> = iced::widget::image(raster_mdi(path, icon_color, px))
-        .width(Length::Fixed(14.0))
-        .height(Length::Fixed(14.0))
-        .filter_method(iced::widget::image::FilterMethod::Linear)
-        .into();
     let content = row![
         Space::with_width(Length::Fixed(indent)),
         icon,
@@ -1512,7 +1505,7 @@ fn sidebar_header<'a>(label: String, trailing: Option<Element<'a, Message>>) -> 
 
 /// Left sidebar: file explorer for the active worktree. Phase 3 = header only
 /// (branch name); phase 4 fills in the git-coloured file tree.
-fn explorer_sidebar(project: &Project, scale: f32) -> Element<'static, Message> {
+fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
     let branch = project.worktrees.get(project.active).map(|w| w.branch.clone()).unwrap_or_default();
     let header = sidebar_header(branch.to_uppercase(), None);
     let mut rows: Vec<(DirEntry, usize)> = Vec::new();
@@ -1521,7 +1514,7 @@ fn explorer_sidebar(project: &Project, scale: f32) -> Element<'static, Message> 
     }
     let mut tree = column![].spacing(0);
     for (entry, depth) in rows {
-        tree = tree.push(explorer_row(&project.explorer, &entry, depth, scale));
+        tree = tree.push(explorer_row(&project.explorer, &entry, depth));
     }
     container(
         column![header, scrollable(tree).width(Length::Fill).height(Length::Fill)]
@@ -2405,7 +2398,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // just the grid; a project workspace is explorer | grid | worktrees (6px gaps,
     // matching the web `.project-workspace`).
     let inner: Element<Message> = match state.active().project.as_ref() {
-        Some(project) => row![explorer_sidebar(project, state.logo_scale), grid, worktree_sidebar(state.active())]
+        Some(project) => row![explorer_sidebar(project), grid, worktree_sidebar(state.active())]
             .spacing(6)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -2640,57 +2633,6 @@ fn mdi(path: &str, size: f32, color: iced::Color) -> Element<'static, Message> {
         b(color.r), b(color.g), b(color.b),
     );
     svg(svg::Handle::from_memory(src.into_bytes())).width(size).height(size).into()
-}
-
-/// Rasterise an SVG to an RGBA `image::Handle` at exactly `px`×`px` physical
-/// pixels — pixel-sharp at the display scale, unlike iced's `svg` widget (which
-/// samples a cached bitmap and softens on HiDPI). Same resvg path as `render_logo`.
-fn raster_svg(svg_bytes: &[u8], px: u32) -> iced::widget::image::Handle {
-    use resvg::{tiny_skia, usvg};
-    let px = px.max(1);
-    let mut pm = tiny_skia::Pixmap::new(px, px).unwrap();
-    if let Ok(tree) = usvg::Tree::from_data(svg_bytes, &usvg::Options::default()) {
-        let s = tree.size();
-        let scale = (px as f32 / s.width()).min(px as f32 / s.height());
-        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
-    }
-    // tiny_skia is premultiplied; iced expects straight RGBA (as in `render_logo`).
-    let mut rgba = pm.data().to_vec();
-    for p in rgba.chunks_exact_mut(4) {
-        let a = p[3] as u32;
-        if a > 0 {
-            p[0] = (p[0] as u32 * 255 / a) as u8;
-            p[1] = (p[1] as u32 * 255 / a) as u8;
-            p[2] = (p[2] as u32 * 255 / a) as u8;
-        }
-    }
-    iced::widget::image::Handle::from_rgba(px, px, rgba)
-}
-
-/// A 24×24 MDI `path` filled `color`, rasterised crisp at `px`×`px`, cached by
-/// (path, colour, px) — drawn once per unique icon/scale, then the texture is
-/// reused. The per-frame cost on a cache hit is just a hashmap lookup + Arc clone.
-fn raster_mdi(path: &'static str, color: iced::Color, px: u32) -> iced::widget::image::Handle {
-    static CACHE: std::sync::Mutex<
-        Option<std::collections::HashMap<(usize, u32, u32), iced::widget::image::Handle>>,
-    > = std::sync::Mutex::new(None);
-    let b = |v: f32| (v * 255.0).round() as u32;
-    let rgb = (b(color.r) << 16) | (b(color.g) << 8) | b(color.b);
-    // Distinct &'static consts have distinct addresses → a stable cache key.
-    let key = (path.as_ptr() as usize, rgb, px);
-    let mut guard = CACHE.lock().unwrap();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(h) = map.get(&key) {
-        return h.clone();
-    }
-    let bb = |v: f32| (v * 255.0).round() as u8;
-    let src = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#{:02x}{:02x}{:02x}" d="{path}"/></svg>"##,
-        bb(color.r), bb(color.g), bb(color.b),
-    );
-    let handle = raster_svg(src.as_bytes(), px);
-    map.insert(key, handle.clone());
-    handle
 }
 
 /// Per-family model colour (web: `.model-opus`/`.model-sonnet`/…).
