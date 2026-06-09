@@ -384,10 +384,51 @@ fn restore_workspaces(
 ) -> Option<(Vec<Workspace>, usize)> {
     let mut workspaces = Vec::new();
     for sw in saved.workspaces {
-        let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
-        let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
-        // TODO(project persistence): restore project workspaces too; terminal-only for now.
-        workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term, project: None });
+        match sw.project {
+            // Project workspace: rebuild each worktree's grid; the active one lives
+            // in Workspace.panes, the rest are stashed (mirrors `new_project`).
+            Some(sp) => {
+                let active_idx = sp.active.min(sp.worktrees.len().saturating_sub(1));
+                let mut worktrees = Vec::new();
+                let mut active: Option<(pane_grid::State<PaneData>, pane_grid::Pane)> = None;
+                for (i, swt) in sp.worktrees.into_iter().enumerate() {
+                    let grid = pane_grid::State::with_configuration(saved_to_config(swt.layout, git_bash));
+                    let Some(focus) = grid.iter().next().map(|(p, _)| *p) else { continue };
+                    let stash = if i == active_idx {
+                        active = Some((grid, focus));
+                        None
+                    } else {
+                        Some((grid, focus))
+                    };
+                    worktrees.push(Worktree { branch: swt.branch, path: swt.path, stash, merged: false });
+                }
+                let Some((panes, focus)) = active else { continue };
+                let mut ws = Workspace {
+                    panes,
+                    focus,
+                    name: sw.name,
+                    next_term: sw.next_term,
+                    project: Some(Project {
+                        root: sp.root,
+                        active: active_idx,
+                        worktrees,
+                        explorer: Explorer {
+                            expanded: sp.expanded.into_iter().collect(),
+                            ..Default::default()
+                        },
+                    }),
+                };
+                if let Some(p) = ws.project.as_mut() {
+                    load_explorer(p);
+                }
+                workspaces.push(ws);
+            }
+            None => {
+                let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
+                let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
+                workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term, project: None });
+            }
+        }
     }
     if workspaces.is_empty() {
         return None;
@@ -397,16 +438,16 @@ fn restore_workspaces(
 }
 
 /// Snapshot one workspace's live split tree into the serialisable form.
-fn node_to_saved(ws: &Workspace, node: &pane_grid::Node) -> persist::SavedNode {
+fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> persist::SavedNode {
     match node {
         pane_grid::Node::Split { axis, ratio, a, b, .. } => persist::SavedNode::Split {
             vertical: matches!(axis, pane_grid::Axis::Vertical),
             ratio: *ratio,
-            a: Box::new(node_to_saved(ws, a)),
-            b: Box::new(node_to_saved(ws, b)),
+            a: Box::new(node_to_saved(grid, a)),
+            b: Box::new(node_to_saved(grid, b)),
         },
         pane_grid::Node::Pane(pane) => {
-            let data = ws.panes.get(*pane);
+            let data = grid.get(*pane);
             persist::SavedNode::Leaf {
                 name: data.map(|d| d.name.clone()).unwrap_or_default(),
                 shell: match data.map(|d| d.shell) {
@@ -491,10 +532,37 @@ fn save_session(state: &State) {
         workspaces: state
             .workspaces
             .iter()
-            .map(|ws| persist::SavedWorkspace {
-                name: ws.name.clone(),
-                next_term: ws.next_term,
-                layout: node_to_saved(ws, ws.panes.layout()),
+            .map(|ws| {
+                // Project workspaces save each worktree's tree (active one from
+                // ws.panes, the rest from their stash) + which is active + explorer.
+                let project = ws.project.as_ref().map(|p| persist::SavedProject {
+                    root: p.root.clone(),
+                    active: p.active,
+                    expanded: p.explorer.expanded.iter().cloned().collect(),
+                    worktrees: p
+                        .worktrees
+                        .iter()
+                        .enumerate()
+                        .map(|(i, w)| {
+                            let grid = if i == p.active {
+                                &ws.panes
+                            } else {
+                                w.stash.as_ref().map(|(g, _)| g).unwrap_or(&ws.panes)
+                            };
+                            persist::SavedWorktree {
+                                branch: w.branch.clone(),
+                                path: w.path.clone(),
+                                layout: node_to_saved(grid, grid.layout()),
+                            }
+                        })
+                        .collect(),
+                });
+                persist::SavedWorkspace {
+                    name: ws.name.clone(),
+                    next_term: ws.next_term,
+                    layout: node_to_saved(&ws.panes, ws.panes.layout()),
+                    project,
+                }
             })
             .collect(),
     });
