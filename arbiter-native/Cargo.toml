@@ -40,6 +40,8 @@ iced = { version = "0.13", features = ["wgpu", "advanced", "tokio", "svg", "imag
 # resampling) so it's crisp — iced nearest-samples SVGs and bilinear-softens
 # downscaled rasters. Same engine iced uses internally; already in the tree.
 resvg = "0.42"
+# Native folder picker + message box for creating project workspaces.
+rfd = "0.15"
 
 # Platform-native glyph rasterisation so terminal text matches the OS's own text
 # rendering (and thus the webview): CoreText on macOS. Versions pinned to those

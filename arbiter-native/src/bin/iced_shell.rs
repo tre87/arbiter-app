@@ -44,6 +44,31 @@ struct Workspace {
     focus: pane_grid::Pane,
     name: String,
     next_term: usize,
+    /// Some → this tab is a project workspace (git repo with worktrees + sidebars).
+    /// `panes`/`focus` above always hold the ACTIVE worktree's grid; the other
+    /// worktrees stash theirs in `Worktree::stash` (swapped on switch), so every
+    /// existing grid handler keeps operating on the visible worktree unchanged.
+    project: Option<Project>,
+}
+
+/// A project workspace: a git repo, its worktrees, and the file-explorer state.
+#[allow(dead_code)] // fields consumed by phases 3–5 (layout, switching, sidebars)
+struct Project {
+    root: String,
+    active: usize,
+    worktrees: Vec<Worktree>,
+    explorer: Explorer,
+}
+
+/// One worktree of a project. The ACTIVE worktree's pane grid lives in
+/// `Workspace.panes` (so `stash` is None); inactive worktrees keep theirs here.
+#[allow(dead_code)] // fields consumed by phases 3–5
+struct Worktree {
+    branch: String,
+    path: String,
+    stash: Option<(pane_grid::State<PaneData>, pane_grid::Pane)>,
+    /// Whether this worktree's branch has been merged into its parent (strikethrough).
+    merged: bool,
 }
 
 impl Workspace {
@@ -54,7 +79,7 @@ impl Workspace {
             shell: ShellKind::PowerShell,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
-        Workspace { panes, focus: first, name, next_term: 2 }
+        Workspace { panes, focus: first, name, next_term: 2, project: None }
     }
 
     /// Next per-workspace terminal name ("Terminal N"); numbering restarts per
@@ -63,6 +88,100 @@ impl Workspace {
         let n = self.next_term;
         self.next_term += 1;
         format!("Terminal {n}")
+    }
+}
+
+/// File-explorer state for a project workspace (lazy tree; phase 4 fills cache).
+#[derive(Default)]
+#[allow(dead_code)] // fields consumed by phase 4 (file explorer)
+struct Explorer {
+    /// Directory paths the user has expanded.
+    expanded: std::collections::HashSet<String>,
+    /// Cached children per directory path (lazy-loaded; dirs first, then files).
+    entries: std::collections::HashMap<String, Vec<DirEntry>>,
+    /// git status per path (relative to the worktree) → modified/added/… colour key.
+    git_status: std::collections::HashMap<String, String>,
+    /// The worktree path the cache currently reflects (cleared on worktree switch).
+    cached_for: String,
+}
+
+/// One file-explorer row.
+#[derive(Clone)]
+#[allow(dead_code)] // fields consumed by phase 4 (file explorer)
+struct DirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+/// Build a worktree's terminal grid: an 80/20 horizontal split — Claude on top
+/// (80%), a shell on the bottom (20%) — both in the worktree's dir. Matches the
+/// web. Further-splittable like any pane.
+fn build_worktree_grid(path: &str) -> (pane_grid::State<PaneData>, pane_grid::Pane) {
+    use pane_grid::Configuration;
+    let claude = PaneData {
+        session: spawn_session(None, Some(path)),
+        name: "Claude".to_string(),
+        shell: ShellKind::PowerShell,
+    };
+    let term = PaneData {
+        session: spawn_session(None, Some(path)),
+        name: "Terminal".to_string(),
+        shell: ShellKind::PowerShell,
+    };
+    let config = Configuration::Split {
+        axis: pane_grid::Axis::Horizontal,
+        ratio: 0.8,
+        a: Box::new(Configuration::Pane(claude)),
+        b: Box::new(Configuration::Pane(term)),
+    };
+    let state = pane_grid::State::with_configuration(config);
+    let focus = *state.iter().next().map(|(p, _)| p).expect("grid has a pane");
+    (state, focus)
+}
+
+/// Build a project workspace from a repo root + its worktree list. The main
+/// worktree is active (its grid in `Workspace.panes`); the rest are stashed.
+fn new_project(root: String, infos: Vec<arbiter_native::git::WorktreeInfo>) -> Workspace {
+    // Order: main first, then existing linked worktrees that have a branch.
+    let mut ordered: Vec<&arbiter_native::git::WorktreeInfo> = Vec::new();
+    if let Some(m) = infos.iter().find(|w| w.is_main) {
+        ordered.push(m);
+    }
+    for w in &infos {
+        if !w.is_main && w.exists && w.branch.is_some() {
+            ordered.push(w);
+        }
+    }
+    if ordered.is_empty() {
+        ordered.extend(infos.first());
+    }
+
+    let mut worktrees = Vec::new();
+    let mut active: Option<(pane_grid::State<PaneData>, pane_grid::Pane)> = None;
+    for (i, info) in ordered.iter().enumerate() {
+        let (grid, focus) = build_worktree_grid(&info.path);
+        let branch = info.branch.clone().unwrap_or_else(|| "detached".to_string());
+        let stash = if i == 0 {
+            active = Some((grid, focus));
+            None
+        } else {
+            Some((grid, focus))
+        };
+        worktrees.push(Worktree { branch, path: info.path.clone(), stash, merged: false });
+    }
+    let (panes, focus) = active.expect("project has a main worktree");
+    let name = std::path::Path::new(&root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+    Workspace {
+        panes,
+        focus,
+        name,
+        next_term: 1,
+        project: Some(Project { root, active: 0, worktrees, explorer: Explorer::default() }),
     }
 }
 
@@ -137,6 +256,9 @@ enum Message {
     Resized(pane_grid::ResizeEvent),
     NewWorkspace,
     SelectWorkspace(usize),
+    /// New project workspace: pick a folder, then validate it's a git repo.
+    NewProjectWorkspace,
+    ProjectFolderPicked(Option<String>),
     SwitchShell(pane_grid::Pane),
     ShiftEnter,
     /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
@@ -260,7 +382,8 @@ fn restore_workspaces(
     for sw in saved.workspaces {
         let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
         let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
-        workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term });
+        // TODO(project persistence): restore project workspaces too; terminal-only for now.
+        workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term, project: None });
     }
     if workspaces.is_empty() {
         return None;
@@ -445,6 +568,42 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.active = state.workspaces.len() - 1;
             save_session(state);
         }
+        Message::NewProjectWorkspace => {
+            // Pick a folder off-thread (native dialog), then validate as a repo.
+            return iced::Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Open a Git repository as a project workspace")
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().to_string_lossy().into_owned())
+                },
+                Message::ProjectFolderPicked,
+            );
+        }
+        Message::ProjectFolderPicked(Some(path)) => {
+            match arbiter_native::git::repo_root(&path) {
+                Some(root) => {
+                    let infos = arbiter_native::git::worktree_list(&root);
+                    state.workspaces.push(new_project(root, infos));
+                    state.active = state.workspaces.len() - 1;
+                    save_session(state);
+                }
+                None => {
+                    // Not a git repo — explain (project workspaces manage worktrees).
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Not a Git repository")
+                        .set_description(format!(
+                            "\"{path}\" isn't inside a Git repository. Project workspaces \
+                             manage git worktrees, so they need a repo. Use a Terminal \
+                             workspace for a plain folder, or run \"git init\" first."
+                        ))
+                        .show();
+                }
+            }
+        }
+        Message::ProjectFolderPicked(None) => {} // dialog cancelled
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
@@ -714,13 +873,32 @@ fn main_view(state: &State) -> Element<'_, Message> {
     bar = bar.push(brand);
     bar = bar.push(Space::with_width(Length::Fixed(12.0)));
     for (i, ws) in state.workspaces.iter().enumerate() {
-        let mut b = button(text(ws.name.clone()).size(12)).on_press(Message::SelectWorkspace(i)).padding([3, 8]);
+        // Project workspaces get a folder glyph so they're distinct from terminal tabs.
+        let label: Element<Message> = if ws.project.is_some() {
+            row![
+                mdi(mdi_path::FOLDER, 13.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
+                text(ws.name.clone()).size(12),
+            ]
+            .spacing(5)
+            .align_y(iced::Center)
+            .into()
+        } else {
+            text(ws.name.clone()).size(12).into()
+        };
+        let mut b = button(label).on_press(Message::SelectWorkspace(i)).padding([3, 8]);
         if i != state.active {
             b = b.style(button::secondary);
         }
         bar = bar.push(b);
     }
     bar = bar.push(button(text("+").size(12)).on_press(Message::NewWorkspace).padding([3, 8]).style(button::secondary));
+    // New project workspace (folder + git worktrees).
+    bar = bar.push(
+        button(mdi(mdi_path::FOLDER, 14.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)))
+            .on_press(Message::NewProjectWorkspace)
+            .padding([3, 8])
+            .style(button::secondary),
+    );
     // Flexible middle: a drag region on Windows (no OS titlebar); a plain spacer
     // on macOS (the OS handles dragging the transparent titlebar).
     #[cfg(target_os = "windows")]
