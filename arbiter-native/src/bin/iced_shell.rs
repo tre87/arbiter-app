@@ -25,6 +25,9 @@ use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 use arbiter_native::persist;
 use arbiter_native::term::SelectKind;
 
+/// File-explorer file-type icons + colours (generated from @mdi/js).
+mod file_icons;
+
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).
 #[derive(Clone, Copy, PartialEq)]
@@ -1436,8 +1439,9 @@ fn flatten_tree(ex: &Explorer, dir: &str, depth: usize, out: &mut Vec<(DirEntry,
 fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'static, Message> {
     let color = git_status_color(ex.git_status.get(&entry.path).map(String::as_str));
     let indent = depth as f32 * 16.0;
-    // Chevron drawn as an MDI SVG (the ▸/▾ glyphs aren't in the UI font → tofu).
-    let chevron: Element<Message> = if entry.is_dir {
+    // The icon slot: a chevron for directories (the ▸/▾ glyphs aren't in the UI
+    // font → tofu), a file-type icon (coloured by type, like the web) for files.
+    let icon: Element<Message> = if entry.is_dir {
         let path = if ex.expanded.contains(&entry.path) {
             mdi_path::CHEVRON_DOWN
         } else {
@@ -1445,14 +1449,15 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'stati
         };
         mdi(path, 14.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
     } else {
-        Space::with_width(Length::Fixed(14.0)).into()
+        let (path, (r, g, b)) = file_icons::file_icon(&entry.name);
+        mdi(path, 14.0, iced::Color::from_rgb8(r, g, b))
     };
     let content = row![
         Space::with_width(Length::Fixed(indent)),
-        chevron,
+        icon,
         text(entry.name.clone()).size(13).color(color),
     ]
-    .spacing(2)
+    .spacing(4)
     .align_y(iced::Center);
     if entry.is_dir {
         button(content)
