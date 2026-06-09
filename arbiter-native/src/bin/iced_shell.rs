@@ -2331,7 +2331,8 @@ fn main_view(state: &State) -> Element<'_, Message> {
             .claude_running()
             .then(|| pane_dot(true, data.session.claude_status().lifecycle, false));
         let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, status, header_round);
-        let content = column![header, term, footer_bar(&data.session, footer_round)]
+        // 1px #2c2c2c dividers under the header and above the footer (web card look).
+        let content = column![header, hline(), term, hline(), footer_bar(&data.session, footer_round)]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -2576,10 +2577,25 @@ fn overview_view(state: &State) -> Element<'_, Message> {
 /// cwd-tracked git info). Claude model/context/tokens land here later.
 fn footer_style(_t: &iced::Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1b, 0x1b, 0x1b))),
+        // Same as the terminal (web `--color-bg` #121212); the 1px #2c2c2c top
+        // border is the `hline()` added above the footer in the pane's content column.
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
         text_color: Some(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
         ..Default::default()
     }
+}
+
+/// A 1px full-width divider line in the card-border colour (#2c2c2c) — the web's
+/// `.pane-toolbar` bottom border / `.terminal-footer` top border, which iced's
+/// single-width `Border` can't do per-side.
+fn hline() -> Element<'static, Message> {
+    container(Space::new(Length::Fill, Length::Fixed(1.0)))
+        .width(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Compact token count: 4200 → "4.2K". TRUNCATES to one decimal (NOT round) to
@@ -3258,7 +3274,7 @@ fn pane_header(
         Some(d) => header_dot(d),
         None => Space::with_width(Length::Fixed(0.0)).into(),
     };
-    let title = container(text(name.to_string()).size(12).color(color)).center_x(Length::Fill);
+    let title = container(text(name.to_string()).size(11).color(color)).center_x(Length::Fill);
     let right: Element<'static, Message> = if has_git_bash {
         let icon = match shell {
             ShellKind::PowerShell => ICON_BASH, // click → switch to Git Bash
@@ -3278,10 +3294,14 @@ fn pane_header(
         container(right).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
     ]
     .align_y(iced::Center)
-    .padding([2, 4]);
+    .height(Length::Fill)
+    .padding([0, 6]);
+    // Web `.pane-toolbar`: 34px tall, #181818, 1px #2c2c2c bottom border (the
+    // border is the `hline()` added below the header in the pane's content column).
     container(header)
+        .height(Length::Fixed(34.0))
         .style(move |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x16, 0x16, 0x16))),
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x18, 0x18, 0x18))),
             border: iced::Border { radius: round, ..Default::default() },
             ..Default::default()
         })
