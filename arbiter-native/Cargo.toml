@@ -94,3 +94,17 @@ objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
 # synchronously when AppKit posts NSWindowDidResize (no resize flicker).
 block2 = "0.5"
 
+# Windows-native glyph rasterisation (DirectWrite + Direct2D + WIC): system font
+# fallback + colour emoji, the OS-native equivalent of the macOS CoreText path.
+# Only pulled when targeting Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
