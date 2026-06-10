@@ -58,4 +58,7 @@ core-text = "20"
 # tree (via winit) to avoid duplicate crates.
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
+# Block-based NSNotificationCenter observer so the traffic lights re-inset
+# synchronously when AppKit posts NSWindowDidResize (no resize flicker).
+block2 = "0.5"
 

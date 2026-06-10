@@ -3235,14 +3235,46 @@ mod winround {
 #[cfg(target_os = "macos")]
 mod trafficlights {
     use objc2::{class, msg_send, runtime::AnyObject};
-    use objc2_foundation::NSRect;
+    use objc2_foundation::{NSRect, NSString};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // Web parity: Tauri `trafficLightPosition { x: 14, y: 22 }`.
     const INSET_X: f64 = 14.0;
     const INSET_Y: f64 = 22.0;
 
+    static OBSERVER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
     pub fn position() {
-        unsafe { position_inner() }
+        unsafe {
+            ensure_resize_observer();
+            position_inner();
+        }
+    }
+
+    /// Re-inset synchronously whenever AppKit posts `NSWindowDidResize` — this runs
+    /// inside AppKit's own resize pass, so the buttons never get a frame at the
+    /// default position (the iced `WindowResized` message lags a frame → flicker).
+    /// Registered once; the block is leaked (lives for the app's lifetime).
+    unsafe fn ensure_resize_observer() {
+        if OBSERVER_REGISTERED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        if center.is_null() {
+            OBSERVER_REGISTERED.store(false, Ordering::SeqCst);
+            return;
+        }
+        let block = block2::RcBlock::new(|_note: *mut AnyObject| unsafe { position_inner() });
+        let name = NSString::from_str("NSWindowDidResizeNotification");
+        let nil: *mut AnyObject = std::ptr::null_mut();
+        let _: *mut AnyObject = msg_send![
+            center,
+            addObserverForName: &*name,
+            object: nil,
+            queue: nil,
+            usingBlock: &*block,
+        ];
+        std::mem::forget(block); // the observer holds it for the app's lifetime
     }
 
     unsafe fn position_inner() {
