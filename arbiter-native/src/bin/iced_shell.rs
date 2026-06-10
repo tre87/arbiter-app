@@ -232,6 +232,11 @@ struct State {
     worktree_menu: Option<usize>,
     /// Whether the "+" new-workspace dropdown (Terminal / Project) is open.
     new_ws_menu: bool,
+    /// Last known cursor position (window coords) — used to anchor the "+" dropdown
+    /// under the click, since iced can't report a widget's screen position.
+    cursor: iced::Point,
+    /// The x at which the "+" dropdown was opened (snapshot of `cursor.x`).
+    new_ws_menu_x: f32,
 }
 
 /// State of the "new worktree" modal: the branch name being typed, the chosen
@@ -281,6 +286,8 @@ enum Message {
     ToggleNewWsMenu,
     /// Dismiss the "+" dropdown.
     CloseNewWsMenu,
+    /// Cursor moved (window coords) — tracked to anchor the "+" dropdown.
+    CursorMoved(iced::Point),
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -718,9 +725,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleNewWsMenu => {
             state.new_ws_menu = !state.new_ws_menu;
+            if state.new_ws_menu {
+                state.new_ws_menu_x = state.cursor.x; // anchor the dropdown under the +
+            }
         }
         Message::CloseNewWsMenu => {
             state.new_ws_menu = false;
+        }
+        Message::CursorMoved(p) => {
+            state.cursor = p;
         }
         Message::NewProjectWorkspace => {
             state.new_ws_menu = false;
@@ -1210,6 +1223,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if s > 0.0 && (s - state.logo_scale).abs() > 0.01 {
                 state.logo_scale = s;
                 state.logo = render_logo((LOGO_LOGICAL * s).round() as u32);
+                set_ui_scale(s); // crisp titlebar icons rasterise at this scale
             }
         }
         #[cfg(target_os = "windows")]
@@ -2080,7 +2094,7 @@ const WT_NAME_INPUT: &str = "wt-name-input";
 /// open: the new-worktree form, or the right-click actions for a worktree.
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if state.new_ws_menu {
-        return Some(new_ws_menu_view());
+        return Some(new_ws_menu_view(state.new_ws_menu_x));
     }
     if let Some(dlg) = &state.worktree_dialog {
         return Some(worktree_dialog_view(dlg));
@@ -2228,13 +2242,15 @@ const AZURE: iced::Color = iced::Color { r: 0x33 as f32 / 255.0, g: 0x99 as f32 
 /// (it captures its own clicks, so the tab's select fires only elsewhere).
 fn tab_pill(i: usize, ws: &Workspace, active: bool, show_close: bool) -> Element<'static, Message> {
     let icon = if ws.project.is_some() { mdi_path::FOLDER } else { mdi_path::CONSOLE };
-    let mut content = row![mdi(icon, 12.0, TXT_MUTED), text(ws.name.clone()).size(12)]
+    let mut content = row![cmdi(icon, 14.0, TXT_MUTED), text(ws.name.clone()).size(12)]
         .spacing(4)
         .align_y(iced::Center)
         .height(Length::Fixed(26.0));
     if show_close {
+        // The × is near-white on the active tab (so it's visible), muted otherwise.
+        let x_color = if active { TXT_PRIMARY } else { TXT_MUTED };
         content = content.push(
-            button(mdi(mdi_path::CLOSE, 12.0, TXT_MUTED))
+            button(cmdi(mdi_path::CLOSE, 13.0, x_color))
                 .padding(2)
                 .on_press(Message::CloseWorkspace(i))
                 .style(|_t: &iced::Theme, s| button::Style {
@@ -2292,11 +2308,11 @@ fn tab_add_button() -> Element<'static, Message> {
     .into()
 }
 
-/// A 1px translucent-white vertical divider (web `.stat` border-right).
+/// A 1px × 22px vertical divider in a dark grey (web `.stat` border-right).
 fn vsep() -> Element<'static, Message> {
-    container(Space::new(Length::Fixed(1.0), Length::Fixed(18.0)))
+    container(Space::new(Length::Fixed(1.0), Length::Fixed(22.0)))
         .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(white_a(0.18))),
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a))),
             ..Default::default()
         })
         .into()
@@ -2305,6 +2321,10 @@ fn vsep() -> Element<'static, Message> {
 /// One usage meter (web `.stat`): label + 72×18 bar (track #121212, coloured fill,
 /// centred % text) + reset-time text.
 fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<'static, Message> {
+    // An 18px absolute line height (= bar height) so the label / % / reset glyphs
+    // sit on the same line as the bar. Regular weight on the % avoids the ~1px rise
+    // the semibold face has in iced.
+    let lh = iced::widget::text::LineHeight::Absolute(iced::Pixels(18.0));
     let p = pct.min(100);
     let bar_row: Element<Message> = row![
         container(Space::new(Length::Fill, Length::Fill))
@@ -2320,7 +2340,7 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
     .height(Length::Fill)
     .into();
     let pct_text: Element<Message> =
-        container(text(format!("{p}%")).size(10).font(ui_semibold()).color(iced::Color::WHITE))
+        container(text(format!("{p}%")).size(10).color(iced::Color::WHITE).line_height(lh))
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into();
@@ -2333,9 +2353,9 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
             ..Default::default()
         });
     row![
-        text(label.to_string()).size(11).color(TXT_SECONDARY),
+        text(label.to_string()).size(11).color(TXT_SECONDARY).line_height(lh),
         track,
-        text(reset.to_string()).size(11).color(TXT_SECONDARY),
+        text(reset.to_string()).size(11).color(TXT_SECONDARY).line_height(lh),
     ]
     .spacing(5)
     .align_y(iced::Center)
@@ -2345,9 +2365,15 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
 /// The usage refresh button (web `.refresh-btn`): a static "1:22" for now.
 fn refresh_btn() -> Element<'static, Message> {
     button(
-        row![mdi(mdi_path::REFRESH, 12.0, TXT_MUTED), text("1:22").size(11).color(TXT_SECONDARY)]
-            .spacing(4)
-            .align_y(iced::Center),
+        row![
+            cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED),
+            text("1:22")
+                .size(11)
+                .color(TXT_SECONDARY)
+                .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(13.0))),
+        ]
+        .spacing(4)
+        .align_y(iced::Center),
     )
     .padding([5, 7])
     .on_press(Message::Noop)
@@ -2371,7 +2397,7 @@ fn refresh_btn() -> Element<'static, Message> {
 /// hover; `active` shows the azure-dim selected wash (used for the overview toggle).
 fn action_icon_btn(path: &'static str, msg: Message, active: bool) -> Element<'static, Message> {
     let color = if active { AZURE } else { TXT_SECONDARY };
-    button(mdi(path, 16.0, color))
+    button(cmdi(path, 16.0, color))
         .padding([4, 6])
         .on_press(msg)
         .style(move |_t: &iced::Theme, s| {
@@ -2394,7 +2420,7 @@ fn action_icon_btn(path: &'static str, msg: Message, active: bool) -> Element<'s
 /// One item in the "+" dropdown (web `.new-menu-item`): icon + label, azure hover.
 fn new_ws_menu_item(icon: &'static str, label: &str, msg: Message) -> Element<'static, Message> {
     button(
-        row![mdi(icon, 14.0, TXT_SECONDARY), text(label.to_string()).size(12)]
+        row![cmdi(icon, 14.0, TXT_SECONDARY), text(label.to_string()).size(12)]
             .spacing(8)
             .align_y(iced::Center),
     )
@@ -2415,7 +2441,7 @@ fn new_ws_menu_item(icon: &'static str, label: &str, msg: Message) -> Element<'s
 /// The "+" dropdown overlay (web `.new-menu`): pick Terminal or Project workspace.
 /// Anchored below the titlebar near the tab area (iced can't read the +'s screen
 /// position, so the left inset is a fixed approximation).
-fn new_ws_menu_view() -> Element<'static, Message> {
+fn new_ws_menu_view(anchor_x: f32) -> Element<'static, Message> {
     let menu = container(
         column![
             new_ws_menu_item(mdi_path::CONSOLE, "Terminal Workspace", Message::NewWorkspace),
@@ -2434,10 +2460,13 @@ fn new_ws_menu_view() -> Element<'static, Message> {
         },
         ..Default::default()
     });
+    // Anchor the menu's left edge just under the click on the "+" (web `.new-menu`
+    // opens at rect.left, bottom+2). 40px titlebar → top 42.
+    let left = (anchor_x - 4.0).max(4.0);
     let anchored = container(mouse_area(menu).on_press(Message::Noop))
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(iced::Padding { top: 42.0, right: 0.0, bottom: 0.0, left: TITLEBAR_LEFT_PAD + 110.0 });
+        .padding(iced::Padding { top: 42.0, right: 0.0, bottom: 0.0, left });
     mouse_area(anchored).on_press(Message::CloseNewWsMenu).into()
 }
 
@@ -2496,7 +2525,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     bar = bar.push(
         row![
             action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()),
-            action_icon_btn(mdi_path::KEYBOARD, Message::Noop, false),
+            action_icon_btn(mdi_path::COMMAND, Message::Noop, false),
             action_icon_btn(mdi_path::COG, Message::Noop, false),
             action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
             action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
@@ -2876,6 +2905,76 @@ fn mdi(path: &str, size: f32, color: iced::Color) -> Element<'static, Message> {
     svg(svg::Handle::from_memory(src.into_bytes())).width(size).height(size).into()
 }
 
+/// Current display scale (physical px per logical px), tracked from the main
+/// window so crisp icons can rasterise at the exact pixel size without threading
+/// it through every helper. Defaults to 2.0 (the common Mac case) until known.
+static UI_SCALE_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn set_ui_scale(s: f32) {
+    UI_SCALE_BITS.store(s.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+fn ui_scale() -> f32 {
+    let b = UI_SCALE_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if b == 0 { 2.0 } else { f32::from_bits(b) }
+}
+
+/// Rasterise an SVG to an RGBA `image::Handle` at exactly `px`×`px` physical
+/// pixels (crisp at the display scale, unlike the `svg` widget). Same path as
+/// `render_logo`; un-premultiplies (tiny-skia premult → iced straight alpha).
+fn raster_svg(svg_bytes: &[u8], px: u32) -> iced::widget::image::Handle {
+    use resvg::{tiny_skia, usvg};
+    let px = px.max(1);
+    let mut pm = tiny_skia::Pixmap::new(px, px).unwrap();
+    if let Ok(tree) = usvg::Tree::from_data(svg_bytes, &usvg::Options::default()) {
+        let s = tree.size();
+        let scale = (px as f32 / s.width()).min(px as f32 / s.height());
+        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
+    }
+    let mut rgba = pm.data().to_vec();
+    for p in rgba.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 {
+            p[0] = (p[0] as u32 * 255 / a) as u8;
+            p[1] = (p[1] as u32 * 255 / a) as u8;
+            p[2] = (p[2] as u32 * 255 / a) as u8;
+        }
+    }
+    iced::widget::image::Handle::from_rgba(px, px, rgba)
+}
+
+/// Crisp MDI icon: a 24×24 `path` filled `color`, rasterised at `size`×scale and
+/// shown 1:1. Cached by (path, colour, px). Use in the titlebar where the soft
+/// `svg`-widget icons (refresh/keyboard/etc.) read as pixelated.
+fn cmdi(path: &'static str, size: f32, color: iced::Color) -> Element<'static, Message> {
+    static CACHE: std::sync::Mutex<
+        Option<std::collections::HashMap<(usize, u32, u32), iced::widget::image::Handle>>,
+    > = std::sync::Mutex::new(None);
+    let px = (size * ui_scale()).round().max(1.0) as u32;
+    let b = |v: f32| (v * 255.0).round() as u32;
+    let rgb = (b(color.r) << 16) | (b(color.g) << 8) | b(color.b);
+    let key = (path.as_ptr() as usize, rgb, px);
+    let handle = {
+        let mut guard = CACHE.lock().unwrap();
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        if let Some(h) = map.get(&key) {
+            h.clone()
+        } else {
+            let bb = |v: f32| (v * 255.0).round() as u8;
+            let src = format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#{:02x}{:02x}{:02x}" d="{path}"/></svg>"##,
+                bb(color.r), bb(color.g), bb(color.b),
+            );
+            let h = raster_svg(src.as_bytes(), px);
+            map.insert(key, h.clone());
+            h
+        }
+    };
+    iced::widget::image(handle)
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .filter_method(iced::widget::image::FilterMethod::Linear)
+        .into()
+}
+
 /// Per-family model colour (web: `.model-opus`/`.model-sonnet`/…).
 fn model_color(model: &str) -> iced::Color {
     let l = model.to_ascii_lowercase();
@@ -2951,9 +3050,11 @@ mod mdi_path {
     pub const CLOSE: &str = "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z";
     pub const REFRESH: &str = "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z";
     pub const VIEW_DASHBOARD: &str = "M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z";
-    pub const KEYBOARD: &str = "M4,5A2,2 0 0,0 2,7V17A2,2 0 0,0 4,19H20A2,2 0 0,0 22,17V7A2,2 0 0,0 20,5H4M4,7H20V17H4V7M5,8V10H7V8H5M8,8V10H10V8H8M11,8V10H13V8H11M14,8V10H16V8H14M17,8V10H19V8H17M5,11V13H7V11H5M8,11V13H10V11H8M11,11V13H13V11H11M14,11V13H16V11H14M17,11V13H19V11H17M8,14V16H16V14H8Z";
     pub const COG: &str = "M12,8A4,4 0 0,1 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12A4,4 0 0,1 12,8M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10M10,22C9.75,22 9.54,21.82 9.5,21.58L9.13,18.93C8.5,18.68 7.96,18.34 7.44,17.94L4.95,18.95C4.73,19.03 4.46,18.95 4.34,18.73L2.34,15.27C2.21,15.05 2.27,14.78 2.46,14.63L4.57,12.97L4.5,12L4.57,11L2.46,9.37C2.27,9.22 2.21,8.95 2.34,8.73L4.34,5.27C4.46,5.05 4.73,4.96 4.95,5.05L7.44,6.05C7.96,5.66 8.5,5.32 9.13,5.07L9.5,2.42C9.54,2.18 9.75,2 10,2H14C14.25,2 14.46,2.18 14.5,2.42L14.87,5.07C15.5,5.32 16.04,5.66 16.56,6.05L19.05,5.05C19.27,4.96 19.54,5.05 19.66,5.27L21.66,8.73C21.79,8.95 21.73,9.22 21.54,9.37L19.43,11L19.5,12L19.43,13L21.54,14.63C21.73,14.78 21.79,15.05 21.66,15.27L19.66,18.73C19.54,18.95 19.27,19.04 19.05,18.95L16.56,17.95C16.04,18.34 15.5,18.68 14.87,18.93L14.5,21.58C14.46,21.82 14.25,22 14,22H10M11.25,4L10.88,6.61C9.68,6.86 8.62,7.5 7.85,8.39L5.44,7.35L4.69,8.65L6.8,10.2C6.4,11.37 6.4,12.64 6.8,13.8L4.68,15.36L5.43,16.66L7.86,15.62C8.63,16.5 9.68,17.14 10.87,17.38L11.24,20H12.76L13.13,17.39C14.32,17.14 15.37,16.5 16.14,15.62L18.57,16.66L19.32,15.36L17.2,13.81C17.6,12.64 17.6,11.37 17.2,10.2L19.31,8.65L18.56,7.35L16.15,8.39C15.38,7.5 14.32,6.86 13.12,6.62L12.75,4H11.25Z";
     pub const ARROW_RIGHT: &str = "M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z";
+    // Keyboard-shortcuts button: the ⌘ command glyph reads cleaner than a busy
+    // keyboard at small sizes.
+    pub const COMMAND: &str = "M6,2A4,4 0 0,1 10,6V8H14V6A4,4 0 0,1 18,2A4,4 0 0,1 22,6A4,4 0 0,1 18,10H16V14H18A4,4 0 0,1 22,18A4,4 0 0,1 18,22A4,4 0 0,1 14,18V16H10V18A4,4 0 0,1 6,22A4,4 0 0,1 2,18A4,4 0 0,1 6,14H8V10H6A4,4 0 0,1 2,6A4,4 0 0,1 6,2M16,18A2,2 0 0,0 18,20A2,2 0 0,0 20,18A2,2 0 0,0 18,16H16V18M14,10H10V14H14V10M6,16A2,2 0 0,0 4,18A2,2 0 0,0 6,20A2,2 0 0,0 8,18V16H6M8,6A2,2 0 0,0 6,4A2,2 0 0,0 4,6A2,2 0 0,0 6,8H8V6M18,8A2,2 0 0,0 20,6A2,2 0 0,0 18,4A2,2 0 0,0 16,6V8H18Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -3591,10 +3692,18 @@ fn subscription(_state: &State) -> Subscription<Message> {
     // and not when a widget already consumed the key — e.g. a focused text input
     // in the new-worktree modal (else the branch name leaks into the terminal).
     let keys = iced::event::listen_with(|event, status, id| {
+        if MAIN_WINDOW.get().copied() != Some(id) {
+            return None;
+        }
+        // Track the cursor only over the titlebar (top ~44px) so the "+" dropdown
+        // can anchor under the click — cheap, since it's off during terminal use.
+        if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = &event {
+            return (position.y < 44.0).then(|| Message::CursorMoved(*position));
+        }
         if status == iced::event::Status::Captured {
             return None;
         }
-        (MAIN_WINDOW.get().copied() == Some(id)).then(|| handle_key(event)).flatten()
+        handle_key(event)
     });
     let closes = iced::window::close_events().map(Message::WindowClosed);
     // Track each window's geometry (no move_events(), so filter the event stream).
@@ -4156,6 +4265,8 @@ fn main() -> iced::Result {
                 worktree_dialog: None,
                 worktree_menu: None,
                 new_ws_menu: false,
+                cursor: iced::Point::ORIGIN,
+                new_ws_menu_x: 0.0,
             };
             (state, iced::Task::batch(tasks))
         })
