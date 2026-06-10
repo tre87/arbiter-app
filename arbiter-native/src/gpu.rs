@@ -41,12 +41,14 @@ struct Uniforms { canvas: vec2<f32>, cell: vec2<f32>, glyph: vec2<f32>, srgb: f3
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var catlas: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) uv: vec2<f32>,
   @location(1) fg: vec3<f32>,
   @location(2) bg: vec3<f32>,
+  @location(3) kind: f32,
 };
 
 @vertex
@@ -56,14 +58,17 @@ fn vs(
   @location(2) uv: vec2<f32>,
   @location(3) fg: vec3<f32>,
   @location(4) bg: vec3<f32>,
+  @location(5) flags: vec2<f32>,  // x = kind (0 mono, 1 colour), y = cells wide
 ) -> VsOut {
-  let px = pos + corner * u.cell;
+  let wide = flags.y;
+  let px = pos + corner * vec2<f32>(u.cell.x * wide, u.cell.y);
   let clip = vec2<f32>((px.x / u.canvas.x) * 2.0 - 1.0, 1.0 - (px.y / u.canvas.y) * 2.0);
   var out: VsOut;
   out.clip = vec4<f32>(clip, 0.0, 1.0);
-  out.uv = uv + corner * u.glyph;
+  out.uv = uv + corner * vec2<f32>(u.glyph.x * wide, u.glyph.y);
   out.fg = fg;
   out.bg = bg;
+  out.kind = flags.x;
   return out;
 }
 
@@ -84,8 +89,16 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let a = textureSample(atlas, samp, in.uv).r;
-  let col = mix(to_linear(in.bg), to_linear(in.fg), a);
+  var col: vec3<f32>;
+  if (in.kind > 0.5) {
+    // Colour glyph (emoji): straight-alpha sRGB RGBA composited over the cell bg.
+    let s = textureSample(catlas, samp, in.uv);
+    col = mix(to_linear(in.bg), to_linear(s.rgb), s.a);
+  } else {
+    // Mono glyph: single-channel coverage tinted with the fg colour.
+    let a = textureSample(atlas, samp, in.uv).r;
+    col = mix(to_linear(in.bg), to_linear(in.fg), a);
+  }
   // An sRGB target re-encodes on write, so hand it linear; a non-sRGB target
   // (the raw spike) needs us to encode to sRGB ourselves.
   var out = col;
@@ -93,6 +106,15 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   return vec4<f32>(out, 1.0);
 }
 "#;
+
+/// A cached glyph: its atlas slot, whether it lives in the colour atlas (emoji),
+/// and how many cells wide it spans (2 for a wide colour glyph).
+#[derive(Clone, Copy)]
+struct Glyph {
+    slot: u32,
+    color: bool,
+    cells: u32,
+}
 
 /// Surface-agnostic renderer: pipeline + glyph atlas + instance buffer.
 pub struct TermGpu {
@@ -103,6 +125,9 @@ pub struct TermGpu {
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     atlas_tex: wgpu::Texture,
+    /// Separate RGBA atlas for colour glyphs (emoji); the mono `atlas_tex` (R8) and
+    /// its writers are untouched, so normal text rendering is unaffected.
+    color_atlas_tex: wgpu::Texture,
 
     font_name: String,
     regular: (Vec<u8>, u32),
@@ -114,10 +139,13 @@ pub struct TermGpu {
     baseline: f32,
     is_srgb: bool,
     atlas_cpu: Vec<u8>,
-    glyphs: HashMap<(char, bool), u32>,
+    color_atlas_cpu: Vec<u8>,
+    glyphs: HashMap<(char, bool), Glyph>,
     next_slot: u32,
+    color_next: u32,
     per_row: u32,
     atlas_dirty: bool,
+    color_dirty: bool,
 
     scratch: Vec<f32>,
     count: u32,
@@ -192,6 +220,21 @@ impl TermGpu {
             ..Default::default()
         });
 
+        // Colour glyph atlas (RGBA, zero = transparent). Same cell grid as the mono
+        // atlas so the uv maths are shared; sampled only for colour-glyph instances.
+        let color_atlas_cpu = vec![0u8; (ATLAS * ATLAS * 4) as usize];
+        let color_atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("color-atlas"),
+            size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let color_atlas_view = color_atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("term-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -225,6 +268,16 @@ impl TermGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -240,6 +293,7 @@ impl TermGpu {
                 wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&color_atlas_view) },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -260,10 +314,10 @@ impl TermGpu {
                         attributes: &wgpu::vertex_attr_array![0 => Float32x2],
                     },
                     wgpu::VertexBufferLayout {
-                        array_stride: 10 * 4,
+                        array_stride: 12 * 4,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![
-                            1 => Float32x2, 2 => Float32x2, 3 => Float32x3, 4 => Float32x3
+                            1 => Float32x2, 2 => Float32x2, 3 => Float32x3, 4 => Float32x3, 5 => Float32x2
                         ],
                     },
                 ],
@@ -294,17 +348,18 @@ impl TermGpu {
         let inst_cap = 8192u64;
         let inst_vb = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("inst"),
-            size: inst_cap * 10 * 4,
+            size: inst_cap * 12 * 4,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         Self {
-            pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex,
+            pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex, color_atlas_tex,
             font_name: spec.name.clone(), regular: spec.regular.clone(), bold_face: spec.bold.clone(),
             em_px, scale, cell_w, cell_h, baseline,
             is_srgb: format.is_srgb(),
-            atlas_cpu, glyphs: HashMap::new(), next_slot: 2, per_row, atlas_dirty: true,
+            atlas_cpu, color_atlas_cpu, glyphs: HashMap::new(), next_slot: 2, color_next: 0,
+            per_row, atlas_dirty: true, color_dirty: true,
             scratch: Vec::new(), count: 0,
         }
     }
@@ -316,41 +371,77 @@ impl TermGpu {
         self.scale
     }
 
-    fn slot_for(&mut self, ch: char, bold: bool) -> u32 {
+    /// Reserve `cells` horizontally-contiguous slots in the colour atlas (a wide
+    /// emoji needs 2), never straddling a row wrap.
+    fn alloc_color(&mut self, cells: u32) -> u32 {
+        let col = self.color_next % self.per_row;
+        if col + cells > self.per_row {
+            self.color_next += self.per_row - col; // skip the row's tail
+        }
+        let slot = self.color_next;
+        self.color_next += cells;
+        slot
+    }
+
+    /// Resolve `ch` (regular/bold) to a cached glyph: a programmatic block/box glyph
+    /// or a rasterised mono glyph in the R8 atlas, or a colour glyph (emoji) in the
+    /// RGBA atlas spanning `wide_hint ? 2 : 1` cells.
+    fn slot_for(&mut self, ch: char, bold: bool, wide_hint: bool) -> Glyph {
         if ch == ' ' || ch == '\0' {
-            return SLOT_BLANK;
+            return Glyph { slot: SLOT_BLANK, color: false, cells: 1 };
         }
-        if let Some(&s) = self.glyphs.get(&(ch, bold)) {
-            return s;
+        if let Some(&g) = self.glyphs.get(&(ch, bold)) {
+            return g;
         }
-        let slot = self.next_slot;
-        self.next_slot += 1;
-        self.glyphs.insert((ch, bold), slot);
-        let ox = (slot % self.per_row) * self.cell_w;
-        let oy = (slot / self.per_row) * self.cell_h;
         let cp = ch as u32;
+        // The next free mono slot (only consumed if we actually draw a mono glyph).
+        let mslot = self.next_slot;
+        let ox = (mslot % self.per_row) * self.cell_w;
+        let oy = (mslot / self.per_row) * self.cell_h;
         // Block Elements + Box Drawing are drawn programmatically with consistent
         // stroke centres so lines AND corners tile seamlessly — what the web's
         // canvas renderer and GPU terminals (Alacritty/Kitty/WezTerm) do.
         // Font-rendering them leaves sub-pixel gaps and, for rounded corners
         // Menlo lacks, mismatched glyphs from a fallback font.
-        let drawn = draw_block_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
-            || draw_box_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h);
-        if !drawn {
-            // Pick the bold face when we carry one (swash path); otherwise pass
-            // the regular bytes and let the rasteriser synthesise bold (CoreText).
-            let (data, index) = match (bold, &self.bold_face) {
-                (true, Some(b)) => (b.0.as_slice(), b.1),
-                _ => (self.regular.0.as_slice(), self.regular.1),
-            };
-            if let Some(bmp) =
-                crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold)
-            {
-                blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
-            }
+        if draw_block_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
+            || draw_box_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
+        {
+            self.next_slot += 1;
+            self.atlas_dirty = true;
+            let g = Glyph { slot: mslot, color: false, cells: 1 };
+            self.glyphs.insert((ch, bold), g);
+            return g;
         }
-        self.atlas_dirty = true;
-        slot
+        // Pick the bold face when we carry one (swash path); otherwise pass the
+        // regular bytes and let the rasteriser synthesise bold (CoreText).
+        let (data, index) = match (bold, &self.bold_face) {
+            (true, Some(b)) => (b.0.as_slice(), b.1),
+            _ => (self.regular.0.as_slice(), self.regular.1),
+        };
+        let g = match crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold) {
+            Some(bmp) if bmp.color => {
+                // Colour glyph → RGBA atlas. Emoji are double-width, so span 2 cells.
+                let cells = if wide_hint { 2 } else { 1 };
+                let slot = self.alloc_color(cells);
+                let cox = (slot % self.per_row) * self.cell_w;
+                let coy = (slot / self.per_row) * self.cell_h;
+                blit_color(
+                    &mut self.color_atlas_cpu, &bmp, self.baseline, cells * self.cell_w, self.cell_h, cox, coy,
+                );
+                self.color_dirty = true;
+                Glyph { slot, color: true, cells }
+            }
+            Some(bmp) => {
+                blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
+                self.next_slot += 1;
+                self.atlas_dirty = true;
+                Glyph { slot: mslot, color: false, cells: 1 }
+            }
+            // No glyph anywhere → blank (don't consume the mono slot).
+            None => Glyph { slot: SLOT_BLANK, color: false, cells: 1 },
+        };
+        self.glyphs.insert((ch, bold), g);
+        g
     }
 
     fn uv(&self, slot: u32) -> (f32, f32) {
@@ -370,23 +461,25 @@ impl TermGpu {
         // Selection highlight bg (VS Code blue, matches the web's #264f78).
         const SEL_BG: [f32; 3] = [0x26 as f32 / 255.0, 0x4f as f32 / 255.0, 0x78 as f32 / 255.0];
         // Collect drawable cells, then resolve glyph slots (needs &mut self).
-        let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3], bool)> = Vec::new();
-        term.for_each_cell(|row, col, c, fg, bg, bold, selected| {
+        let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3], bool, bool)> = Vec::new();
+        term.for_each_cell(|row, col, c, fg, bg, bold, wide, selected| {
             if selected {
                 // Draw every selected cell (even blanks) with the selection bg.
-                cells.push((row, col, c, fg, SEL_BG, bold));
+                cells.push((row, col, c, fg, SEL_BG, bold, wide));
             } else if !((c == ' ' || c == '\0') && bg == default_bg) {
-                cells.push((row, col, c, fg, bg, bold));
+                cells.push((row, col, c, fg, bg, bold, wide));
             }
         });
 
         self.scratch.clear();
-        for (row, col, c, fg, bg, bold) in &cells {
-            let slot = self.slot_for(*c, *bold);
-            let (u, v) = self.uv(slot);
+        for (row, col, c, fg, bg, bold, wide) in &cells {
+            let g = self.slot_for(*c, *bold, *wide);
+            let (u, v) = self.uv(g.slot);
+            let kind = if g.color { 1.0 } else { 0.0 };
             self.scratch.extend_from_slice(&[
                 *col as f32 * cw, *row as f32 * ch, u, v,
                 fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
+                kind, g.cells as f32,
             ]);
         }
         if cur_vis {
@@ -395,9 +488,10 @@ impl TermGpu {
             self.scratch.extend_from_slice(&[
                 cur_col as f32 * cw, cur_row as f32 * ch, u, v,
                 cur[0], cur[1], cur[2], cur[0], cur[1], cur[2],
+                0.0, 1.0,
             ]);
         }
-        self.count = (self.scratch.len() / 10) as u32;
+        self.count = (self.scratch.len() / 12) as u32;
 
         if self.atlas_dirty {
             queue.write_texture(
@@ -413,12 +507,26 @@ impl TermGpu {
             );
             self.atlas_dirty = false;
         }
+        if self.color_dirty {
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.color_atlas_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.color_atlas_cpu,
+                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(ATLAS * 4), rows_per_image: Some(ATLAS) },
+                wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            );
+            self.color_dirty = false;
+        }
 
         if self.count as u64 > self.inst_cap {
             self.inst_cap = (self.count as u64).next_power_of_two();
             self.inst_vb = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("inst"),
-                size: self.inst_cap * 10 * 4,
+                size: self.inst_cap * 12 * 4,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -712,6 +820,31 @@ fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, c
             if cov > atlas[idx] {
                 atlas[idx] = cov;
             }
+        }
+    }
+}
+
+/// Blit a colour (RGBA) glyph into the colour atlas at (ox, oy), baseline-aligned
+/// like [`blit_glyph`], clipped to a `region_w`×`cell_h` box (2 cells wide for an
+/// emoji). `bmp.coverage` is straight-alpha RGBA, 4 bytes/px.
+fn blit_color(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, region_w: u32, cell_h: u32, ox: u32, oy: u32) {
+    let bw = bmp.width as i32;
+    let bh = bmp.height as i32;
+    let base_x = bmp.left;
+    let base_y = baseline.round() as i32 - bmp.top;
+    for gy in 0..bh {
+        let cy = base_y + gy;
+        if cy < 0 || cy >= cell_h as i32 {
+            continue;
+        }
+        for gx in 0..bw {
+            let cx = base_x + gx;
+            if cx < 0 || cx >= region_w as i32 {
+                continue;
+            }
+            let s = ((gy * bw + gx) * 4) as usize;
+            let d = (((oy + cy as u32) * ATLAS + (ox + cx as u32)) * 4) as usize;
+            atlas[d..d + 4].copy_from_slice(&bmp.coverage[s..s + 4]);
         }
     }
 }
