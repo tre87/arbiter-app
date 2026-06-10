@@ -2520,11 +2520,12 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let fixed = if multi { 52.0 } else { 30.0 }; // icon + padding + (× when multi)
     let max_chars = (((per - fixed) / 6.5).floor() as i32).clamp(3, 40) as usize;
 
+    // Every tab truncates to the same `max_chars`, so each is ≤ tab_area/n and the
+    // row never exceeds the band — no clip needed (clipping cut the last tab's ×).
     let mut tabs = row![].spacing(3).align_y(iced::Center);
     for (i, ws) in state.workspaces.iter().enumerate() {
         tabs = tabs.push(tab_pill(i, ws, i == state.active, multi, max_chars));
     }
-    let tabs = container(tabs).max_width(tab_area.max(1.0)).clip(true);
 
     let mut bar = row![brand, Space::with_width(Length::Fixed(12.0)), tabs, tab_add_button()]
         .spacing(6)
@@ -2689,9 +2690,12 @@ fn main_view(state: &State) -> Element<'_, Message> {
         });
 
     // Titlebar: web height (40px), left-padded for the traffic lights. Transparent
-    // so the app-wide azure glow shows through it. `responsive` gives the bar its
-    // available width so tabs/usage can shrink/hide (see `titlebar_row`).
-    let titlebar = container(iced::widget::responsive(move |sz| titlebar_row(state, sz.width)))
+    // so the app-wide azure glow shows through it. The bar's available width comes
+    // from the tracked window size (not a `responsive`/lazy widget — that ran an
+    // extra layout pass on every resize event and made the macOS traffic lights
+    // flicker), so tabs/usage shrink/hide via `titlebar_row`.
+    let bar_w = (state.main_size.width - TITLEBAR_LEFT_PAD - TITLEBAR_RIGHT_PAD).max(0.0);
+    let titlebar = container(titlebar_row(state, bar_w))
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
         .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
