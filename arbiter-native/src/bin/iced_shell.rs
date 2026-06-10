@@ -255,6 +255,10 @@ struct State {
     usage: UsageData,
     /// When `usage` was last updated (epoch ms) — for the refresh countdown.
     usage_updated_ms: u64,
+    /// When the usage subscription started (epoch ms) — if no data arrives within
+    /// a timeout the bar drops out of "Loading" to "Sign in" (e.g. the helper isn't
+    /// built/running), so it never hangs indefinitely.
+    usage_started_ms: u64,
     /// The chosen claude.ai org uuid for usage (persisted; auto-sent to the helper).
     usage_org: Option<String>,
     /// Whether the org-selection modal is open.
@@ -814,6 +818,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 usage_helper_cmd("fetch");
                 state.usage_updated_ms = now_ms(); // restart the countdown immediately
             }
+            // If the first usage fetch never lands (helper not built/running, no
+            // network), stop "Loading" after a timeout and offer Sign in instead of
+            // hanging forever. Real data (incl. needs_login) overrides this sooner.
+            if state.usage.state == UsageState::Pending
+                && now_ms().saturating_sub(state.usage_started_ms) >= USAGE_PENDING_TIMEOUT_MS
+            {
+                state.usage.state = UsageState::NeedsLogin;
+            }
         }
         Message::Input(bytes) => {
             let ws = state.active_mut();
@@ -912,7 +924,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::UsageSignOut => {
             usage_helper_cmd("signout");
             state.usage_org = None;
-            state.usage = UsageData::default(); // back to Pending (→ NeedsLogin)
+            // Land directly on "Sign in" (not "Loading"), so signing out always
+            // leaves an actionable state even if the helper isn't running.
+            state.usage = UsageData { state: UsageState::NeedsLogin, ..Default::default() };
+            state.usage_started_ms = now_ms();
             save_session(state);
         }
         Message::RefreshUsage => {
@@ -2839,7 +2854,13 @@ fn settings_account_line(label: &str, value: &str) -> Element<'static, Message> 
 fn settings_account(u: &UsageData) -> Element<'static, Message> {
     let head = |s: &str| text(s.to_string()).size(13).font(ui_semibold()).color(TXT_PRIMARY);
     match u.state {
-        UsageState::Pending => head("Loading…").into(),
+        UsageState::Pending => column![
+            head("Loading…"),
+            settings_hint("Fetching usage from claude.ai. Sign out to reset if this doesn't finish."),
+            row![settings_btn("Sign out", Message::UsageSignOut, BtnKind::Danger)],
+        ]
+        .spacing(10)
+        .into(),
         UsageState::NeedsLogin => column![
             head("Not signed in"),
             settings_hint("Sign in to claude.ai to show your usage limits in the titlebar."),
@@ -3649,6 +3670,10 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
 /// How often usage auto-refreshes (the countdown length). The app drives this on
 /// the Tick (the helper's own background timer throttles while hidden).
 const USAGE_REFRESH_MS: u64 = 120_000;
+
+/// How long the titlebar shows "Loading" before falling back to "Sign in" if no
+/// usage data has arrived (helper not built/running, offline). Real data wins sooner.
+const USAGE_PENDING_TIMEOUT_MS: u64 = 8_000;
 
 /// The usage refresh button (web `.refresh-btn`): shows the countdown to the next
 /// auto-poll and, when clicked, refetches now + restarts the countdown.
@@ -4759,13 +4784,20 @@ fn footer_bar(
         container(mdi(path, size, col)).center_y(Length::Fixed(LINE)).into()
     };
     let lbl = move |s: String, col: iced::Color| text(s).size(11).color(col).line_height(lh);
-    // Inter Semibold renders ~1px higher than regular in the same line box; wrap it
-    // in a LINE-tall box with 1px top padding to nudge it back down to match `lbl`
-    // (the box stays LINE tall, so the row height / icons don't move).
-    let sbl = move |s: String, col: iced::Color| {
-        container(text(s).size(11).color(col).font(ui_semibold()).line_height(lh))
-            .height(Length::Fixed(LINE))
-            .padding(iced::Padding { top: 1.0, right: 0.0, bottom: 0.0, left: 0.0 })
+    // On macOS, Inter Semibold renders ~1px higher than regular in the same line
+    // box, so nudge it down 1px (wrapped in a LINE-tall box so the row height /
+    // icons don't move). On Windows/Linux that nudge pushed the number visibly low,
+    // so there it's rendered like `lbl` (bare, same line box) — aligning naturally.
+    let sbl = move |s: String, col: iced::Color| -> Element<'static, Message> {
+        let t = text(s).size(11).color(col).font(ui_semibold()).line_height(lh);
+        if cfg!(target_os = "macos") {
+            container(t)
+                .height(Length::Fixed(LINE))
+                .padding(iced::Padding { top: 1.0, right: 0.0, bottom: 0.0, left: 0.0 })
+                .into()
+        } else {
+            t.into()
+        }
     };
     let div = move || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)).line_height(lh);
 
@@ -5110,7 +5142,19 @@ fn pane_header(
             button(svg(svg::Handle::from_memory(icon.as_bytes())).width(15).height(15))
                 .on_press(Message::SwitchShell(pane))
                 .padding(2)
-                .style(button::text),
+                // Bordered like the info button (was borderless `button::text`).
+                .style(|_t: &iced::Theme, s| button::Style {
+                    border: iced::Border {
+                        color: if matches!(s, button::Status::Hovered) {
+                            AZURE
+                        } else {
+                            iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)
+                        },
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                }),
         );
     }
     if claude_running {
@@ -6107,6 +6151,7 @@ fn main() -> iced::Result {
                 new_ws_menu_x: 0.0,
                 usage: UsageData::default(),
                 usage_updated_ms: 0,
+                usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
                 settings: saved_settings,
