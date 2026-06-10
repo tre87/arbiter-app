@@ -115,12 +115,6 @@ fn main() {
         .with_initialization_script(INIT_SCRIPT)
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.into_body();
-            // Diagnostic: a "RAW:<json>" message dumps the raw usage response to a
-            // temp file (so the exact field shape can be inspected) — not to stdout.
-            if let Some(raw) = body.strip_prefix("RAW:") {
-                let _ = std::fs::write(std::env::temp_dir().join("arbiter-usage-raw.json"), raw);
-                return;
-            }
             // Relay the line to the main app.
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
@@ -187,7 +181,8 @@ fn main() {
 /// Injected into the claude.ai page (a port of the web app's `USAGE_INIT_SCRIPT`):
 /// fetch the org list + usage with the page's own session cookies, build a compact
 /// shape (utilization 0–100 + reset as epoch ms), and post it to Rust via wry IPC.
-/// Picks the first org (multi-org selection is a later refinement).
+/// Multi-org: uses the app-chosen org (via `__arbiterSetOrg`), the only org, or
+/// reports `needs_org` with the list so the app can show its picker.
 const INIT_SCRIPT: &str = r#"
 (function () {
   function post(x) { try { window.ipc.postMessage(JSON.stringify(x)); } catch (_) {} }
@@ -229,11 +224,13 @@ const INIT_SCRIPT: &str = r#"
     if (!chosen) { post({ ok: false, error: 'needs_org', orgs: list }); return; }
     var usage = await usageFor(chosen);
     if (!usage) { post({ ok: false, error: 'error' }); return; }
-    // Diagnostic: hand the raw response to Rust to dump (RAW: prefix → not stdout).
-    try { window.ipc.postMessage('RAW:' + JSON.stringify(usage)); } catch (_) {}
     var plan = (usage.seven_day_opus || usage.seven_day_sonnet) ? 'Max' : (usage.seven_day ? 'Pro' : 'Free');
+    var chosenName = (list.find(function (o) { return o.uuid === chosen; }) || {}).name || null;
     post({
       ok: true, plan: plan,
+      // The chosen org + full list travel with every poll so Settings can show the
+      // current org and offer the switcher without a re-fetch.
+      org_uuid: chosen, org_name: chosenName, orgs: list,
       five_hour: per(usage.five_hour),
       seven_day: per(usage.seven_day),
       seven_day_opus: per(usage.seven_day_opus),

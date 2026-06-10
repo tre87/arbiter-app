@@ -15,7 +15,7 @@ use portable_pty::PtySize;
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{
     button, column, container, horizontal_space, mouse_area, pane_grid, pick_list, row, scrollable,
-    shader as shader_widget, svg, text, text_input, Space,
+    shader as shader_widget, svg, text, text_input, toggler, Space,
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
@@ -245,6 +245,20 @@ struct State {
     usage_org: Option<String>,
     /// Whether the org-selection modal is open.
     usage_org_menu: bool,
+    /// User preferences (the Settings dialog) — persisted with the session.
+    settings: persist::Settings,
+    /// Whether the Settings modal is open, and which tab it's showing.
+    settings_open: bool,
+    settings_tab: SettingsTab,
+}
+
+/// The Settings dialog's sidebar tabs (web `SettingsDialog.vue` tabs). Only the
+/// tabs whose settings have native backing are present; the rest of the web's
+/// tabs (Display/Files) cover features the native build doesn't have yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsTab {
+    General,
+    ClaudeUsage,
 }
 
 /// State of the "new worktree" modal: the branch name being typed, the chosen
@@ -305,8 +319,17 @@ enum Message {
     CloseUsageOrgMenu,
     /// Pick a claude.ai org for usage (persist + tell the helper).
     SelectUsageOrg(String),
-    /// Temp: sign out of the usage webview only (clears its claude.ai session).
+    /// Sign out of the usage webview only (clears its claude.ai session).
     UsageSignOut,
+    /// Open / dismiss the Settings dialog, and switch its active tab.
+    OpenSettings,
+    CloseSettings,
+    SettingsSelectTab(SettingsTab),
+    /// Settings toggles (persisted).
+    ToggleHideUsageBar(bool),
+    ToggleHideSonnetUsage(bool),
+    /// Settings → "Clear saved data": delete the on-disk session layout.
+    ClearSavedData,
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -630,6 +653,7 @@ fn save_session(state: &State) {
         overview_window: Some(saved_window(state.overview_size, state.overview_pos)),
         overview_visible: state.overview_window.is_some(),
         usage_org: state.usage_org.clone(),
+        settings: state.settings.clone(),
         workspaces: state
             .workspaces
             .iter()
@@ -792,6 +816,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.usage_org = None;
             state.usage = UsageData::default(); // back to Pending (→ NeedsLogin)
             save_session(state);
+        }
+        Message::OpenSettings => state.settings_open = true,
+        Message::CloseSettings => state.settings_open = false,
+        Message::SettingsSelectTab(tab) => state.settings_tab = tab,
+        Message::ToggleHideUsageBar(v) => {
+            state.settings.hide_usage_bar = v;
+            save_session(state);
+        }
+        Message::ToggleHideSonnetUsage(v) => {
+            state.settings.hide_sonnet_usage = v;
+            save_session(state);
+        }
+        Message::ClearSavedData => {
+            // Forget the on-disk layout only — live workspaces are untouched.
+            persist::clear();
         }
         Message::NewProjectWorkspace => {
             state.new_ws_menu = false;
@@ -2154,8 +2193,13 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if state.new_ws_menu {
         return Some(new_ws_menu_view(state.new_ws_menu_x));
     }
+    // The org picker layers above Settings (it's reached from the Settings "Switch
+    // organization" button), so check it first; dismissing it returns to Settings.
     if state.usage_org_menu {
         return Some(usage_org_menu_view(&state.usage.orgs));
+    }
+    if state.settings_open {
+        return Some(settings_dialog_view(state));
     }
     if let Some(dlg) = &state.worktree_dialog {
         return Some(worktree_dialog_view(dlg));
@@ -2317,6 +2361,312 @@ fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
     modal_scrim(modal_panel(panel.into()), Message::WorktreeMenuClose)
 }
 
+// ── Settings dialog (web SettingsDialog.vue: sidebar + tabbed content) ─────────
+
+/// Variants of the web `.btn` family used in Settings.
+#[derive(Clone, Copy)]
+enum BtnKind {
+    Primary,
+    Secondary,
+    Danger,
+}
+
+/// A 1px full-width hairline (web `border-bottom`/`border-top` on sections/footer).
+fn settings_hdivider() -> Element<'static, Message> {
+    container(Space::new(Length::Fill, Length::Fixed(1.0)))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A web `.btn` (Primary / Secondary / Danger), exact colours from `color.css`.
+fn settings_btn(label: &str, msg: Message, kind: BtnKind) -> Element<'static, Message> {
+    button(text(label.to_string()).size(13))
+        .padding([8, 16])
+        .on_press(msg)
+        .style(move |_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered);
+            let danger = iced::Color::from_rgb8(0xef, 0x44, 0x44);
+            let (bg, tc, bc): (Option<iced::Color>, iced::Color, iced::Color) = match kind {
+                BtnKind::Primary => {
+                    let c = if hovered { iced::Color::from_rgb8(0x02, 0x7d, 0xff) } else { AZURE };
+                    (Some(c), iced::Color::WHITE, c)
+                }
+                BtnKind::Secondary => (
+                    Some(if hovered {
+                        iced::Color::from_rgb8(0x12, 0x12, 0x12)
+                    } else {
+                        iced::Color::from_rgb8(0x1c, 0x1c, 0x1c)
+                    }),
+                    if hovered { TXT_PRIMARY } else { TXT_SECONDARY },
+                    if hovered {
+                        iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)
+                    } else {
+                        iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)
+                    },
+                ),
+                BtnKind::Danger => (
+                    hovered.then(|| iced::Color::from_rgba8(0xef, 0x44, 0x44, 0.15)),
+                    if hovered { danger } else { TXT_SECONDARY },
+                    if hovered {
+                        iced::Color::from_rgba8(0xef, 0x44, 0x44, 0.4)
+                    } else {
+                        iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)
+                    },
+                ),
+            };
+            button::Style {
+                background: bg.map(iced::Background::Color),
+                text_color: tc,
+                border: iced::Border { color: bc, width: 1.0, radius: 6.0.into() },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// Uppercase section header with a hairline underline (web `.panel-title`).
+fn settings_section(label: &str) -> Element<'static, Message> {
+    column![
+        text(label.to_uppercase()).size(11).font(ui_semibold()).color(TXT_MUTED),
+        settings_hdivider(),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// Small muted explanatory text under a section (web `.panel-hint`).
+fn settings_hint(s: &str) -> Element<'static, Message> {
+    text(s.to_string()).size(12).color(TXT_MUTED).into()
+}
+
+/// A toggle row: label (+ optional sub-label) on the left, switch on the right
+/// (web `.toggle-row` + `.switch`).
+fn settings_toggle(
+    label: &str,
+    sub: Option<&str>,
+    value: bool,
+    on_toggle: fn(bool) -> Message,
+) -> Element<'static, Message> {
+    let mut labels = column![text(label.to_string()).size(13).color(TXT_SECONDARY)].spacing(2);
+    if let Some(s) = sub {
+        labels = labels.push(text(s.to_string()).size(11).color(TXT_MUTED));
+    }
+    let tog = toggler(value).size(20.0).on_toggle(on_toggle).style(
+        |_t: &iced::Theme, s| {
+            let on = matches!(
+                s,
+                toggler::Status::Active { is_toggled: true } | toggler::Status::Hovered { is_toggled: true }
+            );
+            toggler::Style {
+                background: if on { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
+                background_border_width: 0.0,
+                background_border_color: iced::Color::TRANSPARENT,
+                foreground: iced::Color::WHITE,
+                foreground_border_width: 0.0,
+                foreground_border_color: iced::Color::TRANSPARENT,
+            }
+        },
+    );
+    container(row![labels, horizontal_space(), tog].spacing(12).align_y(iced::Center))
+        .padding([10, 4])
+        .into()
+}
+
+/// One `label  value` line in the account block (web `.account-meta-row`).
+fn settings_account_line(label: &str, value: &str) -> Element<'static, Message> {
+    row![
+        text(label.to_string()).size(12).color(TXT_MUTED).width(Length::Fixed(104.0)),
+        text(value.to_string()).size(12).color(TXT_SECONDARY),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// The account block of the Claude Usage tab — mirrors web's account section: who
+/// you're signed in as (plan + org), plus Switch-organization / Sign-out (or a
+/// Sign-in button when not authenticated).
+fn settings_account(u: &UsageData) -> Element<'static, Message> {
+    let head = |s: &str| text(s.to_string()).size(13).font(ui_semibold()).color(TXT_PRIMARY);
+    match u.state {
+        UsageState::Pending => head("Loading…").into(),
+        UsageState::NeedsLogin => column![
+            head("Not signed in"),
+            settings_hint("Sign in to claude.ai to show your usage limits in the titlebar."),
+            row![settings_btn("Sign in", Message::ShowUsageLogin, BtnKind::Primary)],
+        ]
+        .spacing(10)
+        .into(),
+        UsageState::NeedsOrg => column![
+            head("Signed in"),
+            settings_hint("Your account has multiple organizations — pick the one to track usage for."),
+            row![
+                settings_btn("Choose organization", Message::ShowUsageOrgMenu, BtnKind::Primary),
+                settings_btn("Sign out", Message::UsageSignOut, BtnKind::Danger),
+            ]
+            .spacing(8),
+        ]
+        .spacing(10)
+        .into(),
+        UsageState::Error => column![
+            head("Signed in"),
+            settings_account_line("Usage", "Unavailable — try reconnecting"),
+            row![
+                settings_btn("Reconnect", Message::ShowUsageLogin, BtnKind::Secondary),
+                settings_btn("Sign out", Message::UsageSignOut, BtnKind::Danger),
+            ]
+            .spacing(8),
+        ]
+        .spacing(10)
+        .into(),
+        UsageState::Ok => {
+            let mut col = column![head("Signed in")].spacing(6);
+            if let Some(plan) = &u.plan {
+                col = col.push(settings_account_line("Plan", plan));
+            }
+            if let Some(org) = &u.org_name {
+                col = col.push(settings_account_line("Organization", org));
+            }
+            let mut btns = row![].spacing(8);
+            if u.orgs.len() > 1 {
+                btns = btns
+                    .push(settings_btn("Switch organization", Message::ShowUsageOrgMenu, BtnKind::Secondary));
+            }
+            btns = btns.push(settings_btn("Sign out", Message::UsageSignOut, BtnKind::Danger));
+            col = col.push(Space::with_height(Length::Fixed(4.0))).push(btns);
+            col.into()
+        }
+    }
+}
+
+/// One sidebar tab entry (web `.tab`): active tab gets the tinted-white wash.
+fn settings_tab_item(label: &str, tab: SettingsTab, active: SettingsTab) -> Element<'static, Message> {
+    let is = tab == active;
+    button(text(label.to_string()).size(13))
+        .width(Length::Fill)
+        .padding([7, 10])
+        .on_press(Message::SettingsSelectTab(tab))
+        .style(move |_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered);
+            let (bg, tc) = if is {
+                (Some(white_a(0.08)), TXT_PRIMARY)
+            } else if hovered {
+                (Some(white_a(0.04)), TXT_PRIMARY)
+            } else {
+                (None, TXT_SECONDARY)
+            };
+            button::Style {
+                background: bg.map(iced::Background::Color),
+                text_color: tc,
+                border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// Wrap a tab's `body` in the scrollable content pane + a footer with Close
+/// (web `.content` → `.tab-panel` scroll area + `.dialog-actions`).
+fn settings_content(body: Element<'static, Message>) -> Element<'static, Message> {
+    column![
+        scrollable(container(body).padding(24).width(Length::Fill)).height(Length::Fill),
+        settings_hdivider(),
+        container(row![horizontal_space(), settings_btn("Close", Message::CloseSettings, BtnKind::Secondary)])
+            .padding([12, 16]),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// The Settings modal: an 820×600 card (web `.dialog`) — a left sidebar of tabs +
+/// a scrollable content pane — over a dimming scrim. Capped to the viewport so it
+/// never overflows a small window.
+fn settings_dialog_view(state: &State) -> Element<'static, Message> {
+    let sidebar = container(
+        column![
+            text("Settings").size(15).font(ui_semibold()).color(TXT_PRIMARY),
+            column![
+                settings_tab_item("General", SettingsTab::General, state.settings_tab),
+                settings_tab_item("Claude Usage", SettingsTab::ClaudeUsage, state.settings_tab),
+            ]
+            .spacing(2),
+            Space::with_height(Length::Fill),
+            text(format!("Arbiter {} · native", env!("CARGO_PKG_VERSION")))
+                .size(11)
+                .color(TXT_MUTED),
+        ]
+        .spacing(14),
+    )
+    .width(Length::Fixed(184.0))
+    .height(Length::Fill)
+    .padding(16);
+
+    let body = match state.settings_tab {
+        SettingsTab::General => column![
+            settings_section("Saved Data"),
+            settings_hint(
+                "Forget the workspace layout and window geometry Arbiter remembers between launches. \
+                 This clears data on disk only — your open terminals aren't affected."
+            ),
+            row![settings_btn("Clear all saved data", Message::ClearSavedData, BtnKind::Danger)],
+        ]
+        .spacing(12),
+        SettingsTab::ClaudeUsage => column![
+            settings_section("Account"),
+            settings_account(&state.usage),
+            Space::with_height(Length::Fixed(8.0)),
+            settings_section("Display"),
+            settings_toggle("Hide usage bar", None, state.settings.hide_usage_bar, Message::ToggleHideUsageBar),
+            settings_toggle(
+                "Hide Sonnet usage",
+                Some("Hide the per-model Sonnet meter — Sonnet is rarely the binding limit."),
+                state.settings.hide_sonnet_usage,
+                Message::ToggleHideSonnetUsage,
+            ),
+        ]
+        .spacing(12),
+    };
+
+    let inner = row![sidebar, settings_vdivider(), settings_content(body.into())].height(Length::Fill);
+    let card = container(inner)
+        .width(Length::Fill)
+        .max_width(820.0)
+        .height(Length::Fill)
+        .max_height(600.0)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+    // Inner clicks are swallowed (Noop); clicks on the dim margin dismiss.
+    let card = mouse_area(card).on_press(Message::Noop);
+    mouse_area(
+        container(card).center(Length::Fill).padding(24).style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba8(0x00, 0x00, 0x00, 0.5))),
+            ..Default::default()
+        }),
+    )
+    .on_press(Message::CloseSettings)
+    .into()
+}
+
+/// A 1px full-height divider between the sidebar and content (web `border-right`).
+fn settings_vdivider() -> Element<'static, Message> {
+    container(Space::new(Length::Fixed(1.0), Length::Fill))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+            ..Default::default()
+        })
+        .into()
+}
+
 // ── Titlebar pieces (web parity: WorkspaceTabs.vue + StatsBar.vue + btn-icon) ──
 
 /// Translucent white at alpha `a` — the tab / "+" chrome uses white borders/fills.
@@ -2461,7 +2811,12 @@ struct UsageData {
     seven_day: Option<UsagePeriod>,
     seven_day_opus: Option<UsagePeriod>,
     seven_day_sonnet: Option<UsagePeriod>,
-    /// Org list (only populated with `NeedsOrg`, for the selector).
+    /// Plan name from the usage API ("Pro" / "Max" / "Free"), shown in Settings.
+    plan: Option<String>,
+    /// Display name of the org usage is being read from (shown in Settings).
+    org_name: Option<String>,
+    /// Org list (for the selector); populated on `NeedsOrg` and on `Ok` so the
+    /// "Switch organization" button in Settings always has the list.
     orgs: Vec<OrgInfo>,
 }
 
@@ -2480,6 +2835,10 @@ struct HelperLine {
     ok: bool,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    org_name: Option<String>,
     #[serde(default)]
     orgs: Vec<HelperOrg>,
     #[serde(default)]
@@ -2513,7 +2872,9 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
         seven_day: cv(l.seven_day),
         seven_day_opus: cv(l.seven_day_opus),
         seven_day_sonnet: cv(l.seven_day_sonnet),
-        orgs: Vec::new(),
+        plan: l.plan,
+        org_name: l.org_name,
+        orgs: l.orgs.into_iter().map(|o| OrgInfo { uuid: o.uuid, name: o.name }).collect(),
     })
 }
 
@@ -2611,7 +2972,11 @@ fn fmt_reset(resets_at_ms: Option<i64>) -> String {
 /// the live bars (Ok), a loading indicator (Pending), a Sign-in button
 /// (NeedsLogin), or a warning (Error). The bars are a meter per present period
 /// (5h blue / 7d green / Opus green / Sonnet blue) + the refresh button.
-fn usage_section(u: &UsageData, updated_ms: u64) -> Option<(Element<'static, Message>, f32)> {
+fn usage_section(
+    u: &UsageData,
+    updated_ms: u64,
+    hide_sonnet: bool,
+) -> Option<(Element<'static, Message>, f32)> {
     match u.state {
         UsageState::Pending => {
             Some((row![usage_loading(), vsep()].spacing(8).align_y(iced::Center).into(), 60.0))
@@ -2631,11 +2996,13 @@ fn usage_section(u: &UsageData, updated_ms: u64) -> Option<(Element<'static, Mes
         UsageState::Error => Some((row![usage_warning(), vsep()].spacing(8).align_y(iced::Center).into(), 168.0)),
         UsageState::Ok => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
+            // Sonnet is hidden by default (Settings → "Hide Sonnet usage").
+            let sonnet = if hide_sonnet { None } else { u.seven_day_sonnet };
             let entries: [(&str, iced::Color, Option<UsagePeriod>); 4] = [
                 ("5h", AZURE, u.five_hour),
                 ("7d", green, u.seven_day),
                 ("Opus", green, u.seven_day_opus),
-                ("Sonnet", AZURE, u.seven_day_sonnet),
+                ("Sonnet", AZURE, sonnet),
             ];
             let mut row = row![].spacing(8).align_y(iced::Center);
             let mut n = 0u32;
@@ -2914,13 +3281,17 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let caption_w = 140.0;
     #[cfg(not(target_os = "windows"))]
     let caption_w = 0.0;
-    let actions_w = 232.0 + caption_w; // 7 btn-icons (+ Windows caption strip)
+    let actions_w = 204.0 + caption_w; // 6 btn-icons (+ Windows caption strip)
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
     // Usage section (bars / loading / sign-in / warning), built once with its own
     // width estimate so the tab budget and the actual push agree. Shown when its
-    // width still leaves a minimum tab band.
-    let usage_el = usage_section(&state.usage, state.usage_updated_ms);
+    // width still leaves a minimum tab band — unless hidden in Settings.
+    let usage_el = if state.settings.hide_usage_bar {
+        None
+    } else {
+        usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
+    };
     let usage_w = usage_el.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
     let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
     let tab_area = (if show_usage { avail - usage_w } else { avail }).max(TAB_MIN);
@@ -2958,12 +3329,10 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         row![
             action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()),
             action_icon_btn(mdi_path::ARROW_ALL, Message::Noop, false),
-            action_icon_btn(mdi_path::COG, Message::Noop, false),
+            action_icon_btn(mdi_path::COG, Message::OpenSettings, state.settings_open),
             action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
             action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
             action_icon_btn(mdi_path::CLOSE, Message::Close, false),
-            // TEMP: sign out of the usage webview only (until Settings exists).
-            action_icon_btn(mdi_path::LOGOUT, Message::UsageSignOut, false),
         ]
         .spacing(4)
         .align_y(iced::Center),
@@ -3496,8 +3865,6 @@ mod mdi_path {
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
     // Usage error indicator: a "!" in a circle.
     pub const ALERT_CIRCLE: &str = "M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z";
-    // Temp usage sign-out button.
-    pub const LOGOUT: &str = "M16,17V14H9V10H16V7L21,12L16,17M14,2A2,2 0 0,1 16,4V6H14V4H5V20H14V18H16V20A2,2 0 0,1 14,22H5A2,2 0 0,1 3,20V4A2,2 0 0,1 5,2H14Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -4641,6 +5008,7 @@ fn main() -> iced::Result {
             let overview_geom = saved.as_ref().and_then(|s| s.overview_window);
             let overview_was_open = saved.as_ref().map(|s| s.overview_visible).unwrap_or(false);
             let saved_usage_org = saved.as_ref().and_then(|s| s.usage_org.clone());
+            let saved_settings = saved.as_ref().map(|s| s.settings.clone()).unwrap_or_default();
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
@@ -4747,6 +5115,9 @@ fn main() -> iced::Result {
                 usage_updated_ms: 0,
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
+                settings: saved_settings,
+                settings_open: false,
+                settings_tab: SettingsTab::General,
             };
             (state, iced::Task::batch(tasks))
         })
