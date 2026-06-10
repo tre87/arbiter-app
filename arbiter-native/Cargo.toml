@@ -70,6 +70,10 @@ tao = { version = "0.30", optional = true }
 muda = { version = "0.13", optional = true }
 
 [features]
+# On by default so `cargo run --bin iced_shell` builds the usage webview with no
+# extra flags. Opt out with `--no-default-features` for a lean build (no wry/tao;
+# on Linux that also avoids needing webkit2gtk dev libs).
+default = ["usage-helper"]
 usage-helper = ["dep:wry", "dep:tao", "dep:muda"]
 
 # Platform-native glyph rasterisation so terminal text matches the OS's own text
