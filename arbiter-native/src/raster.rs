@@ -34,9 +34,15 @@ pub fn rasterize(
         let _ = (font_data, font_index);
         mac::rasterize(font_name, em_px, ch, bold)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // TODO: synthetic/real bold on the swash path (Windows DirectWrite).
+        // DirectWrite: OS-native rendering + system font fallback + colour emoji.
+        let _ = (font_data, font_index);
+        dwrite::rasterize(font_name, em_px, ch, bold)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux: swash with fontdb fallback (incl. Noto Color Emoji).
         let _ = (font_name, bold);
         swash_raster::rasterize(font_data, font_index, em_px, ch)
     }
@@ -46,7 +52,7 @@ pub fn rasterize(
 /// (hinted, grid-fit, crisp at small sizes) and, when the primary font lacks a
 /// glyph, falls back to a system font found via `fontdb` — including colour emoji
 /// fonts (Segoe UI Emoji's COLR / Noto Color Emoji's CBDT), rendered as RGBA.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod swash_raster {
     use super::GlyphBitmap;
     use std::cell::RefCell;
@@ -387,5 +393,207 @@ mod mac {
         }
 
         Some(GlyphBitmap { left, top, width: w as u32, height: h as u32, coverage, color: false })
+    }
+}
+
+/// DirectWrite + Direct2D rasteriser (Windows). Renders one character through an
+/// `IDWriteTextLayout` — which does system font fallback automatically (emoji →
+/// Segoe UI Emoji, CJK/symbols → their fonts) — into a WIC RGBA bitmap with colour
+/// fonts enabled. Mono glyphs come out as white-on-transparent (→ coverage from
+/// alpha); colour glyphs come out coloured (→ RGBA). The OS-native equivalent of
+/// the macOS CoreText path.
+#[cfg(target_os = "windows")]
+mod dwrite {
+    use super::GlyphBitmap;
+    use std::cell::RefCell;
+    use windows::core::{Interface, Result, PCWSTR};
+    use windows::Win32::Graphics::Direct2D::Common::{
+        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
+    };
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+        D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+        D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    };
+    use windows::Win32::Graphics::DirectWrite::{
+        DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
+        WICBitmapLockRead, WICRect,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    };
+
+    struct Ctx {
+        dwrite: IDWriteFactory,
+        d2d: ID2D1Factory,
+        wic: IWICImagingFactory,
+        family: Vec<u16>, // null-terminated
+        name: String,
+        em: f32,
+    }
+
+    thread_local! {
+        static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
+    }
+
+    pub fn rasterize(font_name: &str, em_px: f32, ch: char, bold: bool) -> Option<GlyphBitmap> {
+        CTX.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            let stale = cell
+                .as_ref()
+                .map_or(true, |c| c.name != font_name || (c.em - em_px).abs() > 0.5);
+            if stale {
+                *cell = build_ctx(font_name, em_px).ok();
+            }
+            let ctx = cell.as_ref()?;
+            render(ctx, ch, bold).ok().flatten()
+        })
+    }
+
+    fn build_ctx(font_name: &str, em_px: f32) -> Result<Ctx> {
+        unsafe {
+            // WIC needs COM on this thread; harmless if already initialised.
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let wic: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let mut family: Vec<u16> = font_name.encode_utf16().collect();
+            family.push(0);
+            Ok(Ctx { dwrite, d2d, wic, family, name: font_name.to_string(), em: em_px })
+        }
+    }
+
+    fn render(ctx: &Ctx, ch: char, bold: bool) -> Result<Option<GlyphBitmap>> {
+        unsafe {
+            let weight = if bold { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
+            let locale: Vec<u16> = "en-us\0".encode_utf16().collect();
+            let format = ctx.dwrite.CreateTextFormat(
+                PCWSTR(ctx.family.as_ptr()),
+                None,
+                weight,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                ctx.em,
+                PCWSTR(locale.as_ptr()),
+            )?;
+
+            let mut buf = [0u16; 2];
+            let text: &[u16] = ch.encode_utf16(&mut buf);
+            let boxw = (ctx.em * 2.5).ceil() + 4.0;
+            let boxh = (ctx.em * 2.0).ceil() + 4.0;
+            let layout = ctx.dwrite.CreateTextLayout(text, &format, boxw, boxh)?;
+
+            // Baseline (box-top → baseline) for placement.
+            let mut lm = [DWRITE_LINE_METRICS::default(); 1];
+            let mut count = 0u32;
+            let _ = layout.GetLineMetrics(Some(&mut lm), &mut count);
+            let baseline = if lm[0].baseline > 0.0 { lm[0].baseline } else { ctx.em * 0.8 };
+
+            let (w, h) = (boxw as u32, boxh as u32);
+            let bitmap = ctx.wic.CreateBitmap(
+                w,
+                h,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapCacheOnLoad,
+            )?;
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            let rt: ID2D1RenderTarget = ctx.d2d.CreateWicBitmapRenderTarget(&bitmap, &props)?;
+            let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+            let clear = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+            let brush = rt.CreateSolidColorBrush(&white, None)?;
+            rt.BeginDraw();
+            rt.Clear(Some(&clear));
+            rt.DrawTextLayout(
+                D2D_POINT_2F { x: 0.0, y: 0.0 },
+                &layout,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+            );
+            rt.EndDraw(None, None)?;
+
+            // Read the rendered PBGRA pixels.
+            let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
+            let lock = bitmap.Lock(&rect, WICBitmapLockRead)?;
+            let stride = lock.GetStride()? as usize;
+            let mut size = 0u32;
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            lock.GetDataPointer(&mut size, &mut ptr)?;
+            if ptr.is_null() {
+                return Ok(None);
+            }
+            let data = std::slice::from_raw_parts(ptr, size as usize);
+
+            Ok(build_glyph(data, stride, w, h, baseline))
+        }
+    }
+
+    /// Crop the rendered bitmap to the glyph's ink box and classify mono vs colour.
+    /// PBGRA premultiplied: a white mono glyph has B==G==R==A; a colour glyph varies.
+    fn build_glyph(data: &[u8], stride: usize, w: u32, h: u32, baseline: f32) -> Option<GlyphBitmap> {
+        let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0u32, 0u32);
+        let (mut found, mut is_color) = (false, false);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y as usize * stride + x as usize * 4;
+                let (b, g, r, a) = (data[i], data[i + 1], data[i + 2], data[i + 3]);
+                if a == 0 {
+                    continue;
+                }
+                found = true;
+                minx = minx.min(x);
+                maxx = maxx.max(x);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+                if !(b == g && g == r) {
+                    is_color = true;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        let (bw, bh) = (maxx - minx + 1, maxy - miny + 1);
+        let top = (baseline - miny as f32).round() as i32;
+        let px = |x: u32, y: u32| y as usize * stride + x as usize * 4;
+        if is_color {
+            let mut rgba = vec![0u8; (bw * bh * 4) as usize];
+            for yy in 0..bh {
+                for xx in 0..bw {
+                    let i = px(minx + xx, miny + yy);
+                    let a = data[i + 3] as u32;
+                    let un = |c: u8| if a > 0 { ((c as u32 * 255 / a).min(255)) as u8 } else { 0 };
+                    let d = ((yy * bw + xx) * 4) as usize;
+                    rgba[d] = un(data[i + 2]); // R (from BGRA)
+                    rgba[d + 1] = un(data[i + 1]); // G
+                    rgba[d + 2] = un(data[i]); // B
+                    rgba[d + 3] = a as u8;
+                }
+            }
+            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: rgba, color: true })
+        } else {
+            let mut cov = vec![0u8; (bw * bh) as usize];
+            for yy in 0..bh {
+                for xx in 0..bw {
+                    cov[(yy * bw + xx) as usize] = data[px(minx + xx, miny + yy) + 3]; // alpha
+                }
+            }
+            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: cov, color: false })
+        }
     }
 }
