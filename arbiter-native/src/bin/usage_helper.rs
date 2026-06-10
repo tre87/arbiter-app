@@ -29,7 +29,15 @@ enum UserEvent {
 }
 
 fn main() {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    #[allow(unused_mut)]
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // macOS: run as an Accessory app so the sidecar shows NO dock icon (it can
+    // still display + focus the sign-in window when asked).
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
     let proxy = event_loop.create_proxy();
 
     // Drive window visibility from the parent over stdin: it sends "show\n" when the
