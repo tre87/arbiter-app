@@ -85,6 +85,29 @@ pub struct SavedWorkspace {
     pub project: Option<SavedProject>,
 }
 
+/// User-tweakable preferences (the Settings dialog). Kept small + serialised whole
+/// so adding a field is back-compatible (missing fields fall back to `Default`).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Settings {
+    /// Hide the whole titlebar usage section (web `devStore.hideUsageBar`).
+    #[serde(default)]
+    pub hide_usage_bar: bool,
+    /// Hide the per-model Sonnet usage meter (web `devStore.hideSonnetUsage`,
+    /// default on — Sonnet is rarely the binding limit).
+    #[serde(default = "default_true")]
+    pub hide_sonnet_usage: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { hide_usage_bar: false, hide_sonnet_usage: true }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SavedState {
     pub active: usize,
@@ -101,6 +124,9 @@ pub struct SavedState {
     /// Chosen claude.ai org uuid for the usage bars (so the picker isn't re-shown).
     #[serde(default)]
     pub usage_org: Option<String>,
+    /// User preferences (Settings dialog); defaulted so older saves load.
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 fn path() -> Option<PathBuf> {
@@ -124,6 +150,14 @@ pub fn save(state: &SavedState) {
     }
 }
 
+/// Delete the saved layout on disk (Settings → "Clear saved data"). Best-effort;
+/// the live workspaces aren't touched — only what's remembered between launches.
+pub fn clear() {
+    if let Some(p) = path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +170,7 @@ mod tests {
             overview_window: None,
             overview_visible: true,
             usage_org: None,
+            settings: Settings::default(),
             workspaces: vec![
                 SavedWorkspace {
                     name: "Workspace 1".into(),
@@ -204,6 +239,9 @@ mod tests {
             "layout":{"Leaf":{"name":"T","shell":"PowerShell","cwd":null}}}]}"#;
         let s: SavedState = serde_json::from_str(json).unwrap();
         assert!(s.main_window.is_none());
+        // Settings default when absent: Sonnet meter hidden, usage bar shown.
+        assert!(s.settings.hide_sonnet_usage);
+        assert!(!s.settings.hide_usage_bar);
         match &s.workspaces[0].layout {
             SavedNode::Leaf { claude_running, claude_session, .. } => {
                 assert!(!claude_running);
