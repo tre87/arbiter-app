@@ -64,9 +64,12 @@ tiny-skia = "0.11"
 # so normal `iced_shell` builds don't compile wry/tao.
 wry = { version = "0.45", optional = true }
 tao = { version = "0.30", optional = true }
+# Standard Edit menu (Cut/Copy/Paste/Select-All) for the sign-in window so Cmd+V
+# works in the claude.ai webview (macOS needs a menu item to bind ⌘V).
+muda = { version = "0.13", optional = true }
 
 [features]
-usage-helper = ["dep:wry", "dep:tao"]
+usage-helper = ["dep:wry", "dep:tao", "dep:muda"]
 
 # The sidecar binary; only built when the `usage-helper` feature is on, so the
 # heavy webview deps stay out of normal main-app builds.
