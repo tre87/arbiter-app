@@ -28,6 +28,11 @@ pub enum ClaudeScreen {
 pub struct NoopListener;
 impl EventListener for NoopListener {}
 
+/// Scrollback lines kept per terminal (Settings → "Terminal scrollback lines").
+/// A global so new terminals pick up the setting without threading it through
+/// every `Session::spawn`/`VtTerm::new` call site; existing grids keep their size.
+pub static SCROLLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(5000);
+
 #[derive(Clone, Copy)]
 struct Size {
     cols: usize,
@@ -50,7 +55,7 @@ pub struct VtTerm {
 impl VtTerm {
     pub fn new(cols: usize, rows: usize) -> Self {
         let mut config = Config::default();
-        config.scrolling_history = 5000;
+        config.scrolling_history = SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed);
         let term = Term::new(config, &Size { cols, rows }, NoopListener);
         Self {
             term,

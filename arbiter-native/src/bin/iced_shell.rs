@@ -258,6 +258,7 @@ struct State {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsTab {
     General,
+    Display,
     ClaudeUsage,
 }
 
@@ -328,6 +329,10 @@ enum Message {
     /// Settings toggles (persisted).
     ToggleHideUsageBar(bool),
     ToggleHideSonnetUsage(bool),
+    ToggleOverviewClaudeOnly(bool),
+    ToggleHideShellButton(bool),
+    /// Settings → scrollback lines (text input; parsed + clamped).
+    SetScrollback(String),
     /// Settings → "Clear saved data": delete the on-disk session layout.
     ClearSavedData,
     SelectWorkspace(usize),
@@ -826,6 +831,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleHideSonnetUsage(v) => {
             state.settings.hide_sonnet_usage = v;
+            save_session(state);
+        }
+        Message::ToggleOverviewClaudeOnly(v) => {
+            state.settings.overview_claude_only = v;
+            save_session(state);
+        }
+        Message::ToggleHideShellButton(v) => {
+            state.settings.hide_shell_button = v;
+            save_session(state);
+        }
+        Message::SetScrollback(s) => {
+            // Keep only digits, clamp to the supported range; new terminals pick it
+            // up via the global (existing grids keep their current scrollback).
+            let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
+            let n = digits
+                .parse::<usize>()
+                .unwrap_or(persist::SCROLLBACK_MIN)
+                .clamp(persist::SCROLLBACK_MIN, persist::SCROLLBACK_MAX);
+            state.settings.scrollback = n;
+            arbiter_native::term::SCROLLBACK.store(n, std::sync::atomic::Ordering::Relaxed);
             save_session(state);
         }
         Message::ClearSavedData => {
@@ -2475,6 +2500,44 @@ fn settings_toggle(
         .into()
 }
 
+/// A numeric setting row: label (+ sub) on the left, a small text input on the
+/// right (web `.toggle-row` + `.num-input`). Parsing/clamping happens in `update`.
+fn settings_number_row(
+    label: &str,
+    sub: &str,
+    value: usize,
+    on_input: fn(String) -> Message,
+) -> Element<'static, Message> {
+    let labels = column![
+        text(label.to_string()).size(13).color(TXT_SECONDARY),
+        text(sub.to_string()).size(11).color(TXT_MUTED),
+    ]
+    .spacing(2);
+    let input = text_input("", &value.to_string())
+        .on_input(on_input)
+        .width(Length::Fixed(90.0))
+        .padding([6, 8])
+        .size(13)
+        .style(|_t: &iced::Theme, status| {
+            let focused = matches!(status, text_input::Status::Focused);
+            text_input::Style {
+                background: iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12)),
+                border: iced::Border {
+                    color: if focused { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                icon: TXT_MUTED,
+                placeholder: TXT_MUTED,
+                value: TXT_PRIMARY,
+                selection: iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.35),
+            }
+        });
+    container(row![labels, horizontal_space(), input].spacing(12).align_y(iced::Center))
+        .padding([10, 4])
+        .into()
+}
+
 /// One `label  value` line in the account block (web `.account-meta-row`).
 fn settings_account_line(label: &str, value: &str) -> Element<'static, Message> {
     row![
@@ -2590,6 +2653,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             text("Settings").size(15).font(ui_semibold()).color(TXT_PRIMARY),
             column![
                 settings_tab_item("General", SettingsTab::General, state.settings_tab),
+                settings_tab_item("Display", SettingsTab::Display, state.settings_tab),
                 settings_tab_item("Claude Usage", SettingsTab::ClaudeUsage, state.settings_tab),
             ]
             .spacing(2),
@@ -2614,6 +2678,40 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             row![settings_btn("Clear all saved data", Message::ClearSavedData, BtnKind::Danger)],
         ]
         .spacing(12),
+        SettingsTab::Display => {
+            let mut col = column![
+                settings_section("Overview"),
+                settings_toggle(
+                    "Only show terminals running Claude",
+                    Some("Filter the overview popout to terminals with Claude running."),
+                    state.settings.overview_claude_only,
+                    Message::ToggleOverviewClaudeOnly,
+                ),
+                Space::with_height(Length::Fixed(8.0)),
+                settings_section("Terminal"),
+                settings_number_row(
+                    "Scrollback lines",
+                    &format!(
+                        "Lines kept per terminal ({}–{}). Lower uses less memory. Applies to new terminals.",
+                        persist::SCROLLBACK_MIN, persist::SCROLLBACK_MAX
+                    ),
+                    state.settings.scrollback,
+                    Message::SetScrollback,
+                ),
+            ]
+            .spacing(12);
+            // The header shell-switch button only exists when Git Bash is found, so
+            // only surface its toggle then (mirrors web's Windows-only gate).
+            if state.git_bash.is_some() {
+                col = col.push(settings_toggle(
+                    "Hide Git Bash button in terminal header",
+                    None,
+                    state.settings.hide_shell_button,
+                    Message::ToggleHideShellButton,
+                ));
+            }
+            col
+        }
         SettingsTab::ClaudeUsage => column![
             settings_section("Account"),
             settings_account(&state.usage),
@@ -3359,7 +3457,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // extends behind it; traffic lights overlay the left pad).
     let focus = state.active().focus;
     let font = &state.font;
-    let has_git_bash = state.git_bash.is_some();
+    // The header's shell-switch button shows only when Git Bash is available AND
+    // it isn't hidden in Settings (web `devStore.hideShellButton`).
+    let has_git_bash = state.git_bash.is_some() && !state.settings.hide_shell_button;
     // The terminal area's four OUTER corners are rounded (web
     // `.terminal-workspace-card` border-radius: 8px). Find the leaf pane owning
     // each corner so only those round — never interior corners where panes meet.
@@ -3602,19 +3702,29 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         .spacing(2)
         .push(container(text("ARBITER").size(11).font(ui_semibold()).color(muted)).padding([8, 12]));
 
+    let only_claude = state.settings.overview_claude_only;
     for (wi, ws) in state.workspaces.iter().enumerate() {
-        let count = ws.panes.iter().count();
+        // Optionally list only terminals running Claude (Settings → Display). A
+        // workspace with nothing to show is skipped entirely.
+        let panes: Vec<_> = ws
+            .panes
+            .iter()
+            .filter(|(_, data)| !only_claude || data.session.claude_running())
+            .collect();
+        if panes.is_empty() {
+            continue;
+        }
         // Workspace title + terminal count.
         let header = row![
             text(ws.name.to_uppercase()).size(10).color(muted),
             horizontal_space(),
-            text(count.to_string()).size(9).color(muted),
+            text(panes.len().to_string()).size(9).color(muted),
         ]
         .padding([3, 12])
         .align_y(iced::Center);
         col = col.push(header);
 
-        for (pane, data) in ws.panes.iter() {
+        for (pane, data) in panes {
             let running = data.session.claude_running();
             let lc = data.session.claude_status().lifecycle;
             let busy = data.session.shell_idle() == Some(false);
@@ -5009,6 +5119,10 @@ fn main() -> iced::Result {
             let overview_was_open = saved.as_ref().map(|s| s.overview_visible).unwrap_or(false);
             let saved_usage_org = saved.as_ref().and_then(|s| s.usage_org.clone());
             let saved_settings = saved.as_ref().map(|s| s.settings.clone()).unwrap_or_default();
+            // Apply the saved scrollback before any terminal spawns so restored
+            // sessions get the configured history depth.
+            arbiter_native::term::SCROLLBACK
+                .store(saved_settings.scrollback, std::sync::atomic::Ordering::Relaxed);
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
