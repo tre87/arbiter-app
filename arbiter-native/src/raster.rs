@@ -42,42 +42,149 @@ pub fn rasterize(
     }
 }
 
-/// swash rasteriser (non-macOS fallback, and the Windows path until DirectWrite).
-/// Hinting on, so stems grid-fit to the pixel grid (crisp at small sizes).
+/// swash rasteriser (non-macOS: Windows/Linux). Renders the primary font's glyphs
+/// (hinted, grid-fit, crisp at small sizes) and, when the primary font lacks a
+/// glyph, falls back to a system font found via `fontdb` — including colour emoji
+/// fonts (Segoe UI Emoji's COLR / Noto Color Emoji's CBDT), rendered as RGBA.
 #[cfg(not(target_os = "macos"))]
 mod swash_raster {
     use super::GlyphBitmap;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    use swash::scale::image::Content;
+    use swash::scale::{Render, ScaleContext, Source, StrikeWith};
+    use swash::zeno::Format;
+    use swash::FontRef;
+
+    thread_local! {
+        static SCALE_CTX: RefCell<ScaleContext> = RefCell::new(ScaleContext::new());
+        static FALLBACK: RefCell<Fallback> = RefCell::new(Fallback::new());
+    }
 
     pub fn rasterize(font_data: &[u8], font_index: u32, em_px: f32, ch: char) -> Option<GlyphBitmap> {
-        use swash::scale::{Render, Source};
-        use swash::zeno::Format;
-        thread_local! {
-            static SCALE_CTX: std::cell::RefCell<swash::scale::ScaleContext> =
-                std::cell::RefCell::new(swash::scale::ScaleContext::new());
+        // 1. Primary (terminal) font: a normal mono glyph.
+        let primary = FontRef::from_index(font_data, font_index as usize)?;
+        let gid = primary.charmap().map(ch);
+        if gid != 0 {
+            return render(&primary, gid, em_px, false);
         }
-        let font = swash::FontRef::from_index(font_data, font_index as usize)?;
-        let glyph_id = font.charmap().map(ch);
-        if glyph_id == 0 {
-            return None;
-        }
-        let image = SCALE_CTX.with(|c| {
-            let mut ctx = c.borrow_mut();
-            let mut scaler = ctx.builder(font).size(em_px).hint(true).build();
-            Render::new(&[Source::Outline]).format(Format::Alpha).render(&mut scaler, glyph_id)
-        })?;
-        if image.placement.width == 0 || image.placement.height == 0 {
-            return None;
-        }
-        Some(GlyphBitmap {
-            left: image.placement.left,
-            top: image.placement.top,
-            width: image.placement.width,
-            height: image.placement.height,
-            coverage: image.data,
-            // Colour emoji on the swash path need font fallback to an emoji font,
-            // which this single-font scaler doesn't do yet (Windows DirectWrite TODO).
-            color: false,
+        // 2. Fallback to a system font that has this glyph (emoji / symbols / CJK).
+        FALLBACK.with(|fb| {
+            let mut fb = fb.borrow_mut();
+            let id = fb.resolve(ch)?;
+            let rc = fb.bytes(id)?;
+            let font = FontRef::from_index(&rc.0, rc.1 as usize)?;
+            let gid = font.charmap().map(ch);
+            if gid == 0 {
+                return None;
+            }
+            render(&font, gid, em_px, true)
         })
+    }
+
+    /// Rasterise one glyph. `allow_color` enables the colour sources (emoji); the
+    /// result is RGBA when the font supplies a colour glyph, else alpha coverage.
+    fn render(font: &FontRef, gid: u16, em_px: f32, allow_color: bool) -> Option<GlyphBitmap> {
+        SCALE_CTX.with(|c| {
+            let mut ctx = c.borrow_mut();
+            // Colour bitmaps/outlines aren't hinted; outline glyphs are (crisp stems).
+            let mut scaler = ctx.builder(*font).size(em_px).hint(!allow_color).build();
+            let sources: &[Source] = if allow_color {
+                &[Source::ColorBitmap(StrikeWith::BestFit), Source::ColorOutline(0), Source::Outline]
+            } else {
+                &[Source::Outline]
+            };
+            let image = Render::new(sources).format(Format::Alpha).render(&mut scaler, gid)?;
+            if image.placement.width == 0 || image.placement.height == 0 {
+                return None;
+            }
+            Some(GlyphBitmap {
+                left: image.placement.left,
+                top: image.placement.top,
+                width: image.placement.width,
+                height: image.placement.height,
+                coverage: image.data,
+                color: matches!(image.content, Content::Color),
+            })
+        })
+    }
+
+    /// Rough emoji-codepoint test, to prefer colour-emoji fonts during fallback.
+    fn is_emoji(ch: char) -> bool {
+        let c = ch as u32;
+        (0x1F000..=0x1FAFF).contains(&c)
+            || (0x2600..=0x27BF).contains(&c)
+            || (0x2B00..=0x2BFF).contains(&c)
+            || (0xFE00..=0xFE0F).contains(&c) // variation selectors
+            || (0x1F1E6..=0x1F1FF).contains(&c) // regional indicators
+    }
+
+    /// System-font fallback: a `fontdb` of installed fonts + caches of which font
+    /// serves each char and the loaded font bytes.
+    struct Fallback {
+        db: fontdb::Database,
+        resolved: HashMap<char, Option<fontdb::ID>>,
+        loaded: HashMap<fontdb::ID, Rc<(Vec<u8>, u32)>>,
+    }
+
+    impl Fallback {
+        fn new() -> Self {
+            let mut db = fontdb::Database::new();
+            db.load_system_fonts();
+            Fallback { db, resolved: HashMap::new(), loaded: HashMap::new() }
+        }
+
+        fn resolve(&mut self, ch: char) -> Option<fontdb::ID> {
+            if let Some(&id) = self.resolved.get(&ch) {
+                return id;
+            }
+            let id = self.search(ch);
+            self.resolved.insert(ch, id);
+            id
+        }
+
+        fn search(&self, ch: char) -> Option<fontdb::ID> {
+            // Prefer the platform colour-emoji font for emoji; otherwise a symbol /
+            // CJK font. First match that actually contains the glyph wins.
+            const EMOJI: &[&str] = &["Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"];
+            const OTHER: &[&str] = &[
+                "Segoe UI Symbol", "Segoe UI", "Noto Sans Symbols 2", "Noto Sans Symbols",
+                "Microsoft YaHei UI", "Yu Gothic UI", "Malgun Gothic", "Noto Sans CJK SC",
+                "Noto Sans CJK JP", "Noto Sans CJK KR",
+            ];
+            let names = if is_emoji(ch) { EMOJI } else { OTHER };
+            for name in names {
+                let q = fontdb::Query {
+                    families: &[fontdb::Family::Name(name)],
+                    ..Default::default()
+                };
+                if let Some(id) = self.db.query(&q) {
+                    if self.face_has(id, ch) {
+                        return Some(id);
+                    }
+                }
+            }
+            None
+        }
+
+        fn face_has(&self, id: fontdb::ID, ch: char) -> bool {
+            self.db
+                .with_face_data(id, |d, i| {
+                    FontRef::from_index(d, i as usize).map(|f| f.charmap().map(ch) != 0).unwrap_or(false)
+                })
+                .unwrap_or(false)
+        }
+
+        fn bytes(&mut self, id: fontdb::ID) -> Option<Rc<(Vec<u8>, u32)>> {
+            if let Some(rc) = self.loaded.get(&id) {
+                return Some(rc.clone());
+            }
+            let data = self.db.with_face_data(id, |d, i| (d.to_vec(), i))?;
+            let rc = Rc::new(data);
+            self.loaded.insert(id, rc.clone());
+            Some(rc)
+        }
     }
 }
 
