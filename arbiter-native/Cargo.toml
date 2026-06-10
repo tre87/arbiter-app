@@ -99,6 +99,7 @@ block2 = "0.5"
 # Only pulled when targeting Windows.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
+    "Foundation_Numerics",
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_Graphics_DirectWrite",
