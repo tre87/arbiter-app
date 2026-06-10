@@ -4944,29 +4944,41 @@ fn pane_header(
 
 // ── Pane operations (keyboard: navigate / resize / equalize) ───────────────────
 
-/// Number of leaf panes under a layout node.
-fn leaf_count(node: &pane_grid::Node) -> usize {
+/// Number of tracks a subtree spans along `axis` (Vertical → columns, Horizontal
+/// → rows): splits on the same axis add their children's tracks; cross-axis splits
+/// take the max (a stacked block is as wide as its widest row, etc.).
+fn axis_tracks(node: &pane_grid::Node, axis: pane_grid::Axis) -> usize {
     match node {
         pane_grid::Node::Pane(_) => 1,
-        pane_grid::Node::Split { a, b, .. } => leaf_count(a) + leaf_count(b),
+        pane_grid::Node::Split { axis: a, a: l, b: r, .. } => {
+            if *a == axis {
+                axis_tracks(l, axis) + axis_tracks(r, axis)
+            } else {
+                axis_tracks(l, axis).max(axis_tracks(r, axis))
+            }
+        }
     }
 }
 
-/// Ratios that make every leaf pane equal size: each split is divided in
-/// proportion to its two subtrees' leaf counts (so uniform layouts come out
-/// exactly even — 2 rows → 0.5 each, 4 columns → 0.25 each).
+/// Ratios for a uniform grid: each split is divided by its children's *track*
+/// counts along that split's own axis — so every row divider ends 50/50 (for two
+/// rows) and N columns each get 1/N, independent of how panes nest (web's
+/// leaf-count equalize skewed rows when columns were uneven).
 fn equal_split_ratios(node: &pane_grid::Node, out: &mut Vec<(pane_grid::Split, f32)>) {
-    if let pane_grid::Node::Split { id, a, b, .. } = node {
-        let (la, lb) = (leaf_count(a), leaf_count(b));
-        out.push((*id, la as f32 / (la + lb) as f32));
+    if let pane_grid::Node::Split { id, axis, a, b, .. } = node {
+        let (ta, tb) = (axis_tracks(a, *axis), axis_tracks(b, *axis));
+        out.push((*id, ta as f32 / (ta + tb) as f32));
         equal_split_ratios(a, out);
         equal_split_ratios(b, out);
     }
 }
 
-/// The split to nudge (and its new ratio) to grow the focused pane toward `dir`:
-/// the nearest enclosing split of the matching axis with the pane on the side that
-/// can grow that way. `None` if the pane already spans that edge.
+/// The split to nudge (and its new ratio) to resize the focused pane toward `dir`:
+/// the nearest enclosing split of the matching axis, with its divider moved in the
+/// arrow direction (Right/Down grow the first child, Left/Up shrink it — exactly
+/// the web's `findResizableSplit`, whose per-child branches collapse to this).
+/// `None` if the pane has no split on that axis. Works whichever side the pane is
+/// on, so all four arrows do something for any pane.
 fn resize_target(
     layout: &pane_grid::Node,
     focus: pane_grid::Pane,
@@ -4974,7 +4986,7 @@ fn resize_target(
 ) -> Option<(pane_grid::Split, f32)> {
     use pane_grid::{Axis, Direction};
     const SPACING: f32 = 2.0; // matches the grid's `.spacing(2)`
-    const STEP: f32 = 0.03;
+    const STEP: f32 = 0.05; // web nudges 5 percentage points
     let size = iced::Size::new(4096.0, 4096.0);
     let pane = *layout.pane_regions(SPACING, size).get(&focus)?;
     let (fcx, fcy) = (pane.x + pane.width / 2.0, pane.y + pane.height / 2.0);
@@ -4982,25 +4994,17 @@ fn resize_target(
         Direction::Left | Direction::Right => Axis::Vertical,
         Direction::Up | Direction::Down => Axis::Horizontal,
     };
+    let grow = matches!(dir, Direction::Right | Direction::Down); // move divider +
+    // Nearest matching-axis split enclosing the pane = smallest such region.
     let mut best: Option<(pane_grid::Split, f32, f32)> = None; // (id, new ratio, area)
     for (id, (axis, region, ratio)) in layout.split_regions(SPACING, size) {
         if axis != want || !region.contains(iced::Point::new(fcx, fcy)) {
             continue;
         }
-        // The divider position, and whether the focused pane is on the side that
-        // grows when nudged this direction.
-        let (new_ratio, on_side) = match dir {
-            Direction::Right => (ratio + STEP, fcx < region.x + region.width * ratio),
-            Direction::Left => (ratio - STEP, fcx > region.x + region.width * ratio),
-            Direction::Down => (ratio + STEP, fcy < region.y + region.height * ratio),
-            Direction::Up => (ratio - STEP, fcy > region.y + region.height * ratio),
-        };
-        if !on_side {
-            continue;
-        }
+        let new_ratio = (if grow { ratio + STEP } else { ratio - STEP }).clamp(0.05, 0.95);
         let area = region.width * region.height;
         if best.map_or(true, |(_, _, a)| area < a) {
-            best = Some((id, new_ratio.clamp(0.05, 0.95), area));
+            best = Some((id, new_ratio, area));
         }
     }
     best.map(|(id, r, _)| (id, r))
