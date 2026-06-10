@@ -5213,11 +5213,20 @@ fn working_bar(width_px: f32) -> Element<'static, Message> {
     for x in offs {
         grad = grad.add_stop(x, iced::Color::from_rgba8(0x33, 0x99, 0xff, alpha(x)));
     }
-    let strip = container(Space::with_height(Length::Fixed(3.0)))
+    let glow = container(Space::with_height(Length::Fixed(3.0)))
         .width(Length::Fill)
         .height(Length::Fixed(3.0))
         .style(move |_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Gradient(iced::Gradient::Linear(grad))),
+            ..Default::default()
+        });
+    // Opaque terminal-bg base under the (translucent) glow, so the strip reads as a
+    // clean track instead of revealing/muddying the terminal text behind it.
+    let strip = container(glow)
+        .width(Length::Fill)
+        .height(Length::Fixed(3.0))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
             ..Default::default()
         });
     container(strip)
