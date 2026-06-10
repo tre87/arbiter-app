@@ -218,9 +218,16 @@ const INIT_SCRIPT: &str = r#"
       return;
     }
     var o;
-    try { o = await fetch('/api/organizations'); } catch (_) { post({ ok: false, error: 'needs_login' }); return; }
-    if (o.status === 401 || o.status === 403 || !o.ok) { post({ ok: false, error: 'needs_login' }); return; }
+    // A network failure (offline / claude.ai unreachable) is transient — report
+    // 'error' (Usage unavailable), NOT 'needs_login', so an outage never looks like
+    // you've been signed out.
+    try { o = await fetch('/api/organizations'); } catch (_) { post({ ok: false, error: 'error' }); return; }
+    // Only 401/403 means genuinely unauthenticated → sign in. Any other non-OK
+    // (5xx/429/…) is a server-side problem while still signed in → transient error.
+    if (o.status === 401 || o.status === 403) { post({ ok: false, error: 'needs_login' }); return; }
+    if (!o.ok) { post({ ok: false, error: 'error' }); return; }
     var raw;
+    // A non-JSON 2xx body is almost always the login-redirect HTML page → sign in.
     try { raw = await o.json(); } catch (_) { post({ ok: false, error: 'needs_login' }); return; }
     var list = (Array.isArray(raw) ? raw : [raw])
       .map(function (x) { return { uuid: x.uuid || x.id, name: x.name || x.display_name || (x.uuid || x.id) }; })
