@@ -237,6 +237,10 @@ struct State {
     cursor: iced::Point,
     /// The x at which the "+" dropdown was opened (snapshot of `cursor.x`).
     new_ws_menu_x: f32,
+    /// Latest Claude usage from the sidecar helper (drives the titlebar meters).
+    usage: UsageData,
+    /// When `usage` was last updated (epoch ms) — for the refresh countdown.
+    usage_updated_ms: u64,
 }
 
 /// State of the "new worktree" modal: the branch name being typed, the chosen
@@ -288,6 +292,10 @@ enum Message {
     CloseNewWsMenu,
     /// Cursor moved (window coords) — tracked to anchor the "+" dropdown.
     CursorMoved(iced::Point),
+    /// New Claude usage data from the sidecar helper.
+    UsageUpdated(UsageData),
+    /// Raise the helper's claude.ai sign-in window (titlebar Sign-in button).
+    ShowUsageLogin,
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -735,6 +743,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::CursorMoved(p) => {
             state.cursor = p;
         }
+        Message::UsageUpdated(data) => {
+            // Only stamp the refresh countdown when real data arrives (not on a
+            // needs-login ping), so the countdown reflects the last successful poll.
+            if data.state == UsageState::Ok {
+                state.usage_updated_ms = now_ms();
+            }
+            state.usage = data;
+        }
+        Message::ShowUsageLogin => usage_show_login(),
         Message::NewProjectWorkspace => {
             state.new_ws_menu = false;
             // Pick a folder off-thread (native dialog), then validate as a repo.
@@ -2332,6 +2349,248 @@ fn vsep() -> Element<'static, Message> {
 
 /// One usage meter (web `.stat`): label + 72×18 bar (track #121212, coloured fill,
 /// centred % text) + reset-time text.
+// ── Claude usage (fed by the arbiter-usage-helper sidecar over stdout) ─────────
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum UsageState {
+    /// Initial — first fetch in flight (show a loading indicator).
+    #[default]
+    Pending,
+    /// Not signed in to claude.ai (show a Sign-in button).
+    NeedsLogin,
+    /// Signed in but the usage call failed (show a warning).
+    Error,
+    /// Have usage data (show the bars).
+    Ok,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UsagePeriod {
+    utilization: f64,
+    resets_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageData {
+    state: UsageState,
+    five_hour: Option<UsagePeriod>,
+    seven_day: Option<UsagePeriod>,
+    seven_day_opus: Option<UsagePeriod>,
+    seven_day_sonnet: Option<UsagePeriod>,
+}
+
+#[derive(serde::Deserialize)]
+struct HelperPeriod {
+    utilization: f64,
+    resets_at_ms: Option<i64>,
+}
+#[derive(serde::Deserialize)]
+struct HelperLine {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    five_hour: Option<HelperPeriod>,
+    #[serde(default)]
+    seven_day: Option<HelperPeriod>,
+    #[serde(default)]
+    seven_day_opus: Option<HelperPeriod>,
+    #[serde(default)]
+    seven_day_sonnet: Option<HelperPeriod>,
+}
+
+/// Parse one stdout line from the usage helper into a [`UsageData`].
+fn parse_usage_line(line: &str) -> Option<UsageData> {
+    let l: HelperLine = serde_json::from_str(line.trim()).ok()?;
+    if !l.ok {
+        let state = match l.error.as_deref() {
+            Some("needs_login") => UsageState::NeedsLogin,
+            _ => UsageState::Error,
+        };
+        return Some(UsageData { state, ..Default::default() });
+    }
+    let cv = |p: Option<HelperPeriod>| {
+        p.map(|x| UsagePeriod { utilization: x.utilization, resets_at_ms: x.resets_at_ms })
+    };
+    Some(UsageData {
+        state: UsageState::Ok,
+        five_hour: cv(l.five_hour),
+        seven_day: cv(l.seven_day),
+        seven_day_opus: cv(l.seven_day_opus),
+        seven_day_sonnet: cv(l.seven_day_sonnet),
+    })
+}
+
+/// Path to the sidecar, next to the main executable.
+fn usage_helper_path() -> std::path::PathBuf {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default();
+    let name = if cfg!(windows) { "arbiter-usage-helper.exe" } else { "arbiter-usage-helper" };
+    dir.join(name)
+}
+
+/// The helper's stdin, so the main app can ask it to raise the sign-in window
+/// ("show\n") when the user clicks the titlebar Sign-in button.
+static HELPER_STDIN: std::sync::Mutex<Option<std::process::ChildStdin>> = std::sync::Mutex::new(None);
+
+/// Ask the usage helper to show its claude.ai sign-in window.
+fn usage_show_login() {
+    if let Some(s) = HELPER_STDIN.lock().unwrap().as_mut() {
+        use std::io::Write;
+        let _ = s.write_all(b"show\n");
+        let _ = s.flush();
+    }
+}
+
+/// Subscription: spawn the usage helper and turn each stdout line into a
+/// `UsageUpdated` message. The helper holds the webview; we just read JSON.
+fn usage_subscription() -> Subscription<Message> {
+    Subscription::run(usage_worker)
+}
+
+fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(8, |mut output| async move {
+        use iced::futures::{SinkExt, StreamExt};
+        let mut cmd = std::process::Command::new(usage_helper_path());
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let Ok(mut child) = cmd.spawn() else {
+            // Helper missing/unspawnable → no usage bars; idle forever.
+            std::future::pending::<()>().await;
+            unreachable!()
+        };
+        // Keep the helper's stdin so the Sign-in button can raise its window.
+        *HELPER_STDIN.lock().unwrap() = child.stdin.take();
+        // Bridge the helper's (blocking) stdout lines into this async task.
+        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<String>();
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if tx.unbounded_send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // Holding `child` keeps its piped stdin open; the helper exits on EOF when
+        // this process dies, so no orphan webview.
+        while let Some(line) = rx.next().await {
+            if let Some(data) = parse_usage_line(&line) {
+                let _ = output.send(Message::UsageUpdated(data)).await;
+            }
+        }
+        let _ = child.kill();
+        std::future::pending::<()>().await;
+    })
+}
+
+/// A reset timestamp (epoch ms) → "1d 22h" / "1h 41m" / "15m" (web `formatReset`).
+fn fmt_reset(resets_at_ms: Option<i64>) -> String {
+    let Some(t) = resets_at_ms else { return "—".to_string() };
+    let ms = t - now_ms() as i64;
+    if ms <= 0 {
+        return "now".to_string();
+    }
+    let (d, h, m) = (ms / 86_400_000, (ms % 86_400_000) / 3_600_000, (ms % 3_600_000) / 60_000);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// The titlebar usage section + an estimated width (for the responsive budget):
+/// the live bars (Ok), a loading indicator (Pending), a Sign-in button
+/// (NeedsLogin), or a warning (Error). The bars are a meter per present period
+/// (5h blue / 7d green / Opus green / Sonnet blue) + the refresh button.
+fn usage_section(u: &UsageData, updated_ms: u64) -> Option<(Element<'static, Message>, f32)> {
+    match u.state {
+        UsageState::Pending => Some((usage_loading(), 96.0)),
+        UsageState::NeedsLogin => Some((sign_in_button(), 84.0)),
+        UsageState::Error => Some((usage_warning(), 150.0)),
+        UsageState::Ok => {
+            let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
+            let entries: [(&str, iced::Color, Option<UsagePeriod>); 4] = [
+                ("5h", AZURE, u.five_hour),
+                ("7d", green, u.seven_day),
+                ("Opus", green, u.seven_day_opus),
+                ("Sonnet", AZURE, u.seven_day_sonnet),
+            ];
+            let mut row = row![].spacing(8).align_y(iced::Center);
+            let mut n = 0u32;
+            for (label, color, period) in entries {
+                if let Some(p) = period {
+                    row = row.push(usage_stat(label, p.utilization.round() as u16, color, &fmt_reset(p.resets_at_ms)));
+                    row = row.push(vsep());
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+            row = row.push(refresh_btn(updated_ms));
+            Some((row.into(), 60.0 + n as f32 * 150.0))
+        }
+    }
+}
+
+/// Loading indicator while the first usage fetch is in flight: the animated ✻ +
+/// "Loading" (re-drawn each tick like the working glyph).
+fn usage_loading() -> Element<'static, Message> {
+    let (glyph, color) = working_frame();
+    row![
+        text(glyph).font(symbols_font()).size(13).color(color),
+        text("Loading").size(11).color(TXT_SECONDARY),
+    ]
+    .spacing(5)
+    .align_y(iced::Center)
+    .into()
+}
+
+/// "Sign in" button shown when not authenticated → raises the helper's webview.
+fn sign_in_button() -> Element<'static, Message> {
+    button(text("Sign in").size(11).color(iced::Color::WHITE))
+        .padding([4, 10])
+        .on_press(Message::ShowUsageLogin)
+        .style(|_t: &iced::Theme, s| button::Style {
+            background: Some(iced::Background::Color(if matches!(s, button::Status::Hovered) {
+                iced::Color::from_rgb8(0x49, 0xa6, 0xff)
+            } else {
+                AZURE
+            })),
+            text_color: iced::Color::WHITE,
+            border: iced::Border { radius: 6.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Warning shown when signed in but the usage fetch failed (amber icon + text);
+/// clicking re-opens the sign-in webview to recover.
+fn usage_warning() -> Element<'static, Message> {
+    let amber = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
+    button(
+        row![cmdi(mdi_path::ALERT_CIRCLE, 14.0, amber), text("Usage unavailable").size(11).color(amber)]
+            .spacing(5)
+            .align_y(iced::Center),
+    )
+    .padding([3, 6])
+    .on_press(Message::ShowUsageLogin)
+    .style(|_t: &iced::Theme, s| button::Style {
+        background: matches!(s, button::Status::Hovered)
+            .then(|| iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+        border: iced::Border { radius: 6.0.into(), ..Default::default() },
+        ..Default::default()
+    })
+    .into()
+}
+
 fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<'static, Message> {
     // An 18px absolute line height (= bar height) so the label / % / reset glyphs
     // sit on the same line as the bar. Regular weight on the % avoids the ~1px rise
@@ -2374,12 +2633,19 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
     .into()
 }
 
-/// The usage refresh button (web `.refresh-btn`): a static "1:22" for now.
-fn refresh_btn() -> Element<'static, Message> {
+/// The usage refresh button (web `.refresh-btn`): shows the countdown to the next
+/// poll (the helper refetches every 120s; we reset on each `UsageUpdated`).
+fn refresh_btn(updated_ms: u64) -> Element<'static, Message> {
+    let cd = if updated_ms == 0 {
+        120
+    } else {
+        120u64.saturating_sub(now_ms().saturating_sub(updated_ms) / 1000).min(120)
+    };
+    let label = format!("{}:{:02}", cd / 60, cd % 60);
     button(
         row![
             cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED),
-            text("1:22")
+            text(label)
                 .size(11)
                 .color(TXT_SECONDARY)
                 .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(13.0))),
@@ -2503,7 +2769,6 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     // Approximate widths of the fixed regions (logical px) to budget the tab band.
     const BRAND_W: f32 = 106.0;
     const PLUS_W: f32 = 30.0;
-    const USAGE_W: f32 = 372.0;
     const TAB_MIN: f32 = 60.0;
     #[cfg(target_os = "windows")]
     let caption_w = 140.0;
@@ -2512,9 +2777,13 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let actions_w = 200.0 + caption_w; // 6 btn-icons (+ Windows caption strip)
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
-    // Usage bars only when there's room for them AND a minimum tab band.
-    let show_usage = (avail - USAGE_W) >= (n * TAB_MIN);
-    let tab_area = (if show_usage { avail - USAGE_W } else { avail }).max(TAB_MIN);
+    // Usage section (bars / loading / sign-in / warning), built once with its own
+    // width estimate so the tab budget and the actual push agree. Shown when its
+    // width still leaves a minimum tab band.
+    let usage_el = usage_section(&state.usage, state.usage_updated_ms);
+    let usage_w = usage_el.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
+    let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
+    let tab_area = (if show_usage { avail - usage_w } else { avail }).max(TAB_MIN);
     let per = tab_area / n;
     let multi = state.workspaces.len() > 1;
     let fixed = if multi { 52.0 } else { 30.0 }; // icon + padding + (× when multi)
@@ -2542,19 +2811,8 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         bar = bar.push(horizontal_space());
     }
 
-    if show_usage {
-        let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
-        bar = bar.push(
-            row![
-                usage_stat("5h", 50, AZURE, "1h 41m"),
-                vsep(),
-                usage_stat("7d", 50, green, "1d 22h"),
-                vsep(),
-                refresh_btn(),
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
-        );
+    if let (true, Some((usage, _))) = (show_usage, usage_el) {
+        bar = bar.push(usage);
     }
     bar = bar.push(
         row![
@@ -3094,6 +3352,8 @@ mod mdi_path {
     // Keyboard-shortcuts button: a 4-way arrow cross (reads like the arrow keys,
     // crisp at 16px — the full keyboard glyph is too dense to read small).
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
+    // Usage error indicator: a "!" in a circle.
+    pub const ALERT_CIRCLE: &str = "M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -3786,7 +4046,7 @@ fn subscription(_state: &State) -> Subscription<Message> {
         iced::window::Event::Unfocused => Message::WindowFocusChanged(id, false),
         _ => Message::Noop,
     });
-    Subscription::batch([tick, keys, closes, geom])
+    Subscription::batch([tick, keys, closes, geom, usage_subscription()])
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
@@ -4338,6 +4598,8 @@ fn main() -> iced::Result {
                 new_ws_menu: false,
                 cursor: iced::Point::ORIGIN,
                 new_ws_menu_x: 0.0,
+                usage: UsageData::default(),
+                usage_updated_ms: 0,
             };
             (state, iced::Task::batch(tasks))
         })

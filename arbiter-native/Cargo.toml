@@ -4,6 +4,17 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 description = "Native (no-webview) Arbiter — Phase 0 spike. See ../NATIVE_PLAN.md"
+# Don't auto-discover bins: src/bin/file_icons.rs is a *module* of iced_shell
+# (sibling of the crate root), not a binary. List the real bins explicitly.
+autobins = false
+
+[[bin]]
+name = "arbiter-native"
+path = "src/main.rs"
+
+[[bin]]
+name = "iced_shell"
+path = "src/bin/iced_shell.rs"
 
 [dependencies]
 # Reuse the same PTY layer the shipping app uses (vendored, cross-platform/ConPTY).
@@ -45,6 +56,24 @@ rfd = "0.15"
 # Procedural worktree avatars: draw a deterministic glyph from the branch name to
 # an RGBA buffer. Pinned to resvg 0.42's tiny-skia so no duplicate crate is added.
 tiny-skia = "0.11"
+
+# Claude usage bars: a tiny SIDECAR binary (arbiter-usage-helper) hosts a native
+# webview (WebView2 on Windows, WKWebView on macOS) to log into claude.ai and poll
+# the usage API, streaming JSON to the main app over stdout. Webview is fully
+# isolated in its own process — the terminal stays native. Optional + feature-gated
+# so normal `iced_shell` builds don't compile wry/tao.
+wry = { version = "0.45", optional = true }
+tao = { version = "0.30", optional = true }
+
+[features]
+usage-helper = ["dep:wry", "dep:tao"]
+
+# The sidecar binary; only built when the `usage-helper` feature is on, so the
+# heavy webview deps stay out of normal main-app builds.
+[[bin]]
+name = "arbiter-usage-helper"
+path = "src/bin/usage_helper.rs"
+required-features = ["usage-helper"]
 
 # Platform-native glyph rasterisation so terminal text matches the OS's own text
 # rendering (and thus the webview): CoreText on macOS. Versions pinned to those
