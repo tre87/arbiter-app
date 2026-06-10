@@ -98,6 +98,9 @@ pub struct SavedState {
     /// Whether the overview popout was open at save time → reopen it on startup.
     #[serde(default)]
     pub overview_visible: bool,
+    /// Chosen claude.ai org uuid for the usage bars (so the picker isn't re-shown).
+    #[serde(default)]
+    pub usage_org: Option<String>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -132,6 +135,7 @@ mod tests {
             main_window: Some(SavedWindow { width: 1200.0, height: 800.0, x: Some(10.0), y: Some(20.0) }),
             overview_window: None,
             overview_visible: true,
+            usage_org: None,
             workspaces: vec![
                 SavedWorkspace {
                     name: "Workspace 1".into(),

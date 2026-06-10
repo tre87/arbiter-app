@@ -241,6 +241,10 @@ struct State {
     usage: UsageData,
     /// When `usage` was last updated (epoch ms) — for the refresh countdown.
     usage_updated_ms: u64,
+    /// The chosen claude.ai org uuid for usage (persisted; auto-sent to the helper).
+    usage_org: Option<String>,
+    /// Whether the org-selection modal is open.
+    usage_org_menu: bool,
 }
 
 /// State of the "new worktree" modal: the branch name being typed, the chosen
@@ -296,6 +300,13 @@ enum Message {
     UsageUpdated(UsageData),
     /// Raise the helper's claude.ai sign-in window (titlebar Sign-in button).
     ShowUsageLogin,
+    /// Open / dismiss the org-selection modal.
+    ShowUsageOrgMenu,
+    CloseUsageOrgMenu,
+    /// Pick a claude.ai org for usage (persist + tell the helper).
+    SelectUsageOrg(String),
+    /// Temp: sign out of the usage webview only (clears its claude.ai session).
+    UsageSignOut,
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -618,6 +629,7 @@ fn save_session(state: &State) {
         main_window: Some(saved_window(state.main_size, state.main_pos)),
         overview_window: Some(saved_window(state.overview_size, state.overview_pos)),
         overview_visible: state.overview_window.is_some(),
+        usage_org: state.usage_org.clone(),
         workspaces: state
             .workspaces
             .iter()
@@ -743,15 +755,44 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::CursorMoved(p) => {
             state.cursor = p;
         }
-        Message::UsageUpdated(data) => {
+        Message::UsageUpdated(mut data) => {
             // Only stamp the refresh countdown when real data arrives (not on a
             // needs-login ping), so the countdown reflects the last successful poll.
             if data.state == UsageState::Ok {
                 state.usage_updated_ms = now_ms();
             }
+            // Multi-org: if we have a saved choice that's still valid, auto-apply it
+            // (handles page reloads) instead of re-showing the picker; if it's stale,
+            // drop it and show the picker.
+            if data.state == UsageState::NeedsOrg {
+                match &state.usage_org {
+                    Some(saved) if data.orgs.iter().any(|o| &o.uuid == saved) => {
+                        usage_helper_cmd(&format!("org:{saved}"));
+                        data.state = UsageState::Pending; // wait for the real data
+                    }
+                    _ => {
+                        state.usage_org = None;
+                    }
+                }
+            }
             state.usage = data;
         }
         Message::ShowUsageLogin => usage_show_login(),
+        Message::ShowUsageOrgMenu => state.usage_org_menu = true,
+        Message::CloseUsageOrgMenu => state.usage_org_menu = false,
+        Message::SelectUsageOrg(uuid) => {
+            state.usage_org = Some(uuid.clone());
+            state.usage_org_menu = false;
+            state.usage.state = UsageState::Pending; // loading until the helper replies
+            usage_helper_cmd(&format!("org:{uuid}"));
+            save_session(state);
+        }
+        Message::UsageSignOut => {
+            usage_helper_cmd("signout");
+            state.usage_org = None;
+            state.usage = UsageData::default(); // back to Pending (→ NeedsLogin)
+            save_session(state);
+        }
         Message::NewProjectWorkspace => {
             state.new_ws_menu = false;
             // Pick a folder off-thread (native dialog), then validate as a repo.
@@ -2113,10 +2154,44 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if state.new_ws_menu {
         return Some(new_ws_menu_view(state.new_ws_menu_x));
     }
+    if state.usage_org_menu {
+        return Some(usage_org_menu_view(&state.usage.orgs));
+    }
     if let Some(dlg) = &state.worktree_dialog {
         return Some(worktree_dialog_view(dlg));
     }
     state.worktree_menu.map(|i| worktree_menu_view(state, i))
+}
+
+/// Centred modal listing the user's claude.ai orgs to pick usage for.
+fn usage_org_menu_view(orgs: &[OrgInfo]) -> Element<'static, Message> {
+    let mut items = column![text("Choose organization")
+        .size(12)
+        .font(ui_semibold())
+        .color(iced::Color::from_rgb8(0x6b, 0x7a, 0x8d))]
+    .spacing(2)
+    .padding(iced::Padding { top: 4.0, right: 4.0, bottom: 6.0, left: 12.0 });
+    for o in orgs {
+        let uuid = o.uuid.clone();
+        items = items.push(
+            button(text(o.name.clone()).size(13).color(iced::Color::from_rgb8(0xcc, 0xcc, 0xcc)))
+                .width(Length::Fill)
+                .padding([7, 12])
+                .on_press(Message::SelectUsageOrg(uuid))
+                .style(|_t: &iced::Theme, s| button::Style {
+                    background: matches!(s, button::Status::Hovered)
+                        .then(|| iced::Background::Color(AZURE)),
+                    text_color: if matches!(s, button::Status::Hovered) {
+                        iced::Color::WHITE
+                    } else {
+                        iced::Color::from_rgb8(0xcc, 0xcc, 0xcc)
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+    let panel = container(items).padding(8).width(Length::Fixed(280.0));
+    modal_scrim(modal_panel(panel.into()), Message::CloseUsageOrgMenu)
 }
 
 /// A full-window dimming scrim centring `panel`; a click on the scrim (outside the
@@ -2358,10 +2433,19 @@ enum UsageState {
     Pending,
     /// Not signed in to claude.ai (show a Sign-in button).
     NeedsLogin,
+    /// Signed in, multiple orgs, none chosen yet (show the org selector).
+    NeedsOrg,
     /// Signed in but the usage call failed (show a warning).
     Error,
     /// Have usage data (show the bars).
     Ok,
+}
+
+/// A claude.ai organization the user can pick usage for.
+#[derive(Clone, Debug)]
+struct OrgInfo {
+    uuid: String,
+    name: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2377,6 +2461,8 @@ struct UsageData {
     seven_day: Option<UsagePeriod>,
     seven_day_opus: Option<UsagePeriod>,
     seven_day_sonnet: Option<UsagePeriod>,
+    /// Org list (only populated with `NeedsOrg`, for the selector).
+    orgs: Vec<OrgInfo>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2385,10 +2471,17 @@ struct HelperPeriod {
     resets_at_ms: Option<i64>,
 }
 #[derive(serde::Deserialize)]
+struct HelperOrg {
+    uuid: String,
+    name: String,
+}
+#[derive(serde::Deserialize)]
 struct HelperLine {
     ok: bool,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    orgs: Vec<HelperOrg>,
     #[serde(default)]
     five_hour: Option<HelperPeriod>,
     #[serde(default)]
@@ -2405,9 +2498,11 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
     if !l.ok {
         let state = match l.error.as_deref() {
             Some("needs_login") => UsageState::NeedsLogin,
+            Some("needs_org") => UsageState::NeedsOrg,
             _ => UsageState::Error,
         };
-        return Some(UsageData { state, ..Default::default() });
+        let orgs = l.orgs.into_iter().map(|o| OrgInfo { uuid: o.uuid, name: o.name }).collect();
+        return Some(UsageData { state, orgs, ..Default::default() });
     }
     let cv = |p: Option<HelperPeriod>| {
         p.map(|x| UsagePeriod { utilization: x.utilization, resets_at_ms: x.resets_at_ms })
@@ -2418,6 +2513,7 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
         seven_day: cv(l.seven_day),
         seven_day_opus: cv(l.seven_day_opus),
         seven_day_sonnet: cv(l.seven_day_sonnet),
+        orgs: Vec::new(),
     })
 }
 
@@ -2435,13 +2531,19 @@ fn usage_helper_path() -> std::path::PathBuf {
 /// ("show\n") when the user clicks the titlebar Sign-in button.
 static HELPER_STDIN: std::sync::Mutex<Option<std::process::ChildStdin>> = std::sync::Mutex::new(None);
 
-/// Ask the usage helper to show its claude.ai sign-in window.
-fn usage_show_login() {
+/// Send a line to the usage helper's stdin.
+fn usage_helper_cmd(line: &str) {
     if let Some(s) = HELPER_STDIN.lock().unwrap().as_mut() {
         use std::io::Write;
-        let _ = s.write_all(b"show\n");
+        let _ = s.write_all(line.as_bytes());
+        let _ = s.write_all(b"\n");
         let _ = s.flush();
     }
+}
+
+/// Ask the usage helper to show its claude.ai sign-in window.
+fn usage_show_login() {
+    usage_helper_cmd("show");
 }
 
 /// Subscription: spawn the usage helper and turn each stdout line into a
@@ -2519,6 +2621,13 @@ fn usage_section(u: &UsageData, updated_ms: u64) -> Option<(Element<'static, Mes
             row![sign_in_button(), vsep()].spacing(8).align_y(iced::Center).into(),
             178.0,
         )),
+        UsageState::NeedsOrg => Some((
+            row![tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu), vsep()]
+                .spacing(8)
+                .align_y(iced::Center)
+                .into(),
+            170.0,
+        )),
         UsageState::Error => Some((row![usage_warning(), vsep()].spacing(8).align_y(iced::Center).into(), 168.0)),
         UsageState::Ok => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
@@ -2564,15 +2673,12 @@ fn usage_loading() -> Element<'static, Message> {
     row![dot(0), dot(333), dot(666)].spacing(4).align_y(iced::Center).into()
 }
 
-/// Sign-in button shown when not authenticated → raises the helper's webview.
-/// Same pill shape as a workspace tab, but azure-tinted (web `.btn-icon.is-active`).
-fn sign_in_button() -> Element<'static, Message> {
-    let content = row![text("Claude Usage Sign In").size(12)]
-        .height(Length::Fixed(26.0))
-        .align_y(iced::Center);
+/// A workspace-tab-shaped pill, azure-tinted (web `.btn-icon.is-active`).
+fn tinted_pill_button(label: &str, msg: Message) -> Element<'static, Message> {
+    let content = row![text(label.to_string()).size(12)].height(Length::Fixed(26.0)).align_y(iced::Center);
     button(content)
         .padding([0, 10])
-        .on_press(Message::ShowUsageLogin)
+        .on_press(msg)
         .style(|_t: &iced::Theme, s| {
             let hovered = matches!(s, button::Status::Hovered);
             button::Style {
@@ -2590,6 +2696,11 @@ fn sign_in_button() -> Element<'static, Message> {
             }
         })
         .into()
+}
+
+/// Sign-in button shown when not authenticated → raises the helper's webview.
+fn sign_in_button() -> Element<'static, Message> {
+    tinted_pill_button("Claude Usage Sign In", Message::ShowUsageLogin)
 }
 
 /// Warning shown when signed in but the usage fetch failed (amber icon + text);
@@ -2801,7 +2912,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let caption_w = 140.0;
     #[cfg(not(target_os = "windows"))]
     let caption_w = 0.0;
-    let actions_w = 200.0 + caption_w; // 6 btn-icons (+ Windows caption strip)
+    let actions_w = 232.0 + caption_w; // 7 btn-icons (+ Windows caption strip)
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
     // Usage section (bars / loading / sign-in / warning), built once with its own
@@ -2849,6 +2960,8 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
             action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
             action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
             action_icon_btn(mdi_path::CLOSE, Message::Close, false),
+            // TEMP: sign out of the usage webview only (until Settings exists).
+            action_icon_btn(mdi_path::LOGOUT, Message::UsageSignOut, false),
         ]
         .spacing(4)
         .align_y(iced::Center),
@@ -3381,6 +3494,8 @@ mod mdi_path {
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
     // Usage error indicator: a "!" in a circle.
     pub const ALERT_CIRCLE: &str = "M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z";
+    // Temp usage sign-out button.
+    pub const LOGOUT: &str = "M16,17V14H9V10H16V7L21,12L16,17M14,2A2,2 0 0,1 16,4V6H14V4H5V20H14V18H16V20A2,2 0 0,1 14,22H5A2,2 0 0,1 3,20V4A2,2 0 0,1 5,2H14Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -4523,6 +4638,7 @@ fn main() -> iced::Result {
             let main_geom = saved.as_ref().and_then(|s| s.main_window);
             let overview_geom = saved.as_ref().and_then(|s| s.overview_window);
             let overview_was_open = saved.as_ref().map(|s| s.overview_visible).unwrap_or(false);
+            let saved_usage_org = saved.as_ref().and_then(|s| s.usage_org.clone());
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
@@ -4627,6 +4743,8 @@ fn main() -> iced::Result {
                 new_ws_menu_x: 0.0,
                 usage: UsageData::default(),
                 usage_updated_ms: 0,
+                usage_org: saved_usage_org,
+                usage_org_menu: false,
             };
             (state, iced::Task::batch(tasks))
         })
