@@ -33,6 +33,16 @@ enum UserEvent {
     Fetch,
 }
 
+/// Where WebView2 / WKWebView stores the claude.ai session (cookies) — a stable
+/// per-user "arbiter" appdata folder so the login persists. Honors `ARBITER_DATA_DIR`
+/// (tests/isolation) so it never touches the real profile under test.
+fn webview_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("ARBITER_DATA_DIR") {
+        return Some(std::path::PathBuf::from(d).join("webview"));
+    }
+    Some(dirs::data_dir()?.join("arbiter"))
+}
+
 /// macOS: bring this app to the front (so its key window receives ⌘V etc.).
 #[cfg(target_os = "macos")]
 fn macos_activate() {
@@ -48,6 +58,7 @@ fn macos_activate() {
 /// Run the usage-helper webview loop (this process was re-spawned with
 /// `--usage-helper`). Diverges: runs the event loop until the parent's stdin closes.
 pub fn run() {
+    eprintln!("[usage-helper] started"); // DIAGNOSTIC (Windows usage debugging)
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     // macOS: start as an Accessory app — NO dock icon — and DON'T grab activation
@@ -114,12 +125,29 @@ pub fn run() {
         .build(&event_loop)
         .expect("usage-helper: build window");
 
+    // Persist the claude.ai login in a stable per-user folder (appdata/arbiter) so
+    // it survives restarts and works from a read-only install dir (Program Files).
+    let data_dir = webview_data_dir();
+    if let Some(d) = &data_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut web_context = wry::WebContext::new(data_dir);
+
     let ipc_proxy = proxy.clone();
     let webview = WebViewBuilder::new(&window)
+        .with_web_context(&mut web_context)
         .with_url("https://claude.ai/")
         .with_initialization_script(INIT_SCRIPT)
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.into_body();
+            // DIAGNOSTIC: every IPC message from the page → stderr (inherited by the
+            // parent, so it shows in the terminal). Remove once usage works on Windows.
+            eprintln!("[usage-helper] ipc<- {}", body.chars().take(200).collect::<String>());
+            // `LOG …` lines are JS breadcrumbs (not usage data) — don't relay to stdout.
+            if let Some(rest) = body.strip_prefix("LOG ") {
+                let _ = rest;
+                return;
+            }
             // Relay the line to the main app.
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
@@ -136,7 +164,8 @@ pub fn run() {
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
-        let _keep = &webview; // keep the webview alive for the loop's lifetime
+        // Keep the webview + its web context alive for the loop's lifetime.
+        let _keep = (&webview, &web_context);
         match event {
             Event::UserEvent(UserEvent::Show) => {
                 // Become a normal foreground app: dock icon (findable), menu bar
@@ -195,6 +224,9 @@ pub fn run() {
 const INIT_SCRIPT: &str = r#"
 (function () {
   function post(x) { try { window.ipc.postMessage(JSON.stringify(x)); } catch (_) {} }
+  // DIAGNOSTIC breadcrumb to the helper's stderr (Windows usage debugging).
+  function dbg(m) { try { window.ipc.postMessage('LOG ' + m); } catch (_) {} }
+  dbg('init ' + location.protocol + '//' + location.hostname + location.pathname);
   function per(p) {
     if (!p) return null;
     var r = null;
@@ -214,6 +246,7 @@ const INIT_SCRIPT: &str = r#"
   // The app calls this (refresh button / countdown rollover) to refetch on demand.
   window.__arbiterRefetchUsage = function () { fetchUsage(); };
   async function fetchUsage() {
+    dbg('fetch ' + location.hostname + location.pathname);
     if (location.protocol !== 'https:' || location.hostname !== 'claude.ai') {
       if (location.href !== 'https://claude.ai/') location.href = 'https://claude.ai/';
       return;
@@ -222,7 +255,8 @@ const INIT_SCRIPT: &str = r#"
     // A network failure (offline / claude.ai unreachable) is transient — report
     // 'error' (Usage unavailable), NOT 'needs_login', so an outage never looks like
     // you've been signed out.
-    try { o = await fetch('/api/organizations'); } catch (_) { post({ ok: false, error: 'error' }); return; }
+    try { o = await fetch('/api/organizations'); } catch (_) { dbg('org-catch'); post({ ok: false, error: 'error' }); return; }
+    dbg('org ' + o.status);
     // Only 401/403 means genuinely unauthenticated → sign in. Any other non-OK
     // (5xx/429/…) is a server-side problem while still signed in → transient error.
     if (o.status === 401 || o.status === 403) { post({ ok: false, error: 'needs_login' }); return; }
@@ -240,9 +274,11 @@ const INIT_SCRIPT: &str = r#"
       ? window.__arbiterOrg
       : (list.length === 1 ? list[0].uuid : null);
     if (!chosen) { post({ ok: false, error: 'needs_org', orgs: list }); return; }
+    dbg('orgs ' + list.length + ' chosen ' + (chosen || '-'));
     var usage = await usageFor(chosen);
-    if (!usage) { post({ ok: false, error: 'error' }); return; }
+    if (!usage) { dbg('usage-null'); post({ ok: false, error: 'error' }); return; }
     var plan = (usage.seven_day_opus || usage.seven_day_sonnet) ? 'Max' : (usage.seven_day ? 'Pro' : 'Free');
+    dbg('ok ' + plan);
     var chosenName = (list.find(function (o) { return o.uuid === chosen; }) || {}).name || null;
     post({
       ok: true, plan: plan,
