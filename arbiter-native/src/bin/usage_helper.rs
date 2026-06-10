@@ -152,10 +152,11 @@ pub fn run() {
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
             let _ = out.flush();
-            // Hide the sign-in window once usage actually loads (login succeeded).
-            // We do NOT auto-show on needs_login — the app's Sign-in button does
-            // that (via stdin "show"), so the window never pops unprompted.
-            if body.contains("\"ok\":true") {
+            // Login succeeded once we get usage (`ok`) OR the org list (`needs_org`
+            // — the app then shows its own org picker), so hide the sign-in window.
+            // It stays open only while still unauthenticated (`needs_login`). We
+            // never auto-SHOW; the titlebar Sign-in button does that via stdin.
+            if body.contains("\"ok\":true") || body.contains("needs_org") {
                 let _ = ipc_proxy.send_event(UserEvent::Hide);
             }
         })
