@@ -2796,10 +2796,12 @@ fn refresh_btn(updated_ms: u64) -> Element<'static, Message> {
     .style(|_t: &iced::Theme, s| button::Style {
         background: None,
         border: iced::Border {
+            // Match the #3a3a3a separators (the #2c2c2c card border was too faint
+            // against the titlebar glow).
             color: if matches!(s, button::Status::Hovered) {
                 AZURE
             } else {
-                iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)
+                iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)
             },
             width: 1.0,
             radius: 6.0.into(),
