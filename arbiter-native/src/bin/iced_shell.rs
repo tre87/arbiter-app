@@ -5107,35 +5107,38 @@ fn info_panel(c: &arbiter_native::claude_status::ClaudeStatus) -> Element<'stati
         .into()
 }
 
-/// The Knight-Rider "working" bar (web `.progress-bar`): a soft azure gradient
-/// strip that sweeps back and forth across the top of the terminal while Claude
-/// works. A fixed transparent→azure→transparent strip slid via flex portions, with
-/// the position driven by `now_ms` (the 60fps Tick redraws it).
+/// The Knight-Rider "working" bar (web `.progress-bar`): a soft azure glow that
+/// sweeps back and forth across the top of the terminal while Claude works. A
+/// full-width strip whose gradient *peak* is moved by `now_ms` (the 60fps Tick
+/// redraws it) — sub-pixel smooth (no flex-portion quantization), and the glow
+/// clips off the edges at the extremes so half of it hides there.
 fn working_bar() -> Element<'static, Message> {
-    // Triangle wave 0→1→0 over 3s (web's `3s ... alternate`).
-    let t = (now_ms() % 3000) as f32 / 3000.0;
-    let tri = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 };
-    let left = (tri * 60.0).round() as u16; // 0..60; strip is 40 portions wide
+    // Triangle wave 0→1→0; the peak sits on each edge at the extremes (half-hidden).
+    const PERIOD_MS: u64 = 3600; // 20% slower than the original 3s
+    let t = (now_ms() % PERIOD_MS) as f32 / PERIOD_MS as f32;
+    let peak = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 }; // 0..1..0
     let azure = iced::Color::from_rgb8(0x33, 0x99, 0xff);
     let clear = iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.0);
+    let w = 0.30; // glow half-width (fraction of the pane); wider → reaches further
+    let lo = (peak - w).clamp(0.0, 1.0);
+    let hi = (peak + w).clamp(0.0, 1.0);
+    let mid = peak.clamp(0.0, 1.0);
+    // Add the azure stop LAST so it wins at its offset if it collides with an edge
+    // stop (peak at 0 or 1). Offsets are clamped into [0,1]; out-of-range is ignored.
+    let grad = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
+        .add_stop(0.0, clear)
+        .add_stop(lo, clear)
+        .add_stop(hi, clear)
+        .add_stop(1.0, clear)
+        .add_stop(mid, azure);
     let strip = container(Space::with_height(Length::Fixed(3.0)))
         .width(Length::Fill)
         .height(Length::Fixed(3.0))
         .style(move |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Gradient(iced::Gradient::Linear(
-                iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
-                    .add_stop(0.0, clear)
-                    .add_stop(0.5, azure)
-                    .add_stop(1.0, clear),
-            ))),
+            background: Some(iced::Background::Gradient(iced::Gradient::Linear(grad))),
             ..Default::default()
         });
-    let bar = row![
-        Space::with_width(Length::FillPortion(left)),
-        container(strip).width(Length::FillPortion(40)),
-        Space::with_width(Length::FillPortion(60 - left)),
-    ];
-    container(bar)
+    container(strip)
         .width(Length::Fill)
         .height(Length::Fill)
         .align_y(iced::alignment::Vertical::Top)
