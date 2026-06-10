@@ -28,17 +28,52 @@ enum UserEvent {
     Hide,
 }
 
+/// macOS: bring this app to the front (so its key window receives ⌘V etc.).
+#[cfg(target_os = "macos")]
+fn macos_activate() {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if !app.is_null() {
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+        }
+    }
+}
+
 fn main() {
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    // macOS: run as an Accessory app so the sidecar shows NO dock icon (it can
-    // still display + focus the sign-in window when asked).
+    // macOS: start as an Accessory app — NO dock icon — and DON'T grab activation
+    // on launch (else we'd steal focus from the main app). When the user actually
+    // signs in we flip to Regular (dock icon + menu bar + frontmost) so the window
+    // is findable and ⌘V works, then back to Accessory once usage loads.
     #[cfg(target_os = "macos")]
     {
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        event_loop.set_activate_ignoring_other_apps(false);
     }
     let proxy = event_loop.create_proxy();
+
+    // A standard Edit menu so ⌘X/⌘C/⌘V/⌘A work in the claude.ai sign-in webview
+    // (macOS binds those shortcuts via menu items). Kept alive for the app.
+    #[cfg(target_os = "macos")]
+    let _menu = {
+        use muda::{Menu, PredefinedMenuItem, Submenu};
+        let menu = Menu::new();
+        let app_menu = Submenu::new("Arbiter", true);
+        let edit = Submenu::new("Edit", true);
+        let _ = edit.append_items(&[
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::select_all(None),
+        ]);
+        let _ = menu.append(&app_menu);
+        let _ = menu.append(&edit);
+        menu.init_for_nsapp();
+        menu
+    };
 
     // Drive window visibility from the parent over stdin: it sends "show\n" when the
     // user clicks the titlebar Sign-in button. EOF on stdin = parent gone → exit.
@@ -84,18 +119,39 @@ fn main() {
         .build()
         .expect("usage-helper: build webview");
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
         let _keep = &webview; // keep the webview alive for the loop's lifetime
         match event {
             Event::UserEvent(UserEvent::Show) => {
+                // Become a normal foreground app: dock icon (findable), menu bar
+                // (⌘V), and frontmost so the webview's window is key.
+                #[cfg(target_os = "macos")]
+                {
+                    use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
+                    _target.set_activation_policy_at_runtime(ActivationPolicy::Regular);
+                }
                 window.set_visible(true);
                 window.set_focus();
+                #[cfg(target_os = "macos")]
+                macos_activate();
             }
-            Event::UserEvent(UserEvent::Hide) => window.set_visible(false),
+            Event::UserEvent(UserEvent::Hide) => {
+                window.set_visible(false);
+                #[cfg(target_os = "macos")]
+                {
+                    use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
+                    _target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
+                }
+            }
             // Closing the sign-in window just hides it; we keep polling in the bg.
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 window.set_visible(false);
+                #[cfg(target_os = "macos")]
+                {
+                    use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
+                    _target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
+                }
             }
             _ => {}
         }
