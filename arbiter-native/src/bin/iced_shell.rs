@@ -3462,7 +3462,9 @@ fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
         cmd.arg("--usage-helper")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            // DIAGNOSTIC: surface the helper's stderr in this terminal (Windows usage
+            // debugging). Revert to Stdio::null() once it works.
+            .stderr(std::process::Stdio::inherit());
         let Ok(mut child) = cmd.spawn() else {
             std::future::pending::<()>().await;
             unreachable!()
