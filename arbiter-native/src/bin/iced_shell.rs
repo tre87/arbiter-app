@@ -4784,16 +4784,24 @@ fn footer_bar(
         container(mdi(path, size, col)).center_y(Length::Fixed(LINE)).into()
     };
     let lbl = move |s: String, col: iced::Color| text(s).size(11).color(col).line_height(lh);
-    // On macOS, Inter Semibold renders ~1px higher than regular in the same line
-    // box, so nudge it down 1px (wrapped in a LINE-tall box so the row height /
-    // icons don't move). On Windows/Linux that nudge pushed the number visibly low,
-    // so there it's rendered like `lbl` (bare, same line box) — aligning naturally.
+    // Inter Semibold sits at a slightly different height than regular in the same
+    // line box, per platform: macOS renders it ~1px high → nudge DOWN 1px (LINE-tall
+    // box, top padding); Windows renders it ~1px low → nudge UP 1px (bottom-aligned
+    // in a LINE-tall box with bottom padding — iced has no negative padding). Linux
+    // renders it level → leave bare like `lbl`. The box stays LINE tall either way,
+    // so the row height / icons don't move.
     let sbl = move |s: String, col: iced::Color| -> Element<'static, Message> {
         let t = text(s).size(11).color(col).font(ui_semibold()).line_height(lh);
         if cfg!(target_os = "macos") {
             container(t)
                 .height(Length::Fixed(LINE))
-                .padding(iced::Padding { top: 1.0, right: 0.0, bottom: 0.0, left: 0.0 })
+                .padding(iced::Padding { top: 1.0, ..iced::Padding::ZERO })
+                .into()
+        } else if cfg!(target_os = "windows") {
+            container(t)
+                .height(Length::Fixed(LINE))
+                .align_y(iced::alignment::Vertical::Bottom)
+                .padding(iced::Padding { bottom: 1.0, ..iced::Padding::ZERO })
                 .into()
         } else {
             t.into()
