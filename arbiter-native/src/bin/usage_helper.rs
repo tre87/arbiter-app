@@ -105,6 +105,12 @@ fn main() {
         .with_initialization_script(INIT_SCRIPT)
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.into_body();
+            // Diagnostic: a "RAW:<json>" message dumps the raw usage response to a
+            // temp file (so the exact field shape can be inspected) — not to stdout.
+            if let Some(raw) = body.strip_prefix("RAW:") {
+                let _ = std::fs::write(std::env::temp_dir().join("arbiter-usage-raw.json"), raw);
+                return;
+            }
             // Relay the line to the main app.
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
@@ -173,6 +179,17 @@ const INIT_SCRIPT: &str = r#"
     if (u < 0) u = 0; if (u > 100) u = 100;
     return { utilization: u, resets_at_ms: r };
   }
+  function hasLimits(usage) {
+    if (!usage) return false;
+    return ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet'].some(function (k) {
+      var p = usage[k];
+      return p && (p.resets_at || typeof p.utilization === 'number');
+    });
+  }
+  async function usageFor(uuid) {
+    try { var u = await fetch('/api/organizations/' + uuid + '/usage'); if (!u.ok) return null; return await u.json(); }
+    catch (_) { return null; }
+  }
   async function fetchUsage() {
     if (location.protocol !== 'https:' || location.hostname !== 'claude.ai') {
       if (location.href !== 'https://claude.ai/') location.href = 'https://claude.ai/';
@@ -185,13 +202,18 @@ const INIT_SCRIPT: &str = r#"
     try { raw = await o.json(); } catch (_) { post({ ok: false, error: 'needs_login' }); return; }
     var list = (Array.isArray(raw) ? raw : [raw]).map(function (x) { return x.uuid || x.id; }).filter(Boolean);
     if (!list.length) { post({ ok: false, error: 'needs_login' }); return; }
-    var org = list[0];
-    // Signed in (orgs fetched) but the usage call failed → 'error' (warning), not login.
-    var u;
-    try { u = await fetch('/api/organizations/' + org + '/usage'); } catch (_) { post({ ok: false, error: 'error' }); return; }
-    if (!u.ok) { post({ ok: false, error: 'error' }); return; }
-    var usage;
-    try { usage = await u.json(); } catch (_) { post({ ok: false, error: 'error' }); return; }
+    // Pick the org that actually has usage limits (multi-org: the first one may be
+    // a free/empty org). Fall back to the first org.
+    var usage = null, first = null;
+    for (var i = 0; i < list.length; i++) {
+      var us = await usageFor(list[i]);
+      if (i === 0) first = us;
+      if (hasLimits(us)) { usage = us; break; }
+    }
+    if (!usage) usage = first;
+    if (!usage) { post({ ok: false, error: 'error' }); return; }
+    // Diagnostic: hand the raw response to Rust to dump (RAW: prefix → not stdout).
+    try { window.ipc.postMessage('RAW:' + JSON.stringify(usage)); } catch (_) {}
     var plan = (usage.seven_day_opus || usage.seven_day_sonnet) ? 'Max' : (usage.seven_day ? 'Pro' : 'Free');
     post({
       ok: true, plan: plan,

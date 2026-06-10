@@ -2666,10 +2666,16 @@ fn refresh_btn(updated_ms: u64) -> Element<'static, Message> {
     button(
         row![
             cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED),
-            text(label)
-                .size(11)
-                .color(TXT_SECONDARY)
-                .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(13.0))),
+            // Fixed-width slot so varying digit widths don't resize the button
+            // (iced has no tabular-nums); right-aligned like a timer.
+            container(
+                text(label)
+                    .size(11)
+                    .color(TXT_SECONDARY)
+                    .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(13.0))),
+            )
+            .width(Length::Fixed(26.0))
+            .align_x(iced::alignment::Horizontal::Right),
         ]
         .spacing(4)
         .align_y(iced::Center),
