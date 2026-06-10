@@ -3275,6 +3275,12 @@ fn vsep() -> Element<'static, Message> {
         .into()
 }
 
+/// A `vsep` with horizontal breathing room, for separating titlebar *groups*
+/// (usage ↔ actions, pane controls ↔ menu) — the bare `vsep` sat too close.
+fn group_sep() -> Element<'static, Message> {
+    container(vsep()).padding(iced::Padding { top: 0.0, right: 4.0, bottom: 0.0, left: 4.0 }).into()
+}
+
 /// One usage meter (web `.stat`): label + 72×18 bar (track #121212, coloured fill,
 /// centred % text) + reset-time text.
 // ── Claude usage (fed by the arbiter-usage-helper sidecar over stdout) ─────────
@@ -3480,23 +3486,15 @@ fn usage_section(
     updated_ms: u64,
     hide_sonnet: bool,
 ) -> Option<(Element<'static, Message>, f32)> {
+    // The separator between the usage section and the action buttons is added by
+    // `titlebar_row` (a `group_sep`), so the sections here don't carry a trailing one.
     match u.state {
-        UsageState::Pending => {
-            Some((row![usage_loading(), vsep()].spacing(8).align_y(iced::Center).into(), 60.0))
+        UsageState::Pending => Some((usage_loading(), 60.0)),
+        UsageState::NeedsLogin => Some((sign_in_button(), 178.0)),
+        UsageState::NeedsOrg => {
+            Some((tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu), 170.0))
         }
-        UsageState::NeedsLogin => Some((
-            // Trailing divider so the button reads as separate from the actions.
-            row![sign_in_button(), vsep()].spacing(8).align_y(iced::Center).into(),
-            178.0,
-        )),
-        UsageState::NeedsOrg => Some((
-            row![tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu), vsep()]
-                .spacing(8)
-                .align_y(iced::Center)
-                .into(),
-            170.0,
-        )),
-        UsageState::Error => Some((row![usage_warning(), vsep()].spacing(8).align_y(iced::Center).into(), 168.0)),
+        UsageState::Error => Some((usage_warning(), 168.0)),
         UsageState::Ok => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
             // Sonnet is hidden by default (Settings → "Hide Sonnet usage").
@@ -3520,7 +3518,8 @@ fn usage_section(
                 return None;
             }
             row = row.push(refresh_btn(updated_ms));
-            Some((row.into(), 60.0 + n as f32 * 150.0))
+            // +10 for the group separator titlebar_row adds after the usage section.
+            Some((row.into(), 70.0 + n as f32 * 150.0))
         }
     }
 }
@@ -3840,6 +3839,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
 
     if let (true, Some((usage, _))) = (show_usage, usage_el) {
         bar = bar.push(usage);
+        bar = bar.push(group_sep()); // separate the usage section from the action stack
     }
     // Pane controls (split right/down + close) sit on the left of the app/menu
     // buttons, behind a separator — and are hidden unless enabled in Settings.
@@ -3849,7 +3849,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
             .push(action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false))
             .push(action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false))
             .push(action_icon_btn(mdi_path::CLOSE, Message::Close, false))
-            .push(vsep());
+            .push(group_sep());
     }
     actions = actions
         .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()))
