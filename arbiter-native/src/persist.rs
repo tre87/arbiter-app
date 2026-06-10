@@ -97,8 +97,8 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub hide_sonnet_usage: bool,
     /// Overview popout lists only terminals running Claude (web
-    /// `devStore.overviewClaudeOnly`, default on).
-    #[serde(default = "default_true")]
+    /// `devStore.overviewClaudeOnly`). Off by default — show all terminals.
+    #[serde(default)]
     pub overview_claude_only: bool,
     /// Hide the Git Bash / shell-switch button in the terminal header (web
     /// `devStore.hideShellButton`).
@@ -126,7 +126,7 @@ impl Default for Settings {
         Self {
             hide_usage_bar: false,
             hide_sonnet_usage: true,
-            overview_claude_only: true,
+            overview_claude_only: false,
             hide_shell_button: false,
             scrollback: default_scrollback(),
         }
