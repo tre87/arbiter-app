@@ -4791,20 +4791,25 @@ fn footer_bar(
     // renders it level → leave bare like `lbl`. The box stays LINE tall either way,
     // so the row height / icons don't move.
     let sbl = move |s: String, col: iced::Color| -> Element<'static, Message> {
-        let t = text(s).size(11).color(col).font(ui_semibold()).line_height(lh);
+        let mk = |line: iced::widget::text::LineHeight| {
+            text(s.clone()).size(11).color(col).font(ui_semibold()).line_height(line)
+        };
         if cfg!(target_os = "macos") {
-            container(t)
+            // macOS renders semibold ~1px high → nudge DOWN 1px (top padding).
+            container(mk(lh))
                 .height(Length::Fixed(LINE))
                 .padding(iced::Padding { top: 1.0, ..iced::Padding::ZERO })
                 .into()
         } else if cfg!(target_os = "windows") {
-            container(t)
+            // Windows renders it ~1px low. iced has no negative padding, so shrink
+            // the inner line box by 2px and top-anchor it in a LINE-tall box: the
+            // glyph (centred in its shorter line box) rides ~1px higher, lining up
+            // with the regular "/1M". Row height stays LINE.
+            container(mk(iced::widget::text::LineHeight::Absolute(iced::Pixels(LINE - 2.0))))
                 .height(Length::Fixed(LINE))
-                .align_y(iced::alignment::Vertical::Bottom)
-                .padding(iced::Padding { bottom: 1.0, ..iced::Padding::ZERO })
                 .into()
         } else {
-            t.into()
+            mk(lh).into()
         }
     };
     let div = move || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)).line_height(lh);
