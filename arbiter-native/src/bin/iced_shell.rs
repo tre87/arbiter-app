@@ -3863,6 +3863,16 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // it isn't hidden in Settings (web `devStore.hideShellButton`).
     let has_git_bash = state.git_bash.is_some() && !state.settings.hide_shell_button;
     let info_pane = state.info_pane; // which pane's Claude info popover is open
+    // Approx per-pane pixel widths (from the split ratios × the window width), so
+    // the working bar can keep a constant glow size + sweep speed across panes.
+    let pane_widths: HashMap<pane_grid::Pane, f32> = state
+        .active()
+        .panes
+        .layout()
+        .pane_regions(2.0, iced::Size::new(state.main_size.width.max(1.0), state.main_size.height.max(1.0)))
+        .into_iter()
+        .map(|(p, r)| (p, r.width))
+        .collect();
     // The terminal area's four OUTER corners are rounded (web
     // `.terminal-workspace-card` border-radius: 8px). Find the leaf pane owning
     // each corner so only those round — never interior corners where panes meet.
@@ -3926,9 +3936,10 @@ fn main_view(state: &State) -> Element<'_, Message> {
         // Overlay the Knight-Rider working bar (top edge) + the info popover
         // (top-right) on the terminal when active.
         let working = claude_running && lc == Lifecycle::Working;
+        let pane_w = pane_widths.get(&pane).copied().unwrap_or(800.0);
         let term_area: Element<Message> = match (working, info_open) {
-            (true, true) => iced::widget::stack![term, working_bar(), info_panel(&cstatus)].into(),
-            (true, false) => iced::widget::stack![term, working_bar()].into(),
+            (true, true) => iced::widget::stack![term, working_bar(pane_w), info_panel(&cstatus)].into(),
+            (true, false) => iced::widget::stack![term, working_bar(pane_w)].into(),
             (false, true) => iced::widget::stack![term, info_panel(&cstatus)].into(),
             (false, false) => term.into(),
         };
@@ -5164,25 +5175,44 @@ fn info_panel(c: &arbiter_native::claude_status::ClaudeStatus) -> Element<'stati
 /// full-width strip whose gradient *peak* is moved by `now_ms` (the 60fps Tick
 /// redraws it) — sub-pixel smooth (no flex-portion quantization), and the glow
 /// clips off the edges at the extremes so half of it hides there.
-fn working_bar() -> Element<'static, Message> {
+fn working_bar(width_px: f32) -> Element<'static, Message> {
+    // Constant on-screen glow size + sweep speed regardless of pane width: the glow
+    // is a fixed pixel width (→ a smaller fraction of a wider pane) and the period
+    // scales with width so the peak travels at a constant px/s.
+    const GLOW_HALF_PX: f32 = 130.0; // ~260px glow, constant across pane widths
+    const SPEED_PX_PER_SEC: f32 = 450.0; // constant sweep speed (~3.6s at ~800px)
+    let width = width_px.max(1.0);
+    let w = (GLOW_HALF_PX / width).clamp(0.04, 0.45); // glow half-width as a fraction
+    let period_ms = ((2000.0 * width / SPEED_PX_PER_SEC) as u64).clamp(1200, 12000);
     // Triangle wave 0→1→0; the peak sits on each edge at the extremes (half-hidden).
-    const PERIOD_MS: u64 = 3600; // 20% slower than the original 3s
-    let t = (now_ms() % PERIOD_MS) as f32 / PERIOD_MS as f32;
+    let t = (now_ms() % period_ms) as f32 / period_ms as f32;
     let peak = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 }; // 0..1..0
-    let azure = iced::Color::from_rgb8(0x33, 0x99, 0xff);
-    let clear = iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.0);
-    let w = 0.30; // glow half-width (fraction of the pane); wider → reaches further
-    let lo = (peak - w).clamp(0.0, 1.0);
-    let hi = (peak + w).clamp(0.0, 1.0);
-    let mid = peak.clamp(0.0, 1.0);
-    // Add the azure stop LAST so it wins at its offset if it collides with an edge
-    // stop (peak at 0 or 1). Offsets are clamped into [0,1]; out-of-range is ignored.
-    let grad = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
-        .add_stop(0.0, clear)
-        .add_stop(lo, clear)
-        .add_stop(hi, clear)
-        .add_stop(1.0, clear)
-        .add_stop(mid, azure);
+    // The glow is a symmetric tent of half-width `w` centred on `peak`: alpha falls
+    // linearly to 0 at `peak ± w`. Build stops only at the breakpoints inside [0,1]
+    // (the tent feet + apex when visible) PLUS the two edges, each with the tent's
+    // *interpolated* alpha there — so as the apex reaches an edge the edge brightens
+    // smoothly instead of flashing full azure for one frame (the old jump).
+    let alpha = |x: f32| -> f32 {
+        let d = (x - peak).abs();
+        if d >= w {
+            0.0
+        } else {
+            1.0 - d / w
+        }
+    };
+    let mut offs = vec![0.0_f32, 1.0, peak];
+    if peak - w > 0.0 {
+        offs.push(peak - w); // left foot (alpha 0)
+    }
+    if peak + w < 1.0 {
+        offs.push(peak + w); // right foot (alpha 0)
+    }
+    offs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    offs.dedup();
+    let mut grad = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2));
+    for x in offs {
+        grad = grad.add_stop(x, iced::Color::from_rgba8(0x33, 0x99, 0xff, alpha(x)));
+    }
     let strip = container(Space::with_height(Length::Fixed(3.0)))
         .width(Length::Fill)
         .height(Length::Fixed(3.0))
