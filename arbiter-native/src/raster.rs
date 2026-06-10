@@ -406,7 +406,7 @@ mod mac {
 mod dwrite {
     use super::GlyphBitmap;
     use std::cell::RefCell;
-    use windows::core::{Interface, Result, PCWSTR};
+    use windows::core::{Result, PCWSTR};
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
     };
@@ -529,7 +529,7 @@ mod dwrite {
 
             // Read the rendered PBGRA pixels.
             let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
-            let lock = bitmap.Lock(&rect, WICBitmapLockRead)?;
+            let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
             let stride = lock.GetStride()? as usize;
             let mut size = 0u32;
             let mut ptr: *mut u8 = std::ptr::null_mut();
