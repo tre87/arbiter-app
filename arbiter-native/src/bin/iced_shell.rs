@@ -28,6 +28,11 @@ use arbiter_native::term::SelectKind;
 /// File-explorer file-type icons + colours (generated from @mdi/js).
 mod file_icons;
 
+/// The Claude-usage webview helper, run in a re-spawned `--usage-helper` process
+/// (same binary). Only compiled with the `usage-helper` feature (pulls wry/tao).
+#[cfg(feature = "usage-helper")]
+mod usage_helper;
+
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).
 #[derive(Clone, Copy, PartialEq)]
@@ -3420,16 +3425,6 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
     })
 }
 
-/// Path to the sidecar, next to the main executable.
-fn usage_helper_path() -> std::path::PathBuf {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_default();
-    let name = if cfg!(windows) { "arbiter-usage-helper.exe" } else { "arbiter-usage-helper" };
-    dir.join(name)
-}
-
 /// The helper's stdin, so the main app can ask it to raise the sign-in window
 /// ("show\n") when the user clicks the titlebar Sign-in button.
 static HELPER_STDIN: std::sync::Mutex<Option<std::process::ChildStdin>> = std::sync::Mutex::new(None);
@@ -3458,12 +3453,17 @@ fn usage_subscription() -> Subscription<Message> {
 fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(8, |mut output| async move {
         use iced::futures::{SinkExt, StreamExt};
-        let mut cmd = std::process::Command::new(usage_helper_path());
-        cmd.stdin(std::process::Stdio::piped())
+        // Re-spawn THIS binary as the usage helper (own process, hosts the webview)
+        // — one binary, no separate build/placement. Without `--features
+        // usage-helper` the child sees the flag, no-ops and exits, so the bars just
+        // stay idle (→ "Sign in" after the timeout).
+        let exe = std::env::current_exe().unwrap_or_default();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--usage-helper")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         let Ok(mut child) = cmd.spawn() else {
-            // Helper missing/unspawnable → no usage bars; idle forever.
             std::future::pending::<()>().await;
             unreachable!()
         };
@@ -6013,6 +6013,13 @@ fn wordmark_font() -> iced::Font {
 }
 
 fn main() -> iced::Result {
+    // Re-spawned as the usage-helper webview process (same binary, own process).
+    // Run the helper loop and never start the GUI (avoids recursive spawning).
+    if std::env::args().any(|a| a == "--usage-helper") {
+        #[cfg(feature = "usage-helper")]
+        usage_helper::run();
+        return Ok(());
+    }
     // Headless subcommands Claude invokes via our injected --settings: capture
     // its statusLine JSON / hook signals, then exit without starting the GUI.
     match std::env::args().nth(1).as_deref() {
