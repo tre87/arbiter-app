@@ -107,6 +107,14 @@ pub struct Settings {
     /// Scrollback lines kept per terminal (web `devStore.scrollback`).
     #[serde(default = "default_scrollback")]
     pub scrollback: usize,
+    /// Screenshot-attach folder override (web `filesStore.screenshotFolder`).
+    /// `None` = the system default (macOS `~/Desktop`, else `~/Pictures/Screenshots`).
+    #[serde(default)]
+    pub screenshot_folder: Option<String>,
+    /// Last folder used by "Attach files" (web `filesStore.lastDocsFolder`); sticky,
+    /// not surfaced in the UI. `None` = the documents dir default.
+    #[serde(default)]
+    pub docs_folder: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -129,6 +137,8 @@ impl Default for Settings {
             overview_claude_only: false,
             hide_shell_button: false,
             scrollback: default_scrollback(),
+            screenshot_folder: None,
+            docs_folder: None,
         }
     }
 }

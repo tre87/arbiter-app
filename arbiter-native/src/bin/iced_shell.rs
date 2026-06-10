@@ -250,6 +250,8 @@ struct State {
     /// Whether the Settings modal is open, and which tab it's showing.
     settings_open: bool,
     settings_tab: SettingsTab,
+    /// Whether the keyboard-shortcuts cheat-sheet modal is open.
+    shortcuts_open: bool,
 }
 
 /// The Settings dialog's sidebar tabs (web `SettingsDialog.vue` tabs). Only the
@@ -259,7 +261,17 @@ struct State {
 enum SettingsTab {
     General,
     Display,
+    Files,
     ClaudeUsage,
+}
+
+/// Which default folder the file-attach picker opens in (web Ctrl+Shift+S vs +A).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttachSource {
+    /// Screenshot folder (Ctrl+Shift+S).
+    Screenshot,
+    /// Documents folder, sticky to the last-used dir (Ctrl+Shift+A).
+    Docs,
 }
 
 /// State of the "new worktree" modal: the branch name being typed, the chosen
@@ -335,8 +347,33 @@ enum Message {
     ToggleHideShellButton(bool),
     /// Settings → scrollback lines (text input; parsed + clamped).
     SetScrollback(String),
+    /// Settings → screenshot-attach folder (Files tab): set / browse / reset.
+    SetScreenshotFolder(String),
+    BrowseScreenshotFolder,
+    ScreenshotFolderPicked(Option<String>),
+    ResetScreenshotFolder,
     /// Settings → "Clear saved data": delete the on-disk session layout.
     ClearSavedData,
+    /// Keyboard-shortcuts cheat-sheet modal (titlebar shortcuts button).
+    OpenShortcuts,
+    CloseShortcuts,
+    /// Workspace switching shortcuts: next / previous (Ctrl+Tab / Ctrl+Shift+Tab),
+    /// and jump to workspace N (Ctrl+1..9, 1-indexed).
+    NextWorkspace,
+    PrevWorkspace,
+    SelectWorkspaceNum(usize),
+    /// Move focus to the adjacent pane (Ctrl+Shift+Arrow).
+    NavigatePane(pane_grid::Direction),
+    /// Grow the focused pane toward `dir` (Alt+Shift+Arrow).
+    ResizePane(pane_grid::Direction),
+    /// Make every pane in the active workspace equal size (Ctrl+Shift+E).
+    EqualizePanes,
+    /// Attach file(s) for Claude: open a picker in the source's folder, then write
+    /// the chosen paths to the focused terminal (Ctrl+Shift+S / Ctrl+Shift+A).
+    AttachFiles(AttachSource),
+    FilesPicked(AttachSource, Option<Vec<String>>),
+    /// A file was dropped onto the window → attach it to the focused terminal.
+    FileDropped(std::path::PathBuf),
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -874,6 +911,111 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ClearSavedData => {
             // Forget the on-disk layout only — live workspaces are untouched.
             persist::clear();
+        }
+        Message::SetScreenshotFolder(s) => {
+            let t = s.trim();
+            state.settings.screenshot_folder = (!t.is_empty()).then(|| t.to_string());
+            save_session(state);
+        }
+        Message::BrowseScreenshotFolder => {
+            let start = attach_default_dir(state, AttachSource::Screenshot);
+            return iced::Task::perform(
+                async move {
+                    let mut d = rfd::AsyncFileDialog::new().set_title("Select screenshot folder");
+                    if let Some(dir) = start {
+                        d = d.set_directory(dir);
+                    }
+                    d.pick_folder().await.map(|h| h.path().to_string_lossy().into_owned())
+                },
+                Message::ScreenshotFolderPicked,
+            );
+        }
+        Message::ScreenshotFolderPicked(Some(path)) => {
+            state.settings.screenshot_folder = Some(path);
+            save_session(state);
+        }
+        Message::ScreenshotFolderPicked(None) => {}
+        Message::ResetScreenshotFolder => {
+            state.settings.screenshot_folder = None;
+            save_session(state);
+        }
+        Message::OpenShortcuts => state.shortcuts_open = true,
+        Message::CloseShortcuts => state.shortcuts_open = false,
+        Message::NextWorkspace => {
+            let n = state.workspaces.len();
+            if n > 1 {
+                state.active = (state.active + 1) % n;
+                save_session(state);
+            }
+        }
+        Message::PrevWorkspace => {
+            let n = state.workspaces.len();
+            if n > 1 {
+                state.active = (state.active + n - 1) % n;
+                save_session(state);
+            }
+        }
+        Message::SelectWorkspaceNum(num) => {
+            // 1-indexed (Ctrl+1..9); clamp to the existing tabs.
+            if num >= 1 {
+                let i = (num - 1).min(state.workspaces.len().saturating_sub(1));
+                if i != state.active {
+                    state.active = i;
+                    save_session(state);
+                }
+            }
+        }
+        Message::NavigatePane(dir) => {
+            let ws = state.active_mut();
+            if let Some(p) = ws.panes.adjacent(ws.focus, dir) {
+                ws.focus = p;
+            }
+        }
+        Message::ResizePane(dir) => {
+            let ws = state.active_mut();
+            if let Some((split, ratio)) = resize_target(ws.panes.layout(), ws.focus, dir) {
+                ws.panes.resize(split, ratio);
+                save_session(state);
+            }
+        }
+        Message::EqualizePanes => {
+            let ws = state.active_mut();
+            // Collect ratios first (immutable borrow), then apply (mutable).
+            let mut ratios = Vec::new();
+            equal_split_ratios(ws.panes.layout(), &mut ratios);
+            for (split, ratio) in ratios {
+                ws.panes.resize(split, ratio);
+            }
+            save_session(state);
+        }
+        Message::AttachFiles(src) => {
+            let start = attach_default_dir(state, src);
+            return iced::Task::perform(
+                async move {
+                    let mut d = rfd::AsyncFileDialog::new().set_title("Attach file(s) for Claude");
+                    if let Some(dir) = start {
+                        d = d.set_directory(dir);
+                    }
+                    d.pick_files().await.map(|hs| {
+                        hs.into_iter().map(|h| h.path().to_string_lossy().into_owned()).collect()
+                    })
+                },
+                move |paths| Message::FilesPicked(src, paths),
+            );
+        }
+        Message::FilesPicked(src, Some(paths)) if !paths.is_empty() => {
+            // "Attach files" remembers the folder it was last used in (web sticky).
+            if src == AttachSource::Docs {
+                if let Some(dir) = paths.first().map(|p| parent_dir(p)) {
+                    state.settings.docs_folder = Some(dir);
+                    save_session(state);
+                }
+            }
+            write_attach_paths(state, &paths);
+        }
+        Message::FilesPicked(_, _) => {}
+        Message::FileDropped(path) => {
+            write_attach_paths(state, &[path.to_string_lossy().into_owned()]);
         }
         Message::NewProjectWorkspace => {
             state.new_ws_menu = false;
@@ -2241,6 +2383,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if state.usage_org_menu {
         return Some(usage_org_menu_view(&state.usage.orgs));
     }
+    if state.shortcuts_open {
+        return Some(shortcuts_dialog_view());
+    }
     if state.settings_open {
         return Some(settings_dialog_view(state));
     }
@@ -2518,6 +2663,24 @@ fn settings_toggle(
         .into()
 }
 
+/// Shared dark text-input style (web `.path-input`/`.num-input`): #121212 bg,
+/// #2c2c2c border that turns azure on focus.
+fn settings_input_style(_t: &iced::Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused);
+    text_input::Style {
+        background: iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12)),
+        border: iced::Border {
+            color: if focused { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        icon: TXT_MUTED,
+        placeholder: TXT_MUTED,
+        value: TXT_PRIMARY,
+        selection: iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.35),
+    }
+}
+
 /// A numeric setting row: label (+ sub) on the left, a small text input on the
 /// right (web `.toggle-row` + `.num-input`). Parsing/clamping happens in `update`.
 fn settings_number_row(
@@ -2536,21 +2699,7 @@ fn settings_number_row(
         .width(Length::Fixed(90.0))
         .padding([6, 8])
         .size(13)
-        .style(|_t: &iced::Theme, status| {
-            let focused = matches!(status, text_input::Status::Focused);
-            text_input::Style {
-                background: iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12)),
-                border: iced::Border {
-                    color: if focused { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                icon: TXT_MUTED,
-                placeholder: TXT_MUTED,
-                value: TXT_PRIMARY,
-                selection: iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.35),
-            }
-        });
+        .style(settings_input_style);
     container(row![labels, horizontal_space(), input].spacing(12).align_y(iced::Center))
         .padding([10, 4])
         .into()
@@ -2672,6 +2821,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             column![
                 settings_tab_item("General", SettingsTab::General, state.settings_tab),
                 settings_tab_item("Display", SettingsTab::Display, state.settings_tab),
+                settings_tab_item("Files", SettingsTab::Files, state.settings_tab),
                 settings_tab_item("Claude Usage", SettingsTab::ClaudeUsage, state.settings_tab),
             ]
             .spacing(2),
@@ -2730,6 +2880,35 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             }
             col
         }
+        SettingsTab::Files => {
+            let current = state.settings.screenshot_folder.clone().unwrap_or_default();
+            let placeholder = default_screenshot_dir_label();
+            let input = text_input(&placeholder, &current)
+                .on_input(Message::SetScreenshotFolder)
+                .width(Length::Fill)
+                .padding([7, 9])
+                .size(13)
+                .style(settings_input_style);
+            let mut path_row = row![
+                input,
+                settings_btn("Browse…", Message::BrowseScreenshotFolder, BtnKind::Secondary),
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            if state.settings.screenshot_folder.is_some() {
+                path_row =
+                    path_row.push(settings_btn("Reset", Message::ResetScreenshotFolder, BtnKind::Secondary));
+            }
+            column![
+                settings_section("Screenshot Folder"),
+                settings_hint(
+                    "Folder opened by Attach screenshot (Ctrl+Shift+S). Leave blank to use the system default. \
+                     Attach files (Ctrl+Shift+A) opens your documents folder."
+                ),
+                path_row,
+            ]
+            .spacing(12)
+        }
         SettingsTab::ClaudeUsage => column![
             settings_section("Account"),
             settings_account(&state.usage),
@@ -2781,6 +2960,100 @@ fn settings_vdivider() -> Element<'static, Message> {
             ..Default::default()
         })
         .into()
+}
+
+// ── Keyboard-shortcuts cheat sheet (web ShortcutsDialog.vue) ───────────────────
+
+/// One `<kbd>` chip (web `kbd` styling): a small bordered key cap.
+fn kbd_chip(label: &str) -> Element<'static, Message> {
+    container(text(label.to_string()).size(11).color(TXT_PRIMARY))
+        .padding([2, 6])
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A "Ctrl + Shift + T" combo rendered as separate key chips.
+fn kbd_combo(keys: &str) -> Element<'static, Message> {
+    let mut r = row![].spacing(4).align_y(iced::Center);
+    for tok in keys.split(" + ") {
+        r = r.push(kbd_chip(tok));
+    }
+    r.into()
+}
+
+/// The keyboard-shortcuts cheat sheet — a centred card listing every binding
+/// (Ctrl on all platforms, like the web).
+fn shortcuts_dialog_view() -> Element<'static, Message> {
+    const ROWS: [(&str, &str); 13] = [
+        ("New workspace", "Ctrl + Shift + T"),
+        ("Next workspace", "Ctrl + Tab"),
+        ("Previous workspace", "Ctrl + Shift + Tab"),
+        ("Switch to workspace 1–9", "Ctrl + 1…9"),
+        ("Close pane / workspace", "Ctrl + Shift + W"),
+        ("Split right", "Ctrl + Shift + R"),
+        ("Split down", "Ctrl + Shift + D"),
+        ("Navigate panes", "Ctrl + Shift + Arrow"),
+        ("Resize panes", "Alt + Shift + Arrow"),
+        ("Equalize pane sizes", "Ctrl + Shift + E"),
+        ("Workspace overview", "Ctrl + Shift + O"),
+        ("Attach screenshot", "Ctrl + Shift + S"),
+        ("Attach files", "Ctrl + Shift + A"),
+    ];
+    let mut list = column![].spacing(0);
+    for (i, (action, keys)) in ROWS.iter().enumerate() {
+        list = list.push(
+            container(
+                row![text(*action).size(13).color(TXT_SECONDARY), horizontal_space(), kbd_combo(keys)]
+                    .align_y(iced::Center),
+            )
+            .padding([8, 2]),
+        );
+        if i + 1 < ROWS.len() {
+            list = list.push(settings_hdivider());
+        }
+    }
+    let body = column![
+        text("Keyboard Shortcuts").size(15).font(ui_semibold()).color(TXT_PRIMARY),
+        Space::with_height(Length::Fixed(6.0)),
+        list,
+    ]
+    .padding(20);
+    let card = container(column![
+        scrollable(body).height(Length::Fill),
+        settings_hdivider(),
+        container(row![horizontal_space(), settings_btn("Close", Message::CloseShortcuts, BtnKind::Secondary)])
+            .padding([12, 16]),
+    ])
+    .width(Length::Fill)
+    .max_width(440.0)
+    .height(Length::Fill)
+    .max_height(560.0)
+    .style(|_t: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+        border: iced::Border {
+            color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    });
+    let card = mouse_area(card).on_press(Message::Noop);
+    mouse_area(
+        container(card).center(Length::Fill).padding(24).style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba8(0x00, 0x00, 0x00, 0.5))),
+            ..Default::default()
+        }),
+    )
+    .on_press(Message::CloseShortcuts)
+    .into()
 }
 
 // ── Titlebar pieces (web parity: WorkspaceTabs.vue + StatsBar.vue + btn-icon) ──
@@ -3449,7 +3722,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     bar = bar.push(
         row![
             action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()),
-            action_icon_btn(mdi_path::ARROW_ALL, Message::Noop, false),
+            action_icon_btn(mdi_path::ARROW_ALL, Message::OpenShortcuts, state.shortcuts_open),
             action_icon_btn(mdi_path::COG, Message::OpenSettings, state.settings_open),
             action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
             action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
@@ -4669,6 +4942,132 @@ fn pane_header(
         .into()
 }
 
+// ── Pane operations (keyboard: navigate / resize / equalize) ───────────────────
+
+/// Number of leaf panes under a layout node.
+fn leaf_count(node: &pane_grid::Node) -> usize {
+    match node {
+        pane_grid::Node::Pane(_) => 1,
+        pane_grid::Node::Split { a, b, .. } => leaf_count(a) + leaf_count(b),
+    }
+}
+
+/// Ratios that make every leaf pane equal size: each split is divided in
+/// proportion to its two subtrees' leaf counts (so uniform layouts come out
+/// exactly even — 2 rows → 0.5 each, 4 columns → 0.25 each).
+fn equal_split_ratios(node: &pane_grid::Node, out: &mut Vec<(pane_grid::Split, f32)>) {
+    if let pane_grid::Node::Split { id, a, b, .. } = node {
+        let (la, lb) = (leaf_count(a), leaf_count(b));
+        out.push((*id, la as f32 / (la + lb) as f32));
+        equal_split_ratios(a, out);
+        equal_split_ratios(b, out);
+    }
+}
+
+/// The split to nudge (and its new ratio) to grow the focused pane toward `dir`:
+/// the nearest enclosing split of the matching axis with the pane on the side that
+/// can grow that way. `None` if the pane already spans that edge.
+fn resize_target(
+    layout: &pane_grid::Node,
+    focus: pane_grid::Pane,
+    dir: pane_grid::Direction,
+) -> Option<(pane_grid::Split, f32)> {
+    use pane_grid::{Axis, Direction};
+    const SPACING: f32 = 2.0; // matches the grid's `.spacing(2)`
+    const STEP: f32 = 0.03;
+    let size = iced::Size::new(4096.0, 4096.0);
+    let pane = *layout.pane_regions(SPACING, size).get(&focus)?;
+    let (fcx, fcy) = (pane.x + pane.width / 2.0, pane.y + pane.height / 2.0);
+    let want = match dir {
+        Direction::Left | Direction::Right => Axis::Vertical,
+        Direction::Up | Direction::Down => Axis::Horizontal,
+    };
+    let mut best: Option<(pane_grid::Split, f32, f32)> = None; // (id, new ratio, area)
+    for (id, (axis, region, ratio)) in layout.split_regions(SPACING, size) {
+        if axis != want || !region.contains(iced::Point::new(fcx, fcy)) {
+            continue;
+        }
+        // The divider position, and whether the focused pane is on the side that
+        // grows when nudged this direction.
+        let (new_ratio, on_side) = match dir {
+            Direction::Right => (ratio + STEP, fcx < region.x + region.width * ratio),
+            Direction::Left => (ratio - STEP, fcx > region.x + region.width * ratio),
+            Direction::Down => (ratio + STEP, fcy < region.y + region.height * ratio),
+            Direction::Up => (ratio - STEP, fcy > region.y + region.height * ratio),
+        };
+        if !on_side {
+            continue;
+        }
+        let area = region.width * region.height;
+        if best.map_or(true, |(_, _, a)| area < a) {
+            best = Some((id, new_ratio.clamp(0.05, 0.95), area));
+        }
+    }
+    best.map(|(id, r, _)| (id, r))
+}
+
+// ── File attach (drag-drop + Ctrl+Shift+S / Ctrl+Shift+A pickers) ──────────────
+
+/// Write file `paths` to the focused terminal as bracketed-paste runs (one per
+/// path, unquoted — matches the web's `writePathsToPane`), so Claude/the shell
+/// receives each verbatim even with spaces.
+fn write_attach_paths(state: &mut State, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let payload: String = paths.iter().map(|p| format!("\x1b[200~{p}\x1b[201~")).collect();
+    let ws = state.active_mut();
+    if let Some(p) = ws.panes.get_mut(ws.focus) {
+        p.session.write(payload.as_bytes());
+    }
+}
+
+/// The parent directory of a path (handles `/` and `\`), for docs-folder stickiness.
+fn parent_dir(path: &str) -> String {
+    match path.rfind(['/', '\\']) {
+        Some(i) if i > 0 => path[..i].to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// Folder the attach picker opens in: the saved override / sticky dir if it still
+/// exists, else the platform default (web `resolveScreenshotDir`/docs default).
+fn attach_default_dir(state: &State, src: AttachSource) -> Option<std::path::PathBuf> {
+    let saved = match src {
+        AttachSource::Screenshot => &state.settings.screenshot_folder,
+        AttachSource::Docs => &state.settings.docs_folder,
+    };
+    if let Some(p) = saved.as_ref().map(std::path::PathBuf::from).filter(|p| p.is_dir()) {
+        return Some(p);
+    }
+    match src {
+        AttachSource::Screenshot => {
+            let home = dirs::home_dir()?;
+            Some(if cfg!(target_os = "macos") {
+                home.join("Desktop")
+            } else {
+                home.join("Pictures").join("Screenshots")
+            })
+        }
+        AttachSource::Docs => dirs::document_dir().or_else(dirs::home_dir),
+    }
+}
+
+/// Default screenshot folder as a display string (the Files-tab input placeholder).
+fn default_screenshot_dir_label() -> String {
+    dirs::home_dir()
+        .map(|h| {
+            if cfg!(target_os = "macos") {
+                h.join("Desktop")
+            } else {
+                h.join("Pictures").join("Screenshots")
+            }
+            .to_string_lossy()
+            .into_owned()
+        })
+        .unwrap_or_else(|| "System default".to_string())
+}
+
 fn subscription(_state: &State) -> Subscription<Message> {
     let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
     // Only the main window's keys drive the terminal (not the overview window),
@@ -4696,6 +5095,13 @@ fn subscription(_state: &State) -> Subscription<Message> {
         iced::window::Event::Opened { position, size } => Message::WindowOpened(id, position, size),
         iced::window::Event::Focused => Message::WindowFocusChanged(id, true),
         iced::window::Event::Unfocused => Message::WindowFocusChanged(id, false),
+        // Files dropped on the main window attach to the focused terminal (one
+        // event per file; each writes its own bracketed-paste run).
+        iced::window::Event::FileDropped(path)
+            if MAIN_WINDOW.get().copied() == Some(id) =>
+        {
+            Message::FileDropped(path)
+        }
         _ => Message::Noop,
     });
     Subscription::batch([tick, keys, closes, geom, usage_subscription()])
@@ -4739,6 +5145,22 @@ fn fkey(m: iced::keyboard::Modifiers, ss3: &str, final_byte: char) -> Vec<u8> {
     }
 }
 
+/// An arrow key: Ctrl+Shift navigates panes, Alt+Shift resizes the focused pane,
+/// otherwise it's sent to the terminal as the usual `CSI` sequence.
+fn arrow_key(
+    m: iced::keyboard::Modifiers,
+    dir: pane_grid::Direction,
+    final_byte: char,
+) -> Message {
+    if m.control() && m.shift() && !m.alt() && !m.logo() {
+        Message::NavigatePane(dir)
+    } else if m.alt() && m.shift() && !m.control() && !m.logo() {
+        Message::ResizePane(dir)
+    } else {
+        Message::Input(csi_mod(m, final_byte))
+    }
+}
+
 /// Map a keyboard event to PTY bytes. Special keys are hand-mapped; printable
 /// input uses the event's `text` (Shift/symbols/layout already applied).
 fn handle_key(event: iced::Event) -> Option<Message> {
@@ -4757,17 +5179,21 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         }
         Key::Named(Named::Backspace) => return Some(Message::Input(vec![0x7f])),
         Key::Named(Named::Tab) => {
+            // Ctrl+Tab / Ctrl+Shift+Tab switch workspaces (intercepted before the PTY).
+            if modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+                return Some(if modifiers.shift() { Message::PrevWorkspace } else { Message::NextWorkspace });
+            }
             // Shift+Tab → CSI Z (back-tab); Claude cycles its mode with it.
             let bytes = if modifiers.shift() { b"\x1b[Z".to_vec() } else { b"\t".to_vec() };
             return Some(Message::Input(bytes));
         }
         Key::Named(Named::Escape) => return Some(Message::Input(vec![0x1b])),
-        // Cursor + editing keys. Arrows/Home/End carry modifiers (Ctrl+→ etc.)
-        // as the xterm `CSI 1;<mod><final>` form.
-        Key::Named(Named::ArrowUp) => return Some(Message::Input(csi_mod(modifiers, 'A'))),
-        Key::Named(Named::ArrowDown) => return Some(Message::Input(csi_mod(modifiers, 'B'))),
-        Key::Named(Named::ArrowRight) => return Some(Message::Input(csi_mod(modifiers, 'C'))),
-        Key::Named(Named::ArrowLeft) => return Some(Message::Input(csi_mod(modifiers, 'D'))),
+        // Cursor + editing keys. Arrows carry modifiers (Ctrl+→ etc.) as the xterm
+        // `CSI 1;<mod><final>` form, except the pane navigate/resize chords.
+        Key::Named(Named::ArrowUp) => return Some(arrow_key(modifiers, pane_grid::Direction::Up, 'A')),
+        Key::Named(Named::ArrowDown) => return Some(arrow_key(modifiers, pane_grid::Direction::Down, 'B')),
+        Key::Named(Named::ArrowRight) => return Some(arrow_key(modifiers, pane_grid::Direction::Right, 'C')),
+        Key::Named(Named::ArrowLeft) => return Some(arrow_key(modifiers, pane_grid::Direction::Left, 'D')),
         Key::Named(Named::Home) => return Some(Message::Input(csi_mod(modifiers, 'H'))),
         Key::Named(Named::End) => return Some(Message::Input(csi_mod(modifiers, 'F'))),
         Key::Named(Named::Insert) => return Some(Message::Input(csi_tilde(modifiers, 2))),
@@ -4792,6 +5218,28 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         // Copy/paste: Cmd+C/V (macOS), Ctrl+Shift+C/V, and Ctrl+C/V. Plain Ctrl+C
         // copies only if there's a selection, else sends interrupt (^C).
         Key::Character(s) if modifiers.control() || modifiers.logo() => {
+            // App shortcuts use Ctrl on all platforms (web parity), never Cmd.
+            if modifiers.control() && modifiers.shift() && !modifiers.logo() {
+                match s.chars().next().map(|c| c.to_ascii_lowercase()) {
+                    Some('t') => return Some(Message::NewWorkspace),
+                    Some('r') => return Some(Message::SplitRight),
+                    Some('d') => return Some(Message::SplitDown),
+                    Some('e') => return Some(Message::EqualizePanes),
+                    Some('o') => return Some(Message::ToggleOverview),
+                    Some('w') => return Some(Message::Close),
+                    Some('a') => return Some(Message::AttachFiles(AttachSource::Docs)),
+                    Some('s') => return Some(Message::AttachFiles(AttachSource::Screenshot)),
+                    _ => {} // c/v fall through to copy/paste below
+                }
+            }
+            // Ctrl+1..9 → jump to workspace N.
+            if modifiers.control() && !modifiers.shift() && !modifiers.logo() {
+                if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                    if (1..=9).contains(&d) {
+                        return Some(Message::SelectWorkspaceNum(d as usize));
+                    }
+                }
+            }
             let lc = s.chars().next().map(|c| c.to_ascii_lowercase());
             match lc {
                 Some('c') => {
@@ -5263,6 +5711,7 @@ fn main() -> iced::Result {
                 settings: saved_settings,
                 settings_open: false,
                 settings_tab: SettingsTab::General,
+                shortcuts_open: false,
             };
             (state, iced::Task::batch(tasks))
         })
