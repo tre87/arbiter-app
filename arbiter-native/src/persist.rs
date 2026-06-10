@@ -107,6 +107,10 @@ pub struct Settings {
     /// Scrollback lines kept per terminal (web `devStore.scrollback`).
     #[serde(default = "default_scrollback")]
     pub scrollback: usize,
+    /// Show the terminal split/close buttons (+ their separator) in the titlebar.
+    /// Off by default — the split/close shortcuts cover it.
+    #[serde(default)]
+    pub show_terminal_buttons: bool,
     /// Screenshot-attach folder override (web `filesStore.screenshotFolder`).
     /// `None` = the system default (macOS `~/Desktop`, else `~/Pictures/Screenshots`).
     #[serde(default)]
@@ -137,6 +141,7 @@ impl Default for Settings {
             overview_claude_only: false,
             hide_shell_button: false,
             scrollback: default_scrollback(),
+            show_terminal_buttons: false,
             screenshot_folder: None,
             docs_folder: None,
         }
