@@ -252,6 +252,17 @@ struct State {
     settings_tab: SettingsTab,
     /// Whether the keyboard-shortcuts cheat-sheet modal is open.
     shortcuts_open: bool,
+    /// The pane whose Claude info popover is open (header info button), if any.
+    info_pane: Option<pane_grid::Pane>,
+    /// Pending "rename terminal to repo name" confirmation (footer folder click).
+    rename_confirm: Option<RenameConfirm>,
+}
+
+/// A pending confirm to rename a pane to its git repo's name (footer folder icon).
+struct RenameConfirm {
+    pane: pane_grid::Pane,
+    repo: String,
+    old: String,
 }
 
 /// The Settings dialog's sidebar tabs (web `SettingsDialog.vue` tabs). Only the
@@ -374,6 +385,12 @@ enum Message {
     FilesPicked(AttachSource, Option<Vec<String>>),
     /// A file was dropped onto the window → attach it to the focused terminal.
     FileDropped(std::path::PathBuf),
+    /// Toggle the Claude info popover for a pane (header info button).
+    ToggleInfoPanel(pane_grid::Pane),
+    /// Footer folder icon → confirm renaming the pane to its git repo's name.
+    RequestRenameToRepo(pane_grid::Pane),
+    ConfirmRename,
+    CancelRename,
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -1017,6 +1034,40 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::FileDropped(path) => {
             write_attach_paths(state, &[path.to_string_lossy().into_owned()]);
         }
+        Message::ToggleInfoPanel(pane) => {
+            state.info_pane = (state.info_pane != Some(pane)).then_some(pane);
+        }
+        Message::RequestRenameToRepo(pane) => {
+            // Resolve the repo name from the pane's cwd; only prompt inside a repo.
+            if let Some(d) = state.active().panes.get(pane) {
+                let old = d.name.clone();
+                if let Some(repo) = d
+                    .session
+                    .cwd()
+                    .as_deref()
+                    .and_then(arbiter_native::git::repo_root)
+                    .map(|root| {
+                        root.trim_end_matches(['/', '\\'])
+                            .rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or(&root)
+                            .to_string()
+                    })
+                    .filter(|s| !s.is_empty())
+                {
+                    state.rename_confirm = Some(RenameConfirm { pane, repo, old });
+                }
+            }
+        }
+        Message::ConfirmRename => {
+            if let Some(rc) = state.rename_confirm.take() {
+                if let Some(d) = state.active_mut().panes.get_mut(rc.pane) {
+                    d.name = rc.repo;
+                }
+                save_session(state);
+            }
+        }
+        Message::CancelRename => state.rename_confirm = None,
         Message::NewProjectWorkspace => {
             state.new_ws_menu = false;
             // Pick a folder off-thread (native dialog), then validate as a repo.
@@ -2382,6 +2433,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     // organization" button), so check it first; dismissing it returns to Settings.
     if state.usage_org_menu {
         return Some(usage_org_menu_view(&state.usage.orgs));
+    }
+    if let Some(rc) = &state.rename_confirm {
+        return Some(rename_confirm_view(rc));
     }
     if state.shortcuts_open {
         return Some(shortcuts_dialog_view());
@@ -3756,6 +3810,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // The header's shell-switch button shows only when Git Bash is available AND
     // it isn't hidden in Settings (web `devStore.hideShellButton`).
     let has_git_bash = state.git_bash.is_some() && !state.settings.hide_shell_button;
+    let info_pane = state.info_pane; // which pane's Claude info popover is open
     // The terminal area's four OUTER corners are rounded (web
     // `.terminal-workspace-card` border-radius: 8px). Find the leaf pane owning
     // each corner so only those round — never interior corners where panes meet.
@@ -3807,13 +3862,26 @@ fn main_view(state: &State) -> Element<'_, Message> {
             bottom_left: pick(rbl),
         };
         // Claude status indicator in the header while Claude runs in this pane.
-        let status = data
-            .session
-            .claude_running()
-            .then(|| pane_dot(true, data.session.claude_status().lifecycle, false));
-        let header = pane_header(&data.name, focused, data.shell, has_git_bash, pane, status, header_round);
+        let claude_running = data.session.claude_running();
+        let cstatus = data.session.claude_status();
+        let lc = cstatus.lifecycle;
+        let status = claude_running.then(|| pane_dot(true, lc, false));
+        let info_open = info_pane == Some(pane) && claude_running;
+        let header = pane_header(
+            &data.name, focused, data.shell, has_git_bash, pane, status, claude_running, info_open,
+            header_round,
+        );
+        // Overlay the Knight-Rider working bar (top edge) + the info popover
+        // (top-right) on the terminal when active.
+        let working = claude_running && lc == Lifecycle::Working;
+        let term_area: Element<Message> = match (working, info_open) {
+            (true, true) => iced::widget::stack![term, working_bar(), info_panel(&cstatus)].into(),
+            (true, false) => iced::widget::stack![term, working_bar()].into(),
+            (false, true) => iced::widget::stack![term, info_panel(&cstatus)].into(),
+            (false, false) => term.into(),
+        };
         // 1px #2c2c2c dividers under the header and above the footer (web card look).
-        let content = column![header, hline(), term, hline(), footer_bar(&data.session, footer_round)]
+        let content = column![header, hline(), term_area, hline(), footer_bar(&data.session, pane, footer_round)]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -4279,6 +4347,8 @@ mod mdi_path {
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
     // Usage error indicator: a "!" in a circle.
     pub const ALERT_CIRCLE: &str = "M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z";
+    // Header "i" info button (Claude session info popover).
+    pub const INFORMATION_OUTLINE: &str = "M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -4575,7 +4645,11 @@ mod winresize {
     }
 }
 
-fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static, Message> {
+fn footer_bar(
+    session: &Session,
+    pane: pane_grid::Pane,
+    round: iced::border::Radius,
+) -> Element<'static, Message> {
     let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
     let primary = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
     let blue = iced::Color::from_rgb8(0x56, 0x9c, 0xd6);
@@ -4603,6 +4677,24 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
 
     let c = session.claude_status();
     let mut r = row![].spacing(6).align_y(iced::Center);
+    // In a git repo, the folder segment is a button: click → confirm renaming the
+    // terminal to the repo name (web `folder-seg.clickable` → `rename-to-repo`).
+    let is_repo = session.git().is_some();
+    let folder_seg = move |el: Element<'static, Message>| -> Element<'static, Message> {
+        if !is_repo {
+            return el;
+        }
+        button(el)
+            .on_press(Message::RequestRenameToRepo(pane))
+            .padding(iced::Padding { top: 1.0, bottom: 1.0, left: 3.0, right: 3.0 })
+            .style(|_t: &iced::Theme, s| button::Style {
+                background: matches!(s, button::Status::Hovered)
+                    .then(|| iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                ..Default::default()
+            })
+            .into()
+    };
 
     if session.claude_running() && c.has_stats {
         if let Some(m) = &c.model {
@@ -4646,9 +4738,12 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
 
         r = r.push(horizontal_space());
         if let Some(f) = session.folder() {
-            r = r.push(
-                row![fi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)].spacing(4).align_y(iced::Center),
-            );
+            r = r.push(folder_seg(
+                row![fi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)]
+                    .spacing(4)
+                    .align_y(iced::Center)
+                    .into(),
+            ));
         }
         if let Some(b) = session.git().and_then(|g| g.branch) {
             r = r.push(div());
@@ -4684,7 +4779,7 @@ fn footer_bar(session: &Session, round: iced::border::Radius) -> Element<'static
                 fs = fs.push(lbl(b, green));
                 fs = fs.push(lbl("]".into(), muted));
             }
-            r = r.push(fs);
+            r = r.push(folder_seg(fs.into()));
         }
     }
     // Web `.terminal-footer`: 26px tall, 0 8px padding. `center_y` fixes the height
@@ -4882,9 +4977,10 @@ fn claude_icon(size: f32) -> Element<'static, Message> {
     svg(svg::Handle::from_memory(CLAUDE_ICON.as_bytes())).width(size).height(size).into()
 }
 
-/// Per-pane header: a centred terminal title (focus shown by colour) with a
-/// shell-switch button on the right (Windows) and a Claude status indicator on
-/// the left while Claude runs. A matching left/right slot keeps the title centred.
+/// Per-pane header: the terminal name centred on the full width with its status
+/// dot right beside it (focus shown by colour); on the right, an info button (while
+/// Claude runs) and the Git Bash shell-switch button. The centred name overlays the
+/// right buttons via a stack, so it stays centred regardless of how many buttons show.
 fn pane_header(
     name: &str,
     focused: bool,
@@ -4892,46 +4988,47 @@ fn pane_header(
     has_git_bash: bool,
     pane: pane_grid::Pane,
     status: Option<Dot>,
+    claude_running: bool,
+    info_open: bool,
     round: iced::border::Radius,
 ) -> Element<'static, Message> {
-    const SLOT: f32 = 26.0;
     let color = if focused {
         iced::Color::from_rgb8(0x4d, 0xa6, 0xff)
     } else {
         iced::Color::from_rgb8(0x6b, 0x6b, 0x6b)
     };
-    let left: Element<'static, Message> = match status {
-        // Static dot in the header (no jumpy ✻ animation — that's in the overview).
-        Some(d) => header_dot(d),
-        None => Space::with_width(Length::Fixed(0.0)).into(),
-    };
-    let title = container(text(name.to_string()).size(11).color(color)).center_x(Length::Fill);
-    let right: Element<'static, Message> = if has_git_bash {
+    // Centre layer: status dot + name, centred together on the whole header width.
+    let mut center = row![].spacing(5).align_y(iced::Center);
+    if let Some(d) = status {
+        center = center.push(header_dot(d));
+    }
+    center = center.push(text(name.to_string()).size(11).color(color));
+    let center = container(center).center_x(Length::Fill).center_y(Length::Fill);
+
+    // Right layer: info (while Claude runs) + shell-switch button, hugged right.
+    let mut right = row![].spacing(4).align_y(iced::Center);
+    if has_git_bash {
         let icon = match shell {
             ShellKind::PowerShell => ICON_BASH, // click → switch to Git Bash
             ShellKind::GitBash => ICON_POWERSHELL, // click → switch to PowerShell
         };
-        button(svg(svg::Handle::from_memory(icon.as_bytes())).width(15).height(15))
-            .on_press(Message::SwitchShell(pane))
-            .padding(2)
-            .style(button::text)
-            .into()
-    } else {
-        Space::with_width(Length::Fixed(0.0)).into()
-    };
-    let header = row![
-        container(left).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
-        title,
-        container(right).width(Length::Fixed(SLOT)).center_x(Length::Fixed(SLOT)),
-    ]
-    .align_y(iced::Center)
-    // 2px top / 0 bottom nudges the content (dot + title + shell button) down 1px:
-    // `center_y` below absorbs half the 2px asymmetry, netting +1px at any height.
-    .padding(iced::Padding { top: 2.0, right: 6.0, bottom: 0.0, left: 6.0 });
+        right = right.push(
+            button(svg(svg::Handle::from_memory(icon.as_bytes())).width(15).height(15))
+                .on_press(Message::SwitchShell(pane))
+                .padding(2)
+                .style(button::text),
+        );
+    }
+    if claude_running {
+        right = right.push(header_info_btn(pane, info_open));
+    }
+    let sides = container(row![horizontal_space(), right].align_y(iced::Center))
+        .center_y(Length::Fill)
+        .padding(iced::Padding { top: 2.0, right: 6.0, bottom: 0.0, left: 6.0 });
+
     // Web `.pane-toolbar`: 34px tall, #181818, 1px #2c2c2c bottom border (the
     // border is the `hline()` added below the header in the pane's content column).
-    // `center_y` fixes the height AND vertically centres the content.
-    container(header)
+    container(iced::widget::stack![center, sides])
         .width(Length::Fill)
         .center_y(Length::Fixed(34.0))
         .style(move |_t: &iced::Theme| container::Style {
@@ -4940,6 +5037,153 @@ fn pane_header(
             ..Default::default()
         })
         .into()
+}
+
+/// The header info button (web `.info-btn`, `mdiInformationOutline`): toggles the
+/// Claude session info popover for this pane. Azure when the popover is open.
+fn header_info_btn(pane: pane_grid::Pane, active: bool) -> Element<'static, Message> {
+    let color = if active { AZURE } else { iced::Color::from_rgb8(0x6b, 0x7a, 0x8d) };
+    button(cmdi(mdi_path::INFORMATION_OUTLINE, 14.0, color))
+        .padding(2)
+        .on_press(Message::ToggleInfoPanel(pane))
+        .style(move |_t: &iced::Theme, s| {
+            let on = active || matches!(s, button::Status::Hovered);
+            button::Style {
+                border: iced::Border {
+                    color: if on { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// The Claude session info popover (web `TerminalInfoPanel`): model + token counts,
+/// anchored top-right over the terminal. Built from the pane's live Claude stats.
+fn info_panel(c: &arbiter_native::claude_status::ClaudeStatus) -> Element<'static, Message> {
+    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
+    let primary = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
+    let info_row = |label: &str, value: String| -> Element<'static, Message> {
+        row![
+            text(label.to_string()).size(11).color(muted),
+            horizontal_space(),
+            text(value).size(11).color(primary),
+        ]
+        .spacing(16)
+        .into()
+    };
+    let mut col = column![].spacing(5);
+    if let Some(m) = &c.model {
+        col = col.push(info_row("Model", clean_model(m)));
+    }
+    col = col.push(info_row("Tokens in", fmt_commas(c.input_tokens)));
+    col = col.push(info_row("Tokens out", fmt_commas(c.output_tokens)));
+    col = col.push(info_row("Cache write", fmt_commas(c.cache_write)));
+    col = col.push(info_row("Cache read", fmt_commas(c.cache_read)));
+    if c.cost_usd > 0.0 {
+        col = col.push(info_row("Cost", format!("${:.2}", c.cost_usd)));
+    }
+    let card = container(col)
+        .padding([8, 12])
+        .width(Length::Fixed(220.0))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        });
+    // Anchor top-right within the terminal area.
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Top)
+        .padding(iced::Padding { top: 4.0, right: 6.0, bottom: 0.0, left: 0.0 })
+        .into()
+}
+
+/// The Knight-Rider "working" bar (web `.progress-bar`): a soft azure gradient
+/// strip that sweeps back and forth across the top of the terminal while Claude
+/// works. A fixed transparent→azure→transparent strip slid via flex portions, with
+/// the position driven by `now_ms` (the 60fps Tick redraws it).
+fn working_bar() -> Element<'static, Message> {
+    // Triangle wave 0→1→0 over 3s (web's `3s ... alternate`).
+    let t = (now_ms() % 3000) as f32 / 3000.0;
+    let tri = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 };
+    let left = (tri * 60.0).round() as u16; // 0..60; strip is 40 portions wide
+    let azure = iced::Color::from_rgb8(0x33, 0x99, 0xff);
+    let clear = iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.0);
+    let strip = container(Space::with_height(Length::Fixed(3.0)))
+        .width(Length::Fill)
+        .height(Length::Fixed(3.0))
+        .style(move |_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Gradient(iced::Gradient::Linear(
+                iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
+                    .add_stop(0.0, clear)
+                    .add_stop(0.5, azure)
+                    .add_stop(1.0, clear),
+            ))),
+            ..Default::default()
+        });
+    let bar = row![
+        Space::with_width(Length::FillPortion(left)),
+        container(strip).width(Length::FillPortion(40)),
+        Space::with_width(Length::FillPortion(60 - left)),
+    ];
+    container(bar)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(iced::alignment::Vertical::Top)
+        .into()
+}
+
+/// Integer with thousands separators ("12,345"), for the info popover token counts.
+fn fmt_commas(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// "Rename terminal to <repo>?" confirmation (footer folder click).
+fn rename_confirm_view(rc: &RenameConfirm) -> Element<'static, Message> {
+    let panel = column![
+        text(format!("Rename terminal to \"{}\"?", rc.repo)).size(15).font(ui_semibold()),
+        text(format!(
+            "Set this terminal's name from \"{}\" to the repository name \"{}\".",
+            rc.old, rc.repo
+        ))
+        .size(12)
+        .color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
+        row![
+            horizontal_space(),
+            button(text("Cancel").size(13))
+                .on_press(Message::CancelRename)
+                .style(button::secondary)
+                .padding([6, 14]),
+            button(text("Rename").size(13))
+                .on_press(Message::ConfirmRename)
+                .style(button::primary)
+                .padding([6, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(380.0));
+    modal_scrim(modal_panel(panel.into()), Message::CancelRename)
 }
 
 // ── Pane operations (keyboard: navigate / resize / equalize) ───────────────────
@@ -5716,6 +5960,8 @@ fn main() -> iced::Result {
                 settings_open: false,
                 settings_tab: SettingsTab::General,
                 shortcuts_open: false,
+                info_pane: None,
+                rename_confirm: None,
             };
             (state, iced::Task::batch(tasks))
         })
