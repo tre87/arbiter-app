@@ -2237,20 +2237,32 @@ const TXT_PRIMARY: iced::Color = iced::Color { r: 0xe8 as f32 / 255.0, g: 0xea a
 const TXT_MUTED: iced::Color = iced::Color { r: 0x6b as f32 / 255.0, g: 0x7a as f32 / 255.0, b: 0x8d as f32 / 255.0, a: 1.0 };
 const AZURE: iced::Color = iced::Color { r: 0x33 as f32 / 255.0, g: 0x99 as f32 / 255.0, b: 0xff as f32 / 255.0, a: 1.0 };
 
+/// Truncate `name` to `max_chars`, appending "…" when cut (keeps 3–4 chars min).
+fn truncate_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    let keep = max_chars.saturating_sub(1).max(1);
+    let mut s: String = name.chars().take(keep).collect();
+    s.push('…');
+    s
+}
+
 /// One workspace tab pill (web `.tab`): type icon + name + (×) close, 26px tall,
 /// translucent-white border, tinted bg when active. The close is a nested button
-/// (it captures its own clicks, so the tab's select fires only elsewhere).
-fn tab_pill(i: usize, ws: &Workspace, active: bool, show_close: bool) -> Element<'static, Message> {
+/// (it captures its own clicks, so the tab's select fires only elsewhere). The
+/// name truncates to `max_chars` so tabs shrink on a narrow window; icon + × stay.
+fn tab_pill(i: usize, ws: &Workspace, active: bool, show_close: bool, max_chars: usize) -> Element<'static, Message> {
     let icon = if ws.project.is_some() { mdi_path::FOLDER } else { mdi_path::CONSOLE };
-    let mut content = row![cmdi(icon, 14.0, TXT_MUTED), text(ws.name.clone()).size(12)]
+    // Type icon + close go near-white on the active tab (visible), muted otherwise.
+    let fg = if active { TXT_PRIMARY } else { TXT_MUTED };
+    let mut content = row![cmdi(icon, 12.0, fg), text(truncate_name(&ws.name, max_chars)).size(12)]
         .spacing(4)
         .align_y(iced::Center)
         .height(Length::Fixed(26.0));
     if show_close {
-        // The × is near-white on the active tab (so it's visible), muted otherwise.
-        let x_color = if active { TXT_PRIMARY } else { TXT_MUTED };
         content = content.push(
-            button(cmdi(mdi_path::CLOSE, 13.0, x_color))
+            button(cmdi(mdi_path::CLOSE, 13.0, fg))
                 .padding(2)
                 .on_press(Message::CloseWorkspace(i))
                 .style(|_t: &iced::Theme, s| button::Style {
@@ -2470,12 +2482,12 @@ fn new_ws_menu_view(anchor_x: f32) -> Element<'static, Message> {
     mouse_area(anchored).on_press(Message::CloseNewWsMenu).into()
 }
 
-fn main_view(state: &State) -> Element<'_, Message> {
-    // Unified titlebar: Arbiter logo + animated wordmark, then workspace tabs
-    // (left) + actions (right). On macOS this IS the window titlebar (content
-    // extends behind it; traffic lights overlay the left pad).
-    let mut bar = row![].spacing(6).align_y(iced::Center).height(Length::Fill);
-    // Brand: logo + animated wordmark. On Windows (no OS titlebar) it's a drag handle.
+/// The whole titlebar row, laid out for the available width `avail_w` (from
+/// `responsive`): the right-side action buttons always show and take priority;
+/// the usage bars + refresh drop out first when space is tight; the tabs shrink
+/// (names truncate to a char budget, with icon + × always visible) inside a
+/// clipped band so they never push the actions off-screen; "+" always shows.
+fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let brand = row![
         iced::widget::image(state.logo.clone())
             .width(Length::Fixed(LOGO_LOGICAL))
@@ -2487,18 +2499,39 @@ fn main_view(state: &State) -> Element<'_, Message> {
     .align_y(iced::Center);
     #[cfg(target_os = "windows")]
     let brand = mouse_area(brand).on_press(Message::DragWindow);
-    bar = bar.push(brand);
-    bar = bar.push(Space::with_width(Length::Fixed(12.0)));
-    // Workspace tabs (web `.tab` pills) + the "+" new-workspace button, gap 3.
+
+    // Approximate widths of the fixed regions (logical px) to budget the tab band.
+    const BRAND_W: f32 = 106.0;
+    const PLUS_W: f32 = 30.0;
+    const USAGE_W: f32 = 372.0;
+    const TAB_MIN: f32 = 60.0;
+    #[cfg(target_os = "windows")]
+    let caption_w = 140.0;
+    #[cfg(not(target_os = "windows"))]
+    let caption_w = 0.0;
+    let actions_w = 200.0 + caption_w; // 6 btn-icons (+ Windows caption strip)
+    let n = state.workspaces.len().max(1) as f32;
+    let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
+    // Usage bars only when there's room for them AND a minimum tab band.
+    let show_usage = (avail - USAGE_W) >= (n * TAB_MIN);
+    let tab_area = (if show_usage { avail - USAGE_W } else { avail }).max(TAB_MIN);
+    let per = tab_area / n;
     let multi = state.workspaces.len() > 1;
+    let fixed = if multi { 52.0 } else { 30.0 }; // icon + padding + (× when multi)
+    let max_chars = (((per - fixed) / 6.5).floor() as i32).clamp(3, 40) as usize;
+
     let mut tabs = row![].spacing(3).align_y(iced::Center);
     for (i, ws) in state.workspaces.iter().enumerate() {
-        tabs = tabs.push(tab_pill(i, ws, i == state.active, multi));
+        tabs = tabs.push(tab_pill(i, ws, i == state.active, multi, max_chars));
     }
-    tabs = tabs.push(tab_add_button());
-    bar = bar.push(tabs);
-    // Flexible middle: a drag region on Windows (no OS titlebar); a plain spacer
-    // on macOS (the OS handles dragging the transparent titlebar).
+    let tabs = container(tabs).max_width(tab_area.max(1.0)).clip(true);
+
+    let mut bar = row![brand, Space::with_width(Length::Fixed(12.0)), tabs, tab_add_button()]
+        .spacing(6)
+        .align_y(iced::Center)
+        .height(Length::Fill);
+
+    // Flexible middle (drag region on Windows; spacer on macOS).
     #[cfg(target_os = "windows")]
     {
         bar = bar.push(mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragWindow));
@@ -2507,25 +2540,25 @@ fn main_view(state: &State) -> Element<'_, Message> {
     {
         bar = bar.push(horizontal_space());
     }
-    // Usage meters + refresh (web StatsBar). Static values for now — wiring later.
-    let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
-    bar = bar.push(
-        row![
-            usage_stat("5h", 50, AZURE, "1h 41m"),
-            vsep(),
-            usage_stat("7d", 50, green, "1d 22h"),
-            vsep(),
-            refresh_btn(),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
-    );
-    // Action buttons (web btn-icon): overview (live), keyboard + settings (no-op
-    // for now), then the terminal split extras (right / down arrows).
+
+    if show_usage {
+        let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
+        bar = bar.push(
+            row![
+                usage_stat("5h", 50, AZURE, "1h 41m"),
+                vsep(),
+                usage_stat("7d", 50, green, "1d 22h"),
+                vsep(),
+                refresh_btn(),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        );
+    }
     bar = bar.push(
         row![
             action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()),
-            action_icon_btn(mdi_path::COMMAND, Message::Noop, false),
+            action_icon_btn(mdi_path::KEYBOARD, Message::Noop, false),
             action_icon_btn(mdi_path::COG, Message::Noop, false),
             action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
             action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
@@ -2534,17 +2567,10 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .spacing(4)
         .align_y(iced::Center),
     );
-    // Window controls (Windows only, no OS titlebar): native-proportioned caption
-    // buttons (minimize / maximize / close), flush together at the top-right
-    // corner, with Win11 hover washes (red for close).
     #[cfg(target_os = "windows")]
     {
         let f = state.main_focused;
-        let mid = if state.main_maximized {
-            caption_glyph::RESTORE
-        } else {
-            caption_glyph::MAXIMIZE
-        };
+        let mid = if state.main_maximized { caption_glyph::RESTORE } else { caption_glyph::MAXIMIZE };
         bar = bar.push(
             row![
                 caption_button(caption_glyph::MINIMIZE, Message::WinMinimize, false, f),
@@ -2554,7 +2580,13 @@ fn main_view(state: &State) -> Element<'_, Message> {
             .spacing(0),
         );
     }
+    bar.into()
+}
 
+fn main_view(state: &State) -> Element<'_, Message> {
+    // Unified titlebar: Arbiter logo + animated wordmark, then workspace tabs
+    // (left) + actions (right). On macOS this IS the window titlebar (content
+    // extends behind it; traffic lights overlay the left pad).
     let focus = state.active().focus;
     let font = &state.font;
     let has_git_bash = state.git_bash.is_some();
@@ -2657,8 +2689,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
         });
 
     // Titlebar: web height (40px), left-padded for the traffic lights. Transparent
-    // so the app-wide azure glow shows through it.
-    let titlebar = container(bar)
+    // so the app-wide azure glow shows through it. `responsive` gives the bar its
+    // available width so tabs/usage can shrink/hide (see `titlebar_row`).
+    let titlebar = container(iced::widget::responsive(move |sz| titlebar_row(state, sz.width)))
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
         .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
@@ -2971,7 +3004,9 @@ fn cmdi(path: &'static str, size: f32, color: iced::Color) -> Element<'static, M
     iced::widget::image(handle)
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
-        .filter_method(iced::widget::image::FilterMethod::Linear)
+        // Nearest at the exact physical size = pixel-crisp (Linear softens icons
+        // whose on-screen position lands on a fractional pixel).
+        .filter_method(iced::widget::image::FilterMethod::Nearest)
         .into()
 }
 
@@ -3052,9 +3087,7 @@ mod mdi_path {
     pub const VIEW_DASHBOARD: &str = "M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z";
     pub const COG: &str = "M12,8A4,4 0 0,1 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12A4,4 0 0,1 12,8M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10M10,22C9.75,22 9.54,21.82 9.5,21.58L9.13,18.93C8.5,18.68 7.96,18.34 7.44,17.94L4.95,18.95C4.73,19.03 4.46,18.95 4.34,18.73L2.34,15.27C2.21,15.05 2.27,14.78 2.46,14.63L4.57,12.97L4.5,12L4.57,11L2.46,9.37C2.27,9.22 2.21,8.95 2.34,8.73L4.34,5.27C4.46,5.05 4.73,4.96 4.95,5.05L7.44,6.05C7.96,5.66 8.5,5.32 9.13,5.07L9.5,2.42C9.54,2.18 9.75,2 10,2H14C14.25,2 14.46,2.18 14.5,2.42L14.87,5.07C15.5,5.32 16.04,5.66 16.56,6.05L19.05,5.05C19.27,4.96 19.54,5.05 19.66,5.27L21.66,8.73C21.79,8.95 21.73,9.22 21.54,9.37L19.43,11L19.5,12L19.43,13L21.54,14.63C21.73,14.78 21.79,15.05 21.66,15.27L19.66,18.73C19.54,18.95 19.27,19.04 19.05,18.95L16.56,17.95C16.04,18.34 15.5,18.68 14.87,18.93L14.5,21.58C14.46,21.82 14.25,22 14,22H10M11.25,4L10.88,6.61C9.68,6.86 8.62,7.5 7.85,8.39L5.44,7.35L4.69,8.65L6.8,10.2C6.4,11.37 6.4,12.64 6.8,13.8L4.68,15.36L5.43,16.66L7.86,15.62C8.63,16.5 9.68,17.14 10.87,17.38L11.24,20H12.76L13.13,17.39C14.32,17.14 15.37,16.5 16.14,15.62L18.57,16.66L19.32,15.36L17.2,13.81C17.6,12.64 17.6,11.37 17.2,10.2L19.31,8.65L18.56,7.35L16.15,8.39C15.38,7.5 14.32,6.86 13.12,6.62L12.75,4H11.25Z";
     pub const ARROW_RIGHT: &str = "M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z";
-    // Keyboard-shortcuts button: the ⌘ command glyph reads cleaner than a busy
-    // keyboard at small sizes.
-    pub const COMMAND: &str = "M6,2A4,4 0 0,1 10,6V8H14V6A4,4 0 0,1 18,2A4,4 0 0,1 22,6A4,4 0 0,1 18,10H16V14H18A4,4 0 0,1 22,18A4,4 0 0,1 18,22A4,4 0 0,1 14,18V16H10V18A4,4 0 0,1 6,22A4,4 0 0,1 2,18A4,4 0 0,1 6,14H8V10H6A4,4 0 0,1 2,6A4,4 0 0,1 6,2M16,18A2,2 0 0,0 18,20A2,2 0 0,0 20,18A2,2 0 0,0 18,16H16V18M14,10H10V14H14V10M6,16A2,2 0 0,0 4,18A2,2 0 0,0 6,20A2,2 0 0,0 8,18V16H6M8,6A2,2 0 0,0 6,4A2,2 0 0,0 4,6A2,2 0 0,0 6,8H8V6M18,8A2,2 0 0,0 20,6A2,2 0 0,0 18,4A2,2 0 0,0 16,6V8H18Z";
+    pub const KEYBOARD: &str = "M4,5A2,2 0 0,0 2,7V17A2,2 0 0,0 4,19H20A2,2 0 0,0 22,17V7A2,2 0 0,0 20,5H4M4,7H20V17H4V7M5,8V10H7V8H5M8,8V10H10V8H8M11,8V10H13V8H11M14,8V10H16V8H14M17,8V10H19V8H17M5,11V13H7V11H5M8,11V13H10V11H8M11,11V13H13V11H11M14,11V13H16V11H14M17,11V13H19V11H17M8,14V16H16V14H8Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
