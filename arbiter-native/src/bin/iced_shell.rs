@@ -256,6 +256,14 @@ struct State {
     info_pane: Option<pane_grid::Pane>,
     /// Pending "rename terminal to repo name" confirmation (footer folder click).
     rename_confirm: Option<RenameConfirm>,
+    /// The workspace being renamed (right-click a tab), with its edit buffer.
+    rename_ws: Option<RenameWorkspace>,
+}
+
+/// State of the "rename workspace" modal: which tab, and the name being typed.
+struct RenameWorkspace {
+    index: usize,
+    text: String,
 }
 
 /// A pending confirm to rename a pane to its git repo's name (footer folder icon).
@@ -391,6 +399,11 @@ enum Message {
     RequestRenameToRepo(pane_grid::Pane),
     ConfirmRename,
     CancelRename,
+    /// Right-click a workspace tab → rename it.
+    RenameWorkspaceStart(usize),
+    RenameWorkspaceInput(String),
+    RenameWorkspaceCommit,
+    RenameWorkspaceCancel,
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -1436,15 +1449,45 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state); // the `ws`/`p` borrow has ended
         }
         Message::CloseWorkspace(i) => {
-            if state.workspaces.len() > 1 && i < state.workspaces.len() {
-                state.workspaces.remove(i); // drops it → its sessions close
-                if state.active >= i {
-                    state.active = state.active.saturating_sub(1);
+            if i < state.workspaces.len() {
+                if state.workspaces.len() == 1 {
+                    // Closing the only workspace resets to a fresh "Workspace 1"
+                    // (numbering starts over) rather than leaving none.
+                    state.workspaces[0] = Workspace::new("Workspace 1".into());
+                    state.active = 0;
+                } else {
+                    state.workspaces.remove(i); // drops it → its sessions close
+                    if state.active >= i {
+                        state.active = state.active.saturating_sub(1);
+                    }
+                    state.active = state.active.min(state.workspaces.len() - 1);
                 }
-                state.active = state.active.min(state.workspaces.len() - 1);
                 save_session(state);
             }
         }
+        Message::RenameWorkspaceStart(i) => {
+            if let Some(ws) = state.workspaces.get(i) {
+                state.rename_ws = Some(RenameWorkspace { index: i, text: ws.name.clone() });
+                return text_input::focus(text_input::Id::new(WS_RENAME_INPUT));
+            }
+        }
+        Message::RenameWorkspaceInput(s) => {
+            if let Some(rw) = state.rename_ws.as_mut() {
+                rw.text = s;
+            }
+        }
+        Message::RenameWorkspaceCommit => {
+            if let Some(rw) = state.rename_ws.take() {
+                let name = rw.text.trim().to_string();
+                if !name.is_empty() {
+                    if let Some(ws) = state.workspaces.get_mut(rw.index) {
+                        ws.name = name;
+                    }
+                    save_session(state);
+                }
+            }
+        }
+        Message::RenameWorkspaceCancel => state.rename_ws = None,
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
@@ -2422,6 +2465,7 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
 
 /// The text_input id of the new-worktree dialog's branch-name field (for autofocus).
 const WT_NAME_INPUT: &str = "wt-name-input";
+const WS_RENAME_INPUT: &str = "ws-rename-input";
 
 /// The modal layer over the whole window, if a worktree dialog or context menu is
 /// open: the new-worktree form, or the right-click actions for a worktree.
@@ -2433,6 +2477,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     // organization" button), so check it first; dismissing it returns to Settings.
     if state.usage_org_menu {
         return Some(usage_org_menu_view(&state.usage.orgs));
+    }
+    if let Some(rw) = &state.rename_ws {
+        return Some(rename_workspace_view(rw));
     }
     if let Some(rc) = &state.rename_confirm {
         return Some(rename_confirm_view(rc));
@@ -3744,15 +3791,20 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
     let tab_area = (if show_usage { avail - usage_w } else { avail }).max(TAB_MIN);
     let per = tab_area / n;
-    let multi = state.workspaces.len() > 1;
-    let fixed = if multi { 52.0 } else { 30.0 }; // icon + padding + (× when multi)
+    // The × always shows (even on the last tab — closing it resets to a fresh
+    // workspace), so budget for icon + padding + × on every tab.
+    let fixed = 52.0;
     let max_chars = (((per - fixed) / 6.5).floor() as i32).clamp(3, 40) as usize;
 
     // Every tab truncates to the same `max_chars`, so each is ≤ tab_area/n and the
     // row never exceeds the band — no clip needed (clipping cut the last tab's ×).
+    // Right-click a tab to rename it.
     let mut tabs = row![].spacing(3).align_y(iced::Center);
     for (i, ws) in state.workspaces.iter().enumerate() {
-        tabs = tabs.push(tab_pill(i, ws, i == state.active, multi, max_chars));
+        tabs = tabs.push(
+            mouse_area(tab_pill(i, ws, i == state.active, true, max_chars))
+                .on_right_press(Message::RenameWorkspaceStart(i)),
+        );
     }
 
     let mut bar = row![brand, Space::with_width(Length::Fixed(12.0)), tabs, tab_add_button()]
@@ -5189,6 +5241,34 @@ fn rename_confirm_view(rc: &RenameConfirm) -> Element<'static, Message> {
     modal_scrim(modal_panel(panel.into()), Message::CancelRename)
 }
 
+/// "Rename workspace" modal (right-click a tab): a prefilled name input.
+fn rename_workspace_view(rw: &RenameWorkspace) -> Element<'static, Message> {
+    let input = text_input("Workspace name", &rw.text)
+        .id(text_input::Id::new(WS_RENAME_INPUT))
+        .on_input(Message::RenameWorkspaceInput)
+        .on_submit(Message::RenameWorkspaceCommit)
+        .padding([7, 9])
+        .size(13);
+    let actions = row![
+        horizontal_space(),
+        button(text("Cancel").size(13))
+            .on_press(Message::RenameWorkspaceCancel)
+            .style(button::secondary)
+            .padding([6, 14]),
+        button(text("Rename").size(13))
+            .on_press(Message::RenameWorkspaceCommit)
+            .style(button::primary)
+            .padding([6, 14]),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    let panel = column![text("Rename workspace").size(15).font(ui_semibold()), input, actions]
+        .spacing(14)
+        .padding(18)
+        .width(Length::Fixed(340.0));
+    modal_scrim(modal_panel(panel.into()), Message::RenameWorkspaceCancel)
+}
+
 // ── Pane operations (keyboard: navigate / resize / equalize) ───────────────────
 
 /// Number of tracks a subtree spans along `axis` (Vertical → columns, Horizontal
@@ -5965,6 +6045,7 @@ fn main() -> iced::Result {
                 shortcuts_open: false,
                 info_pane: None,
                 rename_confirm: None,
+                rename_ws: None,
             };
             (state, iced::Task::batch(tasks))
         })
