@@ -58,7 +58,6 @@ fn macos_activate() {
 /// Run the usage-helper webview loop (this process was re-spawned with
 /// `--usage-helper`). Diverges: runs the event loop until the parent's stdin closes.
 pub fn run() {
-    eprintln!("[usage-helper] started"); // DIAGNOSTIC (Windows usage debugging)
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     // macOS: start as an Accessory app — NO dock icon — and DON'T grab activation
@@ -140,14 +139,6 @@ pub fn run() {
         .with_initialization_script(INIT_SCRIPT)
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.into_body();
-            // DIAGNOSTIC: every IPC message from the page → stderr (inherited by the
-            // parent, so it shows in the terminal). Remove once usage works on Windows.
-            eprintln!("[usage-helper] ipc<- {}", body.chars().take(200).collect::<String>());
-            // `LOG …` lines are JS breadcrumbs (not usage data) — don't relay to stdout.
-            if let Some(rest) = body.strip_prefix("LOG ") {
-                let _ = rest;
-                return;
-            }
             // Relay the line to the main app.
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
@@ -225,9 +216,6 @@ pub fn run() {
 const INIT_SCRIPT: &str = r#"
 (function () {
   function post(x) { try { window.ipc.postMessage(JSON.stringify(x)); } catch (_) {} }
-  // DIAGNOSTIC breadcrumb to the helper's stderr (Windows usage debugging).
-  function dbg(m) { try { window.ipc.postMessage('LOG ' + m); } catch (_) {} }
-  dbg('init ' + location.protocol + '//' + location.hostname + location.pathname);
   function per(p) {
     if (!p) return null;
     var r = null;
@@ -247,7 +235,6 @@ const INIT_SCRIPT: &str = r#"
   // The app calls this (refresh button / countdown rollover) to refetch on demand.
   window.__arbiterRefetchUsage = function () { fetchUsage(); };
   async function fetchUsage() {
-    dbg('fetch ' + location.hostname + location.pathname);
     if (location.protocol !== 'https:' || location.hostname !== 'claude.ai') {
       if (location.href !== 'https://claude.ai/') location.href = 'https://claude.ai/';
       return;
@@ -256,8 +243,7 @@ const INIT_SCRIPT: &str = r#"
     // A network failure (offline / claude.ai unreachable) is transient — report
     // 'error' (Usage unavailable), NOT 'needs_login', so an outage never looks like
     // you've been signed out.
-    try { o = await fetch('/api/organizations'); } catch (_) { dbg('org-catch'); post({ ok: false, error: 'error' }); return; }
-    dbg('org ' + o.status);
+    try { o = await fetch('/api/organizations'); } catch (_) { post({ ok: false, error: 'error' }); return; }
     // Only 401/403 means genuinely unauthenticated → sign in. Any other non-OK
     // (5xx/429/…) is a server-side problem while still signed in → transient error.
     if (o.status === 401 || o.status === 403) { post({ ok: false, error: 'needs_login' }); return; }
@@ -275,11 +261,9 @@ const INIT_SCRIPT: &str = r#"
       ? window.__arbiterOrg
       : (list.length === 1 ? list[0].uuid : null);
     if (!chosen) { post({ ok: false, error: 'needs_org', orgs: list }); return; }
-    dbg('orgs ' + list.length + ' chosen ' + (chosen || '-'));
     var usage = await usageFor(chosen);
-    if (!usage) { dbg('usage-null'); post({ ok: false, error: 'error' }); return; }
+    if (!usage) { post({ ok: false, error: 'error' }); return; }
     var plan = (usage.seven_day_opus || usage.seven_day_sonnet) ? 'Max' : (usage.seven_day ? 'Pro' : 'Free');
-    dbg('ok ' + plan);
     var chosenName = (list.find(function (o) { return o.uuid === chosen; }) || {}).name || null;
     post({
       ok: true, plan: plan,
