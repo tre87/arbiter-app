@@ -179,7 +179,7 @@ impl VtTerm {
 
     /// Walk the visible screen, yielding (row, col, char, fg, bg, bold, selected)
     /// per cell. `selected` is true for cells inside the active selection.
-    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool, bool)) {
+    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool, bool, bool)) {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let sel = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
@@ -192,6 +192,11 @@ impl VtTerm {
             let line = &grid[Line(line_idx)];
             for col in 0..cols {
                 let cell = &line[Column(col)];
+                // The dummy cell after a wide char carries no glyph — the wide
+                // glyph (drawn 2 cells wide) covers it.
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
                 let mut fg = self.resolve(cell.fg, true);
                 let mut bg = self.resolve(cell.bg, false);
                 if cell.flags.contains(Flags::INVERSE) {
@@ -201,9 +206,10 @@ impl VtTerm {
                     fg = bg;
                 }
                 let bold = cell.flags.contains(Flags::BOLD);
+                let wide = cell.flags.contains(Flags::WIDE_CHAR);
                 let selected =
                     sel.as_ref().is_some_and(|r| r.contains(Point::new(Line(line_idx), Column(col))));
-                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold, selected);
+                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold, wide, selected);
             }
         }
     }

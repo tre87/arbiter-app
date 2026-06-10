@@ -4,15 +4,18 @@
 //! platforms (DirectWrite on Windows is a follow-up). The returned coverage is a
 //! tightly-packed 8-bit alpha bitmap, rows top-down.
 
-/// A rasterised glyph: 8-bit coverage plus placement relative to the pen.
-/// `left` is the x of the bitmap's left column relative to the pen origin;
-/// `top` is the distance from the baseline up to the top of the bitmap.
+/// A rasterised glyph plus placement relative to the pen. `left` is the x of the
+/// bitmap's left column relative to the pen origin; `top` is the distance from the
+/// baseline up to the top of the bitmap. `coverage` is 8-bit alpha (1 byte/px,
+/// rows top-down) for a normal glyph, or straight-alpha sRGB RGBA (4 bytes/px) when
+/// `color` is set — i.e. a colour glyph like an emoji.
 pub struct GlyphBitmap {
     pub left: i32,
     pub top: i32,
     pub width: u32,
     pub height: u32,
     pub coverage: Vec<u8>,
+    pub color: bool,
 }
 
 /// Rasterise `ch` at `em_px` (the CSS-style em size in device px), in bold if
@@ -71,6 +74,9 @@ mod swash_raster {
             width: image.placement.width,
             height: image.placement.height,
             coverage: image.data,
+            // Colour emoji on the swash path need font fallback to an emoji font,
+            // which this single-font scaler doesn't do yet (Windows DirectWrite TODO).
+            color: false,
         })
     }
 }
@@ -80,9 +86,9 @@ mod swash_raster {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::GlyphBitmap;
-    use core_foundation::base::{CFRange, TCFType};
+    use core_foundation::base::{CFRange, CFRelease, TCFType};
     use core_foundation::string::{CFString, CFStringRef};
-    use core_graphics::base::kCGImageAlphaNone;
+    use core_graphics::base::{kCGImageAlphaNone, kCGImageAlphaPremultipliedLast};
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
     use core_graphics::geometry::CGPoint;
@@ -105,6 +111,25 @@ mod mac {
             sym_trait_value: u32,
             sym_trait_mask: u32,
         ) -> CTFontRef;
+        // Copies a font table by tag, or null if the font lacks it. Used to detect
+        // colour fonts (sbix/COLR/CBDT) so emoji are rendered in colour.
+        fn CTFontCopyTable(font: CTFontRef, table: u32, options: u32) -> *const std::ffi::c_void;
+    }
+
+    /// Whether `font` carries a colour-glyph table (Apple Color Emoji = sbix; COLR/
+    /// CBDT for others) → its glyphs must be rendered as RGBA, not coverage.
+    fn is_color_font(font: &CTFont) -> bool {
+        // FourCC tags, big-endian (as CoreText expects): 'sbix', 'COLR', 'CBDT'.
+        const TAGS: [u32; 3] = [0x73626978, 0x434F4C52, 0x43424454];
+        TAGS.iter().any(|&tag| {
+            let t = unsafe { CTFontCopyTable(font.as_concrete_TypeRef(), tag, 0) };
+            if t.is_null() {
+                false
+            } else {
+                unsafe { CFRelease(t) };
+                true
+            }
+        })
     }
 
     struct Cached {
@@ -192,6 +217,45 @@ mod mac {
         if w == 0 || h == 0 {
             return None;
         }
+        // Placement, top-down + baseline-relative (matches the swash convention).
+        let left = (bbox.origin.x - pad).round() as i32;
+        let top = (h as f64 - (pad - bbox.origin.y)).round() as i32;
+        let pen = CGPoint::new(pad - bbox.origin.x, pad - bbox.origin.y);
+
+        // Colour glyph (emoji) → render RGBA; otherwise grayscale coverage.
+        if is_color_font(&font) {
+            let cs = CGColorSpace::create_device_rgb();
+            let mut ctx =
+                CGContext::create_bitmap_context(None, w, h, 8, w * 4, &cs, kCGImageAlphaPremultipliedLast);
+            ctx.set_should_antialias(true);
+            ctx.set_should_smooth_fonts(false);
+            font.draw_glyphs(&[glyph], &[pen], ctx.clone());
+            let stride = ctx.bytes_per_row();
+            let data = ctx.data();
+            let mut rgba = vec![0u8; w * h * 4];
+            for row in 0..h {
+                for x in 0..w {
+                    let s = row * stride + x * 4;
+                    let a = data[s + 3] as u32;
+                    // Un-premultiply to straight alpha so the shader composites it
+                    // over the cell bg (CoreText gives premultiplied RGBA).
+                    let un = |c: u8| if a > 0 { ((c as u32 * 255 / a) as u8).min(255) } else { 0 };
+                    let d = (row * w + x) * 4;
+                    rgba[d] = un(data[s]);
+                    rgba[d + 1] = un(data[s + 1]);
+                    rgba[d + 2] = un(data[s + 2]);
+                    rgba[d + 3] = a as u8;
+                }
+            }
+            return Some(GlyphBitmap {
+                left,
+                top,
+                width: w as u32,
+                height: h as u32,
+                coverage: rgba,
+                color: true,
+            });
+        }
 
         // Grayscale bitmap (zero-init = black background, white glyph).
         let cs = CGColorSpace::create_device_gray();
@@ -204,7 +268,6 @@ mod mac {
         ctx.set_gray_fill_color(1.0, 1.0);
 
         // Place the ink's bottom-left (bbox.origin) at (pad, pad) in the bitmap.
-        let pen = CGPoint::new(pad - bbox.origin.x, pad - bbox.origin.y);
         font.draw_glyphs(&[glyph], &[pen], ctx.clone());
 
         // Repack to a tight width-stride buffer (CG may pad bytes_per_row).
@@ -216,9 +279,6 @@ mod mac {
             coverage[row * w..row * w + w].copy_from_slice(src);
         }
 
-        // Placement, top-down + baseline-relative (matches the swash convention).
-        let left = (bbox.origin.x - pad).round() as i32;
-        let top = (h as f64 - (pad - bbox.origin.y)).round() as i32;
-        Some(GlyphBitmap { left, top, width: w as u32, height: h as u32, coverage })
+        Some(GlyphBitmap { left, top, width: w as u32, height: h as u32, coverage, color: false })
     }
 }
