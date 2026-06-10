@@ -22,10 +22,14 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum UserEvent {
     Show,
     Hide,
+    /// Use this org uuid for usage (from the app's org selector / saved choice).
+    SetOrg(String),
+    /// Clear ONLY this webview's claude.ai session (usage sign-out) + reload.
+    SignOut,
 }
 
 /// macOS: bring this app to the front (so its key window receives ⌘V etc.).
@@ -82,10 +86,16 @@ fn main() {
         use std::io::BufRead;
         for line in std::io::stdin().lock().lines() {
             match line {
-                Ok(l) if l.trim() == "show" => {
-                    let _ = stdin_proxy.send_event(UserEvent::Show);
+                Ok(l) => {
+                    let t = l.trim();
+                    if t == "show" {
+                        let _ = stdin_proxy.send_event(UserEvent::Show);
+                    } else if t == "signout" {
+                        let _ = stdin_proxy.send_event(UserEvent::SignOut);
+                    } else if let Some(uuid) = t.strip_prefix("org:") {
+                        let _ = stdin_proxy.send_event(UserEvent::SetOrg(uuid.to_string()));
+                    }
                 }
-                Ok(_) => {}
                 Err(_) => break,
             }
         }
@@ -150,6 +160,16 @@ fn main() {
                     _target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
                 }
             }
+            Event::UserEvent(UserEvent::SetOrg(uuid)) => {
+                let js = format!("window.__arbiterSetOrg && window.__arbiterSetOrg({uuid:?})");
+                let _ = webview.evaluate_script(&js);
+            }
+            Event::UserEvent(UserEvent::SignOut) => {
+                // Clears ONLY this webview's data (claude.ai cookies) — nothing else
+                // on the system. Reload so the script re-runs and reports needs_login.
+                let _ = webview.clear_all_browsing_data();
+                let _ = webview.load_url("https://claude.ai/");
+            }
             // Closing the sign-in window just hides it; we keep polling in the bg.
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 window.set_visible(false);
@@ -179,17 +199,14 @@ const INIT_SCRIPT: &str = r#"
     if (u < 0) u = 0; if (u > 100) u = 100;
     return { utilization: u, resets_at_ms: r };
   }
-  function hasLimits(usage) {
-    if (!usage) return false;
-    return ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet'].some(function (k) {
-      var p = usage[k];
-      return p && (p.resets_at || typeof p.utilization === 'number');
-    });
-  }
   async function usageFor(uuid) {
     try { var u = await fetch('/api/organizations/' + uuid + '/usage'); if (!u.ok) return null; return await u.json(); }
     catch (_) { return null; }
   }
+  // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg),
+  // preserved across script re-injection on the same page.
+  window.__arbiterOrg = window.__arbiterOrg || null;
+  window.__arbiterSetOrg = function (u) { window.__arbiterOrg = u; fetchUsage(); };
   async function fetchUsage() {
     if (location.protocol !== 'https:' || location.hostname !== 'claude.ai') {
       if (location.href !== 'https://claude.ai/') location.href = 'https://claude.ai/';
@@ -200,17 +217,17 @@ const INIT_SCRIPT: &str = r#"
     if (o.status === 401 || o.status === 403 || !o.ok) { post({ ok: false, error: 'needs_login' }); return; }
     var raw;
     try { raw = await o.json(); } catch (_) { post({ ok: false, error: 'needs_login' }); return; }
-    var list = (Array.isArray(raw) ? raw : [raw]).map(function (x) { return x.uuid || x.id; }).filter(Boolean);
+    var list = (Array.isArray(raw) ? raw : [raw])
+      .map(function (x) { return { uuid: x.uuid || x.id, name: x.name || x.display_name || (x.uuid || x.id) }; })
+      .filter(function (o) { return !!o.uuid; });
     if (!list.length) { post({ ok: false, error: 'needs_login' }); return; }
-    // Pick the org that actually has usage limits (multi-org: the first one may be
-    // a free/empty org). Fall back to the first org.
-    var usage = null, first = null;
-    for (var i = 0; i < list.length; i++) {
-      var us = await usageFor(list[i]);
-      if (i === 0) first = us;
-      if (hasLimits(us)) { usage = us; break; }
-    }
-    if (!usage) usage = first;
+    // Determine the org: the chosen one (if still valid), else the only one, else
+    // ask the app to show its org selector.
+    var chosen = (window.__arbiterOrg && list.some(function (o) { return o.uuid === window.__arbiterOrg; }))
+      ? window.__arbiterOrg
+      : (list.length === 1 ? list[0].uuid : null);
+    if (!chosen) { post({ ok: false, error: 'needs_org', orgs: list }); return; }
+    var usage = await usageFor(chosen);
     if (!usage) { post({ ok: false, error: 'error' }); return; }
     // Diagnostic: hand the raw response to Rust to dump (RAW: prefix → not stdout).
     try { window.ipc.postMessage('RAW:' + JSON.stringify(usage)); } catch (_) {}
