@@ -322,6 +322,8 @@ enum Message {
     SelectUsageOrg(String),
     /// Sign out of the usage webview only (clears its claude.ai session).
     UsageSignOut,
+    /// Refresh usage stats now (refresh button): refetch + restart the countdown.
+    RefreshUsage,
     /// Open / dismiss the Settings dialog, and switch its active tab.
     OpenSettings,
     CloseSettings,
@@ -721,6 +723,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 #[cfg(target_os = "macos")]
                 trafficlights::position();
             }
+            // Drive the usage refresh from the app: once the 120s countdown hits 0,
+            // ask the helper to refetch and restart the countdown. (The helper's own
+            // setInterval is unreliable while its window is hidden — webviews
+            // throttle background timers — so the app owns the cadence.)
+            if state.usage.state == UsageState::Ok
+                && state.usage_updated_ms != 0
+                && now_ms().saturating_sub(state.usage_updated_ms) >= USAGE_REFRESH_MS
+            {
+                usage_helper_cmd("fetch");
+                state.usage_updated_ms = now_ms(); // restart the countdown immediately
+            }
         }
         Message::Input(bytes) => {
             let ws = state.active_mut();
@@ -821,6 +834,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.usage_org = None;
             state.usage = UsageData::default(); // back to Pending (→ NeedsLogin)
             save_session(state);
+        }
+        Message::RefreshUsage => {
+            // Force a refetch and restart the 2-minute countdown immediately.
+            usage_helper_cmd("fetch");
+            state.usage_updated_ms = now_ms();
         }
         Message::OpenSettings => state.settings_open = true,
         Message::CloseSettings => state.settings_open = false,
@@ -3230,13 +3248,18 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
     .into()
 }
 
+/// How often usage auto-refreshes (the countdown length). The app drives this on
+/// the Tick (the helper's own background timer throttles while hidden).
+const USAGE_REFRESH_MS: u64 = 120_000;
+
 /// The usage refresh button (web `.refresh-btn`): shows the countdown to the next
-/// poll (the helper refetches every 120s; we reset on each `UsageUpdated`).
+/// auto-poll and, when clicked, refetches now + restarts the countdown.
 fn refresh_btn(updated_ms: u64) -> Element<'static, Message> {
+    let secs = USAGE_REFRESH_MS / 1000;
     let cd = if updated_ms == 0 {
-        120
+        secs
     } else {
-        120u64.saturating_sub(now_ms().saturating_sub(updated_ms) / 1000).min(120)
+        secs.saturating_sub(now_ms().saturating_sub(updated_ms) / 1000).min(secs)
     };
     let label = format!("{}:{:02}", cd / 60, cd % 60);
     button(
@@ -3257,7 +3280,7 @@ fn refresh_btn(updated_ms: u64) -> Element<'static, Message> {
         .align_y(iced::Center),
     )
     .padding([5, 7])
-    .on_press(Message::Noop)
+    .on_press(Message::RefreshUsage)
     .style(|_t: &iced::Theme, s| button::Style {
         background: None,
         border: iced::Border {

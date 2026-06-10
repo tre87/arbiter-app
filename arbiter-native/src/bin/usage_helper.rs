@@ -30,6 +30,8 @@ enum UserEvent {
     SetOrg(String),
     /// Clear ONLY this webview's claude.ai session (usage sign-out) + reload.
     SignOut,
+    /// Refetch usage now (the app's refresh button / countdown rollover).
+    Fetch,
 }
 
 /// macOS: bring this app to the front (so its key window receives ⌘V etc.).
@@ -90,6 +92,8 @@ fn main() {
                     let t = l.trim();
                     if t == "show" {
                         let _ = stdin_proxy.send_event(UserEvent::Show);
+                    } else if t == "fetch" {
+                        let _ = stdin_proxy.send_event(UserEvent::Fetch);
                     } else if t == "signout" {
                         let _ = stdin_proxy.send_event(UserEvent::SignOut);
                     } else if let Some(uuid) = t.strip_prefix("org:") {
@@ -158,6 +162,10 @@ fn main() {
                 let js = format!("window.__arbiterSetOrg && window.__arbiterSetOrg({uuid:?})");
                 let _ = webview.evaluate_script(&js);
             }
+            Event::UserEvent(UserEvent::Fetch) => {
+                let _ = webview
+                    .evaluate_script("window.__arbiterRefetchUsage && window.__arbiterRefetchUsage()");
+            }
             Event::UserEvent(UserEvent::SignOut) => {
                 // Clears ONLY this webview's data (claude.ai cookies) — nothing else
                 // on the system. Reload so the script re-runs and reports needs_login.
@@ -202,6 +210,8 @@ const INIT_SCRIPT: &str = r#"
   // preserved across script re-injection on the same page.
   window.__arbiterOrg = window.__arbiterOrg || null;
   window.__arbiterSetOrg = function (u) { window.__arbiterOrg = u; fetchUsage(); };
+  // The app calls this (refresh button / countdown rollover) to refetch on demand.
+  window.__arbiterRefetchUsage = function () { fetchUsage(); };
   async function fetchUsage() {
     if (location.protocol !== 'https:' || location.hostname !== 'claude.ai') {
       if (location.href !== 'https://claude.ai/') location.href = 'https://claude.ai/';
