@@ -364,6 +364,7 @@ enum Message {
     ToggleHideSonnetUsage(bool),
     ToggleOverviewClaudeOnly(bool),
     ToggleHideShellButton(bool),
+    ToggleShowTerminalButtons(bool),
     /// Settings → scrollback lines (text input; parsed + clamped).
     SetScrollback(String),
     /// Settings → screenshot-attach folder (Files tab): set / browse / reset.
@@ -924,6 +925,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleHideShellButton(v) => {
             state.settings.hide_shell_button = v;
+            save_session(state);
+        }
+        Message::ToggleShowTerminalButtons(v) => {
+            state.settings.show_terminal_buttons = v;
             save_session(state);
         }
         Message::SetScrollback(s) => {
@@ -2949,6 +2954,14 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
         .spacing(12),
         SettingsTab::Display => {
             let mut col = column![
+                settings_section("Titlebar"),
+                settings_toggle(
+                    "Show split & close buttons",
+                    Some("Show the terminal split and close buttons (and their divider) in the titlebar."),
+                    state.settings.show_terminal_buttons,
+                    Message::ToggleShowTerminalButtons,
+                ),
+                Space::with_height(Length::Fixed(8.0)),
                 settings_section("Overview"),
                 settings_toggle(
                     "Only show terminals running Claude",
@@ -3776,7 +3789,10 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let caption_w = 140.0;
     #[cfg(not(target_os = "windows"))]
     let caption_w = 0.0;
-    let actions_w = 204.0 + caption_w; // 6 btn-icons (+ Windows caption strip)
+    // 3 menu btn-icons always; the split/down/close trio + separator only when
+    // the terminal buttons are enabled (+ Windows caption strip).
+    let actions_w =
+        (if state.settings.show_terminal_buttons { 216.0 } else { 104.0 }) + caption_w;
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
     // Usage section (bars / loading / sign-in / warning), built once with its own
@@ -3825,18 +3841,21 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     if let (true, Some((usage, _))) = (show_usage, usage_el) {
         bar = bar.push(usage);
     }
-    bar = bar.push(
-        row![
-            action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()),
-            action_icon_btn(mdi_path::ARROW_ALL, Message::OpenShortcuts, state.shortcuts_open),
-            action_icon_btn(mdi_path::COG, Message::OpenSettings, state.settings_open),
-            action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false),
-            action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false),
-            action_icon_btn(mdi_path::CLOSE, Message::Close, false),
-        ]
-        .spacing(4)
-        .align_y(iced::Center),
-    );
+    // Pane controls (split right/down + close) sit on the left of the app/menu
+    // buttons, behind a separator — and are hidden unless enabled in Settings.
+    let mut actions = row![].spacing(4).align_y(iced::Center);
+    if state.settings.show_terminal_buttons {
+        actions = actions
+            .push(action_icon_btn(mdi_path::ARROW_RIGHT, Message::SplitRight, false))
+            .push(action_icon_btn(mdi_path::ARROW_DOWN, Message::SplitDown, false))
+            .push(action_icon_btn(mdi_path::CLOSE, Message::Close, false))
+            .push(vsep());
+    }
+    actions = actions
+        .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()))
+        .push(action_icon_btn(mdi_path::ARROW_ALL, Message::OpenShortcuts, state.shortcuts_open))
+        .push(action_icon_btn(mdi_path::COG, Message::OpenSettings, state.settings_open));
+    bar = bar.push(actions);
     #[cfg(target_os = "windows")]
     {
         let f = state.main_focused;
