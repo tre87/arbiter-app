@@ -143,6 +143,7 @@ version = "0.0.0"
 dependencies = [
  "ab_glyph",
  "alacritty_terminal",
+ "block2 0.5.1",
  "bytemuck",
  "core-foundation",
  "core-graphics",
