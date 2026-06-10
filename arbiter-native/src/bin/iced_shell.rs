@@ -2511,9 +2511,15 @@ fn fmt_reset(resets_at_ms: Option<i64>) -> String {
 /// (5h blue / 7d green / Opus green / Sonnet blue) + the refresh button.
 fn usage_section(u: &UsageData, updated_ms: u64) -> Option<(Element<'static, Message>, f32)> {
     match u.state {
-        UsageState::Pending => Some((usage_loading(), 96.0)),
-        UsageState::NeedsLogin => Some((sign_in_button(), 84.0)),
-        UsageState::Error => Some((usage_warning(), 150.0)),
+        UsageState::Pending => {
+            Some((row![usage_loading(), vsep()].spacing(8).align_y(iced::Center).into(), 60.0))
+        }
+        UsageState::NeedsLogin => Some((
+            // Trailing divider so the button reads as separate from the actions.
+            row![sign_in_button(), vsep()].spacing(8).align_y(iced::Center).into(),
+            178.0,
+        )),
+        UsageState::Error => Some((row![usage_warning(), vsep()].spacing(8).align_y(iced::Center).into(), 168.0)),
         UsageState::Ok => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
             let entries: [(&str, iced::Color, Option<UsagePeriod>); 4] = [
@@ -2558,20 +2564,30 @@ fn usage_loading() -> Element<'static, Message> {
     row![dot(0), dot(333), dot(666)].spacing(4).align_y(iced::Center).into()
 }
 
-/// "Sign in" button shown when not authenticated → raises the helper's webview.
+/// Sign-in button shown when not authenticated → raises the helper's webview.
+/// Same pill shape as a workspace tab, but azure-tinted (web `.btn-icon.is-active`).
 fn sign_in_button() -> Element<'static, Message> {
-    button(text("Sign in").size(11).color(iced::Color::WHITE))
-        .padding([4, 10])
+    let content = row![text("Claude Usage Sign In").size(12)]
+        .height(Length::Fixed(26.0))
+        .align_y(iced::Center);
+    button(content)
+        .padding([0, 10])
         .on_press(Message::ShowUsageLogin)
-        .style(|_t: &iced::Theme, s| button::Style {
-            background: Some(iced::Background::Color(if matches!(s, button::Status::Hovered) {
-                iced::Color::from_rgb8(0x49, 0xa6, 0xff)
-            } else {
-                AZURE
-            })),
-            text_color: iced::Color::WHITE,
-            border: iced::Border { radius: 6.0.into(), ..Default::default() },
-            ..Default::default()
+        .style(|_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered);
+            button::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba8(
+                    0x33, 0x99, 0xff,
+                    if hovered { 0.22 } else { 0.15 },
+                ))),
+                text_color: iced::Color::from_rgb8(0x8f, 0xc4, 0xff),
+                border: iced::Border {
+                    color: iced::Color::from_rgba8(0x33, 0x99, 0xff, if hovered { 0.50 } else { 0.35 }),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            }
         })
         .into()
 }
