@@ -96,15 +96,40 @@ pub struct Settings {
     /// default on — Sonnet is rarely the binding limit).
     #[serde(default = "default_true")]
     pub hide_sonnet_usage: bool,
+    /// Overview popout lists only terminals running Claude (web
+    /// `devStore.overviewClaudeOnly`, default on).
+    #[serde(default = "default_true")]
+    pub overview_claude_only: bool,
+    /// Hide the Git Bash / shell-switch button in the terminal header (web
+    /// `devStore.hideShellButton`).
+    #[serde(default)]
+    pub hide_shell_button: bool,
+    /// Scrollback lines kept per terminal (web `devStore.scrollback`).
+    #[serde(default = "default_scrollback")]
+    pub scrollback: usize,
 }
 
 fn default_true() -> bool {
     true
 }
 
+fn default_scrollback() -> usize {
+    5000
+}
+
+/// Bounds for the scrollback setting (web `SCROLLBACK_MIN`/`MAX`).
+pub const SCROLLBACK_MIN: usize = 100;
+pub const SCROLLBACK_MAX: usize = 100_000;
+
 impl Default for Settings {
     fn default() -> Self {
-        Self { hide_usage_bar: false, hide_sonnet_usage: true }
+        Self {
+            hide_usage_bar: false,
+            hide_sonnet_usage: true,
+            overview_claude_only: true,
+            hide_shell_button: false,
+            scrollback: default_scrollback(),
+        }
     }
 }
 
