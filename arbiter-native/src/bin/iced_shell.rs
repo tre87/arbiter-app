@@ -46,7 +46,6 @@ struct Workspace {
     panes: pane_grid::State<PaneData>,
     focus: pane_grid::Pane,
     name: String,
-    next_term: usize,
     /// Some → this tab is a project workspace (git repo with worktrees + sidebars).
     /// `panes`/`focus` above always hold the ACTIVE worktree's grid; the other
     /// worktrees stash theirs in `Worktree::stash` (swapped on switch), so every
@@ -83,14 +82,30 @@ impl Workspace {
             shell: ShellKind::PowerShell,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
-        Workspace { panes, focus: first, name, next_term: 2, project: None }
+        Workspace { panes, focus: first, name, project: None }
     }
 
-    /// Next per-workspace terminal name ("Terminal N"); numbering restarts per
-    /// workspace, matching the web.
-    fn next_name(&mut self) -> String {
-        let n = self.next_term;
-        self.next_term += 1;
+    /// The next terminal name for THIS workspace: the lowest unused "Terminal N"
+    /// among its current panes. Numbering is therefore per-workspace (and per-
+    /// worktree for projects, since only the active worktree's grid is in `panes`)
+    /// and reuses gaps left by closed terminals — matching the web's
+    /// `nextAvailableNumber`.
+    fn next_name(&self) -> String {
+        let mut used: Vec<usize> = self
+            .panes
+            .iter()
+            .filter_map(|(_, d)| d.name.strip_prefix("Terminal ").and_then(|s| s.trim().parse().ok()))
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        let mut n = 1;
+        for u in used {
+            if u == n {
+                n += 1;
+            } else if u > n {
+                break;
+            }
+        }
         format!("Terminal {n}")
     }
 }
@@ -187,7 +202,6 @@ fn new_project(root: String, infos: Vec<arbiter_native::git::WorktreeInfo>) -> W
         panes,
         focus,
         name,
-        next_term: 1,
         project: Some(Project { root, active: 0, worktrees, explorer: Explorer::default() }),
     }
 }
@@ -604,7 +618,6 @@ fn restore_workspaces(
                     panes,
                     focus,
                     name: sw.name,
-                    next_term: sw.next_term,
                     project: Some(Project {
                         root: sp.root,
                         active: active_idx,
@@ -624,7 +637,7 @@ fn restore_workspaces(
                 let panes =
                     pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash, None));
                 let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
-                workspaces.push(Workspace { panes, focus, name: sw.name, next_term: sw.next_term, project: None });
+                workspaces.push(Workspace { panes, focus, name: sw.name, project: None });
             }
         }
     }
@@ -760,7 +773,6 @@ fn save_session(state: &State) {
                 });
                 persist::SavedWorkspace {
                     name: ws.name.clone(),
-                    next_term: ws.next_term,
                     layout: node_to_saved(&ws.panes, ws.panes.layout()),
                     project,
                 }

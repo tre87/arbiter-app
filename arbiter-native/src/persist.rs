@@ -76,7 +76,6 @@ pub struct SavedProject {
 #[derive(Serialize, Deserialize)]
 pub struct SavedWorkspace {
     pub name: String,
-    pub next_term: usize,
     /// The active worktree's split tree (project) or the workspace's tree (terminal).
     pub layout: SavedNode,
     /// Present → this is a project workspace; restore its sidebars + worktrees.
@@ -214,7 +213,6 @@ mod tests {
             workspaces: vec![
                 SavedWorkspace {
                     name: "Workspace 1".into(),
-                    next_term: 3,
                     layout: SavedNode::Split {
                         vertical: true,
                         ratio: 0.4,
@@ -237,7 +235,6 @@ mod tests {
                 },
                 SavedWorkspace {
                     name: "Workspace 2".into(),
-                    next_term: 2,
                     layout: SavedNode::Leaf {
                         name: "Terminal 1".into(),
                         shell: SavedShell::PowerShell,
@@ -254,7 +251,6 @@ mod tests {
         let back: SavedState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.active, 1);
         assert_eq!(back.workspaces.len(), 2);
-        assert_eq!(back.workspaces[0].next_term, 3);
         assert_eq!(back.main_window.unwrap().width, 1200.0);
         match &back.workspaces[0].layout {
             SavedNode::Split { vertical, ratio, a, .. } => {
