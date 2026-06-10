@@ -2540,17 +2540,22 @@ fn usage_section(u: &UsageData, updated_ms: u64) -> Option<(Element<'static, Mes
     }
 }
 
-/// Loading indicator while the first usage fetch is in flight: the animated ✻ +
-/// "Loading" (re-drawn each tick like the working glyph).
+/// Loading indicator while the first usage fetch is in flight: three azure dots
+/// pulsing in a wave (re-drawn each tick).
 fn usage_loading() -> Element<'static, Message> {
-    let (glyph, color) = working_frame();
-    row![
-        text(glyph).font(symbols_font()).size(13).color(color),
-        text("Loading").size(11).color(TXT_SECONDARY),
-    ]
-    .spacing(5)
-    .align_y(iced::Center)
-    .into()
+    let dot = |offset_ms: u64| -> Element<'static, Message> {
+        // Smooth 0.25→1.0→0.25 pulse over ~1s, each dot phase-shifted.
+        let p = (now_ms().wrapping_add(offset_ms) % 1000) as f32 / 1000.0;
+        let a = 0.25 + 0.75 * (0.5 - 0.5 * (2.0 * std::f32::consts::PI * p).cos());
+        container(Space::new(Length::Fixed(6.0), Length::Fixed(6.0)))
+            .style(move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba8(0x33, 0x99, 0xff, a))),
+                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                ..Default::default()
+            })
+            .into()
+    };
+    row![dot(0), dot(333), dot(666)].spacing(4).align_y(iced::Center).into()
 }
 
 /// "Sign in" button shown when not authenticated → raises the helper's webview.
