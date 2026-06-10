@@ -1,7 +1,9 @@
-//! `arbiter-usage-helper` — a tiny sidecar that logs into claude.ai in a native
-//! webview (WebView2 on Windows, WKWebView on macOS via `wry`) and streams Claude
-//! usage JSON to the main app over **stdout**, one compact line per poll. The
-//! webview is isolated in this process so the terminal app stays fully native.
+//! Usage helper — logs into claude.ai in a native webview (WebView2 on Windows,
+//! WKWebView on macOS via `wry`) and streams Claude usage JSON to the main app over
+//! **stdout**, one compact line per poll. It runs in its OWN process (so the webview
+//! never touches the terminal's event loop) but in the SAME binary: `iced_shell`
+//! re-spawns itself with `--usage-helper` and calls [`run`]. One binary → no
+//! separate build/placement step. Compiled only with `--features usage-helper`.
 //!
 //! Protocol (one JSON object per stdout line):
 //!   { "ok": true, "plan": "Pro|Max|Free",
@@ -9,10 +11,7 @@
 //!     "seven_day": …, "seven_day_opus": …, "seven_day_sonnet": … }
 //!   { "ok": false, "error": "needs_login" }   ← shows the sign-in window
 //!
-//! Built only with `--features usage-helper` (the `[[bin]]` requires it), so wry/
-//! tao stay out of normal main-app builds. Exits when the parent closes (parent
-//! pipes our stdin; EOF on stdin = parent gone).
-#![cfg_attr(windows, windows_subsystem = "windows")]
+//! Exits when the parent closes (parent pipes our stdin; EOF on stdin = parent gone).
 
 use std::io::Write;
 
@@ -46,7 +45,9 @@ fn macos_activate() {
     }
 }
 
-fn main() {
+/// Run the usage-helper webview loop (this process was re-spawned with
+/// `--usage-helper`). Diverges: runs the event loop until the parent's stdin closes.
+pub fn run() {
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     // macOS: start as an Accessory app — NO dock icon — and DON'T grab activation
