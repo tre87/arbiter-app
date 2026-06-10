@@ -3490,15 +3490,23 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let (c_tl, c_tr) = (corner_pane(layout, false, false), corner_pane(layout, true, false));
     let (c_bl, c_br) = (corner_pane(layout, false, true), corner_pane(layout, true, true));
     let grid = pane_grid::PaneGrid::new(&state.active().panes, move |pane, data, _maximized| {
-        let term = shader_widget(TermProgram {
-            id: data.session.id(),
-            pane,
-            term: data.session.term(),
-            master: data.session.master(),
-            font: font.clone(),
-        })
+        // 4px of left breathing room so glyphs don't touch the pane's left edge
+        // (the pane's own #121212 shows through the gap; the renderer derives its
+        // cols from the shrunken width). Transparent container → no colour seam.
+        let term = container(
+            shader_widget(TermProgram {
+                id: data.session.id(),
+                pane,
+                term: data.session.term(),
+                master: data.session.master(),
+                font: font.clone(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fill),
+        )
         .width(Length::Fill)
-        .height(Length::Fill);
+        .height(Length::Fill)
+        .padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 4.0 });
 
         let focused = pane == focus;
         // Which of the grid's outer corners this pane owns → round those. The
