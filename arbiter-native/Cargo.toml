@@ -13,7 +13,9 @@ name = "arbiter-native"
 path = "src/main.rs"
 
 [[bin]]
-name = "iced_shell"
+# The user-facing app/exe is "arbiter" (Arbiter.app on macOS, arbiter.exe on
+# Windows). Source file keeps its historical name. Run: cargo run --bin arbiter
+name = "arbiter"
 path = "src/bin/iced_shell.rs"
 
 # Desktop bundling (cargo-packager): produces Arbiter.app/.dmg (macOS) and an
@@ -25,7 +27,7 @@ path = "src/bin/iced_shell.rs"
 [package.metadata.packager]
 productName = "Arbiter"
 identifier = "com.arbiter.app"
-binaries = [{ path = "iced_shell", main = true }]
+binaries = [{ path = "arbiter", main = true }]
 icons = [
     "icons/icon.icns",
     "icons/icon.ico",
@@ -137,4 +139,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Imaging",
     "Win32_Graphics_Dxgi_Common",
 ] }
+
+# Embed the app icon into the Windows .exe (Explorer + the NSIS shortcut show it).
+# cargo-packager doesn't modify the binary, so the icon must be a Win32 resource
+# compiled in at build time — see build.rs.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
