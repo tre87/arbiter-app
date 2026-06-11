@@ -40,7 +40,11 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("ARBITER_DATA_DIR") {
         return Some(std::path::PathBuf::from(d).join("webview"));
     }
-    Some(dirs::data_dir()?.join("arbiter"))
+    // Debug builds keep a SEPARATE claude.ai usage login from release, matching
+    // the separate app data dir (see shell::app_data_dir). The helper is the same
+    // binary, so its `debug_assertions` matches the parent app's profile.
+    let name = if cfg!(debug_assertions) { "arbiter-debug" } else { "arbiter" };
+    Some(dirs::data_dir()?.join(name))
 }
 
 /// macOS: bring this app to the front (so its key window receives ⌘V etc.).

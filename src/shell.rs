@@ -19,7 +19,13 @@ pub fn app_data_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("ARBITER_DATA_DIR") {
         return Some(std::path::PathBuf::from(dir));
     }
-    Some(dirs::data_dir()?.join("arbiter-native"))
+    // Debug builds (`cargo run`) use a SEPARATE dir from the installed release
+    // app, so dev work doesn't share/clobber its workspaces, layout, settings, or
+    // Claude shim state. Release (incl. `cargo run --release`) uses the canonical
+    // dir. `cfg!(debug_assertions)` is false under `--release`, which is exactly
+    // the split we want.
+    let name = if cfg!(debug_assertions) { "arbiter-native-debug" } else { "arbiter-native" };
+    Some(dirs::data_dir()?.join(name))
 }
 
 static SHIM: OnceLock<Option<claude_shim::ShimSetup>> = OnceLock::new();
