@@ -76,7 +76,7 @@ jobs:
 
       # Default features include `usage-helper` (wry/tao) so the usage bars work.
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin iced_shell
+        run: cargo build --release --target ${{ matrix.target }} --bin arbiter
 
       # cargo-packager fetches its own NSIS toolchain and adds the WebView2
       # bootstrapper to the installer automatically.
@@ -113,7 +113,7 @@ jobs:
             exit 1
           }
           Copy-Item $nsis.FullName "staging/Arbiter-Setup-$v-$os-$arch.exe"
-          Copy-Item "$out/iced_shell.exe" "staging/Arbiter-$v-$os-$arch.exe"
+          Copy-Item "$out/arbiter.exe" "staging/Arbiter-$v-$os-$arch.exe"
 
       - name: Publish to release
         uses: softprops/action-gh-release@v2
