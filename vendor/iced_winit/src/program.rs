@@ -912,6 +912,13 @@ async fn run_instance<P, C>(
                                 window.state.viewport_version();
                         }
 
+                        // VENDORED: don't present while occluded. On macOS the
+                        // 2-deep Metal drawable pool fills and `next_drawable()`
+                        // blocks the main thread with NO timeout once a hidden
+                        // window stops being composited — the ~0.5s refocus lag.
+                        // The Occluded handler above requests a redraw on
+                        // un-occlude so the first visible frame still paints at once.
+                        if !window.occluded {
                         debug.render_started();
                         match compositor.present(
                             &mut window.renderer,
@@ -945,6 +952,7 @@ async fn run_instance<P, C>(
                                 }
                             },
                         }
+                        } // VENDORED: end `if !window.occluded`
                     }
                     event::Event::WindowEvent {
                         event: window_event,
@@ -970,6 +978,21 @@ async fn run_instance<P, C>(
                         else {
                             continue;
                         };
+
+                        // VENDORED: track occlusion so RedrawRequested can skip
+                        // presenting while the window is hidden (see the present
+                        // call below) — that's what avoids the macOS
+                        // `next_drawable()` stall. Force one repaint the moment we
+                        // become visible again so the first foreground frame is
+                        // immediate.
+                        if let winit::event::WindowEvent::Occluded(occ) =
+                            &window_event
+                        {
+                            if window.occluded && !*occ {
+                                window.raw.request_redraw();
+                            }
+                            window.occluded = *occ;
+                        }
 
                         if matches!(
                             window_event,

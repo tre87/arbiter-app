@@ -58,6 +58,17 @@ fn macos_activate() {
 /// Run the usage-helper webview loop (this process was re-spawned with
 /// `--usage-helper`). Diverges: runs the event loop until the parent's stdin closes.
 pub fn run() {
+    // macOS: mark this process Accessory BEFORE tao creates the event loop. tao
+    // only applies its activation policy at `applicationDidFinishLaunching`, so
+    // without this the helper briefly shows a dock icon at launch (the flash you
+    // see when clicking the main app). Setting it on the shared NSApplication up
+    // front means the dock never gets a chance to show it.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use objc2::{class, msg_send, runtime::AnyObject};
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: bool = msg_send![app, setActivationPolicy: 1isize]; // 1 = Accessory
+    }
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     // macOS: start as an Accessory app — NO dock icon — and DON'T grab activation
