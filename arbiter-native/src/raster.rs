@@ -326,14 +326,24 @@ mod mac {
         let bbox = font.get_bounding_rects_for_glyphs(0, &[glyph]);
         let pad = 1.0_f64;
         let w = (bbox.size.width.ceil() + 2.0 * pad) as usize;
-        let h = (bbox.size.height.ceil() + 2.0 * pad) as usize;
+        // Snap the baseline to a WHOLE pixel row so every glyph shares the exact
+        // same baseline. Previously the pen sat at a fractional `pad - origin.y`
+        // while `top` was rounded per-glyph, so the displayed baseline drifted by
+        // `origin.y - round(origin.y)` — which made deep-descender glyphs (g, q)
+        // and ones that dip just below the baseline (ø) sit ~0.5px low vs x-height
+        // letters. Split the bitmap into whole rows above + below the baseline so
+        // the baseline lands on an integer row and `top` is exact (no rounding).
+        let above = (bbox.origin.y + bbox.size.height).ceil().max(0.0) + pad; // rows above baseline
+        let below = (-bbox.origin.y).ceil().max(0.0) + pad; // rows below (descenders)
+        let h = (above + below) as usize;
         if w == 0 || h == 0 {
             return None;
         }
         // Placement, top-down + baseline-relative (matches the swash convention).
         let left = (bbox.origin.x - pad).round() as i32;
-        let top = (h as f64 - (pad - bbox.origin.y)).round() as i32;
-        let pen = CGPoint::new(pad - bbox.origin.x, pad - bbox.origin.y);
+        let top = above as i32;
+        // Pen at an INTEGER baseline (`below` rows up from the bitmap's bottom).
+        let pen = CGPoint::new(pad - bbox.origin.x, below);
 
         // Colour glyph (emoji) → render RGBA; otherwise grayscale coverage.
         if is_color_font(&font) {

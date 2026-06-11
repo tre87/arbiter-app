@@ -1,13 +1,26 @@
 //! Headless VT terminal: `alacritty_terminal` Term + parser + colour palette.
 //! Same approach as the shipping app's `termgrid::HeadlessTerm`.
 
+use std::collections::HashSet;
+use std::ops::RangeInclusive;
+
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+
+/// Active in-terminal find: the matched cell ranges (incl. scrollback), which is
+/// the current one, and the precomputed cell sets for O(1) render highlighting.
+struct Search {
+    matches: Vec<RangeInclusive<Point>>,
+    current: usize,
+    cells: HashSet<(i32, usize)>,
+    cur_cells: HashSet<(i32, usize)>,
+}
 
 /// Selection granularity for a fresh selection (single/double/triple click).
 pub enum SelectKind {
@@ -22,6 +35,29 @@ pub enum ClaudeScreen {
     Menu,
     /// Claude's working spinner / "esc to interrupt" status line is on screen.
     Working,
+}
+
+/// Snapshot of the terminal's mouse-reporting + scroll modes (a TUI toggles these
+/// via DECSET/DECRST). The renderer reads them to decide whether a click is sent
+/// to the app or handled locally (selection / scrollback).
+#[derive(Clone, Copy, Default)]
+pub struct MouseModes {
+    /// Any of ?1000/?1002/?1003 — the app wants click events.
+    pub reporting: bool,
+    /// ?1003 — report motion even with no button held.
+    pub report_motion: bool,
+    /// ?1002 — report motion while a button is held (drag).
+    pub report_drag: bool,
+    /// ?1006 — SGR (`CSI < … M/m`) encoding; else the legacy `CSI M` byte form.
+    pub sgr: bool,
+    /// ?1005 — UTF-8 extended coordinates (legacy encoding only).
+    pub utf8: bool,
+    /// ?1007 — wheel sends arrow keys on the alternate screen.
+    pub alternate_scroll: bool,
+    /// Alternate screen active (vim/less/htop) — gates `alternate_scroll`.
+    pub alt_screen: bool,
+    /// DECCKM — cursor keys send SS3 (`ESC O`) not CSI; used by alternate scroll.
+    pub app_cursor: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -50,6 +86,11 @@ pub struct VtTerm {
     palette: [Rgb; 256],
     default_fg: Rgb,
     default_bg: Rgb,
+    search: Option<Search>,
+    /// When the view was last scrolled BY THE USER (wheel / drag-autoscroll), to
+    /// fade the scroll indicator out. Not set by output or jump-to-bottom, so the
+    /// indicator never flashes while text merely streams in.
+    last_scroll: Option<std::time::Instant>,
 }
 
 impl VtTerm {
@@ -66,11 +107,95 @@ impl VtTerm {
             // web app). The Iced shell's surface is this colour too, so skipped
             // (empty, default-bg) cells show through seamlessly.
             default_bg: Rgb { r: 0x12, g: 0x12, b: 0x12 },
+            search: None,
+            last_scroll: None,
         }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Set the find query: collect all matches over the grid (incl. scrollback)
+    /// via the crate's `RegexSearch`, then scroll the first match into view. An
+    /// empty/invalid query clears the search. Case-insensitive unless the query has
+    /// an uppercase letter (alacritty's smart-case).
+    pub fn set_search(&mut self, query: &str) {
+        if query.is_empty() {
+            self.search = None;
+            return;
+        }
+        let Ok(mut dfas) = RegexSearch::new(query) else {
+            self.search = None;
+            return;
+        };
+        let cols = self.term.columns();
+        let start = Point::new(self.term.topmost_line(), Column(0));
+        let end = Point::new(self.term.bottommost_line(), Column(cols.saturating_sub(1)));
+        // Cap to keep a pathological query ("a") from collecting huge match lists.
+        let matches: Vec<RangeInclusive<Point>> =
+            RegexIter::new(start, end, Direction::Right, &self.term, &mut dfas).take(2000).collect();
+        let mut cells = HashSet::new();
+        for m in &matches {
+            expand_match(m, cols, &mut cells);
+        }
+        self.search = Some(Search { matches, current: 0, cells, cur_cells: HashSet::new() });
+        self.update_cur_cells();
+        self.scroll_to_current();
+    }
+
+    /// Move to the next (or previous) match, wrapping, and scroll it into view.
+    pub fn search_jump(&mut self, forward: bool) {
+        let len = self.search.as_ref().map_or(0, |s| s.matches.len());
+        if len == 0 {
+            return;
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.current = if forward { (s.current + 1) % len } else { (s.current + len - 1) % len };
+        }
+        self.update_cur_cells();
+        self.scroll_to_current();
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    /// `(current 1-based, total)` for the find bar; `None` when no search is active,
+    /// `(0, 0)` when the query matched nothing.
+    pub fn search_status(&self) -> Option<(usize, usize)> {
+        self.search.as_ref().map(|s| {
+            let n = s.matches.len();
+            (if n == 0 { 0 } else { s.current + 1 }, n)
+        })
+    }
+
+    /// Recompute the highlighted cells for the current match.
+    fn update_cur_cells(&mut self) {
+        let cols = self.term.columns();
+        if let Some(s) = self.search.as_mut() {
+            s.cur_cells.clear();
+            if let Some(m) = s.matches.get(s.current) {
+                expand_match(m, cols, &mut s.cur_cells);
+            }
+        }
+    }
+
+    /// Scroll so the current match is on screen (≈1/3 from the top), but leave the
+    /// view alone if it's already visible.
+    fn scroll_to_current(&mut self) {
+        let Some(l) =
+            self.search.as_ref().and_then(|s| s.matches.get(s.current)).map(|m| m.start().line.0)
+        else {
+            return;
+        };
+        let rows = self.term.screen_lines() as i32;
+        let off = self.term.grid().display_offset() as i32;
+        // Visible absolute lines are [-off, rows-1-off]; only scroll if off-screen.
+        if l < -off || l > rows - 1 - off {
+            let target_off = (rows / 3 - l).max(0);
+            self.term.scroll_display(Scroll::Delta(target_off - off));
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -79,13 +204,29 @@ impl VtTerm {
 
     /// Scroll the display by `lines` into scrollback (positive = up/older),
     /// clamped to the history. The next `for_each_cell` renders the new view.
+    /// Records the scroll time so the scroll indicator shows then fades.
     pub fn scroll(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
+        self.last_scroll = Some(std::time::Instant::now());
     }
 
-    /// Jump back to the live bottom (display offset 0).
+    /// Jump back to the live bottom (display offset 0). Does NOT mark a user
+    /// scroll, so typing/jump-to-bottom never flashes the scroll indicator.
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// `(display_offset, history_size, screen_lines)` for sizing/placing the
+    /// scroll indicator thumb.
+    pub fn scroll_state(&self) -> (usize, usize, usize) {
+        let g = self.term.grid();
+        (g.display_offset(), g.history_size(), self.term.screen_lines())
+    }
+
+    /// Milliseconds since the last user scroll, or `None` if there hasn't been
+    /// one — drives the scroll indicator's fade-out.
+    pub fn scroll_age_ms(&self) -> Option<u64> {
+        self.last_scroll.map(|t| t.elapsed().as_millis() as u64)
     }
 
     /// Map a visible row to an absolute grid line (accounting for scrollback).
@@ -135,6 +276,21 @@ impl VtTerm {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Snapshot the active mouse-reporting + scroll modes (see [`MouseModes`]).
+    pub fn mouse_modes(&self) -> MouseModes {
+        let m = self.term.mode();
+        MouseModes {
+            reporting: m.intersects(TermMode::MOUSE_MODE),
+            report_motion: m.contains(TermMode::MOUSE_MOTION),
+            report_drag: m.contains(TermMode::MOUSE_DRAG),
+            sgr: m.contains(TermMode::SGR_MOUSE),
+            utf8: m.contains(TermMode::UTF8_MOUSE),
+            alternate_scroll: m.contains(TermMode::ALTERNATE_SCROLL),
+            alt_screen: m.contains(TermMode::ALT_SCREEN),
+            app_cursor: m.contains(TermMode::APP_CURSOR),
+        }
+    }
+
     /// Classify Claude's visible screen for status. Scanning the *rendered grid*
     /// (vs the raw byte stream) is robust to chunk splits and is level-triggered,
     /// so a menu reads as attention only while it's actually on screen — it clears
@@ -177,9 +333,36 @@ impl VtTerm {
         (p.line.0.max(0) as usize, p.column.0, vis)
     }
 
-    /// Walk the visible screen, yielding (row, col, char, fg, bg, bold, selected)
-    /// per cell. `selected` is true for cells inside the active selection.
-    pub fn for_each_cell(&self, mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool, bool, bool)) {
+    /// The http(s) URL at a visible (row, col), or `None`. Single-row detection
+    /// (web parity: a link does not span wrapped rows).
+    pub fn link_at(&self, row: usize, col: usize) -> Option<String> {
+        let rows = self.term.screen_lines();
+        let cols = self.term.columns();
+        if row >= rows || col >= cols {
+            return None;
+        }
+        let grid = self.term.grid();
+        let off = grid.display_offset() as i32;
+        let line = &grid[Line(row as i32 - off)];
+        let mut text: Vec<char> = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let ch = line[Column(c)].c;
+            text.push(if (ch as u32) < 0x20 { ' ' } else { ch });
+        }
+        url_spans(&text)
+            .into_iter()
+            .find(|&(s, e)| col >= s && col < e)
+            .map(|(s, e)| text[s..e].iter().collect())
+    }
+
+    /// Walk the visible screen, yielding (row, col, char, fg, bg, bold, wide,
+    /// selected, search_hit, link) per cell. `selected` = inside the active
+    /// selection; `search_hit` = 0 none / 1 a find match / 2 the current find
+    /// match; `link` = inside a detected http(s) URL.
+    pub fn for_each_cell(
+        &self,
+        mut f: impl FnMut(usize, usize, char, [f32; 3], [f32; 3], bool, bool, bool, u8, bool),
+    ) {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let sel = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
@@ -187,6 +370,29 @@ impl VtTerm {
         // Offset by the scrollback position so a scrolled-up view shows history
         // (negative line indices address the scrollback).
         let off = grid.display_offset() as i32;
+        // Precompute http(s)-link cells per visible row (single-row, web parity).
+        // Quick-reject rows lacking both ':' and '/' before the regex-ish scan.
+        let mut link_cells: HashSet<(usize, usize)> = HashSet::new();
+        let mut rowbuf: Vec<char> = Vec::with_capacity(cols);
+        for row in 0..rows {
+            let line = &grid[Line(row as i32 - off)];
+            rowbuf.clear();
+            let (mut colon, mut slash) = (false, false);
+            for col in 0..cols {
+                let ch = line[Column(col)].c;
+                let ch = if (ch as u32) < 0x20 { ' ' } else { ch };
+                colon |= ch == ':';
+                slash |= ch == '/';
+                rowbuf.push(ch);
+            }
+            if colon && slash {
+                for (s, e) in url_spans(&rowbuf) {
+                    for col in s..e.min(cols) {
+                        link_cells.insert((row, col));
+                    }
+                }
+            }
+        }
         for row in 0..rows {
             let line_idx = row as i32 - off;
             let line = &grid[Line(line_idx)];
@@ -209,7 +415,13 @@ impl VtTerm {
                 let wide = cell.flags.contains(Flags::WIDE_CHAR);
                 let selected =
                     sel.as_ref().is_some_and(|r| r.contains(Point::new(Line(line_idx), Column(col))));
-                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold, wide, selected);
+                let search_hit = match &self.search {
+                    Some(s) if s.cur_cells.contains(&(line_idx, col)) => 2,
+                    Some(s) if s.cells.contains(&(line_idx, col)) => 1,
+                    _ => 0,
+                };
+                let link = link_cells.contains(&(row, col));
+                f(row, col, cell.c, rgbf(fg), rgbf(bg), bold, wide, selected, search_hit, link);
             }
         }
     }
@@ -238,6 +450,71 @@ impl VtTerm {
 
 fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
+}
+
+/// http(s):// scheme length at `t[i]` (8 for `https://`, 7 for `http://`), else
+/// `None`.
+fn url_scheme_len(t: &[char], i: usize) -> Option<usize> {
+    let at = |p: &[char]| t.len() - i >= p.len() && t[i..i + p.len()] == *p;
+    if at(&['h', 't', 't', 'p', 's', ':', '/', '/']) {
+        Some(8)
+    } else if at(&['h', 't', 't', 'p', ':', '/', '/']) {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+/// Spans `(start, end_exclusive)` of http(s) URLs in a single row's chars,
+/// matching the web `URL_RE = /(https?:\/\/[^\s'"<>` ` ` `]+)/` plus its trailing-
+/// punctuation trim. Single-row only (a URL does not wrap across rows).
+fn url_spans(text: &[char]) -> Vec<(usize, usize)> {
+    // Trailing chars stripped from a match end (web `/[.,;:!?)\]}'"]+$/`).
+    const TRAIL: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"'];
+    // A URL body stops at whitespace or any of `'"<>` plus a backtick.
+    let is_url_char = |c: char| !c.is_whitespace() && !matches!(c, '\'' | '"' | '<' | '>' | '`');
+    let n = text.len();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if let Some(len) = url_scheme_len(text, i) {
+            let body = i + len;
+            let mut j = body;
+            while j < n && is_url_char(text[j]) {
+                j += 1;
+            }
+            if j > body {
+                let mut end = j;
+                while end > body && TRAIL.contains(&text[end - 1]) {
+                    end -= 1;
+                }
+                spans.push((i, end));
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// Expand an inclusive match range (line-major) into its `(abs_line, col)` cells,
+/// clamped to the grid width — for O(1) per-cell highlight lookups.
+fn expand_match(m: &RangeInclusive<Point>, cols: usize, out: &mut HashSet<(i32, usize)>) {
+    let (s, e) = (m.start(), m.end());
+    let last = cols.saturating_sub(1);
+    let mut line = s.line.0;
+    while line <= e.line.0 {
+        let c0 = if line == s.line.0 { s.column.0 } else { 0 };
+        let c1 = if line == e.line.0 { e.column.0 } else { last };
+        for c in c0..=c1.min(last) {
+            out.insert((line, c));
+        }
+        if line - s.line.0 > 100_000 {
+            break; // safety against a degenerate range
+        }
+        line += 1;
+    }
 }
 
 /// Default foreground — the platform terminal default, matching the web themes:
@@ -290,4 +567,41 @@ fn build_palette() -> [Rgb; 256] {
         p[232 + i as usize] = Rgb { r: v, g: v, b: v };
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_spans;
+
+    /// Run the URL scanner over `s` and return the matched substrings.
+    fn matches(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        url_spans(&chars).into_iter().map(|(a, b)| chars[a..b].iter().collect()).collect()
+    }
+
+    #[test]
+    fn detects_basic_url() {
+        assert_eq!(matches("see https://example.com for info"), vec!["https://example.com"]);
+        assert_eq!(matches("http://a.b/c?x=1&y=2"), vec!["http://a.b/c?x=1&y=2"]);
+    }
+
+    #[test]
+    fn trims_trailing_punctuation() {
+        assert_eq!(matches("visit https://example.com."), vec!["https://example.com"]);
+        assert_eq!(matches("(see https://example.com)"), vec!["https://example.com"]);
+        assert_eq!(matches("https://ex.com/path!?"), vec!["https://ex.com/path"]);
+    }
+
+    #[test]
+    fn stops_at_quotes_and_spaces() {
+        assert_eq!(matches("\"https://a.com\" and https://b.com"), vec!["https://a.com", "https://b.com"]);
+        assert_eq!(matches("<https://a.com>"), vec!["https://a.com"]);
+    }
+
+    #[test]
+    fn ignores_non_http_and_bare_scheme() {
+        assert!(matches("ftp://a.com no match").is_empty());
+        assert!(matches("just text, no colon-slash").is_empty());
+        assert!(matches("http://").is_empty()); // scheme with no body
+    }
 }

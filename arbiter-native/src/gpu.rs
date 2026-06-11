@@ -460,14 +460,28 @@ impl TermGpu {
 
         // Selection highlight bg (VS Code blue, matches the web's #264f78).
         const SEL_BG: [f32; 3] = [0x26 as f32 / 255.0, 0x4f as f32 / 255.0, 0x78 as f32 / 255.0];
+        // Find-match highlights: amber for other matches, brighter for the current.
+        const FIND_BG: [f32; 3] = [0x4a as f32 / 255.0, 0x3f as f32 / 255.0, 0x1a as f32 / 255.0];
+        const FIND_CUR_BG: [f32; 3] = [0x8a as f32 / 255.0, 0x6d as f32 / 255.0, 0x1f as f32 / 255.0];
+        // Detected http(s) links recolour their glyphs (web `#58a6ff`).
+        const LINK_FG: [f32; 3] = [0x58 as f32 / 255.0, 0xa6 as f32 / 255.0, 0xff as f32 / 255.0];
         // Collect drawable cells, then resolve glyph slots (needs &mut self).
         let mut cells: Vec<(usize, usize, char, [f32; 3], [f32; 3], bool, bool)> = Vec::new();
-        term.for_each_cell(|row, col, c, fg, bg, bold, wide, selected| {
-            if selected {
-                // Draw every selected cell (even blanks) with the selection bg.
-                cells.push((row, col, c, fg, SEL_BG, bold, wide));
-            } else if !((c == ' ' || c == '\0') && bg == default_bg) {
-                cells.push((row, col, c, fg, bg, bold, wide));
+        term.for_each_cell(|row, col, c, fg, bg, bold, wide, selected, hit, link| {
+            let cell_fg = if link { LINK_FG } else { fg };
+            let cell_bg = if selected {
+                SEL_BG
+            } else if hit == 2 {
+                FIND_CUR_BG
+            } else if hit == 1 {
+                FIND_BG
+            } else {
+                bg
+            };
+            // Draw selected / highlighted cells even when blank; otherwise skip
+            // empty default-bg cells.
+            if selected || hit > 0 || !((c == ' ' || c == '\0') && bg == default_bg) {
+                cells.push((row, col, c, cell_fg, cell_bg, bold, wide));
             }
         });
 

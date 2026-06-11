@@ -56,6 +56,9 @@ rfd = "0.15"
 # Procedural worktree avatars: draw a deterministic glyph from the branch name to
 # an RGBA buffer. Pinned to resvg 0.42's tiny-skia so no duplicate crate is added.
 tiny-skia = "0.11"
+# File-explorer "Delete" moves to the OS trash (recoverable), like the web app's
+# `trash_path`. Cross-platform (Finder Trash / Recycle Bin / freedesktop).
+trash = "5"
 
 # Claude usage bars: a native webview (WebView2 on Windows, WKWebView on macOS)
 # logs into claude.ai and polls the usage API, streaming JSON to the app over
@@ -95,6 +98,13 @@ block2 = "0.5"
 # Windows-native glyph rasterisation (DirectWrite + Direct2D + WIC): system font
 # fallback + colour emoji, the OS-native equivalent of the macOS CoreText path.
 # Only pulled when targeting Windows.
+# Vendored fork of iced_winit 0.13.0 with two macOS-only additions the upstream
+# crate lacks: it enables IME on the window (`set_ime_allowed`) and forwards
+# `WindowEvent::Ime::Commit` as a key event, so dead-key accents (¨+e → ë) compose
+# in the terminal. Windows/Linux conversion is unchanged. See vendor/iced_winit.
+[patch.crates-io]
+iced_winit = { path = "vendor/iced_winit" }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Foundation_Numerics",
