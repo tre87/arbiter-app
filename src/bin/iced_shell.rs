@@ -2316,14 +2316,24 @@ fn send_to_idle_claude(grid: &mut pane_grid::State<PaneData>, bytes: &[u8]) -> b
 }
 
 /// A small filled status dot (drawn, not a glyph) of the given colour.
-fn status_dot(color: iced::Color) -> Element<'static, Message> {
-    container(Space::new(Length::Fixed(8.0), Length::Fixed(8.0)))
+/// A filled status circle of diameter `d` — a styled box (exact size, clean
+/// vertical centering), not a glyph like "●" whose font metrics drift.
+fn dot_circle(color: iced::Color, d: f32) -> Element<'static, Message> {
+    container(Space::new(Length::Fixed(d), Length::Fixed(d)))
         .style(move |_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(color)),
-            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            border: iced::Border { radius: (d / 2.0).into(), ..Default::default() },
             ..Default::default()
         })
         .into()
+}
+
+/// Place a status icon (a dot or the animated ✻ bloom) in a fixed, both-axis-
+/// centred square. The slot keeps the adjacent count from shifting, stops the ✻
+/// from jumping the layout as it blooms, and centres the icon on the number.
+fn status_slot(content: Element<'static, Message>) -> Element<'static, Message> {
+    const N: f32 = 16.0;
+    container(content).center_x(Length::Fixed(N)).center_y(Length::Fixed(N)).into()
 }
 
 /// A random `adjective-noun` worktree branch name (web WorktreeNewDialog), seeded
@@ -2691,25 +2701,31 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
                 let (g, c) = working_frame();
                 status = status.push(
                     row![
-                        text(g).font(symbols_font()).size(13).color(c),
-                        text(wc.working.to_string()).size(11).color(azure),
+                        status_slot(text(g).font(symbols_font()).size(15).color(c).into()),
+                        text(wc.working.to_string()).size(13).color(azure),
                     ]
-                    .spacing(3)
+                    .spacing(2)
                     .align_y(iced::Center),
                 );
             }
             if wc.attention > 0 {
                 status = status.push(
-                    row![status_dot(orange), text(wc.attention.to_string()).size(11).color(orange)]
-                        .spacing(4)
-                        .align_y(iced::Center),
+                    row![
+                        status_slot(dot_circle(orange, 10.0)),
+                        text(wc.attention.to_string()).size(13).color(orange)
+                    ]
+                    .spacing(2)
+                    .align_y(iced::Center),
                 );
             }
             if wc.idle > 0 {
                 status = status.push(
-                    row![status_dot(muted), text(wc.idle.to_string()).size(11).color(muted)]
-                        .spacing(4)
-                        .align_y(iced::Center),
+                    row![
+                        status_slot(dot_circle(muted, 10.0)),
+                        text(wc.idle.to_string()).size(13).color(muted)
+                    ]
+                    .spacing(2)
+                    .align_y(iced::Center),
                 );
             }
             info = info.push(status);
@@ -4802,7 +4818,11 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         let header = row![
             text(ws.name.to_uppercase()).size(10).color(muted),
             horizontal_space(),
-            text(panes.len().to_string()).size(9).color(muted),
+            // Count sits in the same 22px trailing slot as the rows' status dots,
+            // so the number lines up vertically with the icons below it.
+            container(text(panes.len().to_string()).size(11).color(muted))
+                .width(Length::Fixed(22.0))
+                .center_x(Length::Fixed(22.0)),
         ]
         .padding([3, 12])
         .align_y(iced::Center);
