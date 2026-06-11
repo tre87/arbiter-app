@@ -4418,7 +4418,9 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         );
     }
 
-    let mut bar = row![brand, Space::with_width(Length::Fixed(12.0)), tabs, tab_add_button()]
+    // Tabs sit right after the wordmark (just the row's 6px gap) so the title→tabs
+    // space matches the logo→title gap instead of dwarfing it.
+    let mut bar = row![brand, tabs, tab_add_button()]
         .spacing(6)
         .align_y(iced::Center)
         .height(Length::Fill);

@@ -62,6 +62,7 @@ where
                 surface,
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
+                occluded: false,
             },
         );
 
@@ -138,6 +139,11 @@ where
     pub mouse_interaction: mouse::Interaction,
     pub surface: C::Surface,
     pub renderer: P::Renderer,
+    /// VENDORED: window is occluded (fully hidden behind another). While true we
+    /// skip presenting — on macOS the Metal drawable pool fills and
+    /// `next_drawable()` blocks the main thread with no timeout, which is the
+    /// ~0.5s lag when refocusing a long-hidden window.
+    pub occluded: bool,
 }
 
 impl<P, C> Window<P, C>

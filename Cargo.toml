@@ -39,6 +39,14 @@ icons = [
 [package.metadata.packager.macos]
 minimumSystemVersion = "11.0"
 
+# DMG layout: the classic "drag the app onto Applications" Finder window — app on
+# the left, the Applications folder on the right, in a sized window (instead of a
+# plain file list).
+[package.metadata.packager.dmg]
+windowSize = { width = 660, height = 400 }
+appPosition = { x = 180, y = 170 }
+appFolderPosition = { x = 480, y = 170 }
+
 [dependencies]
 # Vendored PTY layer (cross-platform/ConPTY) — kept at the repo root after the
 # web app was removed (was src-tauri/portable-pty).
