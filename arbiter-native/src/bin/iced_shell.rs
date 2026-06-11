@@ -6,6 +6,12 @@
 //!
 //! Run:  cd arbiter-native && cargo run --bin iced_shell --release
 
+// Release builds on Windows run without a console window (the GUI subsystem),
+// matching the shipping Tauri app. Debug builds keep the console for dev output.
+// No-op on macOS/Linux. The Claude shim subcommands + usage helper write to
+// REDIRECTED stdout pipes, which work fine without an attached console.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
