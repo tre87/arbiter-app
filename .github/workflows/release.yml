@@ -47,9 +47,6 @@ jobs:
             formats: nsis
 
     runs-on: ${{ matrix.platform }}
-    defaults:
-      run:
-        working-directory: arbiter-native
 
     steps:
       - name: Checkout
@@ -63,7 +60,7 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: arbiter-native -> target
+          workspaces: . -> target
           key: ${{ matrix.target }}
 
       - name: Install cargo-packager
@@ -123,4 +120,4 @@ jobs:
           draft: false
           prerelease: false
           fail_on_unmatched_files: true
-          files: arbiter-native/staging/*
+          files: staging/*
