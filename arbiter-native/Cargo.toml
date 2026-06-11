@@ -16,6 +16,27 @@ path = "src/main.rs"
 name = "iced_shell"
 path = "src/bin/iced_shell.rs"
 
+# Desktop bundling (cargo-packager): produces Arbiter.app/.dmg (macOS) and an
+# NSIS installer (Windows, which also installs the WebView2 runtime the usage
+# helper needs). Matches the web app's product name + identifier. Signing fields
+# (macos.signingIdentity / notarizationCredentials, windows.certificateThumbprint)
+# are intentionally omitted — supplied via env/CI when certs are available.
+# camelCase keys, deny_unknown_fields — keep names exact.
+[package.metadata.packager]
+productName = "Arbiter"
+identifier = "com.arbiter.app"
+binaries = [{ path = "iced_shell", main = true }]
+icons = [
+    "icons/icon.icns",
+    "icons/icon.ico",
+    "icons/128x128@2x.png",
+    "icons/128x128.png",
+    "icons/32x32.png",
+]
+
+[package.metadata.packager.macos]
+minimumSystemVersion = "11.0"
+
 [dependencies]
 # Reuse the same PTY layer the shipping app uses (vendored, cross-platform/ConPTY).
 portable-pty = { path = "../src-tauri/portable-pty" }
