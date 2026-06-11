@@ -1,109 +1,132 @@
-name: Release
+# Release workflow for the NATIVE app (arbiter-native, Rust + iced, bundled with
+  # cargo-packager). Mirrors the web app's .github/workflows/release.yml — same
+  # triggers, same asset naming — and ADDS a Windows ARM64 build.
+  #
+  # NOTE (transition): this coexists with the web `release.yml`, which also fires on
+  # `v*` tags. Until the Step-4 cutover (native → repo root, web removed), trigger
+  # this manually via "Run workflow" (workflow_dispatch) rather than pushing a `v*`
+  # tag, so the two don't both build into the same release. At cutover this file
+  # becomes the sole `release.yml` and the `arbiter-native/` path prefixes drop away.
+  #
+  # Signing/notarization are intentionally NOT configured yet (unsigned artifacts —
+  # Gatekeeper/SmartScreen will warn). Add macOS `signingIdentity`/notarization and
+  # Windows `certificateThumbprint` to Cargo.toml's [package.metadata.packager] (or
+  # via env) once certs are available.
+  name: Release (native)
 
-on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  on:
+    push:
+      tags:
+        - 'v*'
+    workflow_dispatch:
 
-permissions:
-  contents: write
+  permissions:
+    contents: write
 
-jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-26
-            target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin
-            asset_os: mac
-            asset_arch: arm64
-          - platform: macos-26
-            target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin
-            asset_os: mac
-            asset_arch: x64
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            args: ''
-            asset_os: win
-            asset_arch: x64
+  jobs:
+    build:
+      strategy:
+        fail-fast: false
+        matrix:
+          include:
+            - platform: macos-26
+              target: aarch64-apple-darwin
+              asset_os: mac
+              asset_arch: arm64
+              formats: app,dmg
+            - platform: macos-26
+              target: x86_64-apple-darwin
+              asset_os: mac
+              asset_arch: x64
+              formats: app,dmg
+            - platform: windows-latest
+              target: x86_64-pc-windows-msvc
+              asset_os: win
+              asset_arch: x64
+              formats: nsis
+            # Native ARM64 Windows runner (no cross-compile). If unavailable on the
+            # repo's plan, switch platform to windows-latest and rely on cross-build.
+            - platform: windows-11-arm
+              target: aarch64-pc-windows-msvc
+              asset_os: win
+              asset_arch: arm64
+              formats: nsis
 
-    runs-on: ${{ matrix.platform }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      runs-on: ${{ matrix.platform }}
+      defaults:
+        run:
+          working-directory: arbiter-native
 
-      - name: Install Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        - name: Install Rust toolchain
+          uses: dtolnay/rust-toolchain@stable
+          with:
+            targets: ${{ matrix.target }}
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ./src-tauri -> target
-          key: ${{ matrix.target }}
+        - name: Rust cache
+          uses: swatinem/rust-cache@v2
+          with:
+            workspaces: arbiter-native -> target
+            key: ${{ matrix.target }}
 
-      - name: Install frontend dependencies
-        run: npm ci
+        - name: Install cargo-packager
+          run: cargo install cargo-packager --locked
 
-      - name: Read version
-        id: pkg
-        shell: bash
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        - name: Read version
+          id: ver
+          shell: bash
+          run: echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*\"(.*)\".*/\1/')" >> "$GITHUB_OUTPUT"
 
-      - name: Build with tauri-action
-        uses: tauri-apps/tauri-action@v0
-        with:
-          args: ${{ matrix.args }}
+        # Default features include `usage-helper` (wry/tao) so the usage bars work.
+        - name: Build
+          run: cargo build --release --target ${{ matrix.target }} --bin iced_shell
 
-      - name: Stage release assets (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p staging
-          VERSION="${{ steps.pkg.outputs.version }}"
-          DMG_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
-          DMG=$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -n1 || true)
-          if [ -z "$DMG" ]; then
-            echo "::error::DMG not found under $DMG_DIR"
-            ls -la "src-tauri/target/${{ matrix.target }}/release/bundle/" || true
-            exit 1
-          fi
-          cp "$DMG" "staging/Arbiter-${VERSION}-${{ matrix.asset_os }}-${{ matrix.asset_arch }}.dmg"
+        # cargo-packager fetches its own NSIS toolchain and adds the WebView2
+        # bootstrapper to the installer automatically.
+        - name: Package
+          run: cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }}
 
-      - name: Stage release assets (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path staging | Out-Null
-          $version = "${{ steps.pkg.outputs.version }}"
-          $os = "${{ matrix.asset_os }}"
-          $arch = "${{ matrix.asset_arch }}"
-          $nsis = Get-ChildItem -Path src-tauri\target\release\bundle\nsis\*-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $nsis) {
-            Write-Error "NSIS installer not found under src-tauri\target\release\bundle\nsis"
-            Get-ChildItem -Path src-tauri\target\release\bundle\ -Recurse | Select-Object FullName
-            exit 1
-          }
-          Copy-Item $nsis.FullName "staging\Arbiter-Setup-$version-$os-$arch.exe"
-          Copy-Item src-tauri\target\release\arbiter.exe "staging\Arbiter-$version-$os-$arch.exe"
+        - name: Stage release assets (macOS)
+          if: runner.os == 'macOS'
+          shell: bash
+          run: |
+            set -euo pipefail
+            mkdir -p staging
+            V="${{ steps.ver.outputs.version }}"
+            OUT="target/${{ matrix.target }}/release"
+            DMG=$(ls "$OUT"/*.dmg 2>/dev/null | head -n1 || true)
+            if [ -z "$DMG" ]; then
+              echo "::error::DMG not found under $OUT"; ls -la "$OUT" || true; exit 1
+            fi
+            cp "$DMG" "staging/Arbiter-${V}-${{ matrix.asset_os }}-${{ matrix.asset_arch }}.dmg"
 
-      - name: Publish to draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: 'Arbiter ${{ github.ref_name }}'
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: true
-          files: staging/*
+        - name: Stage release assets (Windows)
+          if: runner.os == 'Windows'
+          shell: pwsh
+          run: |
+            New-Item -ItemType Directory -Force -Path staging | Out-Null
+            $v = "${{ steps.ver.outputs.version }}"
+            $os = "${{ matrix.asset_os }}"
+            $arch = "${{ matrix.asset_arch }}"
+            $out = "target/${{ matrix.target }}/release"
+            $nsis = Get-ChildItem -Path "$out/*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $nsis) {
+              Write-Error "NSIS installer not found under $out"
+              Get-ChildItem -Path $out -ErrorAction SilentlyContinue | Select-Object FullName
+              exit 1
+            }
+            Copy-Item $nsis.FullName "staging/Arbiter-Setup-$v-$os-$arch.exe"
+            Copy-Item "$out/iced_shell.exe" "staging/Arbiter-$v-$os-$arch.exe"
+
+        - name: Publish to release
+          uses: softprops/action-gh-release@v2
+          with:
+            tag_name: ${{ github.ref_name }}
+            name: 'Arbiter ${{ github.ref_name }}'
+            draft: false
+            prerelease: false
+            fail_on_unmatched_files: true
+            files: arbiter-native/staging/*
