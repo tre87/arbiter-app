@@ -40,8 +40,9 @@ icons = [
 minimumSystemVersion = "11.0"
 
 [dependencies]
-# Reuse the same PTY layer the shipping app uses (vendored, cross-platform/ConPTY).
-portable-pty = { path = "../src-tauri/portable-pty" }
+# Vendored PTY layer (cross-platform/ConPTY) — kept at the repo root after the
+# web app was removed (was src-tauri/portable-pty).
+portable-pty = { path = "portable-pty" }
 # Same VT parser + cell grid the shipping app already uses.
 alacritty_terminal = "0.26"
 # Native window + GPU (no webview). wgpu pinned to 0.19 to match Iced 0.13's

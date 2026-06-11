@@ -1,20 +1,5 @@
-# Dependencies
-node_modules/
-
-# Build output
-dist/
-dist-ssr/
-
-# Tauri
-src-tauri/target/
-src-tauri/WixTools/
-
-# Native (no-webview) spike — see NATIVE_PLAN.md
-arbiter-native/target/
-
-# Vite
-*.local
-.vite/
+# Rust build output (covers the root crate + the vendored portable-pty/iced_winit)
+target/
 
 # Env files
 .env
@@ -24,13 +9,6 @@ arbiter-native/target/
 # Claude Code (local only — contains project instructions)
 CLAUDE.md
 .claude/
-
-# Tauri — auto-generated, not needed in source control
-src-tauri/gen/
-
-# Tauri — mobile platform icons (desktop-only app)
-src-tauri/icons/android/
-src-tauri/icons/ios/
 
 # Editor
 .vscode/
@@ -47,10 +25,3 @@ Thumbs.db
 
 # Logs
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# TypeScript
-*.tsbuildinfo
