@@ -23,7 +23,7 @@ use arbiter_native::claude_status::Lifecycle;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 use arbiter_native::persist;
-use arbiter_native::term::SelectKind;
+use arbiter_native::term::{MouseModes, SelectKind};
 
 /// File-explorer file-type icons + colours (generated from @mdi/js).
 mod file_icons;
@@ -126,6 +126,10 @@ struct Explorer {
     git_status: std::collections::HashMap<String, String>,
     /// The worktree path the cache currently reflects (cleared on worktree switch).
     cached_for: String,
+    /// Selected row paths (multi-select via Ctrl/Cmd-click + Shift-range).
+    selected: std::collections::HashSet<String>,
+    /// Anchor path for Shift-range selection (the last non-Shift click).
+    anchor: Option<String>,
 }
 
 /// One file-explorer row.
@@ -281,6 +285,38 @@ struct State {
     rename_confirm: Option<RenameConfirm>,
     /// The workspace being renamed (right-click a tab), with its edit buffer.
     rename_ws: Option<RenameWorkspace>,
+    /// Whether the in-terminal find bar is open, and the current query. The find
+    /// operates on the focused pane's terminal (incl. its scrollback).
+    find_open: bool,
+    find_query: String,
+    /// Open file-explorer right-click menu (anchor position), and the rename/delete
+    /// dialogs it can launch. The menu acts on the explorer's current selection.
+    explorer_menu: Option<ExplorerMenu>,
+    explorer_rename: Option<ExplorerRename>,
+    explorer_delete: Option<ExplorerDelete>,
+    /// Live keyboard modifiers (Shift/Ctrl/Cmd) for multi-select clicks in the
+    /// file explorer. Tracked app-wide via ModifiersChanged.
+    modifiers: iced::keyboard::Modifiers,
+}
+
+/// A file-explorer right-click context menu, anchored at the cursor. Its actions
+/// operate on `Explorer.selected`.
+struct ExplorerMenu {
+    x: f32,
+    y: f32,
+}
+
+/// The file-explorer rename dialog: the path being renamed + the edit buffer.
+struct ExplorerRename {
+    path: String,
+    text: String,
+}
+
+/// The file-explorer delete confirmation: the selected paths to move to trash +
+/// a human label ("\"foo.rs\"" or "3 items") for the prompt.
+struct ExplorerDelete {
+    paths: Vec<String>,
+    label: String,
 }
 
 /// State of the "rename workspace" modal: which tab, and the name being typed.
@@ -428,6 +464,36 @@ enum Message {
     RenameWorkspaceInput(String),
     RenameWorkspaceCommit,
     RenameWorkspaceCancel,
+    /// In-terminal find (Ctrl/Cmd+F): open/close, edit query, jump prev/next.
+    ToggleFind,
+    FindInput(String),
+    FindJump(bool),
+    CloseFind,
+    /// Esc: closes the find bar if open, else sends ESC to the focused terminal.
+    EscapeKey,
+    /// Cmd/Ctrl+click on a detected terminal link → open it in the browser.
+    OpenUrl(String),
+    /// Live keyboard modifiers (for file-explorer multi-select clicks).
+    ModifiersChanged(iced::keyboard::Modifiers),
+    /// File-explorer: select a row (path, is_dir) — Shift/Ctrl/Cmd extend; plain
+    /// click single-selects and toggles a directory's expansion.
+    ExplorerSelect(String, bool),
+    /// File-explorer right-click menu: open (selecting the row first if needed),
+    /// close, and its actions (operate on the selection).
+    ExplorerMenuOpen(String, bool),
+    ExplorerMenuClose,
+    ExplorerOpenSelection,
+    ExplorerReveal(String),
+    ExplorerRenameStart,
+    ExplorerRenameInput(String),
+    ExplorerRenameCommit,
+    ExplorerRenameCancel,
+    ExplorerDeleteStart,
+    ExplorerDeleteConfirm,
+    ExplorerDeleteCancel,
+    /// A mouse event encoded for a TUI that enabled mouse reporting: write the
+    /// bytes to the pane's PTY, focusing it first when the bool is set (press).
+    MouseReport(pane_grid::Pane, Vec<u8>, bool),
     SelectWorkspace(usize),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -436,8 +502,6 @@ enum Message {
     ProjectFolderPicked(Option<String>),
     /// Switch the active project workspace to worktree `i` (swaps its pane grid in).
     SwitchWorktree(usize),
-    /// Expand/collapse a directory in the file explorer.
-    ExplorerToggle(String),
     /// Open the "new worktree" dialog (branch name + base-branch dropdown).
     NewWorktree,
     /// Live edits in the new-worktree dialog.
@@ -856,7 +920,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 p.session.write(bytes);
             }
         }
-        Message::Focus(pane) => state.active_mut().focus = pane,
+        Message::Focus(pane) => {
+            // Moving focus while the find bar is open: drop the old pane's
+            // highlights and re-run the query on the newly focused terminal.
+            if state.find_open && state.active().focus != pane {
+                with_focused_term(state, |t| t.clear_search());
+            }
+            state.active_mut().focus = pane;
+            if state.find_open {
+                let q = state.find_query.clone();
+                with_focused_term(state, |t| t.set_search(&q));
+            }
+        }
         Message::SplitRight => {
             split(state.active_mut(), pane_grid::Axis::Vertical);
             save_session(state);
@@ -1161,16 +1236,39 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::SwitchWorktree(i) => {
             activate_worktree(state.active_mut(), i);
         }
-        Message::ExplorerToggle(path) => {
+        Message::ModifiersChanged(m) => state.modifiers = m,
+        Message::ExplorerSelect(path, is_dir) => {
+            let mods = state.modifiers;
             if let Some(p) = state.active_mut().project.as_mut() {
-                let ex = &mut p.explorer;
-                if ex.expanded.remove(&path) {
-                    // collapsed
+                if mods.shift() && p.explorer.anchor.is_some() {
+                    // Range-select from the anchor to here, in visible (flattened)
+                    // order. The anchor stays put for further shift-clicks.
+                    let root =
+                        p.worktrees.get(p.active).map(|w| w.path.clone()).unwrap_or_default();
+                    let mut rows: Vec<(DirEntry, usize)> = Vec::new();
+                    flatten_tree(&p.explorer, &root, 0, &mut rows);
+                    let list: Vec<String> = rows.into_iter().map(|(e, _)| e.path).collect();
+                    let anchor = p.explorer.anchor.clone().unwrap_or_default();
+                    if let (Some(a), Some(b)) = (
+                        list.iter().position(|x| *x == path),
+                        list.iter().position(|x| *x == anchor),
+                    ) {
+                        let (s, e) = (a.min(b), a.max(b));
+                        p.explorer.selected = list[s..=e].iter().cloned().collect();
+                    }
+                } else if mods.control() || mods.logo() {
+                    // Toggle this row in/out of the selection; move the anchor here.
+                    if !p.explorer.selected.remove(&path) {
+                        p.explorer.selected.insert(path.clone());
+                    }
+                    p.explorer.anchor = Some(path);
                 } else {
-                    ex.expanded.insert(path.clone());
-                    if std::path::Path::new(&path).is_dir() {
-                        let children = read_dir_entries(&path);
-                        p.explorer.entries.insert(path, children);
+                    // Plain click: single-select, and a directory also toggles open.
+                    p.explorer.selected.clear();
+                    p.explorer.selected.insert(path.clone());
+                    p.explorer.anchor = Some(path.clone());
+                    if is_dir {
+                        explorer_toggle_expand(p, &path);
                     }
                 }
             }
@@ -1525,6 +1623,155 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::RenameWorkspaceCancel => state.rename_ws = None,
+        Message::ToggleFind => {
+            if state.find_open {
+                state.find_open = false;
+                with_focused_term(state, |t| t.clear_search());
+            } else {
+                state.find_open = true;
+                let q = state.find_query.clone();
+                with_focused_term(state, |t| t.set_search(&q));
+                return iced::widget::text_input::focus(text_input::Id::new(FIND_INPUT));
+            }
+        }
+        Message::FindInput(q) => {
+            state.find_query = q.clone();
+            with_focused_term(state, |t| t.set_search(&q));
+        }
+        Message::FindJump(forward) => {
+            with_focused_term(state, |t| t.search_jump(forward));
+        }
+        Message::CloseFind => {
+            state.find_open = false;
+            with_focused_term(state, |t| t.clear_search());
+        }
+        Message::EscapeKey => {
+            if state.find_open {
+                state.find_open = false;
+                with_focused_term(state, |t| t.clear_search());
+            } else {
+                let ws = state.active_mut();
+                if let Some(p) = ws.panes.get_mut(ws.focus) {
+                    if let Ok(mut t) = p.session.term().lock() {
+                        t.scroll_to_bottom();
+                        t.clear_selection();
+                    }
+                    p.session.write(&[0x1b]);
+                }
+            }
+        }
+        Message::OpenUrl(url) => open_url(&url),
+        Message::ExplorerMenuOpen(path, _is_dir) => {
+            // Right-click selects the row first if it isn't already in the
+            // selection, so the menu always acts on a meaningful target (web parity).
+            if let Some(p) = state.active_mut().project.as_mut() {
+                if !p.explorer.selected.contains(&path) {
+                    p.explorer.selected.clear();
+                    p.explorer.selected.insert(path.clone());
+                    p.explorer.anchor = Some(path);
+                }
+            }
+            state.explorer_menu = Some(ExplorerMenu { x: state.cursor.x, y: state.cursor.y });
+        }
+        Message::ExplorerMenuClose => state.explorer_menu = None,
+        Message::ExplorerOpenSelection => {
+            state.explorer_menu = None;
+            if let Some(p) = state.active().project.as_ref() {
+                for path in &p.explorer.selected {
+                    open_path(path);
+                }
+            }
+        }
+        Message::ExplorerReveal(path) => {
+            state.explorer_menu = None;
+            reveal_path(&path);
+        }
+        Message::ExplorerRenameStart => {
+            state.explorer_menu = None;
+            // Rename targets the single selected entry.
+            if let Some(p) = state.active().project.as_ref() {
+                if p.explorer.selected.len() == 1 {
+                    let path = p.explorer.selected.iter().next().cloned().unwrap_or_default();
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    state.explorer_rename = Some(ExplorerRename { path, text: name });
+                    return iced::widget::text_input::focus(text_input::Id::new(EXPLORER_RENAME_INPUT));
+                }
+            }
+        }
+        Message::ExplorerRenameInput(s) => {
+            if let Some(r) = state.explorer_rename.as_mut() {
+                r.text = s;
+            }
+        }
+        Message::ExplorerRenameCommit => {
+            if let Some(r) = state.explorer_rename.take() {
+                let new_name = r.text.trim();
+                let old = std::path::Path::new(&r.path);
+                // Reject empty / path-separator names (web `rename_path`).
+                if !new_name.is_empty() && !new_name.contains('/') && !new_name.contains('\\') {
+                    if let Some(parent) = old.parent() {
+                        let new_path = parent.join(new_name);
+                        if !new_path.exists() && std::fs::rename(old, &new_path).is_ok() {
+                            if let Some(p) = state.active_mut().project.as_mut() {
+                                p.explorer.expanded.remove(&r.path); // renamed dir loses expansion
+                                p.explorer.selected.remove(&r.path);
+                                load_explorer(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Message::ExplorerRenameCancel => state.explorer_rename = None,
+        Message::ExplorerDeleteStart => {
+            state.explorer_menu = None;
+            if let Some(p) = state.active().project.as_ref() {
+                let paths: Vec<String> = p.explorer.selected.iter().cloned().collect();
+                if !paths.is_empty() {
+                    let label = if paths.len() == 1 {
+                        let name = std::path::Path::new(&paths[0])
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| paths[0].clone());
+                        format!("\"{name}\"")
+                    } else {
+                        format!("{} items", paths.len())
+                    };
+                    state.explorer_delete = Some(ExplorerDelete { paths, label });
+                }
+            }
+        }
+        Message::ExplorerDeleteConfirm => {
+            if let Some(d) = state.explorer_delete.take() {
+                // Move to the OS trash (recoverable), like the web's `trash_path`.
+                let deleted: Vec<String> =
+                    d.paths.into_iter().filter(|p| trash::delete(p).is_ok()).collect();
+                if !deleted.is_empty() {
+                    if let Some(p) = state.active_mut().project.as_mut() {
+                        for path in &deleted {
+                            p.explorer.expanded.remove(path);
+                            p.explorer.selected.remove(path);
+                        }
+                        load_explorer(p);
+                    }
+                }
+            }
+        }
+        Message::ExplorerDeleteCancel => state.explorer_delete = None,
+        Message::MouseReport(pane, bytes, focus) => {
+            // Write to the reporting pane; focus it on press so keys follow the
+            // click (but a wheel/motion report doesn't steal focus).
+            let ws = state.active_mut();
+            if focus && ws.panes.get(pane).is_some() {
+                ws.focus = pane;
+            }
+            if let Some(p) = ws.panes.get_mut(pane) {
+                p.session.write(&bytes);
+            }
+        }
         Message::SelectWorkspace(i) => {
             if i < state.workspaces.len() {
                 state.active = i;
@@ -1835,6 +2082,21 @@ fn read_dir_entries(dir: &str) -> Vec<DirEntry> {
     out
 }
 
+/// Expand or collapse a directory in the explorer, lazy-loading its children on
+/// expand (a plain click on a folder row toggles it).
+fn explorer_toggle_expand(project: &mut Project, path: &str) {
+    let ex = &mut project.explorer;
+    if ex.expanded.remove(path) {
+        // collapsed
+    } else {
+        ex.expanded.insert(path.to_string());
+        if std::path::Path::new(path).is_dir() {
+            let children = read_dir_entries(path);
+            project.explorer.entries.insert(path.to_string(), children);
+        }
+    }
+}
+
 /// (Re)load the active worktree's explorer cache: root + expanded dirs + git
 /// status (keyed by absolute path). Called when the cache is stale or files change.
 fn load_explorer(project: &mut Project) {
@@ -1876,7 +2138,8 @@ fn flatten_tree(ex: &Explorer, dir: &str, depth: usize, out: &mut Vec<(DirEntry,
 }
 
 /// One file-explorer row: indent + chevron (dirs) + name, git-status coloured.
-/// Dir rows toggle expand; file rows are inert (open/reveal come with the menu).
+/// Dir rows toggle expand; file rows are inert. Right-click opens the context
+/// menu (open / reveal / rename / delete).
 fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'static, Message> {
     let color = git_status_color(ex.git_status.get(&entry.path).map(String::as_str));
     let indent = depth as f32 * 16.0;
@@ -1900,21 +2163,33 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'stati
     ]
     .spacing(4)
     .align_y(iced::Center);
-    if entry.is_dir {
-        button(content)
-            .width(Length::Fill)
-            .padding([2, 8])
-            .on_press(Message::ExplorerToggle(entry.path.clone()))
-            .style(|_t: &iced::Theme, status| button::Style {
-                background: matches!(status, button::Status::Hovered)
-                    .then(|| iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+    // Every row is clickable to select (dirs also toggle on a plain click, handled
+    // in `ExplorerSelect`). Selected rows get the web's blue highlight.
+    let selected = ex.selected.contains(&entry.path);
+    let is_dir = entry.is_dir;
+    let btn = button(content)
+        .width(Length::Fill)
+        .padding([2, 8])
+        .on_press(Message::ExplorerSelect(entry.path.clone(), is_dir))
+        .style(move |_t: &iced::Theme, status| {
+            let bg = if selected {
+                Some(iced::Background::Color(iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.18)))
+            } else if matches!(status, button::Status::Hovered) {
+                Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25)))
+            } else {
+                None
+            };
+            button::Style {
+                background: bg,
                 border: iced::Border { radius: 4.0.into(), ..Default::default() },
                 ..Default::default()
-            })
-            .into()
-    } else {
-        container(content).width(Length::Fill).padding([2, 8]).into()
-    }
+            }
+        });
+    // Right-click → context menu. on_right_press doesn't carry the cursor, so the
+    // menu anchors at the last tracked cursor position (left-strip tracking).
+    mouse_area(btn)
+        .on_right_press(Message::ExplorerMenuOpen(entry.path.clone(), is_dir))
+        .into()
 }
 
 /// Project-workspace sidebar container chrome: same #121212 as the terminals,
@@ -2503,10 +2778,110 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
 /// The text_input id of the new-worktree dialog's branch-name field (for autofocus).
 const WT_NAME_INPUT: &str = "wt-name-input";
 const WS_RENAME_INPUT: &str = "ws-rename-input";
+/// The text_input id of the find bar's query field (for autofocus on Ctrl+F).
+const FIND_INPUT: &str = "find-input";
+
+/// Run a closure on the focused pane's terminal grid (locks the term mutex
+/// briefly). No-op if there's no focused pane. Used by the find handlers.
+fn with_focused_term<R>(
+    state: &State,
+    f: impl FnOnce(&mut arbiter_native::term::VtTerm) -> R,
+) -> Option<R> {
+    let ws = state.active();
+    let d = ws.panes.get(ws.focus)?;
+    let term = d.session.term();
+    let mut g = term.lock().ok()?;
+    Some(f(&mut g))
+}
+
+/// Open an http(s) URL in the default browser. Restricted to http/https so a
+/// terminal link can't trigger arbitrary schemes (file://, custom handlers) —
+/// matches the web `open_url` command. Failures are silent (best-effort).
+fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no flashing console window
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// Open a file/dir with its default app (web `open_path`). Best-effort.
+fn open_path(path: &str) {
+    if !std::path::Path::new(path).exists() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no flashing console window
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", path])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Reveal a path in the OS file manager (web `reveal_path`): select it in
+/// Finder / File Explorer, or open the containing folder on Linux. Best-effort.
+fn reveal_path(path: &str) {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").args(["-R", path]).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(parent) = p.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+/// Platform-specific label for the explorer's "reveal" action (web `revealLabel`).
+fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(target_os = "windows") {
+        "Reveal in File Explorer"
+    } else {
+        "Open containing folder"
+    }
+}
+
+/// The text_input id of the explorer rename dialog's name field (for autofocus).
+const EXPLORER_RENAME_INPUT: &str = "explorer-rename-input";
 
 /// The modal layer over the whole window, if a worktree dialog or context menu is
 /// open: the new-worktree form, or the right-click actions for a worktree.
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
+    // File-explorer rename/delete dialogs + right-click menu (only one is ever set).
+    if let Some(r) = &state.explorer_rename {
+        return Some(explorer_rename_view(r));
+    }
+    if let Some(d) = &state.explorer_delete {
+        return Some(explorer_delete_view(d));
+    }
+    if let Some(m) = &state.explorer_menu {
+        if let Some(p) = state.active().project.as_ref() {
+            return Some(explorer_menu_view(&p.explorer, m.x, m.y, state.main_size));
+        }
+    }
     if state.new_ws_menu {
         return Some(new_ws_menu_view(state.new_ws_menu_x));
     }
@@ -3144,7 +3519,7 @@ fn kbd_combo(keys: &str) -> Element<'static, Message> {
 /// The keyboard-shortcuts cheat sheet — a centred card listing every binding
 /// (Ctrl on all platforms, like the web).
 fn shortcuts_dialog_view() -> Element<'static, Message> {
-    const ROWS: [(&str, &str); 13] = [
+    const ROWS: [(&str, &str); 14] = [
         ("New workspace", "Ctrl + Shift + T"),
         ("Next workspace", "Ctrl + Tab"),
         ("Previous workspace", "Ctrl + Shift + Tab"),
@@ -3155,6 +3530,7 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
         ("Navigate panes", "Ctrl + Shift + Arrow"),
         ("Resize panes", "Alt + Shift + Arrow"),
         ("Equalize pane sizes", "Ctrl + Shift + E"),
+        ("Find in terminal", "Ctrl + F"),
         ("Workspace overview", "Ctrl + Shift + O"),
         ("Attach screenshot", "Ctrl + Shift + S"),
         ("Attach files", "Ctrl + Shift + A"),
@@ -3799,6 +4175,183 @@ fn new_ws_menu_view(anchor_x: f32) -> Element<'static, Message> {
     mouse_area(anchored).on_press(Message::CloseNewWsMenu).into()
 }
 
+/// One file-explorer context-menu item (icon + label; `danger` tints it red).
+/// `msg: None` renders it disabled (greyed, no hover, no action).
+fn explorer_menu_item(
+    icon: &'static str,
+    label: String,
+    msg: Option<Message>,
+    danger: bool,
+) -> Element<'static, Message> {
+    let enabled = msg.is_some();
+    let base = if !enabled {
+        iced::Color::from_rgb8(0x5a, 0x5a, 0x5a)
+    } else if danger {
+        iced::Color::from_rgb8(0xe5, 0x6b, 0x6f)
+    } else {
+        TXT_SECONDARY
+    };
+    let mut b =
+        button(row![cmdi(icon, 14.0, base), text(label).size(12)].spacing(8).align_y(iced::Center))
+            .width(Length::Fill)
+            .padding([6, 12])
+            .style(move |_t: &iced::Theme, s| {
+                let hovered = enabled && matches!(s, button::Status::Hovered);
+                let hover_bg = if danger {
+                    iced::Color::from_rgb8(0x5a, 0x1e, 0x1e)
+                } else {
+                    AZURE
+                };
+                button::Style {
+                    background: hovered.then(|| iced::Background::Color(hover_bg)),
+                    text_color: if hovered { iced::Color::WHITE } else { base },
+                    ..Default::default()
+                }
+            });
+    if let Some(m) = msg {
+        b = b.on_press(m);
+    }
+    b.into()
+}
+
+/// The file-explorer right-click context menu (web `FileExplorerContextMenu`):
+/// Open (files only), Reveal/Rename (single), Delete — over the current
+/// selection, anchored at the cursor and clamped to the window. Scrim closes it.
+fn explorer_menu_view(ex: &Explorer, x0: f32, y0: f32, win: iced::Size) -> Element<'static, Message> {
+    const MENU_W: f32 = 210.0;
+    let is_dir = |path: &str| ex.entries.values().flatten().any(|e| e.path == path && e.is_dir);
+    let count = ex.selected.len();
+    let all_files = count > 0 && ex.selected.iter().all(|p| !is_dir(p));
+    let single = (count == 1).then(|| ex.selected.iter().next().cloned().unwrap_or_default());
+    let divider = || -> Element<'static, Message> {
+        container(
+            container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(
+                |_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+                    ..Default::default()
+                },
+            ),
+        )
+        .padding(iced::Padding { top: 4.0, bottom: 4.0, left: 0.0, right: 0.0 })
+        .into()
+    };
+    let mut items = column![].spacing(0).padding([4, 0]);
+    let mut rows = 0;
+    // Open — only when every selected entry is a file (web hides it otherwise).
+    if all_files {
+        let label = if count > 1 { format!("Open {count} files") } else { "Open".into() };
+        items = items.push(explorer_menu_item(
+            mdi_path::OPEN_IN_APP,
+            label,
+            Some(Message::ExplorerOpenSelection),
+            false,
+        ));
+        rows += 1;
+    }
+    // Reveal — single selection only.
+    items = items.push(explorer_menu_item(
+        mdi_path::FOLDER_OPEN,
+        reveal_label().into(),
+        single.clone().map(Message::ExplorerReveal),
+        false,
+    ));
+    items = items.push(divider());
+    rows += 2;
+    // Rename — single selection only.
+    items = items.push(explorer_menu_item(
+        mdi_path::PENCIL,
+        "Rename".into(),
+        single.map(|_| Message::ExplorerRenameStart),
+        false,
+    ));
+    let del_label = if count > 1 { format!("Delete {count} items") } else { "Delete".into() };
+    items = items.push(explorer_menu_item(
+        mdi_path::DELETE,
+        del_label,
+        (count > 0).then_some(Message::ExplorerDeleteStart),
+        true,
+    ));
+    rows += 2;
+    let card = container(items).width(Length::Fixed(MENU_W)).style(|_t: &iced::Theme| {
+        container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }
+    });
+    // Clamp the anchor so the menu stays fully on-screen.
+    let menu_h = rows as f32 * 30.0 + 18.0;
+    let x = x0.min((win.width - MENU_W - 8.0).max(4.0)).max(4.0);
+    let y = y0.min((win.height - menu_h - 8.0).max(44.0)).max(44.0);
+    let anchored = container(mouse_area(card).on_press(Message::Noop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding { top: y, right: 0.0, bottom: 0.0, left: x });
+    mouse_area(anchored).on_press(Message::ExplorerMenuClose).into()
+}
+
+/// The file-explorer rename dialog (web inline rename): a prefilled name input.
+fn explorer_rename_view(r: &ExplorerRename) -> Element<'static, Message> {
+    let input = text_input("Name", &r.text)
+        .id(text_input::Id::new(EXPLORER_RENAME_INPUT))
+        .on_input(Message::ExplorerRenameInput)
+        .on_submit(Message::ExplorerRenameCommit)
+        .padding([7, 9])
+        .size(13);
+    let actions = row![
+        horizontal_space(),
+        button(text("Cancel").size(13))
+            .on_press(Message::ExplorerRenameCancel)
+            .style(button::secondary)
+            .padding([6, 14]),
+        button(text("Rename").size(13))
+            .on_press(Message::ExplorerRenameCommit)
+            .style(button::primary)
+            .padding([6, 14]),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    let panel = column![text("Rename").size(15).font(ui_semibold()), input, actions]
+        .spacing(14)
+        .padding(18)
+        .width(Length::Fixed(340.0));
+    modal_scrim(modal_panel(panel.into()), Message::ExplorerRenameCancel)
+}
+
+/// The file-explorer delete confirmation (web "Move to trash?").
+fn explorer_delete_view(d: &ExplorerDelete) -> Element<'static, Message> {
+    let body = if d.paths.len() > 1 {
+        "The selected items will be moved to the OS trash.".to_string()
+    } else {
+        "The item will be moved to the OS trash.".to_string()
+    };
+    let panel = column![
+        text(format!("Move {} to trash?", d.label)).size(15).font(ui_semibold()),
+        text(body).size(13).color(TXT_SECONDARY),
+        row![
+            horizontal_space(),
+            button(text("Cancel").size(13))
+                .on_press(Message::ExplorerDeleteCancel)
+                .style(button::secondary)
+                .padding([6, 14]),
+            button(text("Delete").size(13))
+                .on_press(Message::ExplorerDeleteConfirm)
+                .style(button::danger)
+                .padding([6, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(380.0));
+    modal_scrim(modal_panel(panel.into()), Message::ExplorerDeleteCancel)
+}
+
 /// The whole titlebar row, laid out for the available width `avail_w` (from
 /// `responsive`): the right-side action buttons always show and take priority;
 /// the usage bars + refresh drop out first when space is tight; the tabs shrink
@@ -3935,6 +4488,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let layout = state.active().panes.layout();
     let (c_tl, c_tr) = (corner_pane(layout, false, false), corner_pane(layout, true, false));
     let (c_bl, c_br) = (corner_pane(layout, false, true), corner_pane(layout, true, true));
+    // The find bar (Ctrl/Cmd+F) overlays the focused pane only.
+    let find_open = state.find_open;
+    let find_query = state.find_query.as_str();
     let grid = pane_grid::PaneGrid::new(&state.active().panes, move |pane, data, _maximized| {
         // 2px of left breathing room so glyphs don't touch the pane's left edge
         // (the pane's own #121212 shows through the gap; the renderer derives its
@@ -3998,6 +4554,35 @@ fn main_view(state: &State) -> Element<'_, Message> {
             (true, false) => iced::widget::stack![term, working_bar(pane_w)].into(),
             (false, true) => iced::widget::stack![term, info_panel(&cstatus)].into(),
             (false, false) => term.into(),
+        };
+        // Scroll indicator: fades in while scrolling the scrollback, out when it
+        // stops (above the term, below the find bar so find always wins).
+        let term_area: Element<Message> = {
+            let st = data.session.term();
+            let (off, history, screen, age) = {
+                let g = st.lock().unwrap();
+                let (o, h, s) = g.scroll_state();
+                (o, h, s, g.scroll_age_ms())
+            };
+            let alpha = match age {
+                Some(a) if a < SB_HOLD_MS => 1.0,
+                Some(a) if a < SB_HOLD_MS + SB_FADE_MS => {
+                    1.0 - (a - SB_HOLD_MS) as f32 / SB_FADE_MS as f32
+                }
+                _ => 0.0,
+            };
+            if alpha > 0.0 && history > 0 {
+                iced::widget::stack![term_area, scroll_indicator(off, history, screen, alpha)].into()
+            } else {
+                term_area
+            }
+        };
+        // The find bar sits above everything in the focused pane.
+        let term_area: Element<Message> = if focused && find_open {
+            let status = data.session.term().lock().ok().and_then(|t| t.search_status());
+            iced::widget::stack![term_area, find_bar(find_query, status)].into()
+        } else {
+            term_area
         };
         // 1px #2c2c2c dividers under the header and above the footer (web card look).
         let content = column![header, hline(), term_area, hline(), footer_bar(&data.session, pane, footer_round)]
@@ -4450,6 +5035,11 @@ mod mdi_path {
     pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
     pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
     pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
+    // File-explorer context menu (web mdiOpenInApp / FolderOpenOutline / PencilOutline / DeleteOutline).
+    pub const OPEN_IN_APP: &str = "M12,10L8,14H11V20H13V14H16M19,4H5C3.89,4 3,4.89 3,6V18A2,2 0 0,0 5,20H9V18H5V8H19V18H15V20H19A2,2 0 0,0 21,18V6A2,2 0 0,0 19,4Z";
+    pub const FOLDER_OPEN: &str = "M6.1,10L4,18V8H21A2,2 0 0,0 19,6H12L10,4H4A2,2 0 0,0 2,6V18A2,2 0 0,0 4,20H19C19.9,20 20.7,19.4 20.9,18.5L23.2,10H6.1M19,18H6L7.6,12H20.6L19,18Z";
+    pub const PENCIL: &str = "M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z";
+    pub const DELETE: &str = "M9,3V4H4V6H5V19A2,2 0 0,0 7,21H17A2,2 0 0,0 19,19V6H20V4H15V3H9M7,6H17V19H7V6M9,8V17H11V8H9M13,8V17H15V8H13Z";
     // File-explorer expand/collapse chevrons (the ▸/▾ glyphs tofu in the UI font).
     pub const CHEVRON_RIGHT: &str = "M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z";
     pub const CHEVRON_DOWN: &str = "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z";
@@ -5258,6 +5848,55 @@ fn info_panel(c: &arbiter_native::claude_status::ClaudeStatus) -> Element<'stati
         .into()
 }
 
+/// How long the scroll indicator stays fully opaque after the last scroll, then
+/// how long it takes to fade out.
+const SB_HOLD_MS: u64 = 700;
+const SB_FADE_MS: u64 = 450;
+
+/// The terminal scroll indicator: a thin rounded thumb on the right edge whose
+/// height and position reflect the scrollback view. No track behind it — it just
+/// fades in while scrolling and out when it stops (`alpha`, 0–1). `off` =
+/// display offset, `history` = scrollback lines, `screen` = visible rows.
+fn scroll_indicator(off: usize, history: usize, screen: usize, alpha: f32) -> Element<'static, Message> {
+    const THUMB_W: f32 = 6.0;
+    const MIN_THUMB: f32 = 0.06; // keep the thumb visible on deep scrollback
+    let total = (history + screen).max(1) as f32;
+    let thumb_frac = (screen as f32 / total).clamp(MIN_THUMB, 1.0);
+    let track = (1.0 - thumb_frac).max(0.0);
+    // pos: 0 at the oldest line (off == history), 1 at the live bottom (off == 0).
+    let pos = if history == 0 { 1.0 } else { (history - off) as f32 / history as f32 };
+    let top = pos * track;
+    let bottom = (track - top).max(0.0);
+    let portion = |f: f32| (f * 1000.0).round() as u16;
+    let thumb = container(Space::new(Length::Fixed(THUMB_W), Length::Fill))
+        .width(Length::Fixed(THUMB_W))
+        .height(Length::FillPortion(portion(thumb_frac).max(1)))
+        .style(move |_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                r: 0.78,
+                g: 0.79,
+                b: 0.84,
+                a: 0.42 * alpha,
+            })),
+            border: iced::Border { radius: (THUMB_W / 2.0).into(), ..Default::default() },
+            ..Default::default()
+        });
+    let bar = column![
+        Space::with_height(Length::FillPortion(portion(top))),
+        thumb,
+        Space::with_height(Length::FillPortion(portion(bottom))),
+    ]
+    .width(Length::Fixed(THUMB_W))
+    .height(Length::Fill);
+    // Right-anchored, full height, with a small inset from the edge.
+    container(bar)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .padding(iced::Padding { top: 2.0, right: 2.0, bottom: 2.0, left: 0.0 })
+        .into()
+}
+
 /// The Knight-Rider "working" bar (web `.progress-bar`): a soft azure glow that
 /// sweeps back and forth across the top of the terminal while Claude works. A
 /// full-width strip whose gradient *peak* is moved by `now_ms` (the 60fps Tick
@@ -5321,6 +5960,64 @@ fn working_bar(width_px: f32) -> Element<'static, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .align_y(iced::alignment::Vertical::Top)
+        .into()
+}
+
+/// The in-terminal find bar (Ctrl/Cmd+F), anchored top-right over the focused
+/// pane: a query input, the match counter, prev/next/close buttons. `status` is
+/// `(current 1-based, total)`, `None` while the query is empty.
+fn find_bar<'a>(query: &'a str, status: Option<(usize, usize)>) -> Element<'a, Message> {
+    let input = text_input("Find", query)
+        .id(text_input::Id::new(FIND_INPUT))
+        .on_input(Message::FindInput)
+        .on_submit(Message::FindJump(true))
+        .padding([4, 8])
+        .size(13)
+        .width(Length::Fixed(170.0))
+        .style(settings_input_style);
+    // "c/t", "0/0" → "No results", empty query → blank.
+    let count = match status {
+        Some((_, 0)) => "No results".to_string(),
+        Some((c, t)) => format!("{c}/{t}"),
+        None => String::new(),
+    };
+    let counter = text(count).size(11).color(TXT_MUTED).width(Length::Fixed(66.0));
+    // Small icon button: dim by default, lighter on hover, transparent bg.
+    let icon_btn = |path: &'static str, msg: Message| {
+        button(mdi(path, 15.0, TXT_SECONDARY)).padding(3).on_press(msg).style(
+            |_t: &iced::Theme, s: button::Status| button::Style {
+                background: matches!(s, button::Status::Hovered)
+                    .then(|| iced::Background::Color(iced::Color::from_rgb8(0x32, 0x32, 0x32))),
+                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            },
+        )
+    };
+    let bar = row![
+        input,
+        counter,
+        icon_btn(mdi_path::ARROW_UP, Message::FindJump(false)),
+        icon_btn(mdi_path::ARROW_DOWN, Message::FindJump(true)),
+        icon_btn(mdi_path::CLOSE, Message::CloseFind),
+    ]
+    .spacing(4)
+    .align_y(iced::Center);
+    let card = container(bar).padding([5, 6]).style(|_t: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+        border: iced::Border {
+            color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    });
+    // Anchor top-right within the terminal area (clears the working bar's 3px).
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Top)
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 0.0 })
         .into()
 }
 
@@ -5535,10 +6232,16 @@ fn subscription(_state: &State) -> Subscription<Message> {
         if MAIN_WINDOW.get().copied() != Some(id) {
             return None;
         }
-        // Track the cursor only over the titlebar (top ~44px) so the "+" dropdown
-        // can anchor under the click — cheap, since it's off during terminal use.
+        // Track modifiers app-wide (Shift/Ctrl/Cmd) for file-explorer multi-select
+        // clicks — regardless of which widget has focus.
+        if let iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) = &event {
+            return Some(Message::ModifiersChanged(*m));
+        }
+        // Track the cursor over the titlebar (top ~44px, for the "+" dropdown) and
+        // the left strip (~240px, where the project file explorer sits, so its
+        // right-click menu anchors under the click). Cheap — off over the terminals.
         if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = &event {
-            return (position.y < 44.0).then(|| Message::CursorMoved(*position));
+            return (position.y < 44.0 || position.x < 240.0).then(|| Message::CursorMoved(*position));
         }
         if status == iced::event::Status::Captured {
             return None;
@@ -5626,6 +6329,21 @@ fn handle_key(event: iced::Event) -> Option<Message> {
     let iced::Event::Keyboard(KeyPressed { key, text, modifiers, .. }) = event else {
         return None;
     };
+    // Option/AltGr compose symbols: on a non-US layout the OS resolves Option
+    // (macOS) or AltGr = Ctrl+Alt (Windows/Linux) into real characters — `@ { } [ ]
+    // | \ $` on Nordic layouts — which winit hands us in `text`. Emit that text
+    // directly, BEFORE the Ctrl/Cmd shortcut logic, so e.g. Option+' types "@"
+    // instead of being swallowed (iTerm does this; we were dropping it at the
+    // `!alt` gate below). Control chars (Enter/Tab/Ctrl codes) and Cmd chords are
+    // skipped here and handled by their own arms. Dead-key accents (´+e → é) are a
+    // separate matter — they need IME, which iced 0.13 doesn't expose.
+    if modifiers.alt() && !modifiers.logo() {
+        if let Some(t) = &text {
+            if !t.is_empty() && t.chars().all(|c| !c.is_control()) {
+                return Some(Message::Input(t.as_bytes().to_vec()));
+            }
+        }
+    }
     match &key {
         Key::Named(Named::Enter) => {
             // Shift+Enter → resolved in update() (kitty CSI 13;2u for Claude,
@@ -5645,7 +6363,7 @@ fn handle_key(event: iced::Event) -> Option<Message> {
             let bytes = if modifiers.shift() { b"\x1b[Z".to_vec() } else { b"\t".to_vec() };
             return Some(Message::Input(bytes));
         }
-        Key::Named(Named::Escape) => return Some(Message::Input(vec![0x1b])),
+        Key::Named(Named::Escape) => return Some(Message::EscapeKey),
         // Cursor + editing keys. Arrows carry modifiers (Ctrl+→ etc.) as the xterm
         // `CSI 1;<mod><final>` form, except the pane navigate/resize chords.
         Key::Named(Named::ArrowUp) => return Some(arrow_key(modifiers, pane_grid::Direction::Up, 'A')),
@@ -5689,6 +6407,11 @@ fn handle_key(event: iced::Event) -> Option<Message> {
                     Some('s') => return Some(Message::AttachFiles(AttachSource::Screenshot)),
                     _ => {} // c/v fall through to copy/paste below
                 }
+            }
+            // Cmd/Ctrl+F → toggle the in-terminal find bar (web parity). Caught
+            // before the ^F control code so it never reaches the PTY.
+            if !modifiers.shift() && s.chars().next().map(|c| c.to_ascii_lowercase()) == Some('f') {
+                return Some(Message::ToggleFind);
             }
             // Ctrl+1..9 → jump to workspace N.
             if modifiers.control() && !modifiers.shift() && !modifiers.logo() {
@@ -5736,6 +6459,62 @@ fn cell_at(pos: iced::Point, bounds: Rectangle, term: &SharedTerm) -> (usize, us
     (row, col, fx.fract() >= 0.5)
 }
 
+/// Encode a mouse event in the xterm protocol the focused TUI enabled. `button`
+/// is the base code (0/1/2 = left/middle/right, 64/65 = wheel up/down, 3 = no
+/// button); `motion` adds the drag bit; `release` reports a button-up. `col`/`row`
+/// are 0-based visible cells. Shift is never passed (it forces local selection),
+/// so only alt/ctrl modify the code. Returns None if the cell is out of range for
+/// the legacy encoding.
+fn encode_mouse(
+    modes: MouseModes,
+    button: u8,
+    motion: bool,
+    release: bool,
+    col: usize,
+    row: usize,
+    alt: bool,
+    ctrl: bool,
+) -> Option<Vec<u8>> {
+    let mut extra = 0u8;
+    if alt {
+        extra += 8;
+    }
+    if ctrl {
+        extra += 16;
+    }
+    if motion {
+        extra += 32;
+    }
+    if modes.sgr {
+        let c = if release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{};{};{}{}", button + extra, col + 1, row + 1, c).into_bytes())
+    } else {
+        // Legacy `CSI M`: release is button 3; coords are one byte (cap 223) or
+        // UTF-8 (cap 2015). Wheel is press-only so it never releases through here.
+        let max = if modes.utf8 { 2015 } else { 223 };
+        if col > max || row > max {
+            return None;
+        }
+        let cb = (if release { 3 } else { button }) + extra;
+        let mut msg = vec![0x1b, b'[', b'M', 32u8.wrapping_add(cb)];
+        push_mouse_pos(&mut msg, col, modes.utf8);
+        push_mouse_pos(&mut msg, row, modes.utf8);
+        Some(msg)
+    }
+}
+
+/// Push a legacy mouse coordinate byte (`32 + 1-based pos`), UTF-8-encoded past
+/// 0x7F when ?1005 is active.
+fn push_mouse_pos(out: &mut Vec<u8>, pos: usize, utf8: bool) {
+    let v = pos + 33; // 32 offset + 1-based
+    if utf8 && v >= 0x80 {
+        out.push(0xC0 | (v >> 6) as u8);
+        out.push(0x80 | (v & 0x3F) as u8);
+    } else {
+        out.push(v as u8);
+    }
+}
+
 // ── Custom shader widget: the wgpu terminal hosted inside Iced ────────────────
 
 /// Per-pane GPU renderers, keyed by session id. Iced's `Storage` is a global
@@ -5765,6 +6544,14 @@ struct TermState {
     last_click: Option<std::time::Instant>,
     last_cell: (usize, usize),
     clicks: u8,
+    /// Live keyboard modifiers (tracked via ModifiersChanged) so a Cmd/Ctrl+click
+    /// on a link can open it instead of starting a selection.
+    modifiers: iced::keyboard::Modifiers,
+    /// While a TUI grabs the mouse: the base button code (0/1/2) of an in-progress
+    /// reported press, used to emit drag-motion + release events. None otherwise.
+    report_button: Option<u8>,
+    /// Last (row, col) reported for motion, so we emit one event per cell crossed.
+    last_report_cell: (usize, usize),
 }
 
 /// Max gap between clicks to count as a double/triple click.
@@ -5792,27 +6579,101 @@ impl shader::Program<Message> for TermProgram {
         use iced::mouse::{Button, Event::*, ScrollDelta};
         let captured = (Captured, None);
         match event {
-            // Wheel over this pane scrolls its scrollback. ×3 lines per notch
-            // (matches Alacritty); pixel deltas (trackpads) convert via cell
-            // height. Typing jumps back to the bottom (handled in update()).
+            // Track live modifiers so a Cmd/Ctrl+click can open a link. Don't
+            // consume the event — the global key subscription still needs it.
+            shader::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                state.modifiers = m;
+                (Ignored, None)
+            }
+            // Wheel: if a TUI grabbed the mouse, report wheel buttons (unless
+            // Shift overrides to local); on the alternate screen with ?1007, send
+            // arrow keys; otherwise scroll our scrollback (×3 lines/notch, like
+            // Alacritty). Typing jumps back to the bottom (handled in update()).
             shader::Event::Mouse(WheelScrolled { delta }) if cursor.is_over(bounds) => {
-                let mut t = self.term.lock().unwrap();
-                let rows = t.size().1.max(1) as f32;
-                let lines = match delta {
-                    ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
-                    ScrollDelta::Pixels { y, .. } => (y / (bounds.height / rows).max(1.0)).round() as i32,
+                let modes = self.term.lock().unwrap().mouse_modes();
+                let rows = self.term.lock().unwrap().size().1.max(1) as f32;
+                let ch = (bounds.height / rows).max(1.0);
+                // Raw notches (no ×3): one wheel report / arrow key per notch.
+                let notches = match delta {
+                    ScrollDelta::Lines { y, .. } => y.round() as i32,
+                    ScrollDelta::Pixels { y, .. } => (y / ch).round() as i32,
                 };
-                if lines != 0 {
-                    t.scroll(lines);
+                if notches == 0 {
+                    return captured;
                 }
+                let shift = state.modifiers.shift();
+                if modes.reporting && !shift {
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let (row, col, _) = cell_at(pos, bounds, &self.term);
+                        let button = if notches > 0 { 64 } else { 65 }; // wheel up / down
+                        let mut out = Vec::new();
+                        for _ in 0..notches.unsigned_abs().min(16) {
+                            if let Some(b) = encode_mouse(modes, button, false, false, col, row,
+                                state.modifiers.alt(), state.modifiers.control()) {
+                                out.extend_from_slice(&b);
+                            }
+                        }
+                        if !out.is_empty() {
+                            return (Captured, Some(Message::MouseReport(self.pane, out, false)));
+                        }
+                    }
+                    return captured;
+                }
+                if modes.alternate_scroll && modes.alt_screen {
+                    // Wheel → cursor arrow keys (SS3 in app-cursor mode), per notch.
+                    let (up, down): (&[u8], &[u8]) = if modes.app_cursor {
+                        (b"\x1bOA", b"\x1bOB")
+                    } else {
+                        (b"\x1b[A", b"\x1b[B")
+                    };
+                    let arrow = if notches > 0 { up } else { down };
+                    let mut out = Vec::new();
+                    for _ in 0..notches.unsigned_abs().min(16) {
+                        out.extend_from_slice(arrow);
+                    }
+                    return (Captured, Some(Message::MouseReport(self.pane, out, false)));
+                }
+                self.term.lock().unwrap().scroll(notches * 3);
                 captured
             }
-            // Left press: focus the pane + begin a selection. Single/double/
-            // triple click selects char/word/line (alacritty Simple/Semantic/
-            // Lines), tracked by click timing + same-cell.
-            shader::Event::Mouse(ButtonPressed(Button::Left)) => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    let (row, col, right) = cell_at(pos, bounds, &self.term);
+            // Press: Cmd/Ctrl+click opens a link; else if a TUI grabbed the mouse,
+            // report the press (focusing the pane); else left-click begins a
+            // selection (single/double/triple → char/word/line).
+            shader::Event::Mouse(ButtonPressed(btn))
+                if matches!(btn, Button::Left | Button::Middle | Button::Right) =>
+            {
+                let Some(pos) = cursor.position_in(bounds) else {
+                    return (Ignored, None);
+                };
+                let (row, col, right) = cell_at(pos, bounds, &self.term);
+                let modes = self.term.lock().unwrap().mouse_modes();
+                let shift = state.modifiers.shift();
+                // Cmd+click always opens a link; Ctrl+click opens only when the app
+                // isn't grabbing the mouse (so a TUI still gets Ctrl+click).
+                let link_click = btn == Button::Left
+                    && !shift
+                    && (state.modifiers.logo() || (state.modifiers.control() && !modes.reporting));
+                if link_click {
+                    if let Some(url) = self.term.lock().unwrap().link_at(row, col) {
+                        return (Captured, Some(Message::OpenUrl(url)));
+                    }
+                }
+                if modes.reporting && !shift {
+                    let base = match btn {
+                        Button::Middle => 1,
+                        Button::Right => 2,
+                        _ => 0,
+                    };
+                    state.report_button = Some(base);
+                    state.last_report_cell = (row, col);
+                    let bytes = encode_mouse(modes, base, false, false, col, row,
+                        state.modifiers.alt(), state.modifiers.control());
+                    return match bytes {
+                        Some(b) => (Captured, Some(Message::MouseReport(self.pane, b, true))),
+                        None => (Captured, Some(Message::Focus(self.pane))),
+                    };
+                }
+                if btn == Button::Left {
                     let now = std::time::Instant::now();
                     let multi = state.last_cell == (row, col)
                         && state.last_click.is_some_and(|t| now.duration_since(t) < CLICK_THRESHOLD);
@@ -5827,10 +6688,9 @@ impl shader::Program<Message> for TermProgram {
                     self.term.lock().unwrap().start_selection(row, col, right, kind);
                     state.dragging = true;
                     state.autoscroll = 0;
-                    (Captured, Some(Message::Focus(self.pane)))
-                } else {
-                    (Ignored, None)
+                    return (Captured, Some(Message::Focus(self.pane)));
                 }
+                (Ignored, None)
             }
             // Drag: extend the selection. Past the top/bottom edge, arm
             // auto-scroll (applied per frame in RedrawRequested) and clamp the
@@ -5855,6 +6715,36 @@ impl shader::Program<Message> for TermProgram {
                 }
                 captured
             }
+            // Mouse-report motion: drag (?1002, while a button is held) or
+            // any-motion (?1003). One event per cell crossed; Shift = local.
+            shader::Event::Mouse(CursorMoved { .. }) => {
+                let modes = self.term.lock().unwrap().mouse_modes();
+                if !modes.reporting || state.modifiers.shift() {
+                    return (Ignored, None);
+                }
+                let held = state.report_button;
+                let want = match held {
+                    Some(_) => modes.report_drag || modes.report_motion,
+                    None => modes.report_motion,
+                };
+                if !want {
+                    return (Ignored, None);
+                }
+                let Some(pos) = cursor.position_in(bounds) else {
+                    return (Ignored, None);
+                };
+                let (row, col, _) = cell_at(pos, bounds, &self.term);
+                if (row, col) == state.last_report_cell {
+                    return (Ignored, None);
+                }
+                state.last_report_cell = (row, col);
+                let base = held.unwrap_or(3); // 3 = no button (?1003 hover)
+                match encode_mouse(modes, base, true, false, col, row,
+                    state.modifiers.alt(), state.modifiers.control()) {
+                    Some(b) => (Captured, Some(Message::MouseReport(self.pane, b, false))),
+                    None => (Ignored, None),
+                }
+            }
             // Continuous auto-scroll while a drag is held past an edge.
             shader::Event::RedrawRequested(_) if state.dragging && state.autoscroll != 0 => {
                 let mut t = self.term.lock().unwrap();
@@ -5863,13 +6753,55 @@ impl shader::Program<Message> for TermProgram {
                 t.update_selection(r, c, right);
                 (Ignored, None)
             }
-            shader::Event::Mouse(ButtonReleased(Button::Left)) if state.dragging => {
-                state.dragging = false;
-                state.autoscroll = 0;
+            shader::Event::Mouse(ButtonReleased(btn))
+                if matches!(btn, Button::Left | Button::Middle | Button::Right) =>
+            {
+                // A reported press → report the matching release.
+                if let Some(base) = state.report_button.take() {
+                    let modes = self.term.lock().unwrap().mouse_modes();
+                    if modes.reporting && !state.modifiers.shift() {
+                        let (row, col) = cursor
+                            .position_in(bounds)
+                            .map(|p| {
+                                let (r, c, _) = cell_at(p, bounds, &self.term);
+                                (r, c)
+                            })
+                            .unwrap_or(state.last_report_cell);
+                        if let Some(b) = encode_mouse(modes, base, false, true, col, row,
+                            state.modifiers.alt(), state.modifiers.control()) {
+                            return (Captured, Some(Message::MouseReport(self.pane, b, false)));
+                        }
+                    }
+                    return captured;
+                }
+                // End a local selection drag.
+                if state.dragging {
+                    state.dragging = false;
+                    state.autoscroll = 0;
+                }
                 captured
             }
             _ => (Ignored, None),
         }
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &Self::State,
+        bounds: Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> iced::mouse::Interaction {
+        // Pointer cursor over a detected link (web parity). Skip while dragging a
+        // selection so the cursor doesn't flicker.
+        if !state.dragging {
+            if let Some(pos) = cursor.position_in(bounds) {
+                let (row, col, _) = cell_at(pos, bounds, &self.term);
+                if self.term.lock().unwrap().link_at(row, col).is_some() {
+                    return iced::mouse::Interaction::Pointer;
+                }
+            }
+        }
+        iced::mouse::Interaction::default()
     }
 
     fn draw(&self, _state: &Self::State, _cursor: iced::mouse::Cursor, _bounds: Rectangle) -> Self::Primitive {
@@ -6088,6 +7020,14 @@ fn main() -> iced::Result {
                 // tends to restore the DWM rounded corners.
                 settings.platform_specific.undecorated_shadow = true;
             }
+            // App icon (the polished squircle tile, same on every platform) for the
+            // taskbar / app switcher of the running window. On macOS the dock uses
+            // the bundle's .icns; this covers Windows/Linux + the live window.
+            if let Ok(icon) =
+                iced::window::icon::from_file_data(include_bytes!("../../icons/128x128@2x.png"), None)
+            {
+                settings.icon = Some(icon);
+            }
             // Enforce a sane minimum so the window can never be stuck tiny (and so
             // a future drag-resize can't shrink it past usability).
             settings.min_size = Some(iced::Size::new(720.0, 480.0));
@@ -6181,6 +7121,12 @@ fn main() -> iced::Result {
                 info_pane: None,
                 rename_confirm: None,
                 rename_ws: None,
+                find_open: false,
+                find_query: String::new(),
+                explorer_menu: None,
+                explorer_rename: None,
+                explorer_delete: None,
+                modifiers: iced::keyboard::Modifiers::default(),
             };
             (state, iced::Task::batch(tasks))
         })
@@ -6188,7 +7134,39 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_model, hsl_to_rgb, worktree_avatar};
+    use super::{clean_model, encode_mouse, hsl_to_rgb, worktree_avatar, MouseModes};
+
+    fn sgr() -> MouseModes {
+        MouseModes { reporting: true, sgr: true, ..Default::default() }
+    }
+    fn legacy() -> MouseModes {
+        MouseModes { reporting: true, ..Default::default() }
+    }
+
+    #[test]
+    fn sgr_mouse_encoding() {
+        // Left press / release at the top-left cell (1-based coords).
+        assert_eq!(encode_mouse(sgr(), 0, false, false, 0, 0, false, false).unwrap(), b"\x1b[<0;1;1M");
+        assert_eq!(encode_mouse(sgr(), 0, false, true, 0, 0, false, false).unwrap(), b"\x1b[<0;1;1m");
+        // Wheel-up carries no range cap and stays a press ('M').
+        assert_eq!(encode_mouse(sgr(), 64, false, false, 5, 10, false, false).unwrap(), b"\x1b[<64;6;11M");
+        // Ctrl adds 16; a left drag adds the 32 motion bit.
+        assert_eq!(encode_mouse(sgr(), 0, false, false, 0, 0, false, true).unwrap(), b"\x1b[<16;1;1M");
+        assert_eq!(encode_mouse(sgr(), 0, true, false, 2, 3, false, false).unwrap(), b"\x1b[<32;3;4M");
+    }
+
+    #[test]
+    fn legacy_mouse_encoding() {
+        // `CSI M` + (32+cb) + (32+1+col) + (32+1+row).
+        assert_eq!(encode_mouse(legacy(), 0, false, false, 0, 0, false, false).unwrap(), b"\x1b[M\x20\x21\x21");
+        // Release in legacy mode is button 3 regardless of which button.
+        assert_eq!(encode_mouse(legacy(), 0, false, true, 0, 0, false, false).unwrap(), b"\x1b[M\x23\x21\x21");
+        // Out of single-byte range (>223) yields nothing without UTF-8 mode.
+        assert!(encode_mouse(legacy(), 0, false, false, 300, 0, false, false).is_none());
+        // UTF-8 mode (?1005) two-byte-encodes a far column instead of dropping it.
+        let utf8 = MouseModes { reporting: true, utf8: true, ..Default::default() };
+        assert!(encode_mouse(utf8, 0, false, false, 300, 0, false, false).is_some());
+    }
 
     #[test]
     fn worktree_avatar_draws_without_panic() {
