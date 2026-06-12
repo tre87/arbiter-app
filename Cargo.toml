@@ -109,7 +109,9 @@ muda = { version = "0.13", optional = true }
 # extra flags. Opt out with `--no-default-features` for a lean build (no wry/tao;
 # on Linux that also avoids needing webkit2gtk dev libs).
 default = ["usage-helper"]
-usage-helper = ["dep:wry", "dep:tao", "dep:muda"]
+# webview2-com is Windows-only (declared under [target.'cfg(windows)'.dependencies]),
+# so this `dep:` activates it only when targeting Windows; mac builds ignore it.
+usage-helper = ["dep:wry", "dep:tao", "dep:muda", "dep:webview2-com"]
 
 # Platform-native glyph rasterisation so terminal text matches the OS's own text
 # rendering (and thus the webview): CoreText on macOS. Versions pinned to those
@@ -148,6 +150,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Imaging",
     "Win32_Graphics_Dxgi_Common",
 ] }
+# WebView2 suspend/resume (ICoreWebView2_3) for the hidden usage helper — keeps the
+# backgrounded renderer fetching. Same version wry 0.45 uses (windows-core 0.58, so
+# no duplicate). Optional, pulled only by the usage-helper feature.
+webview2-com = { version = "0.33", optional = true }
 
 # Embed the app icon into the Windows .exe (Explorer + the NSIS shortcut show it).
 # cargo-packager doesn't modify the binary, so the icon must be a Win32 resource

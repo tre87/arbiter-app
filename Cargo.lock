@@ -166,6 +166,7 @@ dependencies = [
  "tao",
  "tiny-skia",
  "trash",
+ "webview2-com",
  "wgpu",
  "windows 0.58.0",
  "winit",

@@ -31,6 +31,55 @@ enum UserEvent {
     SignOut,
     /// Refetch usage now (the app's refresh button / countdown rollover).
     Fetch,
+    /// Windows: put the hidden renderer back to sleep (TrySuspend) once its data has
+    /// posted, until the next Fetch wakes it. See the suspend/resume lifecycle below.
+    #[cfg(target_os = "windows")]
+    Sleep,
+}
+
+/// Windows WebView2 suspend/resume lifecycle for the HIDDEN helper. A hidden
+/// window's renderer is backgrounded by Chromium and defers `ExecuteScript`
+/// indefinitely, so the refetch silently stops after a while (the flags don't keep
+/// a surface-less renderer running JS). Microsoft's documented fix for "an
+/// invisible WebView that syncs data" (`ICoreWebView2_3`): keep the controller
+/// `IsVisible=false` and suspended, and per refresh `Resume` → fetch → `TrySuspend`.
+/// macOS (WKWebView) doesn't freeze, so it skips all of this.
+#[cfg(target_os = "windows")]
+mod win_suspend {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+    use webview2_com::TrySuspendCompletedHandler;
+    use windows::core::Interface;
+    use windows::Win32::Foundation::BOOL;
+    use wry::{WebView, WebViewExtWindows};
+
+    fn wv3(webview: &WebView) -> Option<ICoreWebView2_3> {
+        let core = unsafe { webview.controller().CoreWebView2() }.ok()?;
+        core.cast::<ICoreWebView2_3>().ok()
+    }
+
+    /// Show/hide the WebView2 controller, independent of the OS window. Must be
+    /// false for `TrySuspend` to be allowed (else it errors `ERROR_INVALID_STATE`).
+    pub fn set_visible(webview: &WebView, visible: bool) {
+        let _ = unsafe { webview.controller().SetIsVisible(BOOL::from(visible)) };
+    }
+
+    /// Wake a suspended renderer so its JavaScript (the in-page refetch) runs again.
+    pub fn resume(webview: &WebView) {
+        if let Some(w3) = wv3(webview) {
+            let _ = unsafe { w3.Resume() };
+        }
+    }
+
+    /// Suspend the (already-invisible) renderer until the next `resume`. Fire and
+    /// forget — the completion result doesn't matter to us.
+    pub fn suspend(webview: &WebView) {
+        if let Some(w3) = wv3(webview) {
+            let handler = TrySuspendCompletedHandler::create(Box::new(
+                |_result: windows::core::Result<()>, _success: bool| Ok(()),
+            ));
+            let _ = unsafe { w3.TrySuspend(&handler) };
+        }
+    }
 }
 
 /// Where WebView2 / WKWebView stores the claude.ai session (cookies) — a stable
@@ -176,6 +225,14 @@ pub fn run() {
             if body.contains("\"ok\":true") || body.contains("needs_org") {
                 let _ = ipc_proxy.send_event(UserEvent::Hide);
             }
+            // Windows: data's in → re-suspend the hidden renderer until the next
+            // refresh (Hide, sent just above, made the controller invisible first so
+            // TrySuspend is allowed). Not on needs_org — a SetOrg refetch follows and
+            // needs the renderer awake.
+            #[cfg(target_os = "windows")]
+            if body.contains("\"ok\":true") {
+                let _ = ipc_proxy.send_event(UserEvent::Sleep);
+            }
         });
     // Windows (WebView2): a hidden renderer is otherwise throttled/backgrounded by
     // Chromium, which freezes the usage poll timer AND the on-demand refetch — so
@@ -212,6 +269,13 @@ pub fn run() {
                     use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
                     _target.set_activation_policy_at_runtime(ActivationPolicy::Regular);
                 }
+                // Wake + show the webview controller before the OS window (per the
+                // WebView2 docs' restore example: Resume then IsVisible=true).
+                #[cfg(target_os = "windows")]
+                {
+                    win_suspend::resume(&webview);
+                    win_suspend::set_visible(&webview, true);
+                }
                 window.set_visible(true);
                 window.set_focus();
                 #[cfg(target_os = "macos")]
@@ -219,6 +283,11 @@ pub fn run() {
             }
             Event::UserEvent(UserEvent::Hide) => {
                 window.set_visible(false);
+                // Mark the controller invisible (so a following Sleep's TrySuspend is
+                // allowed). Stays resumed until Sleep — so a SetOrg refetch after
+                // needs_org still runs.
+                #[cfg(target_os = "windows")]
+                win_suspend::set_visible(&webview, false);
                 #[cfg(target_os = "macos")]
                 {
                     use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
@@ -231,26 +300,21 @@ pub fn run() {
                 udbg(&format!("SetOrg({uuid}) → evaluate_script ok={}", r.is_ok()));
             }
             Event::UserEvent(UserEvent::Fetch) => {
-                // Windows only: a hidden window's renderer freezes background JS, so
-                // evaluate_script gets queued-but-never-run (returns ok, nothing
-                // happens — see the "Fetch ok, no ipc post" logs). A navigation spins
-                // up a fresh, awake renderer that re-runs INIT_SCRIPT → fetchUsage,
-                // exactly like launch (which always works). The org is persisted in
-                // localStorage so the reload fetches straight to data, no re-prompt.
+                // Windows: the hidden renderer is suspended between refreshes (see
+                // win_suspend), so wake it first, then refetch in-page. The `ok` post
+                // that comes back triggers UserEvent::Sleep (via the IPC handler) to
+                // re-suspend it until the next refresh.
                 #[cfg(target_os = "windows")]
-                {
-                    let r = webview.load_url("https://claude.ai/");
-                    udbg(&format!("Fetch → reload ok={}", r.is_ok()));
-                }
-                // macOS (WKWebView) doesn't freeze a hidden webview, so the lightweight
-                // in-page refetch works — no full reload needed.
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let r = webview.evaluate_script(
-                        "window.__arbiterRefetchUsage && window.__arbiterRefetchUsage()",
-                    );
-                    udbg(&format!("Fetch → refetch ok={}", r.is_ok()));
-                }
+                win_suspend::resume(&webview);
+                let r = webview
+                    .evaluate_script("window.__arbiterRefetchUsage && window.__arbiterRefetchUsage()");
+                udbg(&format!("Fetch → refetch ok={}", r.is_ok()));
+            }
+            #[cfg(target_os = "windows")]
+            Event::UserEvent(UserEvent::Sleep) => {
+                // Data has posted; put the (invisible) renderer back to sleep until the
+                // next Fetch wakes it. No-op if the window is showing for sign-in.
+                win_suspend::suspend(&webview);
             }
             Event::UserEvent(UserEvent::SignOut) => {
                 // Clears ONLY this webview's data (claude.ai cookies) — nothing else
@@ -261,6 +325,8 @@ pub fn run() {
             // Closing the sign-in window just hides it; we keep polling in the bg.
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 window.set_visible(false);
+                #[cfg(target_os = "windows")]
+                win_suspend::set_visible(&webview, false);
                 #[cfg(target_os = "macos")]
                 {
                     use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
@@ -315,9 +381,9 @@ const INIT_SCRIPT: &str = r#"
     catch (_) { return null; }
   }
   // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg).
-  // Persisted in claude.ai localStorage so a refresh-RELOAD picks it up and fetches
-  // straight to data — no needs_org round-trip, so the bar updates in place with no
-  // "loading" blip. Falls back to the in-page value across same-page re-injection.
+  // Persisted in claude.ai localStorage so it survives a page reload/navigation
+  // (sign-out, or any SPA reload) and the webview fetches straight to data with no
+  // needs_org round-trip. Falls back to the in-page value across same-page re-injection.
   window.__arbiterOrg = window.__arbiterOrg
     || (function () { try { return localStorage.getItem('arbiterUsageOrg'); } catch (_) { return null; } })()
     || null;
