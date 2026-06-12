@@ -875,9 +875,31 @@ fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, c
 /// (1 byte/px) and colour (RGBA) coverage. No-op when the glyph already fits.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphBitmap {
-    if bmp.width <= box_w && bmp.height <= box_h {
-        return bmp;
+    let base = baseline.round() as i32;
+    let top_y = base - bmp.top; // glyph's top edge vs the cell top (= blit's base_y)
+    let h_over = bmp.left < 0 || bmp.left + bmp.width as i32 > box_w as i32;
+    let v_over = top_y < 0 || top_y + bmp.height as i32 > box_h as i32;
+    let size_over = bmp.width > box_w || bmp.height > box_h;
+
+    if !size_over {
+        if !h_over && !v_over {
+            return bmp; // fits as-is
+        }
+        // Fits by SIZE but a skewed bearing pushes part past the cell edge (e.g. ⏵,
+        // whose fallback glyph carries a large left bearing → its tip was clipped).
+        // Recenter the overflowing axis only; no scaling → no quality loss.
+        let left =
+            if h_over { ((box_w as f32 - bmp.width as f32) / 2.0).round() as i32 } else { bmp.left };
+        let top = if v_over {
+            base - ((box_h as f32 - bmp.height as f32) / 2.0).round() as i32
+        } else {
+            bmp.top
+        };
+        return GlyphBitmap { left, top, ..bmp };
     }
+
+    // Oversized: scale down to fit, centered. The blit draws the top at
+    // `baseline - top`, so back `top` out from the desired offset from the box top.
     let s = (box_w as f32 / bmp.width as f32).min(box_h as f32 / bmp.height as f32);
     let nw = ((bmp.width as f32 * s).round() as u32).max(1);
     let nh = ((bmp.height as f32 * s).round() as u32).max(1);
@@ -886,11 +908,8 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     } else {
         resample_coverage(&bmp.coverage, bmp.width, bmp.height, nw, nh)
     };
-    // Center horizontally and vertically in the box. The blit draws the top at
-    // `baseline - top`, so back `top` out from the desired offset from the box top.
     let left = ((box_w as f32 - nw as f32) / 2.0).round() as i32;
-    let top_from_box_top = ((box_h as f32 - nh as f32) / 2.0).round();
-    let top = (baseline.round() - top_from_box_top) as i32;
+    let top = base - ((box_h as f32 - nh as f32) / 2.0).round() as i32;
     GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color }
 }
 
@@ -992,6 +1011,17 @@ mod tests {
     fn fitting_glyph_left_untouched() {
         let out = fit_to_box(glyph(6, 12), 8, 16, 13.0);
         assert_eq!((out.width, out.height), (6, 12));
+    }
+
+    #[test]
+    fn position_overflow_recentered_without_scaling() {
+        // ⏵-like: fits by size (5≤7, 8≤14) but a left bearing of 4 pushes the right
+        // tip past the 7-wide cell (4+5=9). Recenter horizontally, no scaling.
+        let bmp = GlyphBitmap { left: 4, top: 8, width: 5, height: 8, coverage: vec![200u8; 5 * 8], color: false };
+        let out = fit_to_box(bmp, 7, 14, 11.0);
+        assert_eq!((out.width, out.height), (5, 8)); // unchanged — no rescale
+        assert_eq!(out.left, 1); // (7-5)/2, centered
+        assert_eq!(out.top, 8); // fits vertically → untouched
     }
 
     #[test]
