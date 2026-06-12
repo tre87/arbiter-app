@@ -1962,6 +1962,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if i < state.workspaces.len() {
                 state.active = i;
                 state.tab_drag = Some(TabDrag { from: i, over: i });
+                set_cursor_over_tab(true); // we're on a tab → this gesture reorders
             }
         }
         Message::TabDragOver(i) => {
@@ -1977,7 +1978,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.hovered_tab == Some(i) {
                 state.hovered_tab = None;
             }
-            set_cursor_over_tab(false); // left a tab → a press now moves the window
+            // While a drag is in flight, keep the flag latched — hover churn from the
+            // moving insertion line must not flip it and hand the drag to AppKit.
+            if state.tab_drag.is_none() {
+                set_cursor_over_tab(false); // left a tab → a press now moves the window
+            }
         }
         Message::TabDragEnd => {
             if let Some(d) = state.tab_drag.take() {
@@ -1990,6 +1995,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 save_session(state); // persist the new order + selection
             }
+            // Drag over → unlatch the flag to match where the cursor actually sits, so
+            // the next press on the brand/empty area moves the window again.
+            set_cursor_over_tab(state.hovered_tab.is_some());
         }
         Message::Noop => {}
         Message::ToggleOverview => {
@@ -4799,8 +4807,10 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     // row never exceeds the band — no clip needed (clipping cut the last tab's ×).
     // Right-click a tab to rename it.
     let mut tabs = row![].spacing(3).align_y(iced::Center);
-    // While dragging, an azure insertion line marks the drop gap (0..=n).
-    let gap = state.tab_drag.map(|d| drop_gap(d.from, d.over));
+    // While actively dragging to a different slot, an azure insertion line marks the
+    // drop gap (0..=n). Not shown on a plain press (over == from) — a marker there
+    // would shift the tabs and, via the hover churn, flip the over-tab flag.
+    let gap = state.tab_drag.filter(|d| d.over != d.from).map(|d| drop_gap(d.from, d.over));
     let n = state.workspaces.len();
     for (i, ws) in state.workspaces.iter().enumerate() {
         if gap == Some(i) {
