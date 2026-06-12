@@ -422,6 +422,11 @@ impl TermGpu {
             Some(bmp) if bmp.color => {
                 // Colour glyph → RGBA atlas. Emoji are double-width, so span 2 cells.
                 let cells = if wide_hint { 2 } else { 1 };
+                // Windows: scale a colour glyph that overflows its region to fit (e.g.
+                // ⏵, drawn as a Segoe UI Emoji glyph wider than its one cell, was
+                // clipped on the right). No-op when it already fits → emoji unchanged.
+                #[cfg(target_os = "windows")]
+                let bmp = fit_to_box(bmp, cells * self.cell_w, self.cell_h, self.baseline);
                 let slot = self.alloc_color(cells);
                 let cox = (slot % self.per_row) * self.cell_w;
                 let coy = (slot / self.per_row) * self.cell_h;
@@ -438,7 +443,7 @@ impl TermGpu {
                 // which would wrongly trigger a rescale + recenter and mangle normal
                 // text. Cascadia's metrics on Windows fit, so only real symbols trip it.
                 #[cfg(target_os = "windows")]
-                let bmp = fit_to_cell(bmp, self.cell_w, self.cell_h, self.baseline);
+                let bmp = fit_to_box(bmp, self.cell_w, self.cell_h, self.baseline);
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
                 self.next_slot += 1;
                 self.atlas_dirty = true;
@@ -845,26 +850,30 @@ fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, c
     }
 }
 
-/// Scale an oversized mono glyph down to fit its cell, centered, instead of letting
-/// `blit_glyph` clip the overflow. Fallback-font symbols Cascadia Mono lacks (e.g.
-/// `✻` / `⏵`, which Claude uses) are drawn near full-em and overflow the narrower
-/// monospace cell on Windows — clipping cut their edges/tips off. No-op when the
-/// glyph already fits (so platforms whose fallback glyphs fit are unchanged).
+/// Scale an oversized glyph down to fit `box_w`×`box_h`, centered, instead of letting
+/// the blit clip the overflow. Fallback-font symbols Cascadia Mono lacks (e.g. `✻`
+/// mono, or `⏵` as a Segoe UI Emoji colour glyph) are drawn near full-em and overflow
+/// the narrow cell on Windows — clipping cut their edges/tips off. Handles both mono
+/// (1 byte/px) and colour (RGBA) coverage. No-op when the glyph already fits.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn fit_to_cell(bmp: GlyphBitmap, cell_w: u32, cell_h: u32, baseline: f32) -> GlyphBitmap {
-    if bmp.width <= cell_w && bmp.height <= cell_h {
+fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphBitmap {
+    if bmp.width <= box_w && bmp.height <= box_h {
         return bmp;
     }
-    let s = (cell_w as f32 / bmp.width as f32).min(cell_h as f32 / bmp.height as f32);
+    let s = (box_w as f32 / bmp.width as f32).min(box_h as f32 / bmp.height as f32);
     let nw = ((bmp.width as f32 * s).round() as u32).max(1);
     let nh = ((bmp.height as f32 * s).round() as u32).max(1);
-    let coverage = resample_coverage(&bmp.coverage, bmp.width, bmp.height, nw, nh);
-    // Center horizontally and vertically in the cell. `blit_glyph` draws the top at
-    // `baseline - top`, so back `top` out from the desired offset from the cell top.
-    let left = ((cell_w as f32 - nw as f32) / 2.0).round() as i32;
-    let top_from_cell_top = ((cell_h as f32 - nh as f32) / 2.0).round();
-    let top = (baseline.round() - top_from_cell_top) as i32;
-    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: false }
+    let coverage = if bmp.color {
+        resample_rgba(&bmp.coverage, bmp.width, bmp.height, nw, nh)
+    } else {
+        resample_coverage(&bmp.coverage, bmp.width, bmp.height, nw, nh)
+    };
+    // Center horizontally and vertically in the box. The blit draws the top at
+    // `baseline - top`, so back `top` out from the desired offset from the box top.
+    let left = ((box_w as f32 - nw as f32) / 2.0).round() as i32;
+    let top_from_box_top = ((box_h as f32 - nh as f32) / 2.0).round();
+    let top = (baseline.round() - top_from_box_top) as i32;
+    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color }
 }
 
 /// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
@@ -885,6 +894,33 @@ fn resample_coverage(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> 
             let t = sample(x0, y0) * (1.0 - fx) + sample(x1, y0) * fx;
             let b = sample(x0, y1) * (1.0 - fx) + sample(x1, y1) * fx;
             out[(dy * dw + dx) as usize] = (t * (1.0 - fy) + b * fy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Bilinear-downscale a straight-alpha RGBA bitmap (4 bytes/px) from `sw`×`sh` to
+/// `dw`×`dh` — the colour-glyph counterpart of [`resample_coverage`].
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn resample_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    let sample = |x: u32, y: u32, c: usize| src[((y * sw + x) * 4) as usize + c] as f32;
+    for dy in 0..dh {
+        let sy = ((dy as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+        let y0 = (sy.floor() as u32).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = sy - y0 as f32;
+        for dx in 0..dw {
+            let sx = ((dx as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+            let x0 = (sx.floor() as u32).min(sw - 1);
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = sx - x0 as f32;
+            let d = ((dy * dw + dx) * 4) as usize;
+            for c in 0..4 {
+                let t = sample(x0, y0, c) * (1.0 - fx) + sample(x1, y0, c) * fx;
+                let b = sample(x0, y1, c) * (1.0 - fx) + sample(x1, y1, c) * fx;
+                out[d + c] = (t * (1.0 - fy) + b * fy).round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
     out
@@ -917,7 +953,7 @@ fn blit_color(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, region_w: u32,
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_to_cell, resample_coverage};
+    use super::{fit_to_box, resample_coverage};
     use crate::raster::GlyphBitmap;
 
     fn glyph(w: u32, h: u32) -> GlyphBitmap {
@@ -927,7 +963,7 @@ mod tests {
     #[test]
     fn oversized_glyph_scaled_into_cell_keeping_aspect() {
         // A 14×14 symbol in an 8×16 cell: width-constrained → 8×8, centered, no clip.
-        let out = fit_to_cell(glyph(14, 14), 8, 16, 13.0);
+        let out = fit_to_box(glyph(14, 14), 8, 16, 13.0);
         assert!(out.width <= 8 && out.height <= 16, "fits: {}x{}", out.width, out.height);
         assert_eq!((out.width, out.height), (8, 8));
         assert_eq!(out.coverage.len(), 64);
@@ -936,8 +972,18 @@ mod tests {
 
     #[test]
     fn fitting_glyph_left_untouched() {
-        let out = fit_to_cell(glyph(6, 12), 8, 16, 13.0);
+        let out = fit_to_box(glyph(6, 12), 8, 16, 13.0);
         assert_eq!((out.width, out.height), (6, 12));
+    }
+
+    #[test]
+    fn oversized_color_glyph_scaled_and_stays_rgba() {
+        // A 16×16 colour glyph in a 1-cell (8×16) region → 8×8 RGBA, centered.
+        let bmp = GlyphBitmap { left: 0, top: 16, width: 16, height: 16, coverage: vec![180u8; 16 * 16 * 4], color: true };
+        let out = fit_to_box(bmp, 8, 16, 13.0);
+        assert_eq!((out.width, out.height), (8, 8));
+        assert!(out.color);
+        assert_eq!(out.coverage.len(), 8 * 8 * 4);
     }
 
     #[test]
