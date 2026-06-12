@@ -5651,11 +5651,11 @@ mod trafficlights {
             }
             let transparent: bool = msg_send![window, titlebarAppearsTransparent];
             if transparent {
-                // Stop a content drag (e.g. grabbing a workspace tab) from moving the
-                // window, so tab drag-reorder isn't stolen as a window move. Explicit
-                // drags (brand / empty titlebar, via window::drag) still work since
-                // they use performWindowDragWithEvent, not background dragging.
-                let _: () = msg_send![window, setMovableByWindowBackground: false];
+                // Stop the OS titlebar/background drag (which moved the whole window
+                // when grabbing a workspace tab) so tab drag-reorder works. The brand
+                // / empty-titlebar drags still move the window — they call
+                // performWindowDragWithEvent, which is independent of `isMovable`.
+                let _: () = msg_send![window, setMovable: false];
                 inset_window(window);
             }
         }
