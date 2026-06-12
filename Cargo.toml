@@ -3,7 +3,7 @@ name = "arbiter-native"
 version = "1.0.4"
 edition = "2021"
 publish = false
-description = "Native (no-webview) Arbiter — Phase 0 spike. See ../NATIVE_PLAN.md"
+description = "Run many Claude Code sessions side by side"
 # Don't auto-discover bins: src/bin/file_icons.rs is a *module* of iced_shell
 # (sibling of the crate root), not a binary. List the real bins explicitly.
 autobins = false

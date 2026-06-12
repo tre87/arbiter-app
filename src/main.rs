@@ -1,4 +1,4 @@
-//! Arbiter native — Phase 0.1 + 0.2 spike (see ../NATIVE_PLAN.md).
+//! Arbiter native — Phase 0.1 + 0.2 spike.
 //!
 //! A winit window + wgpu renderer drawing a LIVE terminal (real PTY → alacritty
 //! parse → glyph-atlas/instanced-quad draw), with NO webview and NO Tauri. This
