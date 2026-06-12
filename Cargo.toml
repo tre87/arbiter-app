@@ -1,6 +1,6 @@
 [package]
 name = "arbiter-native"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 publish = false
 description = "Native (no-webview) Arbiter — Phase 0 spike. See ../NATIVE_PLAN.md"
