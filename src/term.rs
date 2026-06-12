@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -64,6 +65,24 @@ pub struct MouseModes {
 pub struct NoopListener;
 impl EventListener for NoopListener {}
 
+/// Captures the terminal's PTY replies into a shared buffer. alacritty emits a
+/// program's expected responses (cursor-position report for `ESC[6n`, device
+/// attributes for `ESC[c`, mode/status reports, …) as `Event::PtyWrite`; the
+/// reader loop drains this after each `feed` and writes it back to the PTY. With
+/// the old `NoopListener` these replies were dropped, so query-driven programs
+/// (vim, many .NET / Spectre.Console UIs) would hang or misread their own input.
+#[derive(Clone, Default)]
+pub struct Responder {
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+impl EventListener for Responder {
+    fn send_event(&self, event: alacritty_terminal::event::Event) {
+        if let alacritty_terminal::event::Event::PtyWrite(text) = event {
+            self.buf.lock().unwrap().extend_from_slice(text.as_bytes());
+        }
+    }
+}
+
 /// Scrollback lines kept per terminal (Settings → "Terminal scrollback lines").
 /// A global so new terminals pick up the setting without threading it through
 /// every `Session::spawn`/`VtTerm::new` call site; existing grids keep their size.
@@ -81,7 +100,7 @@ impl Dimensions for Size {
 }
 
 pub struct VtTerm {
-    term: Term<NoopListener>,
+    term: Term<Responder>,
     parser: Processor,
     palette: [Rgb; 256],
     default_fg: Rgb,
@@ -91,13 +110,17 @@ pub struct VtTerm {
     /// fade the scroll indicator out. Not set by output or jump-to-bottom, so the
     /// indicator never flashes while text merely streams in.
     last_scroll: Option<std::time::Instant>,
+    /// PTY replies the term produced (query responses), drained by the reader loop
+    /// and written back to the PTY. Shared with the `Responder` event sink.
+    responses: Arc<Mutex<Vec<u8>>>,
 }
 
 impl VtTerm {
     pub fn new(cols: usize, rows: usize) -> Self {
         let mut config = Config::default();
         config.scrolling_history = SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed);
-        let term = Term::new(config, &Size { cols, rows }, NoopListener);
+        let responses: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let term = Term::new(config, &Size { cols, rows }, Responder { buf: responses.clone() });
         Self {
             term,
             parser: Processor::new(),
@@ -109,11 +132,19 @@ impl VtTerm {
             default_bg: Rgb { r: 0x12, g: 0x12, b: 0x12 },
             search: None,
             last_scroll: None,
+            responses,
         }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Drain the terminal's pending PTY replies (responses to queries the running
+    /// program sent, e.g. cursor-position or device-attribute requests) so the
+    /// caller can write them back to the PTY. Empty when nothing was asked.
+    pub fn take_responses(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.responses.lock().unwrap())
     }
 
     /// Set the find query: collect all matches over the grid (incl. scrollback)

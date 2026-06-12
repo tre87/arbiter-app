@@ -35,7 +35,12 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
 pub struct Session {
     /// Unique, stable id — used to key this session's per-pane GPU renderer.
     id: u64,
-    writer: Box<dyn Write + Send>,
+    // All PTY input is funnelled through a dedicated writer thread via this
+    // channel: the UI thread's keystrokes AND the reader thread's query replies
+    // (cursor-position / device-attribute responses). Sending never blocks, so a
+    // slow/blocking PTY write can't wedge the reader (which must keep draining
+    // output) or freeze the UI.
+    writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
     master: SharedMaster,
     term: SharedTerm,
     cwd: Arc<Mutex<Option<String>>>,
@@ -61,8 +66,21 @@ impl Session {
         let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
         let shell_pid = child.process_id();
         drop(pair.slave); // child keeps its own handle
-        let writer = pair.master.take_writer().map_err(io_err)?;
+        let raw_writer = pair.master.take_writer().map_err(io_err)?;
         let reader = pair.master.try_clone_reader().map_err(io_err)?;
+        // Dedicated writer thread: serializes all PTY input (keystrokes + query
+        // replies) off the reader/UI threads. A blocking write here can't deadlock
+        // the reader, which must keep draining output for the slave to make progress.
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut w = raw_writer;
+            while let Ok(bytes) = writer_rx.recv() {
+                if w.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = w.flush();
+            }
+        });
 
         let term: SharedTerm = Arc::new(Mutex::new(VtTerm::new(cols as usize, rows as usize)));
         let cwd = Arc::new(Mutex::new(None));
@@ -87,8 +105,9 @@ impl Session {
             let git = git.clone();
             let watcher = watcher.clone();
             let cmd_epoch = cmd_epoch.clone();
+            let writer_tx = writer_tx.clone();
             std::thread::spawn(move || {
-                reader_loop(reader, term, cwd, shell_idle, claude, git, watcher, cmd_epoch)
+                reader_loop(reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch)
             });
         }
 
@@ -102,7 +121,7 @@ impl Session {
 
         Ok(Self {
             id,
-            writer,
+            writer_tx,
             master: Arc::new(Mutex::new(pair.master)),
             term,
             cwd,
@@ -162,8 +181,7 @@ impl Session {
     pub fn shell_idle(&self) -> Option<bool> { *self.shell_idle.lock().unwrap() }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        let _ = self.writer_tx.send(bytes.to_vec());
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -189,6 +207,7 @@ fn chunk_has_spinner(bytes: &[u8]) -> bool {
 
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
+    writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
     term: SharedTerm,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
@@ -231,8 +250,21 @@ fn reader_loop(
             continue;
         }
 
-        // Feed the full byte stream to the grid (alacritty parses VT incl. OSC).
-        term.lock().unwrap().feed(valid);
+        // Feed the full byte stream to the grid (alacritty parses VT incl. OSC),
+        // then write back any replies it produced — responses to queries the
+        // running program sent (cursor position, device attributes, status). Apps
+        // like vim or .NET/Spectre console UIs wait on these; dropping them made
+        // their input handling misbehave.
+        let responses = {
+            let mut t = term.lock().unwrap();
+            t.feed(valid);
+            t.take_responses()
+        };
+        if !responses.is_empty() {
+            // Hand off to the writer thread — never write from here, or a blocking
+            // PTY write would stop us draining output and could deadlock the slave.
+            let _ = writer_tx.send(responses);
+        }
 
         // Tier-3b: while Claude runs here, reflect the live turn from the *rendered
         // screen* (level-triggered, so attention clears the instant a menu leaves —
