@@ -200,11 +200,13 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
             || orig.trim_start().starts_with("sh ");
         match crate::shell::detect_git_bash().filter(|_| looks_bash) {
             Some(bash) => {
+                debug_log(&format!("forward: via git-bash {bash:?} orig={orig:?}"));
                 let mut c = std::process::Command::new(bash);
                 c.arg("-c").arg(orig);
                 c
             }
             None => {
+                debug_log(&format!("forward: via cmd /C orig={orig:?} (no git-bash / not bash)"));
                 let mut c = std::process::Command::new("cmd");
                 c.arg("/C").arg(orig);
                 c
@@ -219,14 +221,30 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
     };
 
     cmd.stdin(std::process::Stdio::piped());
+    // On Windows: (1) CREATE_NO_WINDOW so spawning cmd/bash from this GUI-subsystem
+    // process doesn't flash a console window on every status-line render; (2) discard
+    // the child's stderr so a failed launch (e.g. `bash` not resolvable from cmd,
+    // invalid /c/... path) can't leak its error text into the terminal / Claude's
+    // status area (the reported `0x800700E8`). Stdout still passes through, so a
+    // working status line renders normally.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd.stderr(std::process::Stdio::null());
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            debug_log(&format!("forward: spawn failed: {e}"));
+            return;
+        }
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_bytes);
     }
-    let _ = child.wait();
+    let status = child.wait();
+    debug_log(&format!("forward: child exited {status:?}"));
 }
 
 // ── Reading captures back (the footer's Tier-2 stats) ────────────────────────
