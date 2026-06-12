@@ -619,8 +619,9 @@ enum Message {
     /// Result of querying the main window's maximized state (Windows caption glyph).
     #[cfg(target_os = "windows")]
     SetMaximized(bool),
-    /// Custom titlebar (Windows, decorations off): drag the window + window controls.
-    #[cfg(target_os = "windows")]
+    /// Custom titlebar (decorations off): drag the window. Windows uses window::drag;
+    /// macOS suppresses AppKit's drag and moves the window manually (trafficlights).
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     DragWindow,
     #[cfg(target_os = "windows")]
     WinMinimize,
@@ -867,16 +868,6 @@ fn on_screen_ish(p: iced::Point) -> bool {
     p.x > -30000.0 && p.y > -30000.0 && p.x < 30000.0 && p.y < 30000.0
 }
 
-/// Tell the macOS `mouseDownCanMoveWindow` override whether the cursor is over a
-/// tab, so a tab drag reorders (window stays) while a brand/empty-area drag still
-/// moves the window. No-op off macOS.
-fn set_cursor_over_tab(over: bool) {
-    #[cfg(target_os = "macos")]
-    trafficlights::CURSOR_OVER_TAB.store(over, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(target_os = "macos"))]
-    let _ = over;
-}
-
 /// Reorder workspace tabs: move the one at `from` to index `to`, keeping the
 /// active workspace selected (its index follows the move). Caller persists.
 fn move_workspace(state: &mut State, from: usize, to: usize) {
@@ -1076,6 +1067,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CursorMoved(p) => {
             state.cursor = p;
+            // Drive the manual window drag (no-op unless begin_drag is active).
+            #[cfg(target_os = "macos")]
+            trafficlights::drag_update();
         }
         Message::UsageUpdated(mut data) => {
             // Only stamp the refresh countdown when real data arrives (not on a
@@ -1962,12 +1956,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if i < state.workspaces.len() {
                 state.active = i;
                 state.tab_drag = Some(TabDrag { from: i, over: i });
-                set_cursor_over_tab(true); // we're on a tab → this gesture reorders
             }
         }
         Message::TabDragOver(i) => {
             state.hovered_tab = Some(i);
-            set_cursor_over_tab(true); // so a press here reorders, doesn't move window
             if let Some(d) = state.tab_drag.as_mut() {
                 if i < state.workspaces.len() {
                     d.over = i;
@@ -1977,11 +1969,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::TabExit(i) => {
             if state.hovered_tab == Some(i) {
                 state.hovered_tab = None;
-            }
-            // While a drag is in flight, keep the flag latched — hover churn from the
-            // moving insertion line must not flip it and hand the drag to AppKit.
-            if state.tab_drag.is_none() {
-                set_cursor_over_tab(false); // left a tab → a press now moves the window
             }
         }
         Message::TabDragEnd => {
@@ -1995,9 +1982,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 save_session(state); // persist the new order + selection
             }
-            // Drag over → unlatch the flag to match where the cursor actually sits, so
-            // the next press on the brand/empty area moves the window again.
-            set_cursor_over_tab(state.hovered_tab.is_some());
+            // A left release also ends any manual window drag (begin_drag → here).
+            #[cfg(target_os = "macos")]
+            trafficlights::end_drag();
         }
         Message::Noop => {}
         Message::ToggleOverview => {
@@ -2108,8 +2095,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 set_ui_scale(s); // crisp titlebar icons rasterise at this scale
             }
         }
-        #[cfg(target_os = "windows")]
-        Message::DragWindow => return iced::window::drag(state.main_window),
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        Message::DragWindow => {
+            // macOS: AppKit's drag is suppressed (disable_appkit_drag) and
+            // window::drag fires too late to catch the live event, so move the
+            // window ourselves — capture the start; CursorMoved follows the mouse.
+            #[cfg(target_os = "macos")]
+            trafficlights::begin_drag();
+            #[cfg(not(target_os = "macos"))]
+            return iced::window::drag(state.main_window);
+        }
         #[cfg(target_os = "windows")]
         Message::WinMinimize => return iced::window::minimize(state.main_window, true),
         #[cfg(target_os = "windows")]
@@ -4769,7 +4764,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     ]
     .spacing(8)
     .align_y(iced::Center);
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let brand = mouse_area(brand).on_press(Message::DragWindow);
 
     // Approximate widths of the fixed regions (logical px) to budget the tab band.
@@ -4839,12 +4834,13 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         .align_y(iced::Center)
         .height(Length::Fill);
 
-    // Flexible middle (drag region on Windows; spacer on macOS).
-    #[cfg(target_os = "windows")]
+    // Flexible middle: a window-drag region on the custom-titlebar platforms
+    // (Windows + macOS), a plain spacer elsewhere.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         bar = bar.push(mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragWindow));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         bar = bar.push(horizontal_space());
     }
@@ -5638,8 +5634,9 @@ mod winround {
 #[cfg(target_os = "macos")]
 mod trafficlights {
     use objc2::{class, msg_send, runtime::AnyObject};
-    use objc2_foundation::{NSRect, NSString};
+    use objc2_foundation::{NSPoint, NSRect, NSString};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     // Web parity: Tauri `trafficLightPosition { x: 14, y: 22 }`.
     const INSET_X: f64 = 14.0;
@@ -5703,24 +5700,22 @@ mod trafficlights {
             }
             let transparent: bool = msg_send![window, titlebarAppearsTransparent];
             if transparent {
-                install_tab_aware_drag(window);
+                disable_appkit_drag(window);
                 inset_window(window);
             }
         }
     }
 
-    /// True while the cursor is over a workspace tab. iced keeps this current (via
-    /// the tab hover handlers); the `mouseDownCanMoveWindow` override reads it.
-    pub static CURSOR_OVER_TAB: AtomicBool = AtomicBool::new(false);
-
-    /// Override the content view's `mouseDownCanMoveWindow` so it returns NO only
-    /// while the cursor is over a tab (AppKit won't drag the window → iced reorders)
-    /// and YES everywhere else (a press on the brand / empty titlebar moves the
-    /// window normally). A blanket NO — or `isMovable = NO` — also blocks the
-    /// brand drag (performWindowDragWithEvent honors the press-location movability),
-    /// so this per-press decision is the only way to get both. Installed once on
-    /// the (shared) winit view class.
-    unsafe fn install_tab_aware_drag(window: *mut AnyObject) {
+    /// Override the content view's `mouseDownCanMoveWindow` to always return NO, so
+    /// AppKit never starts its implicit titlebar drag. That implicit drag can't tell
+    /// a tab press (→ reorder) from a brand press (→ move window) — it fires on any
+    /// titlebar drag — and a per-press flag can't beat AppKit's mouse-down query.
+    /// iced's own `window::drag` runs a run-loop pass too late for
+    /// `performWindowDragWithEvent` to catch the live event. So we suppress AppKit
+    /// entirely and move the window ourselves (begin_drag / drag_update, driven from
+    /// the brand / empty-titlebar press + CursorMoved). Installed once on the
+    /// (shared) winit view class.
+    unsafe fn disable_appkit_drag(window: *mut AnyObject) {
         use objc2::runtime::{Bool, Sel};
         static DONE: AtomicBool = AtomicBool::new(false);
         if DONE.swap(true, Ordering::SeqCst) {
@@ -5734,23 +5729,97 @@ mod trafficlights {
         if cls.is_null() {
             return;
         }
-        extern "C" fn can_move(_this: *mut AnyObject, _sel: Sel) -> Bool {
-            if CURSOR_OVER_TAB.load(Ordering::Relaxed) {
-                Bool::NO
-            } else {
-                Bool::YES
-            }
+        extern "C" fn no_move(_this: *mut AnyObject, _sel: Sel) -> Bool {
+            Bool::NO
         }
         let imp: objc2::ffi::IMP = Some(std::mem::transmute::<
             extern "C" fn(*mut AnyObject, Sel) -> Bool,
             unsafe extern "C" fn(),
-        >(can_move));
+        >(no_move));
         objc2::ffi::class_replaceMethod(
             cls as *mut objc2::ffi::objc_class,
             objc2::sel!(mouseDownCanMoveWindow).as_ptr(),
             imp,
             c"c@:".as_ptr(),
         );
+    }
+
+    /// In-progress manual window drag: (mouse_x, mouse_y, origin_x, origin_y) captured
+    /// at press, all in screen coords. Main-thread only; `Mutex` just satisfies the
+    /// `static` Sync bound.
+    static DRAG: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
+    /// Our main window (the transparent-titlebar one), or null. Looked up fresh — no
+    /// stored pointer — so it can't dangle across the app's lifetime.
+    unsafe fn main_window() -> *mut AnyObject {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return std::ptr::null_mut();
+        }
+        let windows: *mut AnyObject = msg_send![app, windows];
+        if windows.is_null() {
+            return std::ptr::null_mut();
+        }
+        let count: usize = msg_send![windows, count];
+        for i in 0..count {
+            let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+            if !w.is_null() {
+                let transparent: bool = msg_send![w, titlebarAppearsTransparent];
+                if transparent {
+                    return w;
+                }
+            }
+        }
+        std::ptr::null_mut()
+    }
+
+    /// The mouse location in screen coords (points, bottom-left origin) — the same
+    /// space as the window frame origin, so a drag delta just adds.
+    fn mouse_location() -> (f64, f64) {
+        unsafe {
+            let p: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            (p.x, p.y)
+        }
+    }
+
+    /// Start a window drag: remember where the mouse and the window were.
+    pub fn begin_drag() {
+        unsafe {
+            let w = main_window();
+            if w.is_null() {
+                return;
+            }
+            let frame: NSRect = msg_send![w, frame];
+            let (mx, my) = mouse_location();
+            *DRAG.lock().unwrap() = Some((mx, my, frame.origin.x, frame.origin.y));
+        }
+    }
+
+    /// Reposition the window to follow the mouse (called on each CursorMoved while a
+    /// drag is active). No-op if no drag is in progress.
+    pub fn drag_update() {
+        let start = *DRAG.lock().unwrap();
+        let Some((m0x, m0y, o0x, o0y)) = start else { return };
+        let (mx, my) = mouse_location();
+        unsafe {
+            let w = main_window();
+            if w.is_null() {
+                return;
+            }
+            let origin = NSPoint { x: o0x + (mx - m0x), y: o0y + (my - m0y) };
+            let _: () = msg_send![w, setFrameOrigin: origin];
+        }
+    }
+
+    /// End any in-progress window drag (on mouse release).
+    pub fn end_drag() {
+        *DRAG.lock().unwrap() = None;
+    }
+
+    /// Whether a window drag is in progress (so CursorMoved keeps flowing even off
+    /// the titlebar band, for fast drags).
+    pub fn is_dragging() -> bool {
+        DRAG.lock().unwrap().is_some()
     }
 
     unsafe fn inset_window(window: *mut AnyObject) {
@@ -6725,6 +6794,12 @@ fn subscription(_state: &State) -> Subscription<Message> {
         // the left strip (~240px, where the project file explorer sits, so its
         // right-click menu anchors under the click). Cheap — off over the terminals.
         if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = &event {
+            // While a window drag is in flight, forward every move (a fast drag can
+            // briefly carry the cursor off the titlebar band before the window catches up).
+            #[cfg(target_os = "macos")]
+            if trafficlights::is_dragging() {
+                return Some(Message::CursorMoved(*position));
+            }
             return (position.y < 44.0 || position.x < 240.0).then(|| Message::CursorMoved(*position));
         }
         // Any left-button release ends an in-progress workspace-tab drag (the drop
