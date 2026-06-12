@@ -103,6 +103,9 @@ pub struct Settings {
     /// default; toggle off to let it sit behind.
     #[serde(default = "default_true")]
     pub overview_topmost: bool,
+    /// Show the Claude usage bars as a footer in the overview window. On by default.
+    #[serde(default = "default_true")]
+    pub overview_usage_footer: bool,
     /// Hide the Git Bash / shell-switch button in the terminal header (web
     /// `devStore.hideShellButton`).
     #[serde(default)]
@@ -143,6 +146,7 @@ impl Default for Settings {
             hide_sonnet_usage: true,
             overview_claude_only: false,
             overview_topmost: true,
+            overview_usage_footer: true,
             hide_shell_button: false,
             scrollback: default_scrollback(),
             show_terminal_buttons: false,

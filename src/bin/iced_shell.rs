@@ -468,6 +468,7 @@ enum Message {
     ToggleHideSonnetUsage(bool),
     ToggleOverviewClaudeOnly(bool),
     ToggleOverviewTopmost(bool),
+    ToggleOverviewUsageFooter(bool),
     ToggleHideShellButton(bool),
     ToggleShowTerminalButtons(bool),
     /// Settings → scrollback lines (text input; parsed + clamped).
@@ -1145,6 +1146,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if v { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
                 return iced::window::change_level(id, level);
             }
+        }
+        Message::ToggleOverviewUsageFooter(v) => {
+            state.settings.overview_usage_footer = v;
+            save_session(state);
         }
         Message::ToggleHideShellButton(v) => {
             state.settings.hide_shell_button = v;
@@ -3639,6 +3644,12 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     state.settings.overview_topmost,
                     Message::ToggleOverviewTopmost,
                 ),
+                settings_toggle(
+                    "Show usage footer",
+                    Some("Show the Claude usage bars at the bottom of the overview window."),
+                    state.settings.overview_usage_footer,
+                    Message::ToggleOverviewUsageFooter,
+                ),
                 Space::with_height(Length::Fixed(8.0)),
                 settings_section("Terminal"),
                 settings_number_row(
@@ -5270,7 +5281,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     // same fetch + countdown (state.usage / usage_updated_ms; refresh → RefreshUsage),
     // so it tracks the timer and the manual button with no extra polling.
     let mut body = column![list].width(Length::Fill).height(Length::Fill);
-    if !state.settings.hide_usage_bar {
+    if state.settings.overview_usage_footer {
         if let Some((usage, _)) =
             usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
         {
