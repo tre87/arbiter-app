@@ -5515,6 +5515,10 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     let list = container(scrollable(col).width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
+        // Top inset INSIDE the list so the first workspace title sits ~12px from the
+        // list's top edge — matching the 12px the titles already have on the left
+        // (the row padding adds the remaining ~3px).
+        .padding(iced::Padding { top: 9.0, right: 0.0, bottom: 0.0, left: 0.0 })
         .style(move |_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
             border: iced::Border { radius: list_radius, ..Default::default() },
@@ -5555,9 +5559,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     let framed = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        // 6px on all sides incl. the top, so the gap below the titlebar matches the
-        // left/right gutters (the glow frames the list evenly).
-        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 6.0, left: 6.0 });
+        // Flush under the titlebar (top 0); the 6px gutter is left/right/bottom. The
+        // gap above the first title lives INSIDE the list (see its top padding).
+        .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
     let chrome = container(column![titlebar, framed].width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
