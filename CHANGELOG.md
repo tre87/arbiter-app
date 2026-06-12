@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.0.5] — 2026-06-12
+
 ### Added
 - Workspace tabs can be **dragged to reorder** (persistent), with a blue insertion
   line shown between tabs while dragging.

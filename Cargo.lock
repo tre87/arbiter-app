@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "arbiter-native"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "ab_glyph",
  "alacritty_terminal",
