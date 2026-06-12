@@ -312,6 +312,9 @@ struct State {
     /// In-progress workspace-tab drag-reorder: the tab grabbed + the tab the cursor
     /// is currently over (the drop target). None when not dragging.
     tab_drag: Option<TabDrag>,
+    /// The workspace tab the cursor is over (for hover styling — the tabs are now
+    /// mouse_areas, not buttons, so hover is tracked here).
+    hovered_tab: Option<usize>,
 }
 
 /// A workspace-tab drag-reorder in progress.
@@ -556,6 +559,7 @@ enum Message {
     /// serves as the plain "select this workspace" click.
     TabDragStart(usize),
     TabDragOver(usize),
+    TabExit(usize),
     TabDragEnd,
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
@@ -1951,10 +1955,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::TabDragOver(i) => {
+            state.hovered_tab = Some(i);
             if let Some(d) = state.tab_drag.as_mut() {
                 if i < state.workspaces.len() {
                     d.over = i;
                 }
+            }
+        }
+        Message::TabExit(i) => {
+            if state.hovered_tab == Some(i) {
+                state.hovered_tab = None;
             }
         }
         Message::TabDragEnd => {
@@ -3839,6 +3849,7 @@ fn tab_pill(
     i: usize,
     ws: &Workspace,
     active: bool,
+    hovered: bool,
     show_close: bool,
     max_chars: usize,
     dragging_src: bool,
@@ -3864,33 +3875,32 @@ fn tab_pill(
                 }),
         );
     }
-    button(content)
+    // A container, not a button: the wrapping mouse_area (in titlebar_row) owns
+    // press/enter/right-press so the drag arms on mouse-DOWN. A button fires its
+    // press on RELEASE and captures the event, so it can't drive a drag.
+    let (mut bg, mut bc, tc) = if active {
+        (Some(white_a(0.08)), white_a(0.14), TXT_PRIMARY)
+    } else if hovered {
+        (Some(white_a(0.04)), white_a(0.10), TXT_PRIMARY)
+    } else {
+        (None, white_a(0.05), TXT_SECONDARY)
+    };
+    // Drag visuals: the grabbed tab "lifts" (brighter fill); the drop target gets an
+    // azure border marking where the tab will land.
+    if dragging_src {
+        bg = Some(white_a(0.16));
+    }
+    let bw = if drop_target { 2.0 } else { 1.0 };
+    if drop_target {
+        bc = AZURE;
+    }
+    container(content)
         .padding([0, 6])
-        .on_press(Message::TabDragStart(i))
-        .style(move |_t: &iced::Theme, s| {
-            let hovered = matches!(s, button::Status::Hovered);
-            let (mut bg, mut bc, tc) = if active {
-                (Some(white_a(0.08)), white_a(0.14), TXT_PRIMARY)
-            } else if hovered {
-                (Some(white_a(0.04)), white_a(0.10), TXT_PRIMARY)
-            } else {
-                (None, white_a(0.05), TXT_SECONDARY)
-            };
-            // Drag visuals: the grabbed tab "lifts" (brighter fill); the drop target
-            // gets an azure border marking where the tab will land.
-            if dragging_src {
-                bg = Some(white_a(0.16));
-            }
-            let bw = if drop_target { 2.0 } else { 1.0 };
-            if drop_target {
-                bc = AZURE;
-            }
-            button::Style {
-                background: bg.map(iced::Background::Color),
-                text_color: tc,
-                border: iced::Border { color: bc, width: bw, radius: 6.0.into() },
-                ..Default::default()
-            }
+        .style(move |_t: &iced::Theme| container::Style {
+            background: bg.map(iced::Background::Color),
+            text_color: Some(tc),
+            border: iced::Border { color: bc, width: bw, radius: 6.0.into() },
+            ..Default::default()
         })
         .into()
 }
@@ -4756,12 +4766,17 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     for (i, ws) in state.workspaces.iter().enumerate() {
         let dragging_src = state.tab_drag.is_some_and(|d| d.from == i);
         let drop_target = state.tab_drag.is_some_and(|d| d.over == i && d.from != d.over);
+        let hovered = state.hovered_tab == Some(i);
         tabs = tabs.push(
-            mouse_area(tab_pill(i, ws, i == state.active, true, max_chars, dragging_src, drop_target))
-                // While dragging, entering a tab makes it the drop target. Fires on
-                // plain hover too, but the handler ignores it unless a drag is armed.
-                .on_enter(Message::TabDragOver(i))
-                .on_right_press(Message::WorkspaceTabMenuOpen(i)),
+            mouse_area(tab_pill(
+                i, ws, i == state.active, hovered, true, max_chars, dragging_src, drop_target,
+            ))
+            // Press (mouse-down) selects + arms the drag; entering a tab makes it the
+            // drop target (and sets hover); release anywhere commits (subscription).
+            .on_press(Message::TabDragStart(i))
+            .on_enter(Message::TabDragOver(i))
+            .on_exit(Message::TabExit(i))
+            .on_right_press(Message::WorkspaceTabMenuOpen(i)),
         );
     }
 
@@ -7523,6 +7538,7 @@ fn main() -> iced::Result {
                 ws_tab_menu: None,
                 rename_terminal: None,
                 tab_drag: None,
+                hovered_tab: None,
             };
             (state, iced::Task::batch(tasks))
         })
