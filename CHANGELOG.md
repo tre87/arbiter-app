@@ -1,0 +1,83 @@
+# Changelog
+
+All notable changes to Arbiter are documented here. The format roughly follows
+[Keep a Changelog](https://keepachangelog.com/); version numbers track
+`Cargo.toml`. This changelog covers the **native** app (1.0.0 onward); earlier
+history belongs to the prior Tauri/Vue web app it replaced.
+
+## [Unreleased]
+
+### Added
+- Workspace tabs can be **dragged to reorder** (persistent), with a blue insertion
+  line shown between tabs while dragging.
+- **Overview window** redesign:
+  - A Claude **usage-bar footer** that shares the main app's fetch (updates on the
+    same timer + refresh), toggleable in Settings → Display → Overview. The bars hold
+    the header size and only shrink (dropping reset times last) when the window is
+    too narrow.
+  - The **same custom titlebar as the main window** — centered logo + "Overview"
+    with the azure glow behind it, Windows caption buttons / macOS traffic lights,
+    resizable with a minimum size.
+- Overview window **always-on-top** by default, with a Settings toggle.
+
+### Changed
+- macOS: the window can be dragged (logo / empty titlebar) *and* tabs reordered — the
+  window drag is handled manually so the two no longer conflict.
+- The usage refresh countdown no longer jumps backward when fresh data lands.
+
+### Fixed
+- **Windows Claude usage** updates reliably in the background again: stop WebView2
+  throttling/occluding the hidden webview, drive it through a suspend/resume
+  lifecycle, and recover a discarded renderer (after long idle) by reloading. The
+  manual refresh button always recovers.
+- **Windows glyph rendering**: blend coverage in gamma space (matches Windows
+  Terminal) and fit oversized fallback glyphs (e.g. `⏵`, `✻`) into the cell instead
+  of clipping or stretching.
+- Dim/faint (SGR 2) terminal text now renders dimmer.
+
+## [1.0.4] — 2026-06-12
+
+### Added
+- Right-click **context menus** for workspace tabs and terminals (rename, etc.).
+
+## [1.0.3] — 2026-06-12
+
+### Added
+- Terminal query responses (DA / DSR / cursor-position) answered via a dedicated PTY
+  writer thread, so apps that probe the terminal (e.g. biovpn) behave.
+
+### Changed
+- Rewrote the README for the native app; restored the Arbiter SVG logo.
+
+## [1.0.2] — 2026-06-12
+
+The **native rewrite** moves to the repo root: Arbiter is now a native Rust app
+(iced + wgpu, no webview), replacing the Tauri/Vue web app.
+
+### Added
+- GPU terminal renderer (alacritty_terminal + wgpu) matching the web look, with
+  CoreText (macOS) / DirectWrite (Windows) rasterization and color emoji.
+- Event-driven Claude status (statusLine + hooks shim), per-pane footer stats, the
+  working animation, and the popout Overview window.
+- Claude usage bars via an isolated webview sidecar (claude.ai session), with org
+  selection.
+- Project workspaces: git worktrees, 3-pane layout, file explorer, worktree cards
+  with avatars.
+- Native unified titlebar (macOS traffic-light inset; Windows custom caption buttons
+  + borderless resize), session persistence, keyboard shortcuts, file attach, and the
+  Settings dialog.
+
+### Fixed
+- Windows: crisp caption glyphs; the claude shim re-prepends PATH so `claude` is
+  intercepted; no console flash or stderr leak when forwarding the user's statusLine.
+
+## [1.0.1] — 2026-06-11
+
+### Changed
+- Worktree + overview status indicators centered and stabilized.
+- Debug builds use a separate data dir + Claude login from release.
+- Titlebar spacing, helper dock-flash, DMG layout, and window-refocus-lag polish.
+
+## [1.0.0] — 2026-06-11
+
+- Initial native release.
