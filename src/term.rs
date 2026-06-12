@@ -296,6 +296,28 @@ impl VtTerm {
         self.term.selection.is_some()
     }
 
+    /// Select the entire buffer (scrollback + visible screen) — the terminal
+    /// context menu's "Select All".
+    pub fn select_all(&mut self) {
+        let history = self.term.grid().history_size() as i32;
+        let cols = self.term.grid().columns();
+        let lines = self.term.screen_lines() as i32;
+        let mut sel =
+            Selection::new(SelectionType::Simple, Point::new(Line(-history), Column(0)), Side::Left);
+        sel.update(Point::new(Line(lines - 1), Column(cols.saturating_sub(1))), Side::Right);
+        self.term.selection = Some(sel);
+    }
+
+    /// Wipe the visible screen and the scrollback — the context menu's "Clear
+    /// Buffer". Leaves the cursor where it is (the running program owns it).
+    pub fn clear(&mut self) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        self.term.clear_screen(ClearMode::All);
+        self.term.grid_mut().clear_history();
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.selection = None;
+    }
+
     /// The selected text, if any (for copy).
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string().filter(|s| !s.is_empty())

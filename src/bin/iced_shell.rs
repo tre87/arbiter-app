@@ -303,6 +303,32 @@ struct State {
     /// Live keyboard modifiers (Shift/Ctrl/Cmd) for multi-select clicks in the
     /// file explorer. Tracked app-wide via ModifiersChanged.
     modifiers: iced::keyboard::Modifiers,
+    /// Open terminal right-click context menu (target pane + anchor position).
+    term_menu: Option<TermMenu>,
+    /// Open workspace-tab right-click context menu (tab index + anchor position).
+    ws_tab_menu: Option<WsTabMenu>,
+    /// The pane (terminal) being renamed via the context menu, with its edit buffer.
+    rename_terminal: Option<RenameTerminal>,
+}
+
+/// A terminal right-click context menu, anchored at the click. Its actions target
+/// the focused pane (the right-clicked pane is focused when the menu opens).
+struct TermMenu {
+    x: f32,
+    y: f32,
+}
+
+/// A workspace-tab right-click context menu (Close / Rename), anchored at the cursor.
+struct WsTabMenu {
+    index: usize,
+    x: f32,
+    y: f32,
+}
+
+/// The terminal rename dialog: the pane being renamed + the edit buffer.
+struct RenameTerminal {
+    pane: pane_grid::Pane,
+    text: String,
 }
 
 /// A file-explorer right-click context menu, anchored at the cursor. Its actions
@@ -465,11 +491,25 @@ enum Message {
     RequestRenameToRepo(pane_grid::Pane),
     ConfirmRename,
     CancelRename,
-    /// Right-click a workspace tab → rename it.
+    /// Right-click a workspace tab → context menu (Close / Rename).
+    WorkspaceTabMenuOpen(usize),
+    WorkspaceTabMenuClose,
     RenameWorkspaceStart(usize),
     RenameWorkspaceInput(String),
     RenameWorkspaceCommit,
     RenameWorkspaceCancel,
+    /// Right-click a terminal → context menu (anchored at the click), and the
+    /// rename-terminal flow it launches.
+    TermMenuOpen(pane_grid::Pane, iced::Point),
+    TermMenuClose,
+    TermRenameStart,
+    TermRenameInput(String),
+    TermRenameCommit,
+    TermRenameCancel,
+    /// Terminal context-menu actions on the focused pane: clear the buffer and
+    /// select the whole buffer.
+    ClearBuffer,
+    SelectAll,
     /// In-terminal find (Ctrl/Cmd+F): open/close, edit query, jump prev/next.
     ToggleFind,
     FindInput(String),
@@ -939,14 +979,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::SplitRight => {
+            state.term_menu = None;
             split(state.active_mut(), pane_grid::Axis::Vertical);
             save_session(state);
         }
         Message::SplitDown => {
+            state.term_menu = None;
             split(state.active_mut(), pane_grid::Axis::Horizontal);
             save_session(state);
         }
         Message::Close => {
+            state.term_menu = None;
             let ws = state.active_mut();
             if let Some((_, sibling)) = ws.panes.close(ws.focus) {
                 ws.focus = sibling;
@@ -1590,6 +1633,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state); // the `ws`/`p` borrow has ended
         }
         Message::CloseWorkspace(i) => {
+            state.ws_tab_menu = None;
             if i < state.workspaces.len() {
                 if state.workspaces.len() == 1 {
                     // Closing the only workspace resets to a fresh "Workspace 1"
@@ -1606,7 +1650,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 save_session(state);
             }
         }
+        Message::WorkspaceTabMenuOpen(i) => {
+            // The tab sits in the titlebar, where CursorMoved keeps state.cursor live.
+            state.explorer_menu = None;
+            state.term_menu = None;
+            state.ws_tab_menu = Some(WsTabMenu { index: i, x: state.cursor.x, y: state.cursor.y });
+        }
+        Message::WorkspaceTabMenuClose => state.ws_tab_menu = None,
         Message::RenameWorkspaceStart(i) => {
+            state.ws_tab_menu = None;
             if let Some(ws) = state.workspaces.get(i) {
                 state.rename_ws = Some(RenameWorkspace { index: i, text: ws.name.clone() });
                 return text_input::focus(text_input::Id::new(WS_RENAME_INPUT));
@@ -1629,6 +1681,63 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::RenameWorkspaceCancel => state.rename_ws = None,
+        Message::TermMenuOpen(pane, at) => {
+            // Focus the right-clicked pane so the menu's actions (split/close/copy/
+            // paste/clear) target it. Anchor at the click (state.cursor isn't tracked
+            // over the terminal body, so the position rides in the message).
+            state.explorer_menu = None;
+            state.ws_tab_menu = None;
+            let ws = state.active_mut();
+            if ws.panes.get(pane).is_some() {
+                ws.focus = pane;
+                state.term_menu = Some(TermMenu { x: at.x, y: at.y });
+            }
+        }
+        Message::TermMenuClose => state.term_menu = None,
+        Message::TermRenameStart => {
+            state.term_menu = None;
+            let ws = state.active();
+            if let Some(d) = ws.panes.get(ws.focus) {
+                state.rename_terminal =
+                    Some(RenameTerminal { pane: ws.focus, text: d.name.clone() });
+                return text_input::focus(text_input::Id::new(TERM_RENAME_INPUT));
+            }
+        }
+        Message::TermRenameInput(s) => {
+            if let Some(rt) = state.rename_terminal.as_mut() {
+                rt.text = s;
+            }
+        }
+        Message::TermRenameCommit => {
+            if let Some(rt) = state.rename_terminal.take() {
+                let name = rt.text.trim().to_string();
+                if !name.is_empty() {
+                    if let Some(d) = state.active_mut().panes.get_mut(rt.pane) {
+                        d.name = name;
+                    }
+                    save_session(state);
+                }
+            }
+        }
+        Message::TermRenameCancel => state.rename_terminal = None,
+        Message::ClearBuffer => {
+            state.term_menu = None;
+            let ws = state.active_mut();
+            if let Some(d) = ws.panes.get_mut(ws.focus) {
+                if let Ok(mut t) = d.session.term().lock() {
+                    t.clear();
+                }
+            }
+        }
+        Message::SelectAll => {
+            state.term_menu = None;
+            let ws = state.active_mut();
+            if let Some(d) = ws.panes.get_mut(ws.focus) {
+                if let Ok(mut t) = d.session.term().lock() {
+                    t.select_all();
+                }
+            }
+        }
         Message::ToggleFind => {
             if state.find_open {
                 state.find_open = false;
@@ -1921,6 +2030,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Copy(allow_interrupt) => {
+            state.term_menu = None;
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
                 let text = if let Ok(mut t) = p.session.term().lock() {
@@ -1939,7 +2049,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::Paste => return iced::clipboard::read().map(Message::Pasted),
+        Message::Paste => {
+            state.term_menu = None;
+            return iced::clipboard::read().map(Message::Pasted);
+        }
         Message::Pasted(text) => {
             if let Some(text) = text.filter(|t| !t.is_empty()) {
                 let ws = state.active_mut();
@@ -2800,6 +2913,7 @@ fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
 /// The text_input id of the new-worktree dialog's branch-name field (for autofocus).
 const WT_NAME_INPUT: &str = "wt-name-input";
 const WS_RENAME_INPUT: &str = "ws-rename-input";
+const TERM_RENAME_INPUT: &str = "term-rename-input";
 /// The text_input id of the find bar's query field (for autofocus on Ctrl+F).
 const FIND_INPUT: &str = "find-input";
 
@@ -2903,6 +3017,15 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
         if let Some(p) = state.active().project.as_ref() {
             return Some(explorer_menu_view(&p.explorer, m.x, m.y, state.main_size));
         }
+    }
+    if let Some(rt) = &state.rename_terminal {
+        return Some(rename_terminal_view(rt));
+    }
+    if let Some(m) = &state.term_menu {
+        return Some(term_menu_view(state, m.x, m.y));
+    }
+    if let Some(m) = &state.ws_tab_menu {
+        return Some(ws_tab_menu_view(state, m.index, m.x, m.y));
     }
     if state.new_ws_menu {
         return Some(new_ws_menu_view(state.new_ws_menu_x));
@@ -4316,6 +4439,113 @@ fn explorer_menu_view(ex: &Explorer, x0: f32, y0: f32, win: iced::Size) -> Eleme
     mouse_area(anchored).on_press(Message::ExplorerMenuClose).into()
 }
 
+/// A thin horizontal divider between context-menu groups.
+fn menu_divider() -> Element<'static, Message> {
+    container(
+        container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(
+            |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+                ..Default::default()
+            },
+        ),
+    )
+    .padding(iced::Padding { top: 4.0, bottom: 4.0, left: 0.0, right: 0.0 })
+    .into()
+}
+
+/// Wrap a column of menu items in the dark context-menu card, clamp the anchor so
+/// it stays on-screen, and lay a full-window scrim that closes it. `est_h` is a
+/// rough menu height used only for the bottom-edge clamp.
+fn context_menu_card(
+    items: iced::widget::Column<'static, Message>,
+    width: f32,
+    est_h: f32,
+    x0: f32,
+    y0: f32,
+    win: iced::Size,
+    close: Message,
+) -> Element<'static, Message> {
+    let card = container(items).width(Length::Fixed(width)).style(|_t: &iced::Theme| {
+        container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }
+    });
+    let x = x0.min((win.width - width - 8.0).max(4.0)).max(4.0);
+    let y = y0.min((win.height - est_h - 8.0).max(44.0)).max(44.0);
+    let anchored = container(mouse_area(card).on_press(Message::Noop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding { top: y, right: 0.0, bottom: 0.0, left: x });
+    mouse_area(anchored).on_press(close).into()
+}
+
+/// The terminal right-click context menu: rename, clear buffer, split, select/
+/// copy/paste, close. Actions target the focused pane (set when the menu opened).
+fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> {
+    let ws = state.active();
+    let has_sel = ws
+        .panes
+        .get(ws.focus)
+        .and_then(|d| d.session.term().lock().ok().map(|t| t.has_selection()))
+        .unwrap_or(false);
+    let mut items = column![].spacing(0).padding([4, 0]);
+    items = items.push(explorer_menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::TermRenameStart), false));
+    items = items.push(menu_divider());
+    items = items.push(explorer_menu_item(mdi_path::BROOM, "Clear Buffer".into(), Some(Message::ClearBuffer), false));
+    items = items.push(menu_divider());
+    items = items.push(explorer_menu_item(mdi_path::ARROW_RIGHT, "Split Pane Vertically".into(), Some(Message::SplitRight), false));
+    items = items.push(explorer_menu_item(mdi_path::ARROW_DOWN, "Split Pane Horizontally".into(), Some(Message::SplitDown), false));
+    items = items.push(menu_divider());
+    items = items.push(explorer_menu_item(mdi_path::SELECT_ALL, "Select All".into(), Some(Message::SelectAll), false));
+    items = items.push(explorer_menu_item(mdi_path::CONTENT_COPY, "Copy".into(), has_sel.then_some(Message::Copy(false)), false));
+    items = items.push(explorer_menu_item(mdi_path::CONTENT_PASTE, "Paste".into(), Some(Message::Paste), false));
+    items = items.push(menu_divider());
+    items = items.push(explorer_menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::Close), true));
+    context_menu_card(items, 224.0, 300.0, x0, y0, state.main_size, Message::TermMenuClose)
+}
+
+/// The workspace-tab right-click context menu: rename or close the tab.
+fn ws_tab_menu_view(state: &State, index: usize, x0: f32, y0: f32) -> Element<'static, Message> {
+    let mut items = column![].spacing(0).padding([4, 0]);
+    items = items.push(explorer_menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::RenameWorkspaceStart(index)), false));
+    items = items.push(explorer_menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::CloseWorkspace(index)), true));
+    context_menu_card(items, 176.0, 76.0, x0, y0, state.main_size, Message::WorkspaceTabMenuClose)
+}
+
+/// The terminal rename dialog (context menu → Rename): a prefilled name input.
+fn rename_terminal_view(rt: &RenameTerminal) -> Element<'static, Message> {
+    let input = text_input("Terminal name", &rt.text)
+        .id(text_input::Id::new(TERM_RENAME_INPUT))
+        .on_input(Message::TermRenameInput)
+        .on_submit(Message::TermRenameCommit)
+        .padding([7, 9])
+        .size(13);
+    let actions = row![
+        horizontal_space(),
+        button(text("Cancel").size(13))
+            .on_press(Message::TermRenameCancel)
+            .style(button::secondary)
+            .padding([6, 14]),
+        button(text("Rename").size(13))
+            .on_press(Message::TermRenameCommit)
+            .style(button::primary)
+            .padding([6, 14]),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    let panel = column![text("Rename terminal").size(15).font(ui_semibold()), input, actions]
+        .spacing(14)
+        .padding(18)
+        .width(Length::Fixed(340.0));
+    modal_scrim(modal_panel(panel.into()), Message::TermRenameCancel)
+}
+
 /// The file-explorer rename dialog (web inline rename): a prefilled name input.
 fn explorer_rename_view(r: &ExplorerRename) -> Element<'static, Message> {
     let input = text_input("Name", &r.text)
@@ -4430,7 +4660,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     for (i, ws) in state.workspaces.iter().enumerate() {
         tabs = tabs.push(
             mouse_area(tab_pill(i, ws, i == state.active, true, max_chars))
-                .on_right_press(Message::RenameWorkspaceStart(i)),
+                .on_right_press(Message::WorkspaceTabMenuOpen(i)),
         );
     }
 
@@ -5079,6 +5309,11 @@ mod mdi_path {
     pub const VIEW_DASHBOARD: &str = "M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z";
     pub const COG: &str = "M12,8A4,4 0 0,1 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12A4,4 0 0,1 12,8M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10M10,22C9.75,22 9.54,21.82 9.5,21.58L9.13,18.93C8.5,18.68 7.96,18.34 7.44,17.94L4.95,18.95C4.73,19.03 4.46,18.95 4.34,18.73L2.34,15.27C2.21,15.05 2.27,14.78 2.46,14.63L4.57,12.97L4.5,12L4.57,11L2.46,9.37C2.27,9.22 2.21,8.95 2.34,8.73L4.34,5.27C4.46,5.05 4.73,4.96 4.95,5.05L7.44,6.05C7.96,5.66 8.5,5.32 9.13,5.07L9.5,2.42C9.54,2.18 9.75,2 10,2H14C14.25,2 14.46,2.18 14.5,2.42L14.87,5.07C15.5,5.32 16.04,5.66 16.56,6.05L19.05,5.05C19.27,4.96 19.54,5.05 19.66,5.27L21.66,8.73C21.79,8.95 21.73,9.22 21.54,9.37L19.43,11L19.5,12L19.43,13L21.54,14.63C21.73,14.78 21.79,15.05 21.66,15.27L19.66,18.73C19.54,18.95 19.27,19.04 19.05,18.95L16.56,17.95C16.04,18.34 15.5,18.68 14.87,18.93L14.5,21.58C14.46,21.82 14.25,22 14,22H10M11.25,4L10.88,6.61C9.68,6.86 8.62,7.5 7.85,8.39L5.44,7.35L4.69,8.65L6.8,10.2C6.4,11.37 6.4,12.64 6.8,13.8L4.68,15.36L5.43,16.66L7.86,15.62C8.63,16.5 9.68,17.14 10.87,17.38L11.24,20H12.76L13.13,17.39C14.32,17.14 15.37,16.5 16.14,15.62L18.57,16.66L19.32,15.36L17.2,13.81C17.6,12.64 17.6,11.37 17.2,10.2L19.31,8.65L18.56,7.35L16.15,8.39C15.38,7.5 14.32,6.86 13.12,6.62L12.75,4H11.25Z";
     pub const ARROW_RIGHT: &str = "M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z";
+    // Terminal context menu: copy / paste / select-all / clear-buffer.
+    pub const CONTENT_COPY: &str = "M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z";
+    pub const CONTENT_PASTE: &str = "M19,20H5V4H7V7H17V4H19M12,2A1,1 0 0,1 13,3A1,1 0 0,1 12,4A1,1 0 0,1 11,3A1,1 0 0,1 12,2M19,2H14.82C14.4,0.84 13.3,0 12,0C10.7,0 9.6,0.84 9.18,2H5A2,2 0 0,0 3,4V20A2,2 0 0,0 5,22H19A2,2 0 0,0 21,20V4A2,2 0 0,0 19,2Z";
+    pub const SELECT_ALL: &str = "M9,9H15V15H9M7,17H17V7H7M15,5H17V3H15M15,21H17V19H15M19,17H21V15H19M19,9H21V7H19M19,21A2,2 0 0,0 21,19H19M19,13H21V11H19M11,21H13V19H11M9,3H7V5H9M3,17H5V15H3M5,21V19H3A2,2 0 0,0 5,21M19,3V5H21A2,2 0 0,0 19,3M13,3H11V5H13M3,9H5V7H3M7,21H9V19H7M3,13H5V11H3M3,5H5V3A2,2 0 0,0 3,5Z";
+    pub const BROOM: &str = "M19.36,2.72L20.78,4.14L15.06,9.85C16.13,11.39 16.28,13.24 15.38,14.44L9.06,8.12C10.26,7.22 12.11,7.37 13.65,8.44L19.36,2.72M5.93,17.57C3.92,15.56 2.69,13.16 2.35,10.92L7.23,8.83L14.67,16.27L12.58,21.15C10.34,20.81 7.94,19.58 5.93,17.57Z";
     // Keyboard-shortcuts button: a 4-way arrow cross (reads like the arrow keys,
     // crisp at 16px — the full keyboard glyph is too dense to read small).
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
@@ -6726,6 +6961,13 @@ impl shader::Program<Message> for TermProgram {
                     state.autoscroll = 0;
                     return (Captured, Some(Message::Focus(self.pane)));
                 }
+                // Right-click (when the app isn't grabbing the mouse) → context menu,
+                // anchored at the click (state.cursor isn't tracked over the body).
+                if btn == Button::Right {
+                    if let Some(pos) = cursor.position() {
+                        return (Captured, Some(Message::TermMenuOpen(self.pane, pos)));
+                    }
+                }
                 (Ignored, None)
             }
             // Drag: extend the selection. Past the top/bottom edge, arm
@@ -7163,6 +7405,9 @@ fn main() -> iced::Result {
                 explorer_rename: None,
                 explorer_delete: None,
                 modifiers: iced::keyboard::Modifiers::default(),
+                term_menu: None,
+                ws_tab_menu: None,
+                rename_terminal: None,
             };
             (state, iced::Task::batch(tasks))
         })
