@@ -285,12 +285,11 @@ const INIT_SCRIPT: &str = r#"
     return { utilization: u, resets_at_ms: r };
   }
   async function usageFor(uuid) {
-    // Windows-only staleness: timed/manual refresh kept returning the launch-time
-    // numbers (WKWebView on macOS is fine). cache:'no-store' alone didn't fix it, so
-    // a service worker / CDN is serving a cached response. A unique URL per request
-    // (?_=<ms>) misses every such cache → always a real network fetch.
-    var url = '/api/organizations/' + uuid + '/usage?_=' + Date.now();
-    try { var u = await fetch(url, { cache: 'no-store' }); if (!u.ok) return null; return await u.json(); }
+    // cache:'no-store' to dodge WebView2's HTTP cache. (A ?_=<ms> cache-bust param
+    // is NOT an option — the API rejects the extra query param → "Usage
+    // unavailable". If no-store proves insufficient we unregister the service
+    // worker instead.)
+    try { var u = await fetch('/api/organizations/' + uuid + '/usage', { cache: 'no-store' }); if (!u.ok) return null; return await u.json(); }
     catch (_) { return null; }
   }
   // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg),
