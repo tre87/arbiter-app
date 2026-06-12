@@ -867,6 +867,16 @@ fn on_screen_ish(p: iced::Point) -> bool {
     p.x > -30000.0 && p.y > -30000.0 && p.x < 30000.0 && p.y < 30000.0
 }
 
+/// Tell the macOS `mouseDownCanMoveWindow` override whether the cursor is over a
+/// tab, so a tab drag reorders (window stays) while a brand/empty-area drag still
+/// moves the window. No-op off macOS.
+fn set_cursor_over_tab(over: bool) {
+    #[cfg(target_os = "macos")]
+    trafficlights::CURSOR_OVER_TAB.store(over, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_os = "macos"))]
+    let _ = over;
+}
+
 /// Reorder workspace tabs: move the one at `from` to index `to`, keeping the
 /// active workspace selected (its index follows the move). Caller persists.
 fn move_workspace(state: &mut State, from: usize, to: usize) {
@@ -1956,6 +1966,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::TabDragOver(i) => {
             state.hovered_tab = Some(i);
+            set_cursor_over_tab(true); // so a press here reorders, doesn't move window
             if let Some(d) = state.tab_drag.as_mut() {
                 if i < state.workspaces.len() {
                     d.over = i;
@@ -1966,6 +1977,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.hovered_tab == Some(i) {
                 state.hovered_tab = None;
             }
+            set_cursor_over_tab(false); // left a tab → a press now moves the window
         }
         Message::TabDragEnd => {
             if let Some(d) = state.tab_drag.take() {
@@ -5681,19 +5693,24 @@ mod trafficlights {
             }
             let transparent: bool = msg_send![window, titlebarAppearsTransparent];
             if transparent {
-                disable_implicit_window_drag(window);
+                install_tab_aware_drag(window);
                 inset_window(window);
             }
         }
     }
 
-    /// Override the content view's `mouseDownCanMoveWindow` to NO so dragging a
-    /// workspace tab (in the transparent-titlebar region) doesn't move the whole
-    /// window — without breaking the brand / empty-titlebar drag, which uses
-    /// `performWindowDragWithEvent` (window-level, independent of this). `isMovable
-    /// = NO` would've blocked that explicit drag too, so we can't use it. Done once
-    /// per app run; the override lives on the (shared) view class.
-    unsafe fn disable_implicit_window_drag(window: *mut AnyObject) {
+    /// True while the cursor is over a workspace tab. iced keeps this current (via
+    /// the tab hover handlers); the `mouseDownCanMoveWindow` override reads it.
+    pub static CURSOR_OVER_TAB: AtomicBool = AtomicBool::new(false);
+
+    /// Override the content view's `mouseDownCanMoveWindow` so it returns NO only
+    /// while the cursor is over a tab (AppKit won't drag the window → iced reorders)
+    /// and YES everywhere else (a press on the brand / empty titlebar moves the
+    /// window normally). A blanket NO — or `isMovable = NO` — also blocks the
+    /// brand drag (performWindowDragWithEvent honors the press-location movability),
+    /// so this per-press decision is the only way to get both. Installed once on
+    /// the (shared) winit view class.
+    unsafe fn install_tab_aware_drag(window: *mut AnyObject) {
         use objc2::runtime::{Bool, Sel};
         static DONE: AtomicBool = AtomicBool::new(false);
         if DONE.swap(true, Ordering::SeqCst) {
@@ -5707,13 +5724,17 @@ mod trafficlights {
         if cls.is_null() {
             return;
         }
-        extern "C" fn no_move(_this: *mut AnyObject, _sel: Sel) -> Bool {
-            Bool::NO
+        extern "C" fn can_move(_this: *mut AnyObject, _sel: Sel) -> Bool {
+            if CURSOR_OVER_TAB.load(Ordering::Relaxed) {
+                Bool::NO
+            } else {
+                Bool::YES
+            }
         }
         let imp: objc2::ffi::IMP = Some(std::mem::transmute::<
             extern "C" fn(*mut AnyObject, Sel) -> Bool,
             unsafe extern "C" fn(),
-        >(no_move));
+        >(can_move));
         objc2::ffi::class_replaceMethod(
             cls as *mut objc2::ffi::objc_class,
             objc2::sel!(mouseDownCanMoveWindow).as_ptr(),
