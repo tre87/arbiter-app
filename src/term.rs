@@ -458,6 +458,17 @@ impl VtTerm {
                 }
                 let mut fg = self.resolve(cell.fg, true);
                 let mut bg = self.resolve(cell.bg, false);
+                // Faint/dim (SGR 2): darken the foreground, like other terminals
+                // (Alacritty uses 2/3). Without it, Claude's dim status line and hints
+                // rendered at full brightness — far lighter than Windows Terminal etc.
+                // Only DIM cells are touched, so normal text is unaffected.
+                if cell.flags.contains(Flags::DIM) {
+                    fg = Rgb {
+                        r: (fg.r as f32 * 0.66).round() as u8,
+                        g: (fg.g as f32 * 0.66).round() as u8,
+                        b: (fg.b as f32 * 0.66).round() as u8,
+                    };
+                }
                 if cell.flags.contains(Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
