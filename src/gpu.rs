@@ -432,6 +432,12 @@ impl TermGpu {
                 Glyph { slot, color: true, cells }
             }
             Some(bmp) => {
+                // Scale oversized fallback symbols to fit the cell — WINDOWS ONLY.
+                // On macOS the fallback glyphs already fit, and pixel-rounding can
+                // leave an ordinary glyph's ink ~1px past the rounded cell width,
+                // which would wrongly trigger a rescale + recenter and mangle normal
+                // text. Cascadia's metrics on Windows fit, so only real symbols trip it.
+                #[cfg(target_os = "windows")]
                 let bmp = fit_to_cell(bmp, self.cell_w, self.cell_h, self.baseline);
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
                 self.next_slot += 1;
@@ -844,6 +850,7 @@ fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, c
 /// `✻` / `⏵`, which Claude uses) are drawn near full-em and overflow the narrower
 /// monospace cell on Windows — clipping cut their edges/tips off. No-op when the
 /// glyph already fits (so platforms whose fallback glyphs fit are unchanged).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn fit_to_cell(bmp: GlyphBitmap, cell_w: u32, cell_h: u32, baseline: f32) -> GlyphBitmap {
     if bmp.width <= cell_w && bmp.height <= cell_h {
         return bmp;
@@ -861,6 +868,7 @@ fn fit_to_cell(bmp: GlyphBitmap, cell_w: u32, cell_h: u32, baseline: f32) -> Gly
 }
 
 /// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn resample_coverage(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let mut out = vec![0u8; (dw * dh) as usize];
     let sample = |x: u32, y: u32| src[(y * sw + x) as usize] as f32;
