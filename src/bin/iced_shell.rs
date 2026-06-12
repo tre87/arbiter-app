@@ -309,6 +309,16 @@ struct State {
     ws_tab_menu: Option<WsTabMenu>,
     /// The pane (terminal) being renamed via the context menu, with its edit buffer.
     rename_terminal: Option<RenameTerminal>,
+    /// In-progress workspace-tab drag-reorder: the tab grabbed + the tab the cursor
+    /// is currently over (the drop target). None when not dragging.
+    tab_drag: Option<TabDrag>,
+}
+
+/// A workspace-tab drag-reorder in progress.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    from: usize,
+    over: usize,
 }
 
 /// A terminal right-click context menu, anchored at the click. Its actions target
@@ -541,7 +551,12 @@ enum Message {
     /// A mouse event encoded for a TUI that enabled mouse reporting: write the
     /// bytes to the pane's PTY, focusing it first when the bool is set (press).
     MouseReport(pane_grid::Pane, Vec<u8>, bool),
-    SelectWorkspace(usize),
+    /// Workspace-tab drag-reorder: press a tab (selects + arms the drag), drag over
+    /// another tab (drop target), release anywhere (commit the move). The press also
+    /// serves as the plain "select this workspace" click.
+    TabDragStart(usize),
+    TabDragOver(usize),
+    TabDragEnd,
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
     /// New project workspace: pick a folder, then validate it's a git repo.
@@ -846,6 +861,29 @@ fn open_overview(
 /// absurd coordinate) so we keep the last real position instead.
 fn on_screen_ish(p: iced::Point) -> bool {
     p.x > -30000.0 && p.y > -30000.0 && p.x < 30000.0 && p.y < 30000.0
+}
+
+/// Reorder workspace tabs: move the one at `from` to index `to`, keeping the
+/// active workspace selected (its index follows the move). Caller persists.
+fn move_workspace(state: &mut State, from: usize, to: usize) {
+    let n = state.workspaces.len();
+    if from >= n || to >= n || from == to {
+        return;
+    }
+    let ws = state.workspaces.remove(from);
+    state.workspaces.insert(to, ws);
+    state.active = if state.active == from {
+        to
+    } else {
+        let mut a = state.active;
+        if a > from {
+            a -= 1; // the removal shifted everything after `from` down
+        }
+        if a >= to {
+            a += 1; // the insertion shifted everything at/after `to` up
+        }
+        a
+    };
 }
 
 /// Build a `SavedWindow` from a tracked size + optional position.
@@ -1904,10 +1942,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 p.session.write(&bytes);
             }
         }
-        Message::SelectWorkspace(i) => {
+        Message::TabDragStart(i) => {
+            // Press selects the tab AND arms a drag; the release (TabDragEnd) commits
+            // any reorder. A plain click ends with from == over → just a select.
             if i < state.workspaces.len() {
                 state.active = i;
-                save_session(state);
+                state.tab_drag = Some(TabDrag { from: i, over: i });
+            }
+        }
+        Message::TabDragOver(i) => {
+            if let Some(d) = state.tab_drag.as_mut() {
+                if i < state.workspaces.len() {
+                    d.over = i;
+                }
+            }
+        }
+        Message::TabDragEnd => {
+            if let Some(d) = state.tab_drag.take() {
+                if d.from != d.over {
+                    move_workspace(state, d.from, d.over);
+                }
+                save_session(state); // persist the new order + selection
             }
         }
         Message::Noop => {}
@@ -3780,7 +3835,15 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
 /// translucent-white border, tinted bg when active. The close is a nested button
 /// (it captures its own clicks, so the tab's select fires only elsewhere). The
 /// name truncates to `max_chars` so tabs shrink on a narrow window; icon + × stay.
-fn tab_pill(i: usize, ws: &Workspace, active: bool, show_close: bool, max_chars: usize) -> Element<'static, Message> {
+fn tab_pill(
+    i: usize,
+    ws: &Workspace,
+    active: bool,
+    show_close: bool,
+    max_chars: usize,
+    dragging_src: bool,
+    drop_target: bool,
+) -> Element<'static, Message> {
     let icon = if ws.project.is_some() { mdi_path::FOLDER } else { mdi_path::CONSOLE };
     // Type icon + close go near-white on the active tab (visible), muted otherwise.
     let fg = if active { TXT_PRIMARY } else { TXT_MUTED };
@@ -3803,20 +3866,29 @@ fn tab_pill(i: usize, ws: &Workspace, active: bool, show_close: bool, max_chars:
     }
     button(content)
         .padding([0, 6])
-        .on_press(Message::SelectWorkspace(i))
+        .on_press(Message::TabDragStart(i))
         .style(move |_t: &iced::Theme, s| {
             let hovered = matches!(s, button::Status::Hovered);
-            let (bg, bc, tc) = if active {
+            let (mut bg, mut bc, tc) = if active {
                 (Some(white_a(0.08)), white_a(0.14), TXT_PRIMARY)
             } else if hovered {
                 (Some(white_a(0.04)), white_a(0.10), TXT_PRIMARY)
             } else {
                 (None, white_a(0.05), TXT_SECONDARY)
             };
+            // Drag visuals: the grabbed tab "lifts" (brighter fill); the drop target
+            // gets an azure border marking where the tab will land.
+            if dragging_src {
+                bg = Some(white_a(0.16));
+            }
+            let bw = if drop_target { 2.0 } else { 1.0 };
+            if drop_target {
+                bc = AZURE;
+            }
             button::Style {
                 background: bg.map(iced::Background::Color),
                 text_color: tc,
-                border: iced::Border { color: bc, width: 1.0, radius: 6.0.into() },
+                border: iced::Border { color: bc, width: bw, radius: 6.0.into() },
                 ..Default::default()
             }
         })
@@ -4682,8 +4754,13 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     // Right-click a tab to rename it.
     let mut tabs = row![].spacing(3).align_y(iced::Center);
     for (i, ws) in state.workspaces.iter().enumerate() {
+        let dragging_src = state.tab_drag.is_some_and(|d| d.from == i);
+        let drop_target = state.tab_drag.is_some_and(|d| d.over == i && d.from != d.over);
         tabs = tabs.push(
-            mouse_area(tab_pill(i, ws, i == state.active, true, max_chars))
+            mouse_area(tab_pill(i, ws, i == state.active, true, max_chars, dragging_src, drop_target))
+                // While dragging, entering a tab makes it the drop target. Fires on
+                // plain hover too, but the handler ignores it unless a drag is armed.
+                .on_enter(Message::TabDragOver(i))
                 .on_right_press(Message::WorkspaceTabMenuOpen(i)),
         );
     }
@@ -5559,6 +5636,11 @@ mod trafficlights {
             }
             let transparent: bool = msg_send![window, titlebarAppearsTransparent];
             if transparent {
+                // Stop a content drag (e.g. grabbing a workspace tab) from moving the
+                // window, so tab drag-reorder isn't stolen as a window move. Explicit
+                // drags (brand / empty titlebar, via window::drag) still work since
+                // they use performWindowDragWithEvent, not background dragging.
+                let _: () = msg_send![window, setMovableByWindowBackground: false];
                 inset_window(window);
             }
         }
@@ -6538,6 +6620,13 @@ fn subscription(_state: &State) -> Subscription<Message> {
         if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = &event {
             return (position.y < 44.0 || position.x < 240.0).then(|| Message::CursorMoved(*position));
         }
+        // Any left-button release ends an in-progress workspace-tab drag (the drop
+        // commits wherever the cursor is). No-op when not dragging.
+        if let iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) =
+            &event
+        {
+            return Some(Message::TabDragEnd);
+        }
         if status == iced::event::Status::Captured {
             return None;
         }
@@ -7433,6 +7522,7 @@ fn main() -> iced::Result {
                 term_menu: None,
                 ws_tab_menu: None,
                 rename_terminal: None,
+                tab_drag: None,
             };
             (state, iced::Task::batch(tasks))
         })
