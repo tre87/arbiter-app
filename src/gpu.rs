@@ -418,7 +418,25 @@ impl TermGpu {
             (true, Some(b)) => (b.0.as_slice(), b.1),
             _ => (self.regular.0.as_slice(), self.regular.1),
         };
-        let g = match crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold) {
+        let raster = crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold);
+        // Diagnostic: ARBITER_GLYPH_DEBUG logs how non-ASCII symbols (e.g. ✻ U+273B,
+        // ⏵ U+23F5) rasterise — mono vs colour, size + bearing vs the cell, and the
+        // width flag — so glyph-fit issues can be seen instead of guessed. Fires once
+        // per glyph (the cache returns earlier on repeats); silent without the env var.
+        if cp >= 0x2300 && std::env::var_os("ARBITER_GLYPH_DEBUG").is_some() {
+            match &raster {
+                Some(b) => eprintln!(
+                    "[glyph] U+{:04X} {:?} raster={}x{}@({},{}) color={} | cell={}x{} baseline={:.1} wide_hint={}",
+                    cp, ch, b.width, b.height, b.left, b.top, b.color,
+                    self.cell_w, self.cell_h, self.baseline, wide_hint,
+                ),
+                None => eprintln!(
+                    "[glyph] U+{:04X} {:?} NO-GLYPH | cell={}x{} wide_hint={}",
+                    cp, ch, self.cell_w, self.cell_h, wide_hint,
+                ),
+            }
+        }
+        let g = match raster {
             Some(bmp) if bmp.color => {
                 // Colour glyph → RGBA atlas. Emoji are double-width, so span 2 cells.
                 let cells = if wide_hint { 2 } else { 1 };
