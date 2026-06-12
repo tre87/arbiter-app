@@ -5258,12 +5258,35 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         }
     }
 
-    container(scrollable(col).width(Length::Fill).height(Length::Fill))
+    let list = container(scrollable(col).width(Length::Fill).height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
         .style(|_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
             ..Default::default()
-        })
-        .into()
+        });
+
+    // Usage footer: the SAME 5h/7d bars + refresh as the main titlebar, fed by the
+    // same fetch + countdown (state.usage / usage_updated_ms; refresh → RefreshUsage),
+    // so it tracks the timer and the manual button with no extra polling.
+    let mut body = column![list].width(Length::Fill).height(Length::Fill);
+    if !state.settings.hide_usage_bar {
+        if let Some((usage, _)) =
+            usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
+        {
+            body = body.push(hline()).push(
+                container(usage)
+                    .width(Length::Fill)
+                    .padding([8, 12])
+                    .center_x(Length::Fill)
+                    .style(|_t: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1e, 0x1e, 0x1e))),
+                        ..Default::default()
+                    }),
+            );
+        }
+    }
+    body.into()
 }
 
 /// Per-pane footer: folder + git branch + status counts (from the Session's
