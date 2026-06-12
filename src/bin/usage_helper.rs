@@ -231,9 +231,26 @@ pub fn run() {
                 udbg(&format!("SetOrg({uuid}) → evaluate_script ok={}", r.is_ok()));
             }
             Event::UserEvent(UserEvent::Fetch) => {
-                let r = webview
-                    .evaluate_script("window.__arbiterRefetchUsage && window.__arbiterRefetchUsage()");
-                udbg(&format!("Fetch → evaluate_script ok={}", r.is_ok()));
+                // Windows only: a hidden window's renderer freezes background JS, so
+                // evaluate_script gets queued-but-never-run (returns ok, nothing
+                // happens — see the "Fetch ok, no ipc post" logs). A navigation spins
+                // up a fresh, awake renderer that re-runs INIT_SCRIPT → fetchUsage,
+                // exactly like launch (which always works). The org is persisted in
+                // localStorage so the reload fetches straight to data, no re-prompt.
+                #[cfg(target_os = "windows")]
+                {
+                    let r = webview.load_url("https://claude.ai/");
+                    udbg(&format!("Fetch → reload ok={}", r.is_ok()));
+                }
+                // macOS (WKWebView) doesn't freeze a hidden webview, so the lightweight
+                // in-page refetch works — no full reload needed.
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let r = webview.evaluate_script(
+                        "window.__arbiterRefetchUsage && window.__arbiterRefetchUsage()",
+                    );
+                    udbg(&format!("Fetch → refetch ok={}", r.is_ok()));
+                }
             }
             Event::UserEvent(UserEvent::SignOut) => {
                 // Clears ONLY this webview's data (claude.ai cookies) — nothing else
@@ -297,10 +314,18 @@ const INIT_SCRIPT: &str = r#"
     try { var u = await fetch('/api/organizations/' + uuid + '/usage', { cache: 'no-store' }); if (!u.ok) return null; return await u.json(); }
     catch (_) { return null; }
   }
-  // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg),
-  // preserved across script re-injection on the same page.
-  window.__arbiterOrg = window.__arbiterOrg || null;
-  window.__arbiterSetOrg = function (u) { window.__arbiterOrg = u; fetchUsage(); };
+  // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg).
+  // Persisted in claude.ai localStorage so a refresh-RELOAD picks it up and fetches
+  // straight to data — no needs_org round-trip, so the bar updates in place with no
+  // "loading" blip. Falls back to the in-page value across same-page re-injection.
+  window.__arbiterOrg = window.__arbiterOrg
+    || (function () { try { return localStorage.getItem('arbiterUsageOrg'); } catch (_) { return null; } })()
+    || null;
+  window.__arbiterSetOrg = function (u) {
+    try { localStorage.setItem('arbiterUsageOrg', u); } catch (_) {}
+    window.__arbiterOrg = u;
+    fetchUsage();
+  };
   // The app calls this (refresh button / countdown rollover) to refetch on demand.
   window.__arbiterRefetchUsage = function () { fetchUsage(); };
   async function fetchUsage() {
