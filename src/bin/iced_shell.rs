@@ -245,6 +245,12 @@ struct State {
     /// between the maximize square and the restore (double-square) glyph.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     main_maximized: bool,
+    /// Same as main_focused / main_maximized, for the overview popout's custom
+    /// titlebar (it now shares the main window's borderless chrome + caption buttons).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    overview_focused: bool,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    overview_maximized: bool,
     /// One-shot guard: apply platform window-chrome tweaks once the window is
     /// actually up (first frame) — Win11 rounded corners on Windows, traffic-light
     /// repositioning on macOS. The startup Opened event can fire before our
@@ -620,16 +626,29 @@ enum Message {
     /// Result of querying the main window's maximized state (Windows caption glyph).
     #[cfg(target_os = "windows")]
     SetMaximized(bool),
+    /// Result of querying the overview window's maximized state (its caption glyph).
+    #[cfg(target_os = "windows")]
+    SetOverviewMaximized(bool),
     /// Custom titlebar (decorations off): drag the window. Windows uses window::drag;
     /// macOS suppresses AppKit's drag and moves the window manually (trafficlights).
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     DragWindow,
+    /// Same as DragWindow but for the overview popout (its own borderless titlebar).
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    DragOverview,
     #[cfg(target_os = "windows")]
     WinMinimize,
     #[cfg(target_os = "windows")]
     WinMaximizeToggle,
     #[cfg(target_os = "windows")]
     WinClose,
+    /// Overview popout caption buttons (Windows) — min / max-toggle / close.
+    #[cfg(target_os = "windows")]
+    OverviewMinimize,
+    #[cfg(target_os = "windows")]
+    OverviewMaximizeToggle,
+    #[cfg(target_os = "windows")]
+    OverviewClose,
     /// Begin an interactive edge/corner resize (carries a Win32 HT* hit-test code).
     #[cfg(target_os = "windows")]
     WinResize(usize),
@@ -838,6 +857,19 @@ fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) 
         if topmost { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
     if let Some(p) = pos {
         settings.position = iced::window::Position::Specific(p);
+    }
+    // Same borderless custom-titlebar chrome as the main window: the overview draws
+    // its own titlebar (logo + "Overview" + caption / traffic lights).
+    #[cfg(target_os = "macos")]
+    {
+        settings.platform_specific.title_hidden = true;
+        settings.platform_specific.titlebar_transparent = true;
+        settings.platform_specific.fullsize_content_view = true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        settings.decorations = false;
+        settings.platform_specific.undecorated_shadow = true;
     }
     settings
 }
@@ -2048,9 +2080,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     save_session(state);
                 }
             }
-            // macOS resets the traffic-light buttons on resize — re-inset them.
+            // macOS resets the traffic-light buttons on resize — re-inset them (both
+            // the main window and the overview popout, which now shares the chrome).
             #[cfg(target_os = "macos")]
-            if id == state.main_window {
+            if id == state.main_window || state.overview_window == Some(id) {
                 trafficlights::position();
             }
             if id == state.main_window {
@@ -2066,6 +2099,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 ]);
                 #[cfg(not(target_os = "windows"))]
                 return scale;
+            }
+            // Overview maximize/restore → refresh its caption glyph (Windows).
+            #[cfg(target_os = "windows")]
+            if state.overview_window == Some(id) {
+                return iced::window::get_maximized(id).map(Message::SetOverviewMaximized);
             }
         }
         Message::WindowOpened(id, pos, size) => {
@@ -2093,6 +2131,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 if focused {
                     trafficlights::position();
                 }
+            } else if state.overview_window == Some(id) {
+                state.overview_focused = focused;
+                #[cfg(target_os = "macos")]
+                if focused {
+                    trafficlights::position();
+                }
             }
         }
         Message::ScaleChanged(s) => {
@@ -2114,6 +2158,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             #[cfg(not(target_os = "macos"))]
             return iced::window::drag(state.main_window);
         }
+        Message::DragOverview => {
+            // macOS: the manual drag follows the focused (key) window, so grabbing the
+            // overview's titlebar drags the overview — same call as DragWindow.
+            #[cfg(target_os = "macos")]
+            trafficlights::begin_drag();
+            #[cfg(not(target_os = "macos"))]
+            if let Some(id) = state.overview_window {
+                return iced::window::drag(id);
+            }
+        }
         #[cfg(target_os = "windows")]
         Message::WinMinimize => return iced::window::minimize(state.main_window, true),
         #[cfg(target_os = "windows")]
@@ -2129,6 +2183,29 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         #[cfg(target_os = "windows")]
         Message::WinClose => return iced::window::close(state.main_window),
+        #[cfg(target_os = "windows")]
+        Message::OverviewMinimize => {
+            if let Some(id) = state.overview_window {
+                return iced::window::minimize(id, true);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        Message::OverviewMaximizeToggle => {
+            if let Some(id) = state.overview_window {
+                state.overview_maximized = !state.overview_maximized;
+                return iced::window::toggle_maximize(id);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        Message::SetOverviewMaximized(m) => {
+            state.overview_maximized = m;
+        }
+        #[cfg(target_os = "windows")]
+        Message::OverviewClose => {
+            if let Some(id) = state.overview_window {
+                return iced::window::close(id);
+            }
+        }
         #[cfg(target_os = "windows")]
         Message::WinResize(ht) => winresize::begin(ht),
         Message::JumpTo(ws, pane) => {
@@ -5205,11 +5282,54 @@ fn overview_git(session: &Session) -> Element<'static, Message> {
 /// status indicator (idle/running/ready dot · animated ✻ working · amber
 /// attention). Clicking a row jumps to that pane. Reads the same shared status
 /// the footer does — redrawn each frame, no polling.
+/// The overview popout's titlebar — the same borderless chrome as the main window:
+/// logo + "Overview", a drag region, and (Windows) min/max/close caption buttons that
+/// target the overview window. On macOS the native traffic lights sit in the left pad.
+fn overview_titlebar(state: &State) -> Element<'_, Message> {
+    let brand = row![
+        iced::widget::image(state.logo.clone())
+            .width(Length::Fixed(LOGO_LOGICAL))
+            .height(Length::Fixed(LOGO_LOGICAL))
+            .filter_method(iced::widget::image::FilterMethod::Linear),
+        text("Overview").size(15).font(ui_semibold()).color(TXT_PRIMARY),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let brand = mouse_area(brand).on_press(Message::DragOverview);
+
+    let mut bar = row![brand].spacing(6).align_y(iced::Center).height(Length::Fill);
+    // Flexible drag region filling the middle (a plain spacer off the custom-titlebar
+    // platforms).
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        bar = bar.push(mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragOverview));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        bar = bar.push(horizontal_space());
+    }
+    // Windows caption buttons (min / max-toggle / close) → the overview window.
+    #[cfg(target_os = "windows")]
+    {
+        let f = state.overview_focused;
+        let mid =
+            if state.overview_maximized { caption_glyph::RESTORE } else { caption_glyph::MAXIMIZE };
+        bar = bar.push(
+            row![
+                caption_button(caption_glyph::MINIMIZE, Message::OverviewMinimize, false, f),
+                caption_button(mid, Message::OverviewMaximizeToggle, false, f),
+                caption_button(caption_glyph::CLOSE, Message::OverviewClose, true, f),
+            ]
+            .spacing(0),
+        );
+    }
+    bar.into()
+}
+
 fn overview_view(state: &State) -> Element<'_, Message> {
     let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
-    let mut col = column![]
-        .spacing(2)
-        .push(container(text("ARBITER").size(11).font(ui_semibold()).color(muted)).padding([8, 12]));
+    let mut col = column![].spacing(2);
 
     let only_claude = state.settings.overview_claude_only;
     for (wi, ws) in state.workspaces.iter().enumerate() {
@@ -5269,35 +5389,79 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         }
     }
 
+    // Usage footer (toggleable): the SAME 5h/7d bars + refresh as the main titlebar,
+    // fed by the same fetch + countdown (state.usage / usage_updated_ms; refresh →
+    // RefreshUsage), so it tracks the timer and the manual button with no extra polling.
+    let footer = if state.settings.overview_usage_footer {
+        usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
+            .map(|(usage, _)| usage)
+    } else {
+        None
+    };
+
+    // Round the list (top-only when a footer is attached below) so the chrome glow
+    // frames it like the main app's terminal card.
+    let list_radius: iced::border::Radius = if footer.is_some() {
+        iced::border::Radius { top_left: 8.0, top_right: 8.0, bottom_right: 0.0, bottom_left: 0.0 }
+    } else {
+        8.0.into()
+    };
     let list = container(scrollable(col).width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_t: &iced::Theme| container::Style {
+        .style(move |_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+            border: iced::Border { radius: list_radius, ..Default::default() },
             ..Default::default()
         });
-
-    // Usage footer: the SAME 5h/7d bars + refresh as the main titlebar, fed by the
-    // same fetch + countdown (state.usage / usage_updated_ms; refresh → RefreshUsage),
-    // so it tracks the timer and the manual button with no extra polling.
-    let mut body = column![list].width(Length::Fill).height(Length::Fill);
-    if state.settings.overview_usage_footer {
-        if let Some((usage, _)) =
-            usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
-        {
-            body = body.push(hline()).push(
-                container(usage)
-                    .width(Length::Fill)
-                    .padding([8, 12])
-                    .center_x(Length::Fill)
-                    .style(|_t: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1e, 0x1e, 0x1e))),
+    let mut content = column![list].width(Length::Fill).height(Length::Fill);
+    if let Some(usage) = footer {
+        content = content.push(
+            container(usage)
+                .width(Length::Fill)
+                .padding([8, 12])
+                .center_x(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1e, 0x1e, 0x1e))),
+                    border: iced::Border {
+                        radius: iced::border::Radius {
+                            top_left: 0.0,
+                            top_right: 0.0,
+                            bottom_right: 8.0,
+                            bottom_left: 8.0,
+                        },
                         ..Default::default()
-                    }),
-            );
-        }
+                    },
+                    ..Default::default()
+                }),
+        );
     }
-    body.into()
+
+    // Same chrome as the main window: a transparent titlebar over the app-wide azure
+    // glow (so the gradient sits behind the logo + Overview and fades downward), with
+    // the content inset 6px on the sides/bottom so the glow frames it.
+    let titlebar = container(overview_titlebar(state))
+        .width(Length::Fill)
+        .height(Length::Fixed(40.0))
+        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
+    let framed = container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
+    let chrome = container(column![titlebar, framed].width(Length::Fill).height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Gradient(app_glow_gradient())),
+            ..Default::default()
+        });
+    // Windows: borderless → overlay the same synthetic resize hit-zones as the main
+    // window so the overview stays resizable.
+    #[cfg(target_os = "windows")]
+    let base: Element<Message> = iced::widget::stack([chrome.into(), resize_overlay()]).into();
+    #[cfg(not(target_os = "windows"))]
+    let base: Element<Message> = chrome.into();
+    base
 }
 
 /// Per-pane footer: folder + git branch + status counts (from the Session's
@@ -5782,17 +5946,23 @@ mod trafficlights {
         );
     }
 
-    /// In-progress manual window drag: (mouse_x, mouse_y, origin_x, origin_y) captured
-    /// at press, all in screen coords. Main-thread only; `Mutex` just satisfies the
-    /// `static` Sync bound.
-    static DRAG: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+    /// In-progress manual window drag: (mouse_x, mouse_y, origin_x, origin_y, window)
+    /// captured at press — screen coords + the dragged NSWindow as a `usize` (Send;
+    /// valid for the drag's lifetime, the window can't deallocate mid-drag).
+    /// Main-thread only; `Mutex` just satisfies the `static` Sync bound.
+    static DRAG: Mutex<Option<(f64, f64, f64, f64, usize)>> = Mutex::new(None);
 
-    /// Our main window (the transparent-titlebar one), or null. Looked up fresh — no
-    /// stored pointer — so it can't dangle across the app's lifetime.
-    unsafe fn main_window() -> *mut AnyObject {
+    /// The window being dragged = the key (focused) window, so grabbing the overview's
+    /// titlebar drags the overview and the main window's drags the main. Falls back to
+    /// the first transparent window if no key window (e.g. app momentarily inactive).
+    unsafe fn key_window() -> *mut AnyObject {
         let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         if app.is_null() {
             return std::ptr::null_mut();
+        }
+        let key: *mut AnyObject = msg_send![app, keyWindow];
+        if !key.is_null() {
+            return key;
         }
         let windows: *mut AnyObject = msg_send![app, windows];
         if windows.is_null() {
@@ -5820,30 +5990,31 @@ mod trafficlights {
         }
     }
 
-    /// Start a window drag: remember where the mouse and the window were.
+    /// Start a window drag: remember where the mouse + the key window were, and which
+    /// window it is (so drag_update moves that exact window, not whichever is key now).
     pub fn begin_drag() {
         unsafe {
-            let w = main_window();
+            let w = key_window();
             if w.is_null() {
                 return;
             }
             let frame: NSRect = msg_send![w, frame];
             let (mx, my) = mouse_location();
-            *DRAG.lock().unwrap() = Some((mx, my, frame.origin.x, frame.origin.y));
+            *DRAG.lock().unwrap() = Some((mx, my, frame.origin.x, frame.origin.y, w as usize));
         }
     }
 
-    /// Reposition the window to follow the mouse (called on each CursorMoved while a
-    /// drag is active). No-op if no drag is in progress.
+    /// Reposition the dragged window to follow the mouse (called on each CursorMoved
+    /// while a drag is active). No-op if no drag is in progress.
     pub fn drag_update() {
         let start = *DRAG.lock().unwrap();
-        let Some((m0x, m0y, o0x, o0y)) = start else { return };
+        let Some((m0x, m0y, o0x, o0y, wptr)) = start else { return };
+        let w = wptr as *mut AnyObject;
+        if w.is_null() {
+            return;
+        }
         let (mx, my) = mouse_location();
         unsafe {
-            let w = main_window();
-            if w.is_null() {
-                return;
-            }
             let origin = NSPoint { x: o0x + (mx - m0x), y: o0y + (my - m0y) };
             let _: () = msg_send![w, setFrameOrigin: origin];
         }
@@ -6820,6 +6991,22 @@ fn subscription(_state: &State) -> Subscription<Message> {
     // and not when a widget already consumed the key — e.g. a focused text input
     // in the new-worktree modal (else the branch name leaks into the terminal).
     let keys = iced::event::listen_with(|event, status, id| {
+        // macOS manual window drag: while a drag is active, forward cursor moves + the
+        // left release from EITHER window — checked before the main-window gate so the
+        // overview popout's own drag (its events have the overview's id) isn't dropped.
+        // drag_update moves whichever window was grabbed (captured at begin_drag).
+        #[cfg(target_os = "macos")]
+        if trafficlights::is_dragging() {
+            match &event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    return Some(Message::CursorMoved(*position));
+                }
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                    return Some(Message::TabDragEnd);
+                }
+                _ => {}
+            }
+        }
         if MAIN_WINDOW.get().copied() != Some(id) {
             return None;
         }
@@ -7711,6 +7898,8 @@ fn main() -> iced::Result {
                 overview_pos,
                 main_focused: true,
                 main_maximized: false,
+                overview_focused: false,
+                overview_maximized: false,
                 chrome_init: false,
                 // Render for a 2× display initially (the common Mac case); the
                 // startup get_scale_factor query corrects it for the real display.
