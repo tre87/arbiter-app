@@ -33,11 +33,13 @@ struct Uniforms {
     cell: [f32; 2],
     glyph: [f32; 2],
     srgb: f32,
-    _pad: f32,
+    // 1.0 = blend glyph coverage in gamma space (flatter/thinner — matches Windows
+    // Terminal); 0.0 = linear space (fuller — the macOS look). Was the alignment pad.
+    gamma_blend: f32,
 }
 
 const SHADER: &str = r#"
-struct Uniforms { canvas: vec2<f32>, cell: vec2<f32>, glyph: vec2<f32>, srgb: f32 };
+struct Uniforms { canvas: vec2<f32>, cell: vec2<f32>, glyph: vec2<f32>, srgb: f32, gamma_blend: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -89,6 +91,24 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  if (u.gamma_blend > 0.5) {
+    // Gamma-space blend: flatter/thinner edges, matching Windows Terminal. fg/bg
+    // (and colour-glyph texels) are sRGB, so composite directly in sRGB.
+    var p: vec3<f32>;
+    if (in.kind > 0.5) {
+      let s = textureSample(catlas, samp, in.uv);
+      p = mix(in.bg, s.rgb, s.a);
+    } else {
+      let a = textureSample(atlas, samp, in.uv).r;
+      p = mix(in.bg, in.fg, a);
+    }
+    // p is the desired sRGB pixel: a non-sRGB target stores it as-is; an sRGB
+    // target re-encodes on write, so hand it the linear form.
+    var out = p;
+    if (u.srgb > 0.5) { out = to_linear(p); }
+    return vec4<f32>(out, 1.0);
+  }
+  // Linear-space blend: fuller edges, the macOS look.
   var col: vec3<f32>;
   if (in.kind > 0.5) {
     // Colour glyph (emoji): straight-alpha sRGB RGBA composited over the cell bg.
@@ -582,7 +602,9 @@ impl TermGpu {
             cell: [cw, ch],
             glyph: [cw / ATLAS as f32, ch / ATLAS as f32],
             srgb: if self.is_srgb { 1.0 } else { 0.0 },
-            _pad: 0.0,
+            // Windows: gamma-space blend to match Windows Terminal's thinner, sharper
+            // text. macOS keeps the fuller linear blend that matches iTerm2/Terminal.app.
+            gamma_blend: if cfg!(target_os = "windows") { 1.0 } else { 0.0 },
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
     }
