@@ -179,15 +179,20 @@ pub fn run() {
         });
     // Windows (WebView2): a hidden renderer is otherwise throttled/backgrounded by
     // Chromium, which freezes the usage poll timer AND the on-demand refetch — so
-    // usage only updated at launch and the refresh button/countdown did nothing
-    // (macOS WKWebView doesn't background like this). Disable that backgrounding so
-    // the hidden sign-in webview keeps fetching. The leading flag is wry's own
-    // default (preserved, since setting args replaces it).
+    // usage updates at launch then goes stale (evaluate_script still returns ok but
+    // its JS never actually runs in the frozen renderer); a restart wakes it. macOS
+    // WKWebView doesn't background like this. The backgrounding flags alone weren't
+    // enough: Windows *native occlusion detection* (CalculateNativeWinOcclusion) keeps
+    // marking the hidden window occluded and re-freezing it, so disable that feature
+    // too (the standard Electron/WebView2 fix for background windows), plus
+    // IntensiveWakeUpThrottling (timer throttling after ~5 min hidden). The leading
+    // flag is wry's own default (preserved, since setting args replaces it).
     #[cfg(target_os = "windows")]
     let builder = {
         use wry::WebViewBuilderExtWindows;
         builder.with_additional_browser_args(
-            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
+             CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
              --disable-background-timer-throttling --disable-renderer-backgrounding \
              --disable-backgrounding-occluded-windows",
         )
