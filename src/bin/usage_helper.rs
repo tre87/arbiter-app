@@ -161,7 +161,10 @@ pub fn run() {
         })
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.into_body();
-            udbg(&format!("ipc post: {}", body.chars().take(140).collect::<String>()));
+            // Log the whole payload (the five_hour/seven_day numbers sit after the
+            // org list) so consecutive fetches can be compared — same numbers ⇒ the
+            // fetch is still cached; different ⇒ the app isn't applying them.
+            udbg(&format!("ipc post: {}", body.chars().take(1000).collect::<String>()));
             // Relay the line to the main app.
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
@@ -282,10 +285,12 @@ const INIT_SCRIPT: &str = r#"
     return { utilization: u, resets_at_ms: r };
   }
   async function usageFor(uuid) {
-    // cache:'no-store' is essential: WebView2 (Chromium) otherwise serves this GET
-    // from its HTTP cache, so timed/manual refresh returns the launch-time numbers
-    // and usage never appears to change (WKWebView on macOS doesn't cache it).
-    try { var u = await fetch('/api/organizations/' + uuid + '/usage', { cache: 'no-store' }); if (!u.ok) return null; return await u.json(); }
+    // Windows-only staleness: timed/manual refresh kept returning the launch-time
+    // numbers (WKWebView on macOS is fine). cache:'no-store' alone didn't fix it, so
+    // a service worker / CDN is serving a cached response. A unique URL per request
+    // (?_=<ms>) misses every such cache → always a real network fetch.
+    var url = '/api/organizations/' + uuid + '/usage?_=' + Date.now();
+    try { var u = await fetch(url, { cache: 'no-store' }); if (!u.ok) return null; return await u.json(); }
     catch (_) { return null; }
   }
   // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg),
