@@ -1969,8 +1969,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::TabDragEnd => {
             if let Some(d) = state.tab_drag.take() {
-                if d.from != d.over {
-                    move_workspace(state, d.from, d.over);
+                // The grabbed tab drops into the insertion gap; once it's removed,
+                // a gap past its old slot shifts down by one.
+                let gap = drop_gap(d.from, d.over);
+                let target = if gap > d.from { gap - 1 } else { gap };
+                if target != d.from {
+                    move_workspace(state, d.from, target);
                 }
                 save_session(state); // persist the new order + selection
             }
@@ -3853,7 +3857,6 @@ fn tab_pill(
     show_close: bool,
     max_chars: usize,
     dragging_src: bool,
-    drop_target: bool,
 ) -> Element<'static, Message> {
     let icon = if ws.project.is_some() { mdi_path::FOLDER } else { mdi_path::CONSOLE };
     // Type icon + close go near-white on the active tab (visible), muted otherwise.
@@ -3878,31 +3881,52 @@ fn tab_pill(
     // A container, not a button: the wrapping mouse_area (in titlebar_row) owns
     // press/enter/right-press so the drag arms on mouse-DOWN. A button fires its
     // press on RELEASE and captures the event, so it can't drive a drag.
-    let (mut bg, mut bc, tc) = if active {
+    let (mut bg, bc, tc) = if active {
         (Some(white_a(0.08)), white_a(0.14), TXT_PRIMARY)
     } else if hovered {
         (Some(white_a(0.04)), white_a(0.10), TXT_PRIMARY)
     } else {
         (None, white_a(0.05), TXT_SECONDARY)
     };
-    // Drag visuals: the grabbed tab "lifts" (brighter fill); the drop target gets an
-    // azure border marking where the tab will land.
+    // The grabbed tab "lifts" (brighter fill) while dragging; the drop position is
+    // shown by an azure insertion line between tabs (see `tab_drop_line`).
     if dragging_src {
         bg = Some(white_a(0.16));
-    }
-    let bw = if drop_target { 2.0 } else { 1.0 };
-    if drop_target {
-        bc = AZURE;
     }
     container(content)
         .padding([0, 6])
         .style(move |_t: &iced::Theme| container::Style {
             background: bg.map(iced::Background::Color),
             text_color: Some(tc),
-            border: iced::Border { color: bc, width: bw, radius: 6.0.into() },
+            border: iced::Border { color: bc, width: 1.0, radius: 6.0.into() },
             ..Default::default()
         })
         .into()
+}
+
+/// The azure insertion line shown between tabs while dragging, marking where the
+/// grabbed tab will drop (a 2px bar; the row's spacing seats it in the gap).
+fn tab_drop_line() -> Element<'static, Message> {
+    container(Space::new(Length::Fixed(2.0), Length::Fixed(22.0)))
+        .center_y(Length::Fixed(26.0))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(AZURE)),
+            border: iced::Border { radius: 1.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Insertion gap (0..=n) where the grabbed tab `from` drops given the hovered tab
+/// `over`: before `over` when dragging left, after it when dragging right.
+fn drop_gap(from: usize, over: usize) -> usize {
+    if over < from {
+        over
+    } else if over > from {
+        over + 1
+    } else {
+        from
+    }
 }
 
 /// The square "+" new-workspace button (web `.tab-add`).
@@ -4763,21 +4787,27 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     // row never exceeds the band — no clip needed (clipping cut the last tab's ×).
     // Right-click a tab to rename it.
     let mut tabs = row![].spacing(3).align_y(iced::Center);
+    // While dragging, an azure insertion line marks the drop gap (0..=n).
+    let gap = state.tab_drag.map(|d| drop_gap(d.from, d.over));
+    let n = state.workspaces.len();
     for (i, ws) in state.workspaces.iter().enumerate() {
+        if gap == Some(i) {
+            tabs = tabs.push(tab_drop_line());
+        }
         let dragging_src = state.tab_drag.is_some_and(|d| d.from == i);
-        let drop_target = state.tab_drag.is_some_and(|d| d.over == i && d.from != d.over);
         let hovered = state.hovered_tab == Some(i);
         tabs = tabs.push(
-            mouse_area(tab_pill(
-                i, ws, i == state.active, hovered, true, max_chars, dragging_src, drop_target,
-            ))
-            // Press (mouse-down) selects + arms the drag; entering a tab makes it the
-            // drop target (and sets hover); release anywhere commits (subscription).
-            .on_press(Message::TabDragStart(i))
-            .on_enter(Message::TabDragOver(i))
-            .on_exit(Message::TabExit(i))
-            .on_right_press(Message::WorkspaceTabMenuOpen(i)),
+            mouse_area(tab_pill(i, ws, i == state.active, hovered, true, max_chars, dragging_src))
+                // Press (mouse-down) selects + arms the drag; entering a tab sets the
+                // drop target (and hover); release anywhere commits (subscription).
+                .on_press(Message::TabDragStart(i))
+                .on_enter(Message::TabDragOver(i))
+                .on_exit(Message::TabExit(i))
+                .on_right_press(Message::WorkspaceTabMenuOpen(i)),
         );
+    }
+    if gap == Some(n) {
+        tabs = tabs.push(tab_drop_line());
     }
 
     // Tabs sit right after the wordmark (just the row's 6px gap) so the title→tabs
@@ -5651,14 +5681,45 @@ mod trafficlights {
             }
             let transparent: bool = msg_send![window, titlebarAppearsTransparent];
             if transparent {
-                // Stop the OS titlebar/background drag (which moved the whole window
-                // when grabbing a workspace tab) so tab drag-reorder works. The brand
-                // / empty-titlebar drags still move the window — they call
-                // performWindowDragWithEvent, which is independent of `isMovable`.
-                let _: () = msg_send![window, setMovable: false];
+                disable_implicit_window_drag(window);
                 inset_window(window);
             }
         }
+    }
+
+    /// Override the content view's `mouseDownCanMoveWindow` to NO so dragging a
+    /// workspace tab (in the transparent-titlebar region) doesn't move the whole
+    /// window — without breaking the brand / empty-titlebar drag, which uses
+    /// `performWindowDragWithEvent` (window-level, independent of this). `isMovable
+    /// = NO` would've blocked that explicit drag too, so we can't use it. Done once
+    /// per app run; the override lives on the (shared) view class.
+    unsafe fn disable_implicit_window_drag(window: *mut AnyObject) {
+        use objc2::runtime::{Bool, Sel};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let view: *mut AnyObject = msg_send![window, contentView];
+        if view.is_null() {
+            return;
+        }
+        let cls: *mut AnyObject = msg_send![view, class];
+        if cls.is_null() {
+            return;
+        }
+        extern "C" fn no_move(_this: *mut AnyObject, _sel: Sel) -> Bool {
+            Bool::NO
+        }
+        let imp: objc2::ffi::IMP = Some(std::mem::transmute::<
+            extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            unsafe extern "C" fn(),
+        >(no_move));
+        objc2::ffi::class_replaceMethod(
+            cls as *mut objc2::ffi::objc_class,
+            objc2::sel!(mouseDownCanMoveWindow).as_ptr(),
+            imp,
+            c"c@:".as_ptr(),
+        );
     }
 
     unsafe fn inset_window(window: *mut AnyObject) {
