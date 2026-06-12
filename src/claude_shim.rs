@@ -189,9 +189,27 @@ fn write_capture(dir: &Path, session_id: &str, buf: &[u8]) {
 fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.arg("/C").arg(orig);
-        c
+        // Claude statusLines are conventionally Git-Bash scripts (e.g.
+        // `bash /c/Users/.../statusline.sh`). Running such a command through `cmd /C`
+        // fails — `bash` from cmd resolves to WSL or is absent, and the /c/... MSYS
+        // path is invalid there (the exact failure the user hit). When the command
+        // looks bash-based and Git Bash is installed, run it through Git Bash so it
+        // renders; otherwise fall back to cmd for plain cmd/PowerShell commands.
+        let looks_bash = orig.contains(".sh")
+            || orig.trim_start().starts_with("bash ")
+            || orig.trim_start().starts_with("sh ");
+        match crate::shell::detect_git_bash().filter(|_| looks_bash) {
+            Some(bash) => {
+                let mut c = std::process::Command::new(bash);
+                c.arg("-c").arg(orig);
+                c
+            }
+            None => {
+                let mut c = std::process::Command::new("cmd");
+                c.arg("/C").arg(orig);
+                c
+            }
+        }
     };
     #[cfg(not(windows))]
     let mut cmd = {

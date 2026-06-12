@@ -167,6 +167,14 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                 "PROMPT_COMMAND",
                 concat!(
                     r#"printf '\e]133;D\a\e]7;file:///%s\a\e]133;A\a' "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
+                    // Re-prepend Arbiter's claude-shim dir LAST (after Git Bash's
+                    // profile/rc, which may reorder PATH so the real claude wins), so
+                    // `claude` resolves to our launcher and our --settings →
+                    // statusLine/hook capture applies. Mirrors the macOS zsh precmd
+                    // re-prepend. `cygpath -u` converts the Windows shim path to the
+                    // /c/... form Git Bash's PATH uses; only prepends when not already
+                    // first. No-op until the shim sets ARBITER_SHIM_BIN.
+                    r#"; if [ -n "$ARBITER_SHIM_BIN" ]; then _sb=$(cygpath -u "$ARBITER_SHIM_BIN" 2>/dev/null); if [ -n "$_sb" ]; then case "$PATH" in "$_sb":*) ;; *) PATH="$_sb:$PATH";; esac; fi; unset _sb; fi"#,
                 ),
             );
             cmd.env("PS0", "\x1b]133;C\x07");
@@ -192,7 +200,13 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                             "[Console]::Write([char]27 + ']133;C' + [char]7); ",
                             "[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() ",
                         "} ",
-                    "}"
+                    "}",
+                    // Re-prepend Arbiter's claude-shim dir AFTER $PROFILE has run (it
+                    // may reorder PATH so the real claude wins), so `claude` resolves to
+                    // our launcher and our --settings → statusLine/hook capture applies.
+                    // Mirrors the macOS zsh precmd re-prepend. No-op until the shim sets
+                    // ARBITER_SHIM_BIN, or when it's already first.
+                    "; if ($env:ARBITER_SHIM_BIN -and ($env:PATH -split ';')[0] -ne $env:ARBITER_SHIM_BIN) { $env:PATH = $env:ARBITER_SHIM_BIN + ';' + $env:PATH }"
                 ),
             ]);
             apply_claude_shim(&mut cmd);
