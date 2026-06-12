@@ -31,6 +31,11 @@ enum UserEvent {
     SignOut,
     /// Refetch usage now (the app's refresh button / countdown rollover).
     Fetch,
+    /// Re-navigate the page to recover a dead/discarded renderer (Windows can discard
+    /// a long-suspended renderer; Resume then can't revive it, but a navigation
+    /// respawns one). The app sends this when a Fetch goes unanswered + on manual
+    /// refresh. INIT_SCRIPT re-runs on load → fetchUsage (org from localStorage).
+    Reload,
     /// Windows: put the hidden renderer back to sleep (TrySuspend) once its data has
     /// posted, until the next Fetch wakes it. See the suspend/resume lifecycle below.
     #[cfg(target_os = "windows")]
@@ -169,6 +174,8 @@ pub fn run() {
                         let _ = stdin_proxy.send_event(UserEvent::Show);
                     } else if t == "fetch" {
                         let _ = stdin_proxy.send_event(UserEvent::Fetch);
+                    } else if t == "reload" {
+                        let _ = stdin_proxy.send_event(UserEvent::Reload);
                     } else if t == "signout" {
                         let _ = stdin_proxy.send_event(UserEvent::SignOut);
                     } else if let Some(uuid) = t.strip_prefix("org:") {
@@ -302,6 +309,14 @@ pub fn run() {
                 // Data has posted; put the (invisible) renderer back to sleep until the
                 // next Fetch wakes it. No-op if the window is showing for sign-in.
                 win_suspend::suspend(&webview);
+            }
+            Event::UserEvent(UserEvent::Reload) => {
+                // Recover a dead/discarded renderer: a navigation respawns one and
+                // re-runs INIT_SCRIPT → fetchUsage. Resume first so the navigation
+                // isn't itself deferred on a suspended webview (Windows).
+                #[cfg(target_os = "windows")]
+                win_suspend::resume(&webview);
+                let _ = webview.load_url("https://claude.ai/");
             }
             Event::UserEvent(UserEvent::SignOut) => {
                 // Clears ONLY this webview's data (claude.ai cookies) — nothing else

@@ -276,6 +276,10 @@ struct State {
     usage: UsageData,
     /// When `usage` was last updated (epoch ms) — for the refresh countdown.
     usage_updated_ms: u64,
+    /// A usage fetch was sent but its data hasn't come back yet. If the NEXT poll
+    /// finds this still set, the helper's renderer likely died (Windows discards a
+    /// long-suspended one), so we escalate to a page reload to respawn it.
+    usage_fetch_pending: bool,
     /// When the usage subscription started (epoch ms) — if no data arrives within
     /// a timeout the bar drops out of "Loading" to "Sign in" (e.g. the helper isn't
     /// built/running), so it never hangs indefinitely.
@@ -1018,7 +1022,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 && state.usage_updated_ms != 0
                 && now_ms().saturating_sub(state.usage_updated_ms) >= USAGE_REFRESH_MS
             {
-                usage_helper_cmd("fetch");
+                if state.usage_fetch_pending {
+                    // Last poll's fetch was never answered → the renderer likely died;
+                    // a navigation respawns it. (Cleared when data arrives.)
+                    usage_helper_cmd("reload");
+                } else {
+                    usage_helper_cmd("fetch");
+                    state.usage_fetch_pending = true;
+                }
                 state.usage_updated_ms = now_ms(); // restart the countdown immediately
             }
             // If the first usage fetch never lands (helper not built/running, no
@@ -1110,6 +1121,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             trafficlights::drag_update();
         }
         Message::UsageUpdated(mut data) => {
+            // The helper posted, so its renderer is alive → clear the pending guard
+            // (a still-set guard at the next poll is what triggers the reload).
+            state.usage_fetch_pending = false;
             // Seed the countdown on the FIRST successful data only (the Tick
             // auto-poll needs a non-zero stamp to start). Don't re-stamp on later
             // arrivals: the countdown is owned by the request side (Tick auto-poll +
@@ -1155,8 +1169,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state);
         }
         Message::RefreshUsage => {
-            // Force a refetch and restart the 2-minute countdown immediately.
-            usage_helper_cmd("fetch");
+            // Manual refresh always RELOADs (not just a refetch): it respawns the
+            // renderer, so it recovers even if the hidden one died — the button can
+            // never silently "do nothing". Restart the 2-minute countdown.
+            usage_helper_cmd("reload");
             state.usage_updated_ms = now_ms();
         }
         Message::OpenSettings => state.settings_open = true,
@@ -8026,6 +8042,7 @@ fn main() -> iced::Result {
                 new_ws_menu_x: 0.0,
                 usage: UsageData::default(),
                 usage_updated_ms: 0,
+                usage_fetch_pending: false,
                 usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
