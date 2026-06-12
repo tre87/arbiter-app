@@ -851,10 +851,9 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 }
 
 /// Window settings for the overview popout at a (saved) size + optional position.
-/// Overview popout minimum size. It can shrink to a strip (the footer bars shrink to
-/// fit; below this the list just scrolls). 40px ≈ the titlebar height.
-const OVERVIEW_MIN_W: f32 = 100.0;
-const OVERVIEW_MIN_H: f32 = 40.0;
+/// Overview popout minimum size.
+const OVERVIEW_MIN_W: f32 = 200.0;
+const OVERVIEW_MIN_H: f32 = 100.0;
 
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
@@ -4486,22 +4485,30 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
             if shown.is_empty() {
                 return None;
             }
-            // Each bar is 72px (header size) until the row won't fit, then shrinks to
-            // share what's left — capped at 72 (no stretch), floored at 20. ~90px/stat
-            // for the label + reset + spacing, ~50px for the footer/frame padding.
             let n = shown.len() as f32;
-            let track_w = (((avail - 50.0) / n) - 90.0).clamp(20.0, 72.0);
+            let resets: Vec<String> = shown.iter().map(|(_, _, p)| fmt_reset(p.resets_at_ms)).collect();
+            // Estimate text widths so the bars stay 72px (header size) — with the
+            // centred margin collapsing first — until the row genuinely won't fit, only
+            // then shrinking. ~6.5px/char for the size-11 UI font.
+            let tw = |s: &str| s.chars().count() as f32 * 6.5 + 4.0;
+            let usable = (avail - 36.0).max(0.0); // window minus frame (12) + footer pad (24)
+            let between = 12.0 * (n - 1.0);
+            let labels_w: f32 = shown.iter().map(|(l, _, _)| tw(l)).sum();
+            let resets_w: f32 = resets.iter().map(|r| tw(r)).sum();
+            // With reset times: bar = (room left after text + spacing) / n, capped 72.
+            let with_reset = (usable - between - labels_w - resets_w - 10.0 * n) / n;
+            let (track_w, show_reset) = if with_reset >= 20.0 {
+                (with_reset.min(72.0), true)
+            } else {
+                // Too narrow even for 20px bars with reset → drop the reset times.
+                (((usable - between - labels_w - 10.0 * n) / n).clamp(20.0, 72.0), false)
+            };
             let mut row = row![].spacing(12).align_y(iced::Center);
-            for (label, color, p) in &shown {
-                row = row.push(usage_stat(
-                    label,
-                    p.utilization.round() as u16,
-                    *color,
-                    &fmt_reset(p.resets_at_ms),
-                    track_w,
-                ));
+            for ((label, color, p), reset) in shown.iter().zip(&resets) {
+                let r = if show_reset { reset.as_str() } else { "" };
+                row = row.push(usage_stat(label, p.utilization.round() as u16, *color, r, track_w));
             }
-            // Centered group (not stretched); the bars themselves carry the sizing.
+            // Centered group (not stretched); the centred margin yields before the bars.
             Some(container(row).center_x(Length::Fill).into())
         }
     }
@@ -5548,7 +5555,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     let framed = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
+        // 6px on all sides incl. the top, so the gap below the titlebar matches the
+        // left/right gutters (the glow frames the list evenly).
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 6.0, left: 6.0 });
     let chrome = container(column![titlebar, framed].width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
