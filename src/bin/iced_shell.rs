@@ -5114,13 +5114,21 @@ fn winctl_style(close: bool) -> impl Fn(&iced::Theme, button::Status) -> button:
 // `(path, render_px, stroke_width)` — easy knobs to tune the on-screen size.
 #[cfg(target_os = "windows")]
 mod caption_glyph {
-    pub const MINIMIZE: (&str, f32, f32) = ("M1,6 H11", 12.0, 1.0);
-    pub const MAXIMIZE: (&str, f32, f32) = ("M1.5,1.5 H10.5 V10.5 H1.5 Z", 12.0, 1.15);
+    // (path, render px, stroke). Coords on .5 boundaries snap a 1px stroke onto a
+    // single device-pixel row/col at 100% scale — the square's 1.5/10.5 edges
+    // already do, which is why it looks crisp. The minimize line sits at y=6.5 (not
+    // the integer 6): an integer y splits the 1px stroke 50/50 across two rows, so
+    // it rendered as a dim, fuzzy grey. All three share stroke 1.0 to read at equal
+    // weight (maximize was 1.15, which also read slightly larger/heavier).
+    pub const MINIMIZE: (&str, f32, f32) = ("M1,6.5 H11", 12.0, 1.0);
+    pub const MAXIMIZE: (&str, f32, f32) = ("M1.5,1.5 H10.5 V10.5 H1.5 Z", 12.0, 1.0);
     // Restore (shown when maximized): a front square + the visible L of a square
     // offset behind it, top-right — matches Segoe Fluent's ChromeRestore.
     pub const RESTORE: (&str, f32, f32) =
         ("M1.5,4 H8 V10.5 H1.5 Z M4,4 V1.5 H10.5 V8 H8", 12.0, 1.0);
-    pub const CLOSE: (&str, f32, f32) = ("M1.5,1.5 L10.5,10.5 M10.5,1.5 L1.5,10.5", 12.0, 1.0);
+    // X reaches the full 1..11 box (vs the square's 1.5..10.5) so it doesn't read
+    // smaller — an X of equal bounding box looks smaller than an enclosed square.
+    pub const CLOSE: (&str, f32, f32) = ("M1,1 L11,11 M11,1 L1,11", 12.0, 1.0);
 }
 
 /// A thin-stroked Win11 caption glyph (0–12 viewBox), stroked in `color`.
