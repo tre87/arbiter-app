@@ -454,6 +454,7 @@ enum Message {
     ToggleHideUsageBar(bool),
     ToggleHideSonnetUsage(bool),
     ToggleOverviewClaudeOnly(bool),
+    ToggleOverviewTopmost(bool),
     ToggleHideShellButton(bool),
     ToggleShowTerminalButtons(bool),
     /// Settings → scrollback lines (text input; parsed + clamped).
@@ -810,8 +811,10 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 }
 
 /// Window settings for the overview popout at a (saved) size + optional position.
-fn overview_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window::Settings {
+fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
+    settings.level =
+        if topmost { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
     if let Some(p) = pos {
         settings.position = iced::window::Position::Specific(p);
     }
@@ -822,8 +825,12 @@ fn overview_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window
 /// position, then issues an explicit `move_to`: the at-creation position is
 /// ignored by winit/macOS for off-primary (e.g. negative/second-display) coords,
 /// but a post-open `set_outer_position` places it there reliably.
-fn open_overview(size: iced::Size, pos: Option<iced::Point>) -> (iced::window::Id, Task<Message>) {
-    let (id, open) = iced::window::open(overview_settings(size, pos));
+fn open_overview(
+    size: iced::Size,
+    pos: Option<iced::Point>,
+    topmost: bool,
+) -> (iced::window::Id, Task<Message>) {
+    let (id, open) = iced::window::open(overview_settings(size, pos, topmost));
     let mut task = open.map(|_| Message::Noop);
     if let Some(p) = pos {
         task = Task::batch([task, iced::window::move_to(id, p)]);
@@ -1078,6 +1085,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ToggleOverviewClaudeOnly(v) => {
             state.settings.overview_claude_only = v;
             save_session(state);
+        }
+        Message::ToggleOverviewTopmost(v) => {
+            state.settings.overview_topmost = v;
+            save_session(state);
+            // Apply live to the open overview window, not just the next open.
+            if let Some(id) = state.overview_window {
+                let level =
+                    if v { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
+                return iced::window::change_level(id, level);
+            }
         }
         Message::ToggleHideShellButton(v) => {
             state.settings.hide_shell_button = v;
@@ -1899,7 +1916,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 save_session(state); // persist "overview closed"
                 return iced::window::close(id);
             }
-            let (id, task) = open_overview(state.overview_size, state.overview_pos);
+            let (id, task) =
+                open_overview(state.overview_size, state.overview_pos, state.settings.overview_topmost);
             state.overview_window = Some(id);
             save_session(state); // persist "overview open"
             return task;
@@ -3526,6 +3544,12 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     Some("Filter the overview popout to terminals with Claude running."),
                     state.settings.overview_claude_only,
                     Message::ToggleOverviewClaudeOnly,
+                ),
+                settings_toggle(
+                    "Always on top",
+                    Some("Keep the overview window above other windows."),
+                    state.settings.overview_topmost,
+                    Message::ToggleOverviewTopmost,
                 ),
                 Space::with_height(Length::Fixed(8.0)),
                 settings_section("Terminal"),
@@ -7350,7 +7374,8 @@ fn main() -> iced::Result {
             // Reopen the overview popout if it was open at quit (matches the web).
             let mut tasks = vec![open.map(|_| Message::Noop)];
             let overview_window = if overview_was_open {
-                let (ov_id, ov_task) = open_overview(overview_size, overview_pos);
+                let (ov_id, ov_task) =
+                    open_overview(overview_size, overview_pos, saved_settings.overview_topmost);
                 // The overview opens after the main window and grabs focus on
                 // startup; chain a focus-back so the MAIN window is active (and its
                 // traffic lights coloured) — chained (not batched) so it runs after

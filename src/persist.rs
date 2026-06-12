@@ -99,6 +99,10 @@ pub struct Settings {
     /// `devStore.overviewClaudeOnly`). Off by default — show all terminals.
     #[serde(default)]
     pub overview_claude_only: bool,
+    /// Keep the overview popout above other windows (it's a floating panel). On by
+    /// default; toggle off to let it sit behind.
+    #[serde(default = "default_true")]
+    pub overview_topmost: bool,
     /// Hide the Git Bash / shell-switch button in the terminal header (web
     /// `devStore.hideShellButton`).
     #[serde(default)]
@@ -138,6 +142,7 @@ impl Default for Settings {
             hide_usage_bar: false,
             hide_sonnet_usage: true,
             overview_claude_only: false,
+            overview_topmost: true,
             hide_shell_button: false,
             scrollback: default_scrollback(),
             show_terminal_buttons: false,
