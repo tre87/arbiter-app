@@ -282,7 +282,10 @@ const INIT_SCRIPT: &str = r#"
     return { utilization: u, resets_at_ms: r };
   }
   async function usageFor(uuid) {
-    try { var u = await fetch('/api/organizations/' + uuid + '/usage'); if (!u.ok) return null; return await u.json(); }
+    // cache:'no-store' is essential: WebView2 (Chromium) otherwise serves this GET
+    // from its HTTP cache, so timed/manual refresh returns the launch-time numbers
+    // and usage never appears to change (WKWebView on macOS doesn't cache it).
+    try { var u = await fetch('/api/organizations/' + uuid + '/usage', { cache: 'no-store' }); if (!u.ok) return null; return await u.json(); }
     catch (_) { return null; }
   }
   // The chosen org uuid (set by the app's selector / saved choice via __arbiterSetOrg),
@@ -300,7 +303,7 @@ const INIT_SCRIPT: &str = r#"
     // A network failure (offline / claude.ai unreachable) is transient — report
     // 'error' (Usage unavailable), NOT 'needs_login', so an outage never looks like
     // you've been signed out.
-    try { o = await fetch('/api/organizations'); } catch (_) { post({ ok: false, error: 'error' }); return; }
+    try { o = await fetch('/api/organizations', { cache: 'no-store' }); } catch (_) { post({ ok: false, error: 'error' }); return; }
     // Only 401/403 means genuinely unauthenticated → sign in. Any other non-OK
     // (5xx/429/…) is a server-side problem while still signed in → transient error.
     if (o.status === 401 || o.status === 403) { post({ ok: false, error: 'needs_login' }); return; }
