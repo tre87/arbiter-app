@@ -432,6 +432,7 @@ impl TermGpu {
                 Glyph { slot, color: true, cells }
             }
             Some(bmp) => {
+                let bmp = fit_to_cell(bmp, self.cell_w, self.cell_h, self.baseline);
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
                 self.next_slot += 1;
                 self.atlas_dirty = true;
@@ -838,6 +839,49 @@ fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, c
     }
 }
 
+/// Scale an oversized mono glyph down to fit its cell, centered, instead of letting
+/// `blit_glyph` clip the overflow. Fallback-font symbols Cascadia Mono lacks (e.g.
+/// `✻` / `⏵`, which Claude uses) are drawn near full-em and overflow the narrower
+/// monospace cell on Windows — clipping cut their edges/tips off. No-op when the
+/// glyph already fits (so platforms whose fallback glyphs fit are unchanged).
+fn fit_to_cell(bmp: GlyphBitmap, cell_w: u32, cell_h: u32, baseline: f32) -> GlyphBitmap {
+    if bmp.width <= cell_w && bmp.height <= cell_h {
+        return bmp;
+    }
+    let s = (cell_w as f32 / bmp.width as f32).min(cell_h as f32 / bmp.height as f32);
+    let nw = ((bmp.width as f32 * s).round() as u32).max(1);
+    let nh = ((bmp.height as f32 * s).round() as u32).max(1);
+    let coverage = resample_coverage(&bmp.coverage, bmp.width, bmp.height, nw, nh);
+    // Center horizontally and vertically in the cell. `blit_glyph` draws the top at
+    // `baseline - top`, so back `top` out from the desired offset from the cell top.
+    let left = ((cell_w as f32 - nw as f32) / 2.0).round() as i32;
+    let top_from_cell_top = ((cell_h as f32 - nh as f32) / 2.0).round();
+    let top = (baseline.round() - top_from_cell_top) as i32;
+    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: false }
+}
+
+/// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
+fn resample_coverage(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (dw * dh) as usize];
+    let sample = |x: u32, y: u32| src[(y * sw + x) as usize] as f32;
+    for dy in 0..dh {
+        let sy = ((dy as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+        let y0 = (sy.floor() as u32).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = sy - y0 as f32;
+        for dx in 0..dw {
+            let sx = ((dx as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+            let x0 = (sx.floor() as u32).min(sw - 1);
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = sx - x0 as f32;
+            let t = sample(x0, y0) * (1.0 - fx) + sample(x1, y0) * fx;
+            let b = sample(x0, y1) * (1.0 - fx) + sample(x1, y1) * fx;
+            out[(dy * dw + dx) as usize] = (t * (1.0 - fy) + b * fy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
 /// Blit a colour (RGBA) glyph into the colour atlas at (ox, oy), baseline-aligned
 /// like [`blit_glyph`], clipped to a `region_w`×`cell_h` box (2 cells wide for an
 /// emoji). `bmp.coverage` is straight-alpha RGBA, 4 bytes/px.
@@ -860,5 +904,44 @@ fn blit_color(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, region_w: u32,
             let d = (((oy + cy as u32) * ATLAS + (ox + cx as u32)) * 4) as usize;
             atlas[d..d + 4].copy_from_slice(&bmp.coverage[s..s + 4]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit_to_cell, resample_coverage};
+    use crate::raster::GlyphBitmap;
+
+    fn glyph(w: u32, h: u32) -> GlyphBitmap {
+        GlyphBitmap { left: 0, top: h as i32, width: w, height: h, coverage: vec![200u8; (w * h) as usize], color: false }
+    }
+
+    #[test]
+    fn oversized_glyph_scaled_into_cell_keeping_aspect() {
+        // A 14×14 symbol in an 8×16 cell: width-constrained → 8×8, centered, no clip.
+        let out = fit_to_cell(glyph(14, 14), 8, 16, 13.0);
+        assert!(out.width <= 8 && out.height <= 16, "fits: {}x{}", out.width, out.height);
+        assert_eq!((out.width, out.height), (8, 8));
+        assert_eq!(out.coverage.len(), 64);
+        assert_eq!(out.left, 0); // (8-8)/2
+    }
+
+    #[test]
+    fn fitting_glyph_left_untouched() {
+        let out = fit_to_cell(glyph(6, 12), 8, 16, 13.0);
+        assert_eq!((out.width, out.height), (6, 12));
+    }
+
+    #[test]
+    fn resample_uniform_is_uniform_and_sized() {
+        let out = resample_coverage(&vec![100u8; 16], 4, 4, 2, 2);
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn resample_single_row_does_not_panic() {
+        let out = resample_coverage(&[10, 250], 2, 1, 1, 1);
+        assert_eq!(out.len(), 1);
     }
 }
