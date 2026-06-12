@@ -201,19 +201,8 @@ pub fn run() {
         .with_web_context(&mut web_context)
         .with_url("https://claude.ai/")
         .with_initialization_script(INIT_SCRIPT)
-        .with_on_page_load_handler(|event, url| {
-            let phase = match event {
-                wry::PageLoadEvent::Started => "started",
-                wry::PageLoadEvent::Finished => "finished",
-            };
-            udbg(&format!("page {phase}: {url}"));
-        })
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.into_body();
-            // Log the whole payload (the five_hour/seven_day numbers sit after the
-            // org list) so consecutive fetches can be compared — same numbers ⇒ the
-            // fetch is still cached; different ⇒ the app isn't applying them.
-            udbg(&format!("ipc post: {}", body.chars().take(1000).collect::<String>()));
             // Relay the line to the main app.
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{body}");
@@ -296,8 +285,7 @@ pub fn run() {
             }
             Event::UserEvent(UserEvent::SetOrg(uuid)) => {
                 let js = format!("window.__arbiterSetOrg && window.__arbiterSetOrg({uuid:?})");
-                let r = webview.evaluate_script(&js);
-                udbg(&format!("SetOrg({uuid}) → evaluate_script ok={}", r.is_ok()));
+                let _ = webview.evaluate_script(&js);
             }
             Event::UserEvent(UserEvent::Fetch) => {
                 // Windows: the hidden renderer is suspended between refreshes (see
@@ -306,9 +294,8 @@ pub fn run() {
                 // re-suspend it until the next refresh.
                 #[cfg(target_os = "windows")]
                 win_suspend::resume(&webview);
-                let r = webview
+                let _ = webview
                     .evaluate_script("window.__arbiterRefetchUsage && window.__arbiterRefetchUsage()");
-                udbg(&format!("Fetch → refetch ok={}", r.is_ok()));
             }
             #[cfg(target_os = "windows")]
             Event::UserEvent(UserEvent::Sleep) => {
@@ -343,24 +330,6 @@ pub fn run() {
 /// shape (utilization 0–100 + reset as epoch ms), and post it to Rust via wry IPC.
 /// Multi-org: uses the app-chosen org (via `__arbiterSetOrg`), the only org, or
 /// reports `needs_org` with the list so the app can show its picker.
-/// Append a diagnostic line to `<temp>/arbiter-usage-debug.log` when
-/// `ARBITER_USAGE_DEBUG` is set — to trace the usage fetch chain (page loads, IPC
-/// posts, evaluate_script results) on Windows, where refresh stopped updating.
-fn udbg(msg: &str) {
-    if std::env::var_os("ARBITER_USAGE_DEBUG").is_none() {
-        return;
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join("arbiter-usage-debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "[{ts}] {msg}");
-    }
-}
-
 const INIT_SCRIPT: &str = r#"
 (function () {
   function post(x) { try { window.ipc.postMessage(JSON.stringify(x)); } catch (_) {} }
