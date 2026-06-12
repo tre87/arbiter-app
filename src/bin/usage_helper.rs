@@ -148,7 +148,7 @@ pub fn run() {
     let mut web_context = wry::WebContext::new(data_dir);
 
     let ipc_proxy = proxy.clone();
-    let webview = WebViewBuilder::new(&window)
+    let builder = WebViewBuilder::new(&window)
         .with_web_context(&mut web_context)
         .with_url("https://claude.ai/")
         .with_initialization_script(INIT_SCRIPT)
@@ -165,9 +165,23 @@ pub fn run() {
             if body.contains("\"ok\":true") || body.contains("needs_org") {
                 let _ = ipc_proxy.send_event(UserEvent::Hide);
             }
-        })
-        .build()
-        .expect("usage-helper: build webview");
+        });
+    // Windows (WebView2): a hidden renderer is otherwise throttled/backgrounded by
+    // Chromium, which freezes the usage poll timer AND the on-demand refetch — so
+    // usage only updated at launch and the refresh button/countdown did nothing
+    // (macOS WKWebView doesn't background like this). Disable that backgrounding so
+    // the hidden sign-in webview keeps fetching. The leading flag is wry's own
+    // default (preserved, since setting args replaces it).
+    #[cfg(target_os = "windows")]
+    let builder = {
+        use wry::WebViewBuilderExtWindows;
+        builder.with_additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --disable-background-timer-throttling --disable-renderer-backgrounding \
+             --disable-backgrounding-occluded-windows",
+        )
+    };
+    let webview = builder.build().expect("usage-helper: build webview");
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
