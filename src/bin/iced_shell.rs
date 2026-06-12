@@ -851,11 +851,14 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 }
 
 /// Window settings for the overview popout at a (saved) size + optional position.
+/// Overview popout minimum size. It can shrink to a strip (the footer bars shrink to
+/// fit; below this the list just scrolls). 40px ≈ the titlebar height.
+const OVERVIEW_MIN_W: f32 = 100.0;
+const OVERVIEW_MIN_H: f32 = 40.0;
+
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
-    // Allow shrinking to a tiny strip (the footer bars shrink to fit; below this the
-    // list just scrolls). 40px ≈ the titlebar height.
-    settings.min_size = Some(iced::Size::new(100.0, 40.0));
+    settings.min_size = Some(iced::Size::new(OVERVIEW_MIN_W, OVERVIEW_MIN_H));
     settings.level =
         if topmost { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
     if let Some(p) = pos {
@@ -2070,13 +2073,29 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::WindowResized(id, s) => {
-            // Skip the degenerate size a minimized window reports, so the saved
-            // (restored) size isn't clobbered.
-            if s.width >= 100.0 && s.height >= 100.0 {
-                let known = id == state.main_window || state.overview_window == Some(id);
+            let is_overview = state.overview_window == Some(id);
+            // The overview is borderless and winit's min_inner_size isn't reliably
+            // enforced for it, so clamp here: snap a real sub-minimum resize back up.
+            // The width>50/height>20 guard skips the degenerate size a *minimized*
+            // window reports (so we don't accidentally un-minimize it).
+            if is_overview
+                && s.width > 50.0
+                && s.height > 20.0
+                && (s.width < OVERVIEW_MIN_W || s.height < OVERVIEW_MIN_H)
+            {
+                return iced::window::resize(
+                    id,
+                    iced::Size::new(s.width.max(OVERVIEW_MIN_W), s.height.max(OVERVIEW_MIN_H)),
+                );
+            }
+            // Track + save real sizes; skip the degenerate minimized size (main uses a
+            // 100x100 floor, the overview its own 100x40 minimum).
+            let (min_w, min_h) = if is_overview { (OVERVIEW_MIN_W, OVERVIEW_MIN_H) } else { (100.0, 100.0) };
+            if s.width >= min_w && s.height >= min_h {
+                let known = id == state.main_window || is_overview;
                 if id == state.main_window {
                     state.main_size = s;
-                } else if state.overview_window == Some(id) {
+                } else if is_overview {
                     state.overview_size = s;
                 }
                 if known {
@@ -4303,7 +4322,13 @@ fn usage_section(
             let mut n = 0u32;
             for (label, color, period) in entries {
                 if let Some(p) = period {
-                    row = row.push(usage_stat(label, p.utilization.round() as u16, color, &fmt_reset(p.resets_at_ms)));
+                    row = row.push(usage_stat(
+                        label,
+                        p.utilization.round() as u16,
+                        color,
+                        &fmt_reset(p.resets_at_ms),
+                        72.0,
+                    ));
                     row = row.push(vsep());
                     n += 1;
                 }
@@ -4386,7 +4411,7 @@ fn usage_warning() -> Element<'static, Message> {
     .into()
 }
 
-fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<'static, Message> {
+fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str, track_w: f32) -> Element<'static, Message> {
     // An 18px absolute line height (= bar height) so the label / % / reset glyphs
     // sit on the same line as the bar. Regular weight on the % avoids the ~1px rise
     // the semibold face has in iced.
@@ -4411,50 +4436,7 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
             .center_y(Length::Fill)
             .into();
     let track = container(iced::widget::stack([bar_row, pct_text]))
-        .width(Length::Fixed(72.0))
-        .height(Length::Fixed(18.0))
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
-            border: iced::Border { radius: 4.0.into(), ..Default::default() },
-            ..Default::default()
-        });
-    row![
-        text(label.to_string()).size(11).color(TXT_SECONDARY).line_height(lh),
-        track,
-        text(reset.to_string()).size(11).color(TXT_SECONDARY).line_height(lh),
-    ]
-    .spacing(5)
-    .align_y(iced::Center)
-    .into()
-}
-
-/// A width-flexible usage bar for the overview footer: `[label] [bar with %]` only —
-/// no reset text, no refresh. The bar fills the available width and the whole stat is
-/// `FillPortion(1)`, so a row of them shrinks evenly with a narrow window and never
-/// wraps to a second line (the label is no-wrap; below its width it just clips).
-fn usage_stat_flex(label: &str, pct: u16, fill: iced::Color) -> Element<'static, Message> {
-    let lh = iced::widget::text::LineHeight::Absolute(iced::Pixels(18.0));
-    let p = pct.min(100);
-    let bar_row: Element<Message> = row![
-        container(Space::new(Length::Fill, Length::Fill))
-            .width(Length::FillPortion(p.max(1)))
-            .height(Length::Fill)
-            .style(move |_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(fill)),
-                border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                ..Default::default()
-            }),
-        Space::with_width(Length::FillPortion((100 - p).max(1))),
-    ]
-    .height(Length::Fill)
-    .into();
-    let pct_text: Element<Message> =
-        container(text(format!("{p}%")).size(10).color(iced::Color::WHITE).line_height(lh))
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
-    let track = container(iced::widget::stack([bar_row, pct_text]))
-        .width(Length::Fill)
+        .width(Length::Fixed(track_w))
         .height(Length::Fixed(18.0))
         .style(|_t: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
@@ -4468,18 +4450,22 @@ fn usage_stat_flex(label: &str, pct: u16, fill: iced::Color) -> Element<'static,
             .line_height(lh)
             .wrapping(iced::widget::text::Wrapping::None),
         track,
+        text(reset.to_string())
+            .size(11)
+            .color(TXT_SECONDARY)
+            .line_height(lh)
+            .wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(5)
     .align_y(iced::Center)
-    .width(Length::FillPortion(1))
     .into()
 }
 
-/// The overview footer's usage bars — the same data/state as the titlebar, with no
-/// refresh button. At a comfortable width the bars are the SAME fixed size as the
-/// titlebar header (label + 72px bar + reset time), centered. Only when `avail` (the
-/// overview width) is too small do they switch to the flex layout that shrinks each
-/// bar and drops the reset text so nothing wraps. None when there's nothing to show.
+/// The overview footer's usage bars — the same data/state + look as the titlebar
+/// (label + bar + reset time), centered, with no refresh button. The bar width stays
+/// at the header's 72px until the row would no longer fit `avail` (the overview
+/// width), then shrinks just enough to fit — never stretches past 72px, never wraps.
+/// None when there's nothing to show.
 fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Element<'static, Message>> {
     match u.state {
         UsageState::Pending => Some(usage_loading()),
@@ -4500,25 +4486,23 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
             if shown.is_empty() {
                 return None;
             }
-            // Fits at the fixed (titlebar) size? ~165px/stat budget incl. spacing + the
-            // footer's own padding; below that, shrink instead of clipping.
-            let fits = avail >= shown.len() as f32 * 165.0 + 40.0;
+            // Each bar is 72px (header size) until the row won't fit, then shrinks to
+            // share what's left — capped at 72 (no stretch), floored at 20. ~90px/stat
+            // for the label + reset + spacing, ~50px for the footer/frame padding.
+            let n = shown.len() as f32;
+            let track_w = (((avail - 50.0) / n) - 90.0).clamp(20.0, 72.0);
             let mut row = row![].spacing(12).align_y(iced::Center);
             for (label, color, p) in &shown {
-                let pct = p.utilization.round() as u16;
-                row = row.push(if fits {
-                    usage_stat(label, pct, *color, &fmt_reset(p.resets_at_ms))
-                } else {
-                    usage_stat_flex(label, pct, *color)
-                });
+                row = row.push(usage_stat(
+                    label,
+                    p.utilization.round() as u16,
+                    *color,
+                    &fmt_reset(p.resets_at_ms),
+                    track_w,
+                ));
             }
-            if fits {
-                // Fixed-size group, centered (not stretched).
-                Some(container(row).center_x(Length::Fill).into())
-            } else {
-                // Narrow: fill the width so the flex bars share + shrink it.
-                Some(row.width(Length::Fill).into())
-            }
+            // Centered group (not stretched); the bars themselves carry the sizing.
+            Some(container(row).center_x(Length::Fill).into())
         }
     }
 }
