@@ -853,6 +853,9 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 /// Window settings for the overview popout at a (saved) size + optional position.
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
+    // Allow shrinking to a tiny strip (the footer bars shrink to fit; below this the
+    // list just scrolls). 40px ≈ the titlebar height.
+    settings.min_size = Some(iced::Size::new(100.0, 40.0));
     settings.level =
         if topmost { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
     if let Some(p) = pos {
@@ -4472,10 +4475,12 @@ fn usage_stat_flex(label: &str, pct: u16, fill: iced::Color) -> Element<'static,
     .into()
 }
 
-/// The overview footer's usage bars — the same data/state as the titlebar but laid
-/// out to shrink with the window (flex bars, no reset text, no refresh button). The
-/// non-Ok states reuse the titlebar widgets. None when there's nothing to show.
-fn overview_usage(u: &UsageData, hide_sonnet: bool) -> Option<Element<'static, Message>> {
+/// The overview footer's usage bars — the same data/state as the titlebar, with no
+/// refresh button. At a comfortable width the bars are the SAME fixed size as the
+/// titlebar header (label + 72px bar + reset time), centered. Only when `avail` (the
+/// overview width) is too small do they switch to the flex layout that shrinks each
+/// bar and drops the reset text so nothing wraps. None when there's nothing to show.
+fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Element<'static, Message>> {
     match u.state {
         UsageState::Pending => Some(usage_loading()),
         UsageState::NeedsLogin => Some(sign_in_button()),
@@ -4490,18 +4495,30 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool) -> Option<Element<'static, M
                 ("Opus", green, u.seven_day_opus),
                 ("Sonnet", AZURE, sonnet),
             ];
-            let mut row = row![].spacing(12).align_y(iced::Center).width(Length::Fill);
-            let mut n = 0u32;
-            for (label, color, period) in entries {
-                if let Some(p) = period {
-                    row = row.push(usage_stat_flex(label, p.utilization.round() as u16, color));
-                    n += 1;
-                }
-            }
-            if n == 0 {
+            let shown: Vec<(&str, iced::Color, UsagePeriod)> =
+                entries.into_iter().filter_map(|(l, c, p)| p.map(|p| (l, c, p))).collect();
+            if shown.is_empty() {
                 return None;
             }
-            Some(row.into())
+            // Fits at the fixed (titlebar) size? ~165px/stat budget incl. spacing + the
+            // footer's own padding; below that, shrink instead of clipping.
+            let fits = avail >= shown.len() as f32 * 165.0 + 40.0;
+            let mut row = row![].spacing(12).align_y(iced::Center);
+            for (label, color, p) in &shown {
+                let pct = p.utilization.round() as u16;
+                row = row.push(if fits {
+                    usage_stat(label, pct, *color, &fmt_reset(p.resets_at_ms))
+                } else {
+                    usage_stat_flex(label, pct, *color)
+                });
+            }
+            if fits {
+                // Fixed-size group, centered (not stretched).
+                Some(container(row).center_x(Length::Fill).into())
+            } else {
+                // Narrow: fill the width so the flex bars share + shrink it.
+                Some(row.width(Length::Fill).into())
+            }
         }
     }
 }
@@ -5492,7 +5509,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     // fed by the same fetch + countdown (state.usage / usage_updated_ms; refresh →
     // RefreshUsage), so it tracks the timer and the manual button with no extra polling.
     let footer = if state.settings.overview_usage_footer {
-        overview_usage(&state.usage, state.settings.hide_sonnet_usage)
+        overview_usage(&state.usage, state.settings.hide_sonnet_usage, state.overview_size.width)
     } else {
         None
     };
@@ -7963,7 +7980,7 @@ fn main() -> iced::Result {
             };
             let overview_size = overview_geom
                 .map(|g| iced::Size::new(g.width, g.height))
-                .filter(|s| s.width >= 200.0 && s.height >= 150.0)
+                .filter(|s| s.width >= 100.0 && s.height >= 40.0)
                 .unwrap_or(iced::Size::new(720.0, 520.0));
             let overview_pos = overview_geom.and_then(point);
 
