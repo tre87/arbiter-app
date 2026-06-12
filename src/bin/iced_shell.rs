@@ -4425,6 +4425,87 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str) -> Element<
     .into()
 }
 
+/// A width-flexible usage bar for the overview footer: `[label] [bar with %]` only —
+/// no reset text, no refresh. The bar fills the available width and the whole stat is
+/// `FillPortion(1)`, so a row of them shrinks evenly with a narrow window and never
+/// wraps to a second line (the label is no-wrap; below its width it just clips).
+fn usage_stat_flex(label: &str, pct: u16, fill: iced::Color) -> Element<'static, Message> {
+    let lh = iced::widget::text::LineHeight::Absolute(iced::Pixels(18.0));
+    let p = pct.min(100);
+    let bar_row: Element<Message> = row![
+        container(Space::new(Length::Fill, Length::Fill))
+            .width(Length::FillPortion(p.max(1)))
+            .height(Length::Fill)
+            .style(move |_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(fill)),
+                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                ..Default::default()
+            }),
+        Space::with_width(Length::FillPortion((100 - p).max(1))),
+    ]
+    .height(Length::Fill)
+    .into();
+    let pct_text: Element<Message> =
+        container(text(format!("{p}%")).size(10).color(iced::Color::WHITE).line_height(lh))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+    let track = container(iced::widget::stack([bar_row, pct_text]))
+        .width(Length::Fill)
+        .height(Length::Fixed(18.0))
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            ..Default::default()
+        });
+    row![
+        text(label.to_string())
+            .size(11)
+            .color(TXT_SECONDARY)
+            .line_height(lh)
+            .wrapping(iced::widget::text::Wrapping::None),
+        track,
+    ]
+    .spacing(5)
+    .align_y(iced::Center)
+    .width(Length::FillPortion(1))
+    .into()
+}
+
+/// The overview footer's usage bars — the same data/state as the titlebar but laid
+/// out to shrink with the window (flex bars, no reset text, no refresh button). The
+/// non-Ok states reuse the titlebar widgets. None when there's nothing to show.
+fn overview_usage(u: &UsageData, hide_sonnet: bool) -> Option<Element<'static, Message>> {
+    match u.state {
+        UsageState::Pending => Some(usage_loading()),
+        UsageState::NeedsLogin => Some(sign_in_button()),
+        UsageState::NeedsOrg => Some(tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu)),
+        UsageState::Error => Some(usage_warning()),
+        UsageState::Ok => {
+            let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
+            let sonnet = if hide_sonnet { None } else { u.seven_day_sonnet };
+            let entries: [(&str, iced::Color, Option<UsagePeriod>); 4] = [
+                ("5h", AZURE, u.five_hour),
+                ("7d", green, u.seven_day),
+                ("Opus", green, u.seven_day_opus),
+                ("Sonnet", AZURE, sonnet),
+            ];
+            let mut row = row![].spacing(12).align_y(iced::Center).width(Length::Fill);
+            let mut n = 0u32;
+            for (label, color, period) in entries {
+                if let Some(p) = period {
+                    row = row.push(usage_stat_flex(label, p.utilization.round() as u16, color));
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+            Some(row.into())
+        }
+    }
+}
+
 /// How often usage auto-refreshes (the countdown length). The app drives this on
 /// the Tick (the helper's own background timer throttles while hidden).
 const USAGE_REFRESH_MS: u64 = 120_000;
@@ -5286,7 +5367,7 @@ fn overview_git(session: &Session) -> Element<'static, Message> {
 /// logo + "Overview", a drag region, and (Windows) min/max/close caption buttons that
 /// target the overview window. On macOS the native traffic lights sit in the left pad.
 fn overview_titlebar(state: &State) -> Element<'_, Message> {
-    let brand = row![
+    let brand_inner = row![
         iced::widget::image(state.logo.clone())
             .width(Length::Fixed(LOGO_LOGICAL))
             .height(Length::Fixed(LOGO_LOGICAL))
@@ -5295,27 +5376,30 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
     ]
     .spacing(8)
     .align_y(iced::Center);
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let brand = mouse_area(brand).on_press(Message::DragOverview);
 
-    let mut bar = row![brand].spacing(6).align_y(iced::Center).height(Length::Fill);
-    // Flexible drag region filling the middle (a plain spacer off the custom-titlebar
-    // platforms).
+    // The logo + title is CENTERED via a stack: a base layer (full-width drag region
+    // + the Windows caption buttons on the right) with the brand floated centred on
+    // top. Centring in a plain row would be thrown off by the traffic lights / caption
+    // on the sides; the stack keeps it at the header centre. The brand is draggable;
+    // the transparent area around it falls through to the base drag layer.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        bar = bar.push(mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragOverview));
-    }
+    let brand: Element<Message> = mouse_area(brand_inner).on_press(Message::DragOverview).into();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        bar = bar.push(horizontal_space());
-    }
-    // Windows caption buttons (min / max-toggle / close) → the overview window.
+    let brand: Element<Message> = brand_inner.into();
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let drag: Element<Message> =
+        mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragOverview).into();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let drag: Element<Message> = Space::new(Length::Fill, Length::Fill).into();
+    #[allow(unused_mut)]
+    let mut base = row![drag].align_y(iced::Center).height(Length::Fill);
     #[cfg(target_os = "windows")]
     {
         let f = state.overview_focused;
         let mid =
             if state.overview_maximized { caption_glyph::RESTORE } else { caption_glyph::MAXIMIZE };
-        bar = bar.push(
+        base = base.push(
             row![
                 caption_button(caption_glyph::MINIMIZE, Message::OverviewMinimize, false, f),
                 caption_button(mid, Message::OverviewMaximizeToggle, false, f),
@@ -5324,7 +5408,22 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
             .spacing(0),
         );
     }
-    bar.into()
+
+    // Overlay: the brand centred. On Windows reserve the caption strip on the right so
+    // the centre is the area before the buttons (so it never overlaps when narrow).
+    #[allow(unused_mut)]
+    let mut overlay = row![container(brand)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)]
+    .height(Length::Fill);
+    #[cfg(target_os = "windows")]
+    {
+        overlay = overlay.push(Space::with_width(Length::Fixed(140.0)));
+    }
+
+    iced::widget::stack([base.into(), overlay.into()]).height(Length::Fill).into()
 }
 
 fn overview_view(state: &State) -> Element<'_, Message> {
@@ -5393,8 +5492,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     // fed by the same fetch + countdown (state.usage / usage_updated_ms; refresh →
     // RefreshUsage), so it tracks the timer and the manual button with no extra polling.
     let footer = if state.settings.overview_usage_footer {
-        usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
-            .map(|(usage, _)| usage)
+        overview_usage(&state.usage, state.settings.hide_sonnet_usage)
     } else {
         None
     };
@@ -5440,10 +5538,12 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     // Same chrome as the main window: a transparent titlebar over the app-wide azure
     // glow (so the gradient sits behind the logo + Overview and fades downward), with
     // the content inset 6px on the sides/bottom so the glow frames it.
+    // Small symmetric pad (not the main window's 88px traffic-light inset): the brand
+    // is centred, not left-aligned, so it clears the macOS traffic lights on its own.
     let titlebar = container(overview_titlebar(state))
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
-        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
+        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: 6.0 });
     let framed = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
