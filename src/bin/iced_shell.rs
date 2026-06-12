@@ -1072,9 +1072,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             trafficlights::drag_update();
         }
         Message::UsageUpdated(mut data) => {
-            // Only stamp the refresh countdown when real data arrives (not on a
-            // needs-login ping), so the countdown reflects the last successful poll.
-            if data.state == UsageState::Ok {
+            // Seed the countdown on the FIRST successful data only (the Tick
+            // auto-poll needs a non-zero stamp to start). Don't re-stamp on later
+            // arrivals: the countdown is owned by the request side (Tick auto-poll +
+            // RefreshUsage), and re-stamping here — ~1s after the request, when the
+            // fetch returns — bumps it back up, which reads as the timer "gaining a
+            // few seconds" just as the numbers refresh.
+            if data.state == UsageState::Ok && state.usage_updated_ms == 0 {
                 state.usage_updated_ms = now_ms();
             }
             // Multi-org: if we have a saved choice that's still valid, auto-apply it
