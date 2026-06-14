@@ -16,6 +16,11 @@ pub struct GlyphBitmap {
     pub height: u32,
     pub coverage: Vec<u8>,
     pub color: bool,
+    /// Windows only: a small MONO symbol that came from a *fallback* font (not the
+    /// bundled Cascadia). Such glyphs (e.g. ✻ from Segoe UI Symbol) render undersized,
+    /// so the GPU atlas step (`fit_to_box`) scales them UP toward the cell, the way
+    /// Windows Terminal does. Always false on macOS/Linux and for primary-font text.
+    pub upscale_fallback: bool,
 }
 
 /// Rasterise `ch` at `em_px` (the CSS-style em size in device px), in bold if
@@ -115,6 +120,7 @@ mod swash_raster {
                 height: image.placement.height,
                 coverage: image.data,
                 color: matches!(image.content, Content::Color),
+                upscale_fallback: false,
             })
         })
     }
@@ -380,6 +386,7 @@ mod mac {
                 height: h as u32,
                 coverage: rgba,
                 color: true,
+                upscale_fallback: false,
             });
         }
 
@@ -405,7 +412,15 @@ mod mac {
             coverage[row * w..row * w + w].copy_from_slice(src);
         }
 
-        Some(GlyphBitmap { left, top, width: w as u32, height: h as u32, coverage, color: false })
+        Some(GlyphBitmap {
+            left,
+            top,
+            width: w as u32,
+            height: h as u32,
+            coverage,
+            color: false,
+            upscale_fallback: false,
+        })
     }
 }
 
@@ -606,6 +621,15 @@ mod dwrite {
             } else {
                 None
             };
+            // Is `ch` absent from the bundled Cascadia (so DirectWrite falls back to a
+            // system font)? Reuse the bundled face as a coverage proxy (regular + bold
+            // share coverage). A fallback symbol like ✻ renders undersized → upscale it.
+            let fallback = ctx.bold.as_ref().map_or(false, |b| {
+                let cps = [ch as u32];
+                let mut gids = [0u16; 1];
+                b.face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).is_ok() && gids[0] == 0
+            });
+            let upscale_hint = is_upscale_symbol(ch) && fallback;
             let weight = if bold { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
             let (collection, family): (Option<&IDWriteFontCollection>, &[u16]) = match bold_src {
                 Some(b) => (Some(&b.collection), &b.family),
@@ -622,8 +646,18 @@ mod dwrite {
                 PCWSTR(locale.as_ptr()),
             )?;
 
-            let mut buf = [0u16; 2];
-            let text: &[u16] = ch.encode_utf16(&mut buf);
+            // Encode the glyph; for media-control symbols (⏸ etc.) append VS15 (U+FE0E)
+            // so DirectWrite renders the MONOCHROME text presentation, not a colour emoji.
+            let mut buf = [0u16; 3];
+            let n = ch.len_utf16();
+            ch.encode_utf16(&mut buf[..n]);
+            let len = if wants_text_presentation(ch) {
+                buf[n] = 0xFE0E;
+                n + 1
+            } else {
+                n
+            };
+            let text: &[u16] = &buf[..len];
             let boxw = (ctx.em * 2.5).ceil() + 4.0;
             let boxh = (ctx.em * 2.0).ceil() + 4.0;
             let layout = ctx.dwrite.CreateTextLayout(text, &format, boxw, boxh)?;
@@ -681,13 +715,36 @@ mod dwrite {
             }
             let data = std::slice::from_raw_parts(ptr, size as usize);
 
-            Ok(build_glyph(data, stride, w, h, baseline))
+            Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
         }
+    }
+
+    /// Codepoints with Unicode "emoji presentation by default" that we want rendered
+    /// MONOCHROME (media-control symbols Claude/TUIs use, incl. ⏸ U+23F8). Appending VS15
+    /// (U+FE0E) makes DirectWrite pick the text presentation, not a colour emoji font.
+    fn wants_text_presentation(ch: char) -> bool {
+        matches!(ch as u32, 0x23E9..=0x23FA)
+    }
+
+    /// Symbol/dingbat codepoints (arrows, technical, shapes, dingbats, misc-symbols incl.
+    /// ✻ U+273B) that, when they come from a FALLBACK font, should be scaled up to fill the
+    /// cell like Windows Terminal. Excludes Latin/punctuation/combining marks.
+    fn is_upscale_symbol(ch: char) -> bool {
+        matches!(ch as u32, 0x2190..=0x2BFF)
     }
 
     /// Crop the rendered bitmap to the glyph's ink box and classify mono vs colour.
     /// PBGRA premultiplied: a white mono glyph has B==G==R==A; a colour glyph varies.
-    fn build_glyph(data: &[u8], stride: usize, w: u32, h: u32, baseline: f32) -> Option<GlyphBitmap> {
+    /// `upscale_hint` marks an undersized fallback symbol the atlas step should enlarge
+    /// (mono only — colour emoji keep their own size).
+    fn build_glyph(
+        data: &[u8],
+        stride: usize,
+        w: u32,
+        h: u32,
+        baseline: f32,
+        upscale_hint: bool,
+    ) -> Option<GlyphBitmap> {
         let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0u32, 0u32);
         let (mut found, mut is_color) = (false, false);
         for y in 0..h {
@@ -727,7 +784,15 @@ mod dwrite {
                     rgba[d + 3] = a as u8;
                 }
             }
-            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: rgba, color: true })
+            Some(GlyphBitmap {
+                left: minx as i32,
+                top,
+                width: bw,
+                height: bh,
+                coverage: rgba,
+                color: true,
+                upscale_fallback: false,
+            })
         } else {
             let mut cov = vec![0u8; (bw * bh) as usize];
             for yy in 0..bh {
@@ -735,7 +800,15 @@ mod dwrite {
                     cov[(yy * bw + xx) as usize] = data[px(minx + xx, miny + yy) + 3]; // alpha
                 }
             }
-            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: cov, color: false })
+            Some(GlyphBitmap {
+                left: minx as i32,
+                top,
+                width: bw,
+                height: bh,
+                coverage: cov,
+                color: false,
+                upscale_fallback: upscale_hint,
+            })
         }
     }
 }
