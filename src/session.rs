@@ -423,8 +423,28 @@ fn repoint_watcher(
         let new = crate::git::repo_root(&cwd_path).and_then(|root| {
             let cwd = cwd.clone();
             let git = git.clone();
+            let root_path = std::path::PathBuf::from(&root);
             let mut deb = new_debouncer(Duration::from_millis(400), move |res: DebounceEventResult| {
-                if res.is_ok() {
+                let Ok(events) = res else { return };
+                // Only refresh on changes git actually reflects. Crucially, ignore .git/
+                // churn: `git status` rewrites .git/index (stat-cache), which would re-fire
+                // the watcher → another status → a self-sustaining loop pinning the CPU in
+                // ANY repo. Also ignore gitignored build/dep dirs (target/, node_modules/…)
+                // a dev repo writes constantly and git ignores anyway. Terminal git commands
+                // still refresh the footer via the OSC-133 prompt edge.
+                let relevant = events.iter().any(|e| {
+                    let rel = e.path.strip_prefix(&root_path).unwrap_or(e.path.as_path());
+                    !rel.components().any(|c| {
+                        matches!(
+                            c.as_os_str().to_str(),
+                            Some(
+                                ".git" | "target" | "node_modules" | "dist" | ".next" | ".venv"
+                                    | "__pycache__"
+                            )
+                        )
+                    })
+                });
+                if relevant {
                     recompute_git(cwd.clone(), git.clone());
                 }
             })

@@ -13,6 +13,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   nothing is animating. Idle goes from a constant ~1–2% repaint to near-zero; the fast
   tick returns only while Claude is working, a status needs attention, or the scroll
   indicator is fading.
+- The git-status file watcher no longer pins the CPU in a repo: it ignores `.git/`
+  churn (so `git status`'s own index rewrite can't re-trigger it in a loop) and
+  gitignored build/dep dirs (`target/`, `node_modules/`, …).
 
 ### Added
 - **Bold text style** setting (Settings → Display → Terminal), mirroring Windows
