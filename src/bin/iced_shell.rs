@@ -5531,11 +5531,10 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
     .spacing(8)
     .align_y(iced::Center);
 
-    // The logo + title is CENTERED via a stack: a base layer (full-width drag region
-    // + the Windows caption buttons on the right) with the brand floated centred on
-    // top. Centring in a plain row would be thrown off by the traffic lights / caption
-    // on the sides; the stack keeps it at the header centre. The brand is draggable;
-    // the transparent area around it falls through to the base drag layer.
+    // Left-aligned like the main window: the brand first, then a draggable fill, then
+    // (Windows) the caption buttons flush right. The wrapper supplies the left pad
+    // (TITLEBAR_LEFT_PAD) so the brand clears the macOS traffic lights — same setup as
+    // the main window's titlebar. The brand + the empty area both drag the window.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let brand: Element<Message> = mouse_area(brand_inner).on_press(Message::DragOverview).into();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -5546,14 +5545,15 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
         mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragOverview).into();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let drag: Element<Message> = Space::new(Length::Fill, Length::Fill).into();
+
     #[allow(unused_mut)]
-    let mut base = row![drag].align_y(iced::Center).height(Length::Fill);
+    let mut bar = row![brand, drag].align_y(iced::Center).height(Length::Fill);
     #[cfg(target_os = "windows")]
     {
         let f = state.overview_focused;
         let mid =
             if state.overview_maximized { caption_glyph::RESTORE } else { caption_glyph::MAXIMIZE };
-        base = base.push(
+        bar = bar.push(
             row![
                 caption_button(caption_glyph::MINIMIZE, Message::OverviewMinimize, false, f),
                 caption_button(mid, Message::OverviewMaximizeToggle, false, f),
@@ -5562,22 +5562,7 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
             .spacing(0),
         );
     }
-
-    // Overlay: the brand centred. On Windows reserve the caption strip on the right so
-    // the centre is the area before the buttons (so it never overlaps when narrow).
-    #[allow(unused_mut)]
-    let mut overlay = row![container(brand)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)]
-    .height(Length::Fill);
-    #[cfg(target_os = "windows")]
-    {
-        overlay = overlay.push(Space::with_width(Length::Fixed(140.0)));
-    }
-
-    iced::widget::stack([base.into(), overlay.into()]).height(Length::Fill).into()
+    bar.into()
 }
 
 fn overview_view(state: &State) -> Element<'_, Message> {
@@ -5698,13 +5683,18 @@ fn overview_view(state: &State) -> Element<'_, Message> {
 
     // Same chrome as the main window: a transparent titlebar over the app-wide azure
     // glow (so the gradient sits behind the logo + Overview and fades downward), with
-    // the content inset 6px on the sides/bottom so the glow frames it.
-    // Small symmetric pad (not the main window's 88px traffic-light inset): the brand
-    // is centred, not left-aligned, so it clears the macOS traffic lights on its own.
+    // the content inset 6px on the sides/bottom so the glow frames it. The brand is
+    // left-aligned at TITLEBAR_LEFT_PAD — the same inset as the main window (clears the
+    // macOS traffic lights; 8px on Windows).
     let titlebar = container(overview_titlebar(state))
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
-        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: 6.0 });
+        .padding(iced::Padding {
+            top: 0.0,
+            right: TITLEBAR_RIGHT_PAD,
+            bottom: 0.0,
+            left: TITLEBAR_LEFT_PAD,
+        });
     let framed = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
