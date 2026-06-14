@@ -16,6 +16,11 @@ pub struct GlyphBitmap {
     pub height: u32,
     pub coverage: Vec<u8>,
     pub color: bool,
+    /// Windows ClearType subpixel coverage: `coverage` is RGBA (4 bytes/px) where
+    /// R/G/B are the per-subpixel coverage (A = max channel). Blended per-channel,
+    /// tinted with the fg colour — distinct from `color` (a self-coloured emoji).
+    /// Always false on macOS (grayscale) and the swash path.
+    pub subpixel: bool,
 }
 
 /// Rasterise `ch` at `em_px` (the CSS-style em size in device px), in bold if
@@ -28,22 +33,24 @@ pub fn rasterize(
     em_px: f32,
     ch: char,
     bold: bool,
+    subpixel: bool,
 ) -> Option<GlyphBitmap> {
     #[cfg(target_os = "macos")]
     {
-        let _ = (font_data, font_index);
+        let _ = (font_data, font_index, subpixel);
         mac::rasterize(font_name, em_px, ch, bold)
     }
     #[cfg(target_os = "windows")]
     {
         // DirectWrite: OS-native rendering + system font fallback + colour emoji.
+        // `subpixel` requests ClearType (3-channel) coverage for mono text.
         let _ = (font_data, font_index);
-        dwrite::rasterize(font_name, em_px, ch, bold)
+        dwrite::rasterize(font_name, em_px, ch, bold, subpixel)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // Linux: swash with fontdb fallback (incl. Noto Color Emoji).
-        let _ = (font_name, bold);
+        let _ = (font_name, bold, subpixel);
         swash_raster::rasterize(font_data, font_index, em_px, ch)
     }
 }
@@ -112,6 +119,7 @@ mod swash_raster {
                 height: image.placement.height,
                 coverage: image.data,
                 color: matches!(image.content, Content::Color),
+                subpixel: false,
             })
         })
     }
@@ -377,6 +385,7 @@ mod mac {
                 height: h as u32,
                 coverage: rgba,
                 color: true,
+                subpixel: false,
             });
         }
 
@@ -402,7 +411,7 @@ mod mac {
             coverage[row * w..row * w + w].copy_from_slice(src);
         }
 
-        Some(GlyphBitmap { left, top, width: w as u32, height: h as u32, coverage, color: false })
+        Some(GlyphBitmap { left, top, width: w as u32, height: h as u32, coverage, color: false, subpixel: false })
     }
 }
 
@@ -418,12 +427,14 @@ mod dwrite {
     use std::cell::RefCell;
     use windows::core::{Result, PCWSTR};
     use windows::Win32::Graphics::Direct2D::Common::{
-        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
+        D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+        D2D_POINT_2F,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-        D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
-        D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+        D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+        D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+        D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
     };
     use windows::Win32::Graphics::DirectWrite::{
         DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
@@ -451,7 +462,7 @@ mod dwrite {
         static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
     }
 
-    pub fn rasterize(font_name: &str, em_px: f32, ch: char, bold: bool) -> Option<GlyphBitmap> {
+    pub fn rasterize(font_name: &str, em_px: f32, ch: char, bold: bool, subpixel: bool) -> Option<GlyphBitmap> {
         CTX.with(|cell| {
             let mut cell = cell.borrow_mut();
             let stale = cell
@@ -461,7 +472,7 @@ mod dwrite {
                 *cell = build_ctx(font_name, em_px).ok();
             }
             let ctx = cell.as_ref()?;
-            render(ctx, ch, bold).ok().flatten()
+            render(ctx, ch, bold, subpixel).ok().flatten()
         })
     }
 
@@ -479,7 +490,7 @@ mod dwrite {
         }
     }
 
-    fn render(ctx: &Ctx, ch: char, bold: bool) -> Result<Option<GlyphBitmap>> {
+    fn render(ctx: &Ctx, ch: char, bold: bool, subpixel: bool) -> Result<Option<GlyphBitmap>> {
         unsafe {
             let weight = if bold { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
             let locale: Vec<u16> = "en-us\0".encode_utf16().collect();
@@ -549,8 +560,116 @@ mod dwrite {
             }
             let data = std::slice::from_raw_parts(ptr, size as usize);
 
-            Ok(build_glyph(data, stride, w, h, baseline))
+            let glyph = build_glyph(data, stride, w, h, baseline);
+            // Mono text + subpixel requested → re-render with ClearType (3-channel
+            // coverage on an opaque target) for crisper, Windows-Terminal-style text.
+            // Colour emoji keep their straight-alpha RGBA from this (transparent) pass.
+            if subpixel {
+                if let Some(g) = &glyph {
+                    if !g.color {
+                        if let Ok(Some(sp)) = render_cleartype(ctx, &layout, w, h, baseline) {
+                            return Ok(Some(sp));
+                        }
+                    }
+                }
+            }
+            Ok(glyph)
         }
+    }
+
+    /// Re-render a mono glyph with ClearType subpixel AA: white text on an OPAQUE
+    /// black target (ClearType needs an opaque target, so alphaMode = IGNORE). The
+    /// resulting R/G/B per pixel ARE the per-subpixel coverage (0 = bg, 255 = full).
+    fn render_cleartype(
+        ctx: &Ctx,
+        layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+        w: u32,
+        h: u32,
+        baseline: f32,
+    ) -> Result<Option<GlyphBitmap>> {
+        unsafe {
+            let bitmap =
+                ctx.wic.CreateBitmap(w, h, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)?;
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE, // opaque → ClearType allowed
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            let rt: ID2D1RenderTarget = ctx.d2d.CreateWicBitmapRenderTarget(&bitmap, &props)?;
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+            let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+            let black = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+            let brush = rt.CreateSolidColorBrush(&white, None)?;
+            rt.BeginDraw();
+            rt.Clear(Some(&black));
+            // No colour-font here: this path is only taken for known-mono glyphs.
+            rt.DrawTextLayout(D2D_POINT_2F { x: 0.0, y: 0.0 }, layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            rt.EndDraw(None, None)?;
+            let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
+            let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
+            let stride = lock.GetStride()? as usize;
+            let mut size = 0u32;
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            lock.GetDataPointer(&mut size, &mut ptr)?;
+            if ptr.is_null() {
+                return Ok(None);
+            }
+            let data = std::slice::from_raw_parts(ptr, size as usize);
+            Ok(build_subpixel(data, stride, w, h, baseline))
+        }
+    }
+
+    /// Crop the white-on-black ClearType render to its ink box and pack the per-pixel
+    /// R/G/B as straight RGBA coverage (A = max channel) — a subpixel `GlyphBitmap`.
+    fn build_subpixel(data: &[u8], stride: usize, w: u32, h: u32, baseline: f32) -> Option<GlyphBitmap> {
+        let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0u32, 0u32);
+        let mut found = false;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y as usize * stride + x as usize * 4;
+                // PBGRA bytes: B, G, R, A. On opaque black, ink = any channel lit.
+                if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 {
+                    continue;
+                }
+                found = true;
+                minx = minx.min(x);
+                maxx = maxx.max(x);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+            }
+        }
+        if !found {
+            return None;
+        }
+        let (bw, bh) = (maxx - minx + 1, maxy - miny + 1);
+        let top = (baseline - miny as f32).round() as i32;
+        let mut rgba = vec![0u8; (bw * bh * 4) as usize];
+        for yy in 0..bh {
+            for xx in 0..bw {
+                let i = (miny + yy) as usize * stride + (minx + xx) as usize * 4;
+                let (b, g, r) = (data[i], data[i + 1], data[i + 2]);
+                let d = ((yy * bw + xx) * 4) as usize;
+                rgba[d] = r;
+                rgba[d + 1] = g;
+                rgba[d + 2] = b;
+                rgba[d + 3] = r.max(g).max(b);
+            }
+        }
+        Some(GlyphBitmap {
+            left: minx as i32,
+            top,
+            width: bw,
+            height: bh,
+            coverage: rgba,
+            color: false,
+            subpixel: true,
+        })
     }
 
     /// Crop the rendered bitmap to the glyph's ink box and classify mono vs colour.
@@ -595,7 +714,7 @@ mod dwrite {
                     rgba[d + 3] = a as u8;
                 }
             }
-            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: rgba, color: true })
+            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: rgba, color: true, subpixel: false })
         } else {
             let mut cov = vec![0u8; (bw * bh) as usize];
             for yy in 0..bh {
@@ -603,7 +722,7 @@ mod dwrite {
                     cov[(yy * bw + xx) as usize] = data[px(minx + xx, miny + yy) + 3]; // alpha
                 }
             }
-            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: cov, color: false })
+            Some(GlyphBitmap { left: minx as i32, top, width: bw, height: bh, coverage: cov, color: false, subpixel: false })
         }
     }
 }
