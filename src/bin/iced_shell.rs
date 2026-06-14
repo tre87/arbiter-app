@@ -6864,7 +6864,11 @@ fn pane_header(
         center = center.push(header_dot(d));
     }
     center = center.push(text(name.to_string()).size(11).color(color));
-    let center = container(center).center_x(Length::Fill).center_y(Length::Fill);
+    // Nudge the dot + name down 1px (top padding shifts centred content by half its value).
+    let center = container(center)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .padding(iced::Padding { top: 2.0, ..Default::default() });
 
     // Right layer: info (while Claude runs) + shell-switch button, hugged right.
     let mut right = row![].spacing(4).align_y(iced::Center);
