@@ -4447,6 +4447,7 @@ fn usage_section(
                         color,
                         &fmt_reset(p.resets_at_ms),
                         72.0,
+                        iced::Color::from_rgb8(0x12, 0x12, 0x12), // main titlebar: unchanged
                     ));
                     row = row.push(vsep());
                     n += 1;
@@ -4530,7 +4531,14 @@ fn usage_warning() -> Element<'static, Message> {
     .into()
 }
 
-fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str, track_w: f32) -> Element<'static, Message> {
+fn usage_stat(
+    label: &str,
+    pct: u16,
+    fill: iced::Color,
+    reset: &str,
+    track_w: f32,
+    track_bg: iced::Color,
+) -> Element<'static, Message> {
     // An 18px absolute line height (= bar height) so the label / % / reset glyphs
     // sit on the same line as the bar. Regular weight on the % avoids the ~1px rise
     // the semibold face has in iced.
@@ -4557,8 +4565,8 @@ fn usage_stat(label: &str, pct: u16, fill: iced::Color, reset: &str, track_w: f3
     let track = container(iced::widget::stack([bar_row, pct_text]))
         .width(Length::Fixed(track_w))
         .height(Length::Fixed(18.0))
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+        .style(move |_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(track_bg)),
             border: iced::Border { radius: 4.0.into(), ..Default::default() },
             ..Default::default()
         });
@@ -4626,7 +4634,16 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
             let mut row = row![].spacing(12).align_y(iced::Center);
             for ((label, color, p), reset) in shown.iter().zip(&resets) {
                 let r = if show_reset { reset.as_str() } else { "" };
-                row = row.push(usage_stat(label, p.utilization.round() as u16, *color, r, track_w));
+                // Overview: track in the header colour so the bars stand out against
+                // the (configurable) footer background, which can be very dark.
+                row = row.push(usage_stat(
+                    label,
+                    p.utilization.round() as u16,
+                    *color,
+                    r,
+                    track_w,
+                    app_header_bg(),
+                ));
             }
             // Centered group (not stretched); the centred margin yields before the bars.
             Some(container(row).center_x(Length::Fill).into())
