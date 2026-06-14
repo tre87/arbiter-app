@@ -426,8 +426,9 @@ mod dwrite {
         D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     };
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS,
+        DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED,
+        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE_GDI_NATURAL,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
@@ -445,6 +446,10 @@ mod dwrite {
         family: Vec<u16>, // null-terminated
         name: String,
         em: f32,
+        /// System rendering params (gamma/contrast) but forced to a GRID-FITTING mode
+        /// so small features (e.g. the counter of `B`) snap to the pixel grid and stay
+        /// crisp at small sizes, instead of rendering as soft gray. Applied per RT.
+        params: IDWriteRenderingParams,
     }
 
     thread_local! {
@@ -475,7 +480,18 @@ mod dwrite {
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
             let mut family: Vec<u16> = font_name.encode_utf16().collect();
             family.push(0);
-            Ok(Ctx { dwrite, d2d, wic, family, name: font_name.to_string(), em: em_px })
+            // Start from the system defaults (the user's ClearType gamma/contrast, same
+            // as Windows Terminal uses) but force GDI_NATURAL — a grid-fitting mode — so
+            // counters/stems land on the pixel grid and stay crisp at small sizes.
+            let def = dwrite.CreateRenderingParams()?;
+            let params = dwrite.CreateCustomRenderingParams(
+                def.GetGamma(),
+                def.GetEnhancedContrast(),
+                def.GetClearTypeLevel(),
+                def.GetPixelGeometry(),
+                DWRITE_RENDERING_MODE_GDI_NATURAL,
+            )?;
+            Ok(Ctx { dwrite, d2d, wic, family, name: font_name.to_string(), em: em_px, params })
         }
     }
 
@@ -524,6 +540,9 @@ mod dwrite {
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
             let rt: ID2D1RenderTarget = ctx.d2d.CreateWicBitmapRenderTarget(&bitmap, &props)?;
+            // Grid-fitting rendering params (crisp counters); grayscale AA (the target
+            // has alpha, so D2D uses grayscale, not ClearType — no subpixel fringing).
+            rt.SetTextRenderingParams(&ctx.params);
             let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
             let clear = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
             let brush = rt.CreateSolidColorBrush(&white, None)?;

@@ -602,9 +602,11 @@ impl TermGpu {
             cell: [cw, ch],
             glyph: [cw / ATLAS as f32, ch / ATLAS as f32],
             srgb: if self.is_srgb { 1.0 } else { 0.0 },
-            // Windows: gamma-space blend to match Windows Terminal's thinner, sharper
-            // text. macOS keeps the fuller linear blend that matches iTerm2/Terminal.app.
-            gamma_blend: if cfg!(target_os = "windows") { 1.0 } else { 0.0 },
+            // Linear (gamma-correct) AA blend on every platform — the fuller, smoother
+            // look that matches iTerm2/Terminal.app on macOS. Windows previously used
+            // the gamma-space blend (thinner, to mimic Windows Terminal), but it read
+            // as hazy/washed; the linear blend is fuller + crisper there too.
+            gamma_blend: 0.0,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
     }
