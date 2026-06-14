@@ -429,15 +429,13 @@ mod dwrite {
         D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     };
     use windows::core::Interface;
-    use windows::Win32::Foundation::FALSE;
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontFace,
-        IDWriteFontFile, IDWriteInMemoryFontFileLoader, IDWriteRenderingParams3,
-        DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE_TRUETYPE, DWRITE_FONT_METRICS,
+        DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection,
+        IDWriteFontFace, IDWriteFontFile, IDWriteFontSetBuilder1, IDWriteInMemoryFontFileLoader,
+        IDWriteRenderingParams3, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE_TRUETYPE,
         DWRITE_FONT_SIMULATIONS_NONE, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN,
-        DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL,
-        DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+        DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GRID_FIT_MODE_ENABLED,
+        DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
@@ -460,14 +458,22 @@ mod dwrite {
         /// features like the counter of `B` stay crisp). Gamma 1.0 / no contrast so the
         /// atlas holds RAW coverage; the gamma-correction is applied in the GPU shader.
         params: IDWriteRenderingParams3,
-        /// The bundled Cascadia Mono **Bold** face, loaded straight from our shipped
-        /// bytes (not the system font collection). Bold glyphs render from this real
-        /// bold face via DrawGlyphRun, instead of DirectWrite synthesising a soft
-        /// faux-bold by name. None if the bytes weren't supplied or failed to load.
-        bold_face: Option<IDWriteFontFace>,
-        /// Keeps the in-memory font loader for `bold_face` alive + registered for the
-        /// lifetime of this Ctx (the face reads its data through it).
-        _bold_loader: Option<IDWriteInMemoryFontFileLoader>,
+        /// The bundled Cascadia Mono **Bold** face, loaded from our shipped bytes into a
+        /// private font collection. Bold glyphs render through the SAME DrawTextLayout
+        /// path as regular (just pointed at this collection), so they're as crisp as
+        /// regular — instead of DirectWrite synthesising a soft faux-bold by name. None
+        /// if the bytes weren't supplied or failed to load.
+        bold: Option<BoldFont>,
+    }
+
+    /// The bundled bold face + the private collection wrapping it (for CreateTextFormat)
+    /// + that collection's family name. `_loader` is kept alive + registered for the
+    /// collection/face's lifetime (they read the in-memory bytes through it).
+    struct BoldFont {
+        _loader: IDWriteInMemoryFontFileLoader,
+        face: IDWriteFontFace,
+        collection: IDWriteFontCollection,
+        family: Vec<u16>, // null-terminated
     }
 
     thread_local! {
@@ -494,13 +500,11 @@ mod dwrite {
         })
     }
 
-    /// Load the bundled bold .ttf into a real DirectWrite font face (in-memory loader,
-    /// no dependency on the system font collection). Returns (loader, face) — the loader
-    /// must outlive the face. None on any failure (caller falls back to by-name bold).
-    unsafe fn build_bold_face(
-        dwrite: &IDWriteFactory,
-        data: &[u8],
-    ) -> Option<(IDWriteInMemoryFontFileLoader, IDWriteFontFace)> {
+    /// Load the bundled bold .ttf into a private DirectWrite font collection (in-memory
+    /// loader, no dependency on the system fonts) plus a font face for glyph-coverage
+    /// checks, and read back the collection's family name. None on any failure (caller
+    /// then falls back to the by-name path). The loader must outlive the collection/face.
+    unsafe fn build_bold_face(dwrite: &IDWriteFactory, data: &[u8]) -> Option<BoldFont> {
         let f5: IDWriteFactory5 = dwrite.cast().ok()?;
         let loader = f5.CreateInMemoryFontFileLoader().ok()?;
         f5.RegisterFontFileLoader(&loader).ok()?;
@@ -512,10 +516,28 @@ mod dwrite {
                 None,
             )
             .ok()?;
+        // A face for the glyph-presence check (GetGlyphIndices).
         let face = dwrite
-            .CreateFontFace(DWRITE_FONT_FACE_TYPE_TRUETYPE, &[Some(file)], 0, DWRITE_FONT_SIMULATIONS_NONE)
+            .CreateFontFace(
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                &[Some(file.clone())],
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+            )
             .ok()?;
-        Some((loader, face))
+        // A private collection wrapping the same file, so CreateTextFormat can resolve
+        // the bold face by family name and DrawTextLayout renders it exactly like regular.
+        let builder: IDWriteFontSetBuilder1 = f5.CreateFontSetBuilder().ok()?.cast().ok()?;
+        builder.AddFontFile(&file).ok()?;
+        let set = builder.CreateFontSet().ok()?;
+        let coll = f5.CreateFontCollectionFromFontSet(&set).ok()?;
+        // Family name of the (single) family in the collection, null-terminated.
+        let names = coll.GetFontFamily(0).ok()?.GetFamilyNames().ok()?;
+        let len = names.GetStringLength(0).ok()? as usize;
+        let mut family = vec![0u16; len + 1];
+        names.GetString(0, &mut family).ok()?;
+        let collection: IDWriteFontCollection = coll.cast().ok()?;
+        Some(BoldFont { _loader: loader, face, collection, family })
     }
 
     fn build_ctx(font_name: &str, bold_data: Option<&[u8]>, em_px: f32) -> Result<Ctx> {
@@ -550,11 +572,9 @@ mod dwrite {
                 DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
                 DWRITE_GRID_FIT_MODE_ENABLED,
             )?;
-            // Load the bundled bold face (best-effort; falls back to by-name bold).
-            let (bold_loader, bold_face) = match bold_data.and_then(|d| build_bold_face(&dwrite, d)) {
-                Some((l, f)) => (Some(l), Some(f)),
-                None => (None, None),
-            };
+            // Load the bundled bold into a private collection (best-effort; falls back
+            // to the by-name path if it fails).
+            let bold = bold_data.and_then(|d| build_bold_face(&dwrite, d));
             Ok(Ctx {
                 dwrite,
                 d2d,
@@ -563,34 +583,38 @@ mod dwrite {
                 name: font_name.to_string(),
                 em: em_px,
                 params,
-                bold_face,
-                _bold_loader: bold_loader,
+                bold,
             })
         }
     }
 
     fn render(ctx: &Ctx, ch: char, bold: bool) -> Result<Option<GlyphBitmap>> {
         unsafe {
-            // Bold: render the REAL bundled bold face. DirectWrite would otherwise
-            // synthesise a soft faux-bold from the regular when asked for bold by name
-            // (the installed Cascadia Mono has no static 700 face). Only when the bold
-            // font actually has the glyph; otherwise fall through to the by-name path so
-            // system fallback still serves emoji/symbols the font lacks.
-            if bold {
-                if let Some(face) = &ctx.bold_face {
+            // Pick the font source. For bold, prefer our private collection holding the
+            // REAL bundled bold face — DirectWrite would otherwise synthesise a soft
+            // faux-bold by name (the installed Cascadia Mono has no static 700 face).
+            // Only when the bold font actually has this glyph; otherwise use the system
+            // collection by name so font fallback still serves emoji/symbols it lacks.
+            // Either way it's the SAME DrawTextLayout path below, so bold is as crisp as
+            // regular — only the collection + family differ.
+            let bold_src = if bold {
+                ctx.bold.as_ref().filter(|b| {
                     let cps = [ch as u32];
                     let mut gids = [0u16; 1];
-                    if face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).is_ok() && gids[0] != 0
-                    {
-                        return render_glyph_run(ctx, face, gids[0]);
-                    }
-                }
-            }
+                    b.face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).is_ok() && gids[0] != 0
+                })
+            } else {
+                None
+            };
             let weight = if bold { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
+            let (collection, family): (Option<&IDWriteFontCollection>, &[u16]) = match bold_src {
+                Some(b) => (Some(&b.collection), &b.family),
+                None => (None, &ctx.family),
+            };
             let locale: Vec<u16> = "en-us\0".encode_utf16().collect();
             let format = ctx.dwrite.CreateTextFormat(
-                PCWSTR(ctx.family.as_ptr()),
-                None,
+                PCWSTR(family.as_ptr()),
+                collection,
                 weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
@@ -659,73 +683,6 @@ mod dwrite {
 
             Ok(build_glyph(data, stride, w, h, baseline))
         }
-    }
-
-    /// Rasterise one glyph (by index) from a specific font face via DrawGlyphRun — used
-    /// for the bundled bold face. Mirrors `render`'s box/readback/crop exactly so glyph
-    /// placement is identical to the by-name path; only the glyph source differs.
-    unsafe fn render_glyph_run(
-        ctx: &Ctx,
-        face: &IDWriteFontFace,
-        gid: u16,
-    ) -> Result<Option<GlyphBitmap>> {
-        // Baseline (box-top → baseline) from the face's own metrics.
-        let mut fm = DWRITE_FONT_METRICS::default();
-        face.GetMetrics(&mut fm);
-        let upm = if fm.designUnitsPerEm != 0 { fm.designUnitsPerEm as f32 } else { 2048.0 };
-        let baseline = ctx.em * fm.ascent as f32 / upm;
-
-        let boxw = (ctx.em * 2.5).ceil() + 4.0;
-        let boxh = (ctx.em * 2.0).ceil() + 4.0;
-        let (w, h) = (boxw as u32, boxh as u32);
-        let bitmap = ctx.wic.CreateBitmap(w, h, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)?;
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            usage: D2D1_RENDER_TARGET_USAGE_NONE,
-            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-        };
-        let rt: ID2D1RenderTarget = ctx.d2d.CreateWicBitmapRenderTarget(&bitmap, &props)?;
-        rt.SetTextRenderingParams(&ctx.params);
-        let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-        let clear = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
-        let brush = rt.CreateSolidColorBrush(&white, None)?;
-
-        let gids = [gid];
-        let advances = [0.0f32];
-        let mut run = DWRITE_GLYPH_RUN {
-            fontFace: std::mem::ManuallyDrop::new(Some(face.clone())),
-            fontEmSize: ctx.em,
-            glyphCount: 1,
-            glyphIndices: gids.as_ptr(),
-            glyphAdvances: advances.as_ptr(),
-            glyphOffsets: std::ptr::null(),
-            isSideways: FALSE,
-            bidiLevel: 0,
-        };
-        rt.BeginDraw();
-        rt.Clear(Some(&clear));
-        rt.DrawGlyphRun(D2D_POINT_2F { x: 0.0, y: baseline }, &run, &brush, DWRITE_MEASURING_MODE_NATURAL);
-        // Release the cloned face ref we parked in the run (ManuallyDrop won't).
-        std::mem::ManuallyDrop::drop(&mut run.fontFace);
-        rt.EndDraw(None, None)?;
-
-        let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
-        let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
-        let stride = lock.GetStride()? as usize;
-        let mut size = 0u32;
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        lock.GetDataPointer(&mut size, &mut ptr)?;
-        if ptr.is_null() {
-            return Ok(None);
-        }
-        let data = std::slice::from_raw_parts(ptr, size as usize);
-        Ok(build_glyph(data, stride, w, h, baseline))
     }
 
     /// Crop the rendered bitmap to the glyph's ink box and classify mono vs colour.
