@@ -420,20 +420,21 @@ struct WorktreeDialog {
 /// window doesn't reach the terminal). Set once at startup.
 static MAIN_WINDOW: std::sync::OnceLock<iced::window::Id> = std::sync::OnceLock::new();
 
-/// The app-wide background colour (terminals, sidebars, overview), read from the
-/// shared `term` global so every surface stays in lock-step with the terminal cells.
+/// The configurable surface colour for the terminals, sidebars and the overview's
+/// terminal-list area (NOT the main app background / chrome / gradients). Read from the
+/// shared `term` global so those surfaces stay in lock-step with the terminal cells.
 fn app_bg() -> iced::Color {
     let (r, g, b) = arbiter_native::term::bg();
     iced::Color::from_rgb8(r, g, b)
 }
 
-/// Foundational dark theme matching Arbiter's palette (configurable bg, azure accent).
+/// Foundational dark theme matching Arbiter's palette (#121212 bg, azure accent).
 /// The detailed chrome polish comes after the status/footer are functional.
-fn arbiter_theme(bg: iced::Color) -> iced::Theme {
+fn arbiter_theme() -> iced::Theme {
     iced::Theme::custom(
         "Arbiter".to_string(),
         iced::theme::Palette {
-            background: bg,
+            background: iced::Color::from_rgb8(0x12, 0x12, 0x12),
             text: iced::Color::from_rgb8(0xcc, 0xcc, 0xcc),
             primary: iced::Color::from_rgb8(0x33, 0x99, 0xff),
             success: iced::Color::from_rgb8(0x2d, 0xbd, 0x6e),
@@ -1233,11 +1234,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let hex = hex.trim().to_string();
             state.settings.background = hex.clone();
             // Apply only when it parses (live as-you-type; partial input is kept in the
-            // field but doesn't change the colour until valid). Terminals + surfaces read
-            // the global; the theme (window base / overview) is rebuilt from it.
+            // field but doesn't change the colour until valid). The terminals, sidebars
+            // and overview list area read the global on the next frame.
             if let Some((r, g, b)) = persist::parse_hex(&hex) {
                 arbiter_native::term::set_bg((r as u32) << 16 | (g as u32) << 8 | b as u32);
-                state.theme = arbiter_theme(app_bg());
             }
             save_session(state);
         }
@@ -3647,24 +3647,27 @@ fn settings_bg_row(current: &str) -> Element<'static, Message> {
         let kind = if norm(hex) == cur { BtnKind::Primary } else { BtnKind::Secondary };
         settings_btn(label, Message::SetBackground(hex.to_string()), kind)
     };
-    let labels = column![
-        text("Background").size(13).color(TXT_SECONDARY),
-        text("Terminals, sidebars and the overview. Pick a preset or enter a hex colour.")
-            .size(11)
-            .color(TXT_MUTED),
-    ]
-    .spacing(2);
     let input = text_input("#rrggbb", current)
         .on_input(Message::SetBackground)
-        .width(Length::Fixed(96.0))
+        .width(Length::Fixed(180.0))
         .padding([6, 8])
         .size(13)
         .style(settings_input_style);
-    let controls =
-        row![preset("Default", "#121212"), preset("Black", "#000000"), input].spacing(8).align_y(iced::Center);
-    container(row![labels, horizontal_space(), controls].spacing(12).align_y(iced::Center))
-        .padding([10, 4])
-        .into()
+    // Label + hint, then the presets and the (wide) custom field on the row below.
+    container(
+        column![
+            text("Background").size(13).color(TXT_SECONDARY),
+            text("Terminals, sidebars and the overview. Pick a preset or enter a hex colour.")
+                .size(11)
+                .color(TXT_MUTED),
+            row![preset("Default", "#121212"), preset("Black", "#000000"), input]
+                .spacing(8)
+                .align_y(iced::Center),
+        ]
+        .spacing(8),
+    )
+    .padding([10, 4])
+    .into()
 }
 
 /// One `label  value` line in the account block (web `.account-meta-row`).
@@ -5623,7 +5626,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         // (the row padding adds the remaining ~3px).
         .padding(iced::Padding { top: 9.0, right: 0.0, bottom: 0.0, left: 0.0 })
         .style(move |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+            // The terminal-list area uses the configurable background (Settings →
+            // Display), matching the terminals — NOT the chrome/gradient around it.
+            background: Some(iced::Background::Color(app_bg())),
             border: iced::Border { radius: list_radius, ..Default::default() },
             ..Default::default()
         });
@@ -8116,7 +8121,7 @@ fn main() -> iced::Result {
                 active,
                 font: font.clone(),
                 git_bash: git_bash.clone(),
-                theme: arbiter_theme(app_bg()),
+                theme: arbiter_theme(),
                 main_window: main_id,
                 overview_window,
                 main_size,
