@@ -5531,10 +5531,12 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
     .spacing(8)
     .align_y(iced::Center);
 
-    // Left-aligned like the main window: the brand first, then a draggable fill, then
-    // (Windows) the caption buttons flush right. The wrapper supplies the left pad
-    // (TITLEBAR_LEFT_PAD) so the brand clears the macOS traffic lights — same setup as
-    // the main window's titlebar. The brand + the empty area both drag the window.
+    // The brand (logo + "Overview") is CENTRED over the full titlebar width — the true
+    // window centre — so it reads centred on every platform. A drag region sits beneath
+    // it, and on Windows the caption buttons are the TOP stack layer so they stay
+    // clickable even if a narrow window lets the centred brand reach them. (Previously
+    // the centre reserved a 140px caption strip on the right, which pushed the brand
+    // left of centre on Windows — the bug.)
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let brand: Element<Message> = mouse_area(brand_inner).on_press(Message::DragOverview).into();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -5546,23 +5548,32 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let drag: Element<Message> = Space::new(Length::Fill, Length::Fill).into();
 
+    let centered: Element<Message> = container(brand)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into();
+
     #[allow(unused_mut)]
-    let mut bar = row![brand, drag].align_y(iced::Center).height(Length::Fill);
+    let mut layers: Vec<Element<Message>> = vec![drag, centered];
     #[cfg(target_os = "windows")]
     {
         let f = state.overview_focused;
         let mid =
             if state.overview_maximized { caption_glyph::RESTORE } else { caption_glyph::MAXIMIZE };
-        bar = bar.push(
+        layers.push(
             row![
+                horizontal_space(),
                 caption_button(caption_glyph::MINIMIZE, Message::OverviewMinimize, false, f),
                 caption_button(mid, Message::OverviewMaximizeToggle, false, f),
                 caption_button(caption_glyph::CLOSE, Message::OverviewClose, true, f),
             ]
-            .spacing(0),
+            .height(Length::Fill)
+            .into(),
         );
     }
-    bar.into()
+    iced::widget::stack(layers).height(Length::Fill).into()
 }
 
 fn overview_view(state: &State) -> Element<'_, Message> {
@@ -5684,17 +5695,12 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     // Same chrome as the main window: a transparent titlebar over the app-wide azure
     // glow (so the gradient sits behind the logo + Overview and fades downward), with
     // the content inset 6px on the sides/bottom so the glow frames it. The brand is
-    // left-aligned at TITLEBAR_LEFT_PAD — the same inset as the main window (clears the
-    // macOS traffic lights; 8px on Windows).
+    // centred (see overview_titlebar), so a small symmetric pad is enough — the centred
+    // brand clears the macOS traffic lights on its own.
     let titlebar = container(overview_titlebar(state))
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
-        .padding(iced::Padding {
-            top: 0.0,
-            right: TITLEBAR_RIGHT_PAD,
-            bottom: 0.0,
-            left: TITLEBAR_LEFT_PAD,
-        });
+        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: 6.0 });
     let framed = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
