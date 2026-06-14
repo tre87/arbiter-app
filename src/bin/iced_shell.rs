@@ -4447,7 +4447,7 @@ fn usage_section(
                         color,
                         &fmt_reset(p.resets_at_ms),
                         72.0,
-                        iced::Color::from_rgb8(0x12, 0x12, 0x12), // main titlebar: unchanged
+                        None, // main titlebar: no border
                     ));
                     row = row.push(vsep());
                     n += 1;
@@ -4537,7 +4537,7 @@ fn usage_stat(
     fill: iced::Color,
     reset: &str,
     track_w: f32,
-    track_bg: iced::Color,
+    border_color: Option<iced::Color>,
 ) -> Element<'static, Message> {
     // An 18px absolute line height (= bar height) so the label / % / reset glyphs
     // sit on the same line as the bar. Regular weight on the % avoids the ~1px rise
@@ -4566,8 +4566,14 @@ fn usage_stat(
         .width(Length::Fixed(track_w))
         .height(Length::Fixed(18.0))
         .style(move |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(track_bg)),
-            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            // Static track colour (same on the main titlebar + overview). An optional
+            // border (the overview passes #121212) frames the bars on a dark background.
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+            border: iced::Border {
+                color: border_color.unwrap_or(iced::Color::TRANSPARENT),
+                width: if border_color.is_some() { 1.0 } else { 0.0 },
+                radius: 4.0.into(),
+            },
             ..Default::default()
         });
     row![
@@ -4634,15 +4640,15 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
             let mut row = row![].spacing(12).align_y(iced::Center);
             for ((label, color, p), reset) in shown.iter().zip(&resets) {
                 let r = if show_reset { reset.as_str() } else { "" };
-                // Overview: track in the header colour so the bars stand out against
-                // the (configurable) footer background, which can be very dark.
+                // Overview: a #121212 border frames the bars against the (configurable,
+                // possibly very dark) footer background. Track colour is static (as main).
                 row = row.push(usage_stat(
                     label,
                     p.utilization.round() as u16,
                     *color,
                     r,
                     track_w,
-                    app_header_bg(),
+                    Some(iced::Color::from_rgb8(0x12, 0x12, 0x12)),
                 ));
             }
             // Centered group (not stretched); the centred margin yields before the bars.
