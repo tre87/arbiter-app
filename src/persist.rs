@@ -125,6 +125,51 @@ pub struct Settings {
     /// not surfaced in the UI. `None` = the documents dir default.
     #[serde(default)]
     pub docs_folder: Option<String>,
+    /// How bold/intense (SGR 1) text renders — mirrors Windows Terminal's
+    /// `intenseTextStyle`. Default: a bold font face.
+    #[serde(default)]
+    pub intense_text_style: IntenseStyle,
+}
+
+/// How "intense" (SGR 1 / bold) terminal text is rendered. Mirrors Windows Terminal's
+/// `intenseTextStyle`: `Bold` draws the bold font face, `Bright` brightens the colour at
+/// regular weight (the classic xterm behaviour), `All` does both, `None` ignores it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IntenseStyle {
+    None,
+    #[default]
+    Bold,
+    Bright,
+    All,
+}
+
+impl IntenseStyle {
+    /// All variants, in menu order (for the Settings picker).
+    pub const ALL: [IntenseStyle; 4] =
+        [IntenseStyle::None, IntenseStyle::Bold, IntenseStyle::Bright, IntenseStyle::All];
+
+    /// Compact code passed to the renderer's atomic (see `term::set_intense_style`):
+    /// 0 = None, 1 = Bold, 2 = Bright, 3 = All.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            IntenseStyle::None => 0,
+            IntenseStyle::Bold => 1,
+            IntenseStyle::Bright => 2,
+            IntenseStyle::All => 3,
+        }
+    }
+}
+
+impl std::fmt::Display for IntenseStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IntenseStyle::None => "None",
+            IntenseStyle::Bold => "Bold",
+            IntenseStyle::Bright => "Bright",
+            IntenseStyle::All => "Bold + Bright",
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -152,6 +197,7 @@ impl Default for Settings {
             show_terminal_buttons: false,
             screenshot_folder: None,
             docs_folder: None,
+            intense_text_style: IntenseStyle::Bold,
         }
     }
 }

@@ -481,6 +481,8 @@ enum Message {
     ToggleOverviewUsageFooter(bool),
     ToggleHideShellButton(bool),
     ToggleShowTerminalButtons(bool),
+    /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
+    SetIntenseStyle(persist::IntenseStyle),
     /// Settings → scrollback lines (text input; parsed + clamped).
     SetScrollback(String),
     /// Settings → screenshot-attach folder (Files tab): set / browse / reset.
@@ -1211,6 +1213,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ToggleShowTerminalButtons(v) => {
             state.settings.show_terminal_buttons = v;
             save_session(state);
+        }
+        Message::SetIntenseStyle(s) => {
+            state.settings.intense_text_style = s;
+            arbiter_native::term::set_intense_style(s.as_u8());
+            save_session(state);
+            // Existing terminals re-render from the global on the next frame.
         }
         Message::SetScrollback(s) => {
             // Keep only digits, clamp to the supported range; new terminals pick it
@@ -3588,6 +3596,27 @@ fn settings_number_row(
         .into()
 }
 
+/// A `label  [picker]` row for the intense-text style (label + hint on the left, a
+/// pick_list on the right) — mirrors `settings_number_row`'s layout.
+fn settings_intense_row(
+    label: &str,
+    sub: &str,
+    selected: persist::IntenseStyle,
+) -> Element<'static, Message> {
+    let labels = column![
+        text(label.to_string()).size(13).color(TXT_SECONDARY),
+        text(sub.to_string()).size(11).color(TXT_MUTED),
+    ]
+    .spacing(2);
+    let picker = pick_list(&persist::IntenseStyle::ALL[..], Some(selected), Message::SetIntenseStyle)
+        .padding([6, 8])
+        .text_size(13)
+        .width(Length::Fixed(150.0));
+    container(row![labels, horizontal_space(), picker].spacing(12).align_y(iced::Center))
+        .padding([10, 4])
+        .into()
+}
+
 /// One `label  value` line in the account block (web `.account-meta-row`).
 fn settings_account_line(label: &str, value: &str) -> Element<'static, Message> {
     row![
@@ -3774,6 +3803,11 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     ),
                     state.settings.scrollback,
                     Message::SetScrollback,
+                ),
+                settings_intense_row(
+                    "Bold text style",
+                    "How bold (SGR 1) text renders: Bold = bold font, Bright = brighter colour, both, or none.",
+                    state.settings.intense_text_style,
                 ),
             ]
             .spacing(12);
@@ -7929,6 +7963,8 @@ fn main() -> iced::Result {
             // sessions get the configured history depth.
             arbiter_native::term::SCROLLBACK
                 .store(saved_settings.scrollback, std::sync::atomic::Ordering::Relaxed);
+            // Apply the saved intense-text (bold/bright) mode before the first render.
+            arbiter_native::term::set_intense_style(saved_settings.intense_text_style.as_u8());
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();

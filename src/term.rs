@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::EventListener;
@@ -13,6 +14,17 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+
+/// App-wide "intense text" (SGR 1 / bold) rendering mode, mirroring Windows Terminal's
+/// `intenseTextStyle` (see [`crate::persist::IntenseStyle`]): 0 = None, 1 = Bold,
+/// 2 = Bright, 3 = All. Read per-cell in `for_each_cell`; set from Settings on load and
+/// when changed. Defaults to Bold (a bold font face).
+static INTENSE_STYLE: AtomicU8 = AtomicU8::new(1);
+
+/// Set the intense-text rendering mode from Settings (`IntenseStyle::as_u8`).
+pub fn set_intense_style(v: u8) {
+    INTENSE_STYLE.store(v, Ordering::Relaxed);
+}
 
 /// Active in-terminal find: the matched cell ranges (incl. scrollback), which is
 /// the current one, and the precomputed cell sets for O(1) render highlighting.
@@ -460,6 +472,15 @@ impl VtTerm {
                 }
                 let mut fg = self.resolve(cell.fg, true);
                 let mut bg = self.resolve(cell.bg, false);
+                // Intense/bold (SGR 1): mirror Windows Terminal's intenseTextStyle.
+                // style 2 (Bright) / 3 (All) brighten the colour; style 1 (Bold) / 3 (All)
+                // use the bold font face. So "Bright" gives crisp regular-weight text in a
+                // brighter colour (the classic xterm look), "Bold" the bold font, etc.
+                let intense = cell.flags.contains(Flags::BOLD);
+                let style = INTENSE_STYLE.load(Ordering::Relaxed);
+                if intense && (style == 2 || style == 3) {
+                    fg = self.intense_fg(cell.fg);
+                }
                 // Faint/dim (SGR 2): darken the foreground, like other terminals
                 // (Alacritty uses 2/3). Without it, Claude's dim status line and hints
                 // rendered at full brightness — far lighter than Windows Terminal etc.
@@ -477,7 +498,7 @@ impl VtTerm {
                 if cell.flags.contains(Flags::HIDDEN) {
                     fg = bg;
                 }
-                let bold = cell.flags.contains(Flags::BOLD);
+                let bold = intense && (style == 1 || style == 3);
                 let wide = cell.flags.contains(Flags::WIDE_CHAR);
                 let selected =
                     sel.as_ref().is_some_and(|r| r.contains(Point::new(Line(line_idx), Column(col))));
@@ -512,6 +533,25 @@ impl VtTerm {
             },
         }
     }
+
+    /// The "intense" (bright) foreground for a colour, à la xterm/Windows Terminal:
+    /// the eight standard ANSI colours (0–7) map to their bright variants (8–15), the
+    /// default foreground is lightened toward white, and everything else (already-bright
+    /// palette entries, 256-cube, and explicit RGB) is left as the user set it.
+    fn intense_fg(&self, color: Color) -> Rgb {
+        match color {
+            Color::Named(NamedColor::Foreground) => lighten(self.default_fg),
+            Color::Named(n) if (n as usize) < 8 => self.palette[n as usize + 8],
+            Color::Indexed(i) if (i as usize) < 8 => self.palette[i as usize + 8],
+            other => self.resolve(other, true),
+        }
+    }
+}
+
+/// Lighten a colour toward white (used for intense default-foreground text).
+fn lighten(c: Rgb) -> Rgb {
+    let f = |v: u8| (v as f32 + (255.0 - v as f32) * 0.4).round() as u8;
+    Rgb { r: f(c.r), g: f(c.g), b: f(c.b) }
 }
 
 fn rgbf(c: Rgb) -> [f32; 3] {

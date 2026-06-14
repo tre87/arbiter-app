@@ -7,6 +7,18 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Bold text style** setting (Settings → Display → Terminal), mirroring Windows
+  Terminal's `intenseTextStyle`: render bold/intense (SGR 1) text as a **bold font**,
+  a **brighter colour** (regular weight, the classic xterm look), **both**, or **none**.
+
+### Fixed
+- **Windows terminal text** is sharper and now matches Windows Terminal. Grayscale
+  antialiasing uses DirectWrite's gamma-correct blend (the gamma-1.8 algorithm from
+  WT's own shader) instead of a hazy/thin gamma-space blend; glyphs render in the
+  recommended NATURAL_SYMMETRIC mode with grid-fitting; and **bold** renders from the
+  bundled Cascadia Mono Bold face instead of a soft synthesised faux-bold.
+
 ## [1.0.5] — 2026-06-12
 
 ### Added
