@@ -425,10 +425,12 @@ mod dwrite {
         D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
         D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     };
+    use windows::core::Interface;
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED,
-        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE_DEFAULT,
+        DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteRenderingParams3,
+        DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GRID_FIT_MODE_ENABLED,
+        DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
@@ -446,10 +448,11 @@ mod dwrite {
         family: Vec<u16>, // null-terminated
         name: String,
         em: f32,
-        /// System rendering params (gamma/contrast) but forced to a GRID-FITTING mode
-        /// so small features (e.g. the counter of `B`) snap to the pixel grid and stay
-        /// crisp at small sizes, instead of rendering as soft gray. Applied per RT.
-        params: IDWriteRenderingParams,
+        /// Rendering params matching Windows Terminal: NATURAL_SYMMETRIC mode (smooth,
+        /// fractional positioning — no GDI bold-distortion) with grid-fit ENABLED (small
+        /// features like the counter of `B` stay crisp). Gamma 1.0 / no contrast so the
+        /// atlas holds RAW coverage; the gamma-correction is applied in the GPU shader.
+        params: IDWriteRenderingParams3,
     }
 
     thread_local! {
@@ -484,18 +487,23 @@ mod dwrite {
             // GPU shader (Windows Terminal's DirectWrite algorithm), so baking it in twice
             // would over-darken. Hence gamma 1.0 + no enhanced contrast.
             //
-            // Rendering mode DEFAULT lets DirectWrite auto-select the recommended NATURAL
-            // mode for the font+size — exactly what WT does via GetRecommendedRenderingMode
-            // (BackendD3D.cpp). We previously forced GDI_NATURAL (GDI-compatible grid-fit),
-            // but that snaps stems to whole pixels and over-thickens BOLD glyphs; natural
-            // hinting + the shader's gamma give crisp counters without that distortion.
+            // Rendering mode: NATURAL_SYMMETRIC + grid-fit ENABLED, the combination WT's
+            // GetRecommendedRenderingMode returns at terminal sizes. NATURAL_SYMMETRIC uses
+            // fractional positioning (no GDI bitmap-matching that over-thickens BOLD), while
+            // grid-fit keeps stems/counters crisp on the pixel grid. We earlier tried
+            // GDI_NATURAL (sharp but bold too heavy) and DEFAULT (lost grid-fit → soft);
+            // this is the in-between WT actually uses. Needs IDWriteFactory3 (Win8.1+),
+            // whose CreateCustomRenderingParams exposes mode + grid-fit as separate knobs.
             let def = dwrite.CreateRenderingParams()?;
-            let params = dwrite.CreateCustomRenderingParams(
+            let f3: IDWriteFactory3 = dwrite.cast()?;
+            let params = f3.CreateCustomRenderingParams(
                 1.0, // gamma 1.0: capture raw coverage (shader applies WT's gamma 1.8)
-                0.0, // no enhanced contrast baked in (shader applies it against fg/bg)
-                0.0, // no ClearType level (grayscale AA, no subpixel)
+                0.0, // enhanced contrast: none baked in (shader applies it against fg/bg)
+                0.0, // grayscale enhanced contrast: none (shader applies it)
+                0.0, // ClearType level: none (grayscale AA, no subpixel)
                 def.GetPixelGeometry(),
-                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+                DWRITE_GRID_FIT_MODE_ENABLED,
             )?;
             Ok(Ctx { dwrite, d2d, wic, family, name: font_name.to_string(), em: em_px, params })
         }
