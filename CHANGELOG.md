@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.0.6] — 2026-06-14
+
 ### Changed
 - **Much lower idle CPU.** The terminal now redraws on PTY output (event-driven) and
   the title is a static gradient, so the 60fps animation tick pauses (→ 1s) whenever
@@ -16,6 +18,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
 - The git-status file watcher no longer pins the CPU in a repo: it ignores `.git/`
   churn (so `git status`'s own index rewrite can't re-trigger it in a loop) and
   gitignored build/dep dirs (`target/`, `node_modules/`, …).
+- **Titlebar & overview polish:** a static azure title gradient (no pale blue); the
+  overview titlebar matches the main window (centered on macOS, left-aligned on Windows,
+  same indent); and the overview usage bars stay legible on the dark background.
 
 ### Added
 - **Bold text style** setting (Settings → Display → Terminal), mirroring Windows
