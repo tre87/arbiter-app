@@ -5567,12 +5567,10 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
     .spacing(8)
     .align_y(iced::Center);
 
-    // The brand (logo + "Overview") is CENTRED over the full titlebar width — the true
-    // window centre — so it reads centred on every platform. A drag region sits beneath
-    // it, and on Windows the caption buttons are the TOP stack layer so they stay
-    // clickable even if a narrow window lets the centred brand reach them. (Previously
-    // the centre reserved a 140px caption strip on the right, which pushed the brand
-    // left of centre on Windows — the bug.)
+    // Windows: LEFT-ALIGNED (brand, draggable fill, caption buttons flush right) — like
+    // the main window, so the title doesn't fight the caption strip. macOS (and others):
+    // CENTRED over the full width (no right-side caption; the centred brand clears the
+    // traffic lights on its own). The brand + the empty area both drag the window.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let brand: Element<Message> = mouse_area(brand_inner).on_press(Message::DragOverview).into();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -5584,32 +5582,34 @@ fn overview_titlebar(state: &State) -> Element<'_, Message> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let drag: Element<Message> = Space::new(Length::Fill, Length::Fill).into();
 
-    let centered: Element<Message> = container(brand)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into();
-
-    #[allow(unused_mut)]
-    let mut layers: Vec<Element<Message>> = vec![drag, centered];
     #[cfg(target_os = "windows")]
     {
         let f = state.overview_focused;
         let mid =
             if state.overview_maximized { caption_glyph::RESTORE } else { caption_glyph::MAXIMIZE };
-        layers.push(
+        row![
+            brand,
+            drag,
             row![
-                horizontal_space(),
                 caption_button(caption_glyph::MINIMIZE, Message::OverviewMinimize, false, f),
                 caption_button(mid, Message::OverviewMaximizeToggle, false, f),
                 caption_button(caption_glyph::CLOSE, Message::OverviewClose, true, f),
             ]
-            .height(Length::Fill)
-            .into(),
-        );
+            .spacing(0),
+        ]
+        .align_y(iced::Center)
+        .height(Length::Fill)
+        .into()
     }
-    iced::widget::stack(layers).height(Length::Fill).into()
+    #[cfg(not(target_os = "windows"))]
+    {
+        let centered = container(brand)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        iced::widget::stack(vec![drag, centered.into()]).height(Length::Fill).into()
+    }
 }
 
 fn overview_view(state: &State) -> Element<'_, Message> {
