@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Changed
+- **Much lower idle CPU.** The terminal now redraws on PTY output (event-driven) and
+  the title is a static gradient, so the 60fps animation tick pauses (→ 1s) whenever
+  nothing is animating. Idle goes from a constant ~1–2% repaint to near-zero; the fast
+  tick returns only while Claude is working, a status needs attention, or the scroll
+  indicator is fading.
+
 ### Added
 - **Bold text style** setting (Settings → Display → Terminal), mirroring Windows
   Terminal's `intenseTextStyle`: render bold/intense (SGR 1) text as a **bold font**,

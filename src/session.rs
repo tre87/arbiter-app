@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
@@ -23,6 +23,24 @@ type CmdEpoch = Arc<(Mutex<u64>, Condvar)>;
 type GitWatcher = Debouncer<RecommendedWatcher>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// UI redraw hook: a PTY reader calls this after feeding new output so the UI can
+/// redraw *on output* instead of polling the grid every frame. The iced shell wires
+/// it to a redraw message at startup; it's a no-op until then (early output is covered
+/// by the startup fast tick). Keeps this lib iced-agnostic.
+static UI_WAKER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Register the UI redraw hook (called once by the shell).
+pub fn set_ui_waker(f: Box<dyn Fn() + Send + Sync>) {
+    let _ = UI_WAKER.set(f);
+}
+
+/// Wake the UI to redraw, if a waker is registered.
+fn wake_ui() {
+    if let Some(f) = UI_WAKER.get() {
+        f();
+    }
+}
 
 pub type SharedTerm = Arc<Mutex<VtTerm>>;
 pub type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
@@ -265,6 +283,10 @@ fn reader_loop(
             // PTY write would stop us draining output and could deadlock the slave.
             let _ = writer_tx.send(responses);
         }
+        // The grid changed — wake the UI to redraw (event-driven; the UI no longer
+        // polls the grid every frame). Coalesced on the UI side, so a burst of output
+        // is one redraw.
+        wake_ui();
 
         // Tier-3b: while Claude runs here, reflect the live turn from the *rendered
         // screen* (level-triggered, so attention clears the instant a menu leaves —

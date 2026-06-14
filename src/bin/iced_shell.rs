@@ -462,6 +462,9 @@ impl State {
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
+    /// No-op whose only purpose is to make iced redraw — sent by the terminal-output
+    /// wake (a PTY reader produced output) so the grid renders without polling.
+    Redraw,
     Input(Vec<u8>),
     Focus(pane_grid::Pane),
     SplitRight,
@@ -1017,6 +1020,9 @@ fn save_session(state: &State) {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        // A no-op: processing any message makes iced redraw, which is the whole point
+        // (the terminal-output wake fires this so new PTY output renders on-demand).
+        Message::Redraw => {}
         Message::Tick => {
             // Persist when a Claude session newly bound in a pane (the watcher sets
             // this on an FS event; the tick just reacts to the flag — a cheap atomic
@@ -4343,6 +4349,33 @@ fn usage_show_login() {
     usage_helper_cmd("show");
 }
 
+/// Subscription: PTY readers wake the UI here when they produce output, so the
+/// terminal redraws *on output* instead of the tick polling the grid every frame.
+/// Registers a waker (a channel sender) the readers call; coalesces a burst of pings
+/// into a single `Redraw` so heavy output isn't one redraw per byte.
+fn term_wake_subscription() -> Subscription<Message> {
+    Subscription::run(term_wake_worker)
+}
+
+fn term_wake_worker() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(64, |mut output| async move {
+        use iced::futures::{SinkExt, StreamExt};
+        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<()>();
+        // Wire the lib's reader waker to this channel.
+        arbiter_native::session::set_ui_waker(Box::new(move || {
+            let _ = tx.unbounded_send(());
+        }));
+        loop {
+            // Block until at least one ping, then drain the backlog → one redraw.
+            if rx.next().await.is_none() {
+                break;
+            }
+            while rx.try_recv().is_ok() {}
+            let _ = output.send(Message::Redraw).await;
+        }
+    })
+}
+
 /// Subscription: spawn the usage helper and turn each stdout line into a
 /// `UsageUpdated` message. The helper holds the webview; we just read JSON.
 fn usage_subscription() -> Subscription<Message> {
@@ -7243,8 +7276,42 @@ fn default_screenshot_dir_label() -> String {
         .unwrap_or_else(|| "System default".to_string())
 }
 
-fn subscription(_state: &State) -> Subscription<Message> {
-    let tick = iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick);
+/// Whether the 16ms (60fps) tick is needed, vs a slow 1s tick. Fast only while
+/// something is actually animating: the first-frame chrome init, the usage loading
+/// dots, any pane with Claude working (bar/dingbat/avatar) or needing attention
+/// (pulsing dot), or a scroll indicator still fading. Terminal *output* no longer
+/// needs the fast tick — it redraws via the event-driven wake (term_wake_subscription).
+fn needs_fast_tick(state: &State) -> bool {
+    if !state.chrome_init || state.usage.state == UsageState::Pending {
+        return true;
+    }
+    state.workspaces.iter().any(|ws| {
+        ws.panes.iter().any(|(_, d)| {
+            if d.session.claude_running()
+                && matches!(
+                    d.session.claude_status().lifecycle,
+                    Lifecycle::Working | Lifecycle::Attention
+                )
+            {
+                return true;
+            }
+            // Scroll indicator fading (try_lock: skip if the reader holds it — output
+            // is happening, which the wake already redraws).
+            d.session
+                .term()
+                .try_lock()
+                .ok()
+                .and_then(|t| t.scroll_age_ms())
+                .is_some_and(|age| age < SB_HOLD_MS + SB_FADE_MS)
+        })
+    })
+}
+
+fn subscription(state: &State) -> Subscription<Message> {
+    // 60fps only while animating; otherwise 1s (just the usage countdown / save flag).
+    // Idle drops from a constant 60fps repaint to ~1 redraw/sec.
+    let interval = if needs_fast_tick(state) { 16 } else { 1000 };
+    let tick = iced::time::every(Duration::from_millis(interval)).map(|_| Message::Tick);
     // Only the main window's keys drive the terminal (not the overview window),
     // and not when a widget already consumed the key — e.g. a focused text input
     // in the new-worktree modal (else the branch name leaks into the terminal).
@@ -7314,7 +7381,7 @@ fn subscription(_state: &State) -> Subscription<Message> {
         }
         _ => Message::Noop,
     });
-    Subscription::batch([tick, keys, closes, geom, usage_subscription()])
+    Subscription::batch([tick, keys, closes, geom, usage_subscription(), term_wake_subscription()])
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
