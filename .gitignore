@@ -6,8 +6,9 @@ target/
 .env.local
 .env.*.local
 
-# Claude Code (local only — contains project instructions)
-CLAUDE.md
+# Claude Code: CLAUDE.md is committed (shared project instructions) — `!` overrides the
+# user's global gitignore, which ignores CLAUDE.md everywhere. `.claude/` stays local.
+!CLAUDE.md
 .claude/
 
 # Editor
