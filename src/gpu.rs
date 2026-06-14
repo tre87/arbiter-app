@@ -970,6 +970,19 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
         return GlyphBitmap { left, top, ..bmp };
     }
 
+    // A MONO fallback symbol only SLIGHTLY wider than the narrow cell, and no taller
+    // (e.g. ✻ ~9px wide in a 7px cell): center it and let the blit clip the ~1px overhang,
+    // keeping FULL height. Downscaling to the cell width (below) would shrink it well under
+    // its natural size — Windows Terminal renders these at full size and lets them overflow
+    // the cell. Capped at +3px overflow so a genuinely oversized glyph (or a colour emoji)
+    // still scales down rather than losing big chunks to the clip; taller-than-cell glyphs
+    // also fall through to the scale-down (vertical clipping is far more noticeable).
+    if !bmp.color && bmp.height <= box_h && bmp.width > box_w && bmp.width <= box_w + 3 {
+        let left = ((box_w as f32 - bmp.width as f32) / 2.0).round() as i32; // negative → clipped
+        let top = base - ((box_h as f32 - bmp.height as f32) / 2.0).round() as i32;
+        return GlyphBitmap { left, top, ..bmp };
+    }
+
     // Oversized: scale down to fit, centered. The blit draws the top at
     // `baseline - top`, so back `top` out from the desired offset from the box top.
     let s = (box_w as f32 / bmp.width as f32).min(box_h as f32 / bmp.height as f32);
@@ -1141,6 +1154,24 @@ mod tests {
         assert!(out.width > 5, "should enlarge: {}x{}", out.width, out.height);
         assert!(out.width <= 7 && out.height <= 14, "within cell: {}x{}", out.width, out.height);
         assert_eq!((out.width, out.height), (7, 7));
+    }
+
+    #[test]
+    fn wide_mono_symbol_centered_not_shrunk() {
+        // ✻-like: 9px wide in a 7px cell, fits in height. Keep the full 9×10 (centered,
+        // left<0 so the blit clips the ~1px overhang) instead of downscaling to ~7×8 —
+        // matching Windows Terminal's full-size rendering.
+        let out = fit_to_box(glyph(9, 10), 7, 14, 11.0);
+        assert_eq!((out.width, out.height), (9, 10)); // not shrunk
+        assert_eq!(out.left, -1); // (7-9)/2 → 1px clipped each side
+    }
+
+    #[test]
+    fn very_wide_mono_glyph_still_scaled_down() {
+        // Far wider than the cell (14px in 8px): clipping would gut it, so it still scales
+        // down to fit (the +3px center-clip cap doesn't apply).
+        let out = fit_to_box(glyph(14, 14), 8, 16, 13.0);
+        assert_eq!((out.width, out.height), (8, 8));
     }
 
     #[test]

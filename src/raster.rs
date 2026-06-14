@@ -439,7 +439,8 @@ mod dwrite {
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
     };
     use windows::Win32::Graphics::Direct2D::{
-        D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+        D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS,
+        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NONE,
         D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
         D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     };
@@ -646,18 +647,13 @@ mod dwrite {
                 PCWSTR(locale.as_ptr()),
             )?;
 
-            // Encode the glyph; for media-control symbols (⏸ etc.) append VS15 (U+FE0E)
-            // so DirectWrite renders the MONOCHROME text presentation, not a colour emoji.
-            let mut buf = [0u16; 3];
+            // Encode the glyph as-is — no variation selector. Windows Terminal appends
+            // none; text-presentation is achieved by DRAWING without the colour-font
+            // option (below), not by VS15 (which DirectWrite was ignoring here anyway).
+            let mut buf = [0u16; 2];
             let n = ch.len_utf16();
             ch.encode_utf16(&mut buf[..n]);
-            let len = if wants_text_presentation(ch) {
-                buf[n] = 0xFE0E;
-                n + 1
-            } else {
-                n
-            };
-            let text: &[u16] = &buf[..len];
+            let text: &[u16] = &buf[..n];
             let boxw = (ctx.em * 2.5).ceil() + 4.0;
             let boxh = (ctx.em * 2.0).ceil() + 4.0;
             let layout = ctx.dwrite.CreateTextLayout(text, &format, boxw, boxh)?;
@@ -693,35 +689,48 @@ mod dwrite {
             let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
             let clear = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
             let brush = rt.CreateSolidColorBrush(&white, None)?;
-            rt.BeginDraw();
-            rt.Clear(Some(&clear));
-            rt.DrawTextLayout(
-                D2D_POINT_2F { x: 0.0, y: 0.0 },
-                &layout,
-                &brush,
-                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-            );
-            rt.EndDraw(None, None)?;
-
-            // Read the rendered PBGRA pixels.
             let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
-            let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
-            let stride = lock.GetStride()? as usize;
-            let mut size = 0u32;
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            lock.GetDataPointer(&mut size, &mut ptr)?;
-            if ptr.is_null() {
-                return Ok(None);
-            }
-            let data = std::slice::from_raw_parts(ptr, size as usize);
 
-            Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
+            // Draw the layout with `opts` and read back the cropped glyph. Factored so a
+            // text-presentation symbol can be drawn MONOCHROME first (no colour-font
+            // substitution) and only fall back to the colour path if that left no ink.
+            let draw_read = |opts: D2D1_DRAW_TEXT_OPTIONS| -> Result<Option<GlyphBitmap>> {
+                rt.BeginDraw();
+                rt.Clear(Some(&clear));
+                rt.DrawTextLayout(D2D_POINT_2F { x: 0.0, y: 0.0 }, &layout, &brush, opts);
+                rt.EndDraw(None, None)?;
+                let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
+                let stride = lock.GetStride()? as usize;
+                let mut size = 0u32;
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                lock.GetDataPointer(&mut size, &mut ptr)?;
+                if ptr.is_null() {
+                    return Ok(None);
+                }
+                let data = std::slice::from_raw_parts(ptr, size as usize);
+                Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
+            };
+
+            if wants_text_presentation(ch) {
+                // ⏸ and other text-default media controls: render the MONOCHROME outline,
+                // not a colour emoji — DrawTextLayout without ENABLE_COLOR_FONT draws the
+                // glyph outline in the brush colour, the same mono result Windows Terminal
+                // gets (it draws these via DrawGlyphRun). If the resolved font's glyph is
+                // colour-only (no plain outline → no ink), fall back to colour so it shows.
+                match draw_read(D2D1_DRAW_TEXT_OPTIONS_NONE)? {
+                    Some(g) => Ok(Some(g)),
+                    None => draw_read(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT),
+                }
+            } else {
+                draw_read(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT)
+            }
         }
     }
 
-    /// Codepoints with Unicode "emoji presentation by default" that we want rendered
-    /// MONOCHROME (media-control symbols Claude/TUIs use, incl. ⏸ U+23F8). Appending VS15
-    /// (U+FE0E) makes DirectWrite pick the text presentation, not a colour emoji font.
+    /// Media-control symbols Claude/TUIs use (⏯⏸⏹⏺⏭⏮…, U+23E9..=U+23FA). These are
+    /// "text-default" in Unicode (emoji presentation only with VS16), so they should be
+    /// MONOCHROME. We force that by drawing without the colour-font option (see `render`),
+    /// matching Windows Terminal. Real emoji are outside this range → unaffected.
     fn wants_text_presentation(ch: char) -> bool {
         matches!(ch as u32, 0x23E9..=0x23FA)
     }
