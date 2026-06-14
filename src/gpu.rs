@@ -925,35 +925,6 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     let size_over = bmp.width > box_w || bmp.height > box_h;
 
     if !size_over {
-        // Undersized fallback symbol (e.g. ✻ from Segoe UI Symbol renders small within
-        // the em): scale it UP toward the cell so it matches Windows Terminal, instead of
-        // leaving it tiny. Only enlarge (s > 1.01), never overflow the box.
-        if bmp.upscale_fallback {
-            let target_h = (box_h as f32 * 0.74).round().max(1.0);
-            let s = (target_h / bmp.height as f32)
-                .min(box_w as f32 / bmp.width as f32)
-                .min(box_h as f32 / bmp.height as f32);
-            if s > 1.01 {
-                let nw = ((bmp.width as f32 * s).round() as u32).max(1).min(box_w);
-                let nh = ((bmp.height as f32 * s).round() as u32).max(1).min(box_h);
-                let coverage = if bmp.color {
-                    resample_rgba(&bmp.coverage, bmp.width, bmp.height, nw, nh)
-                } else {
-                    resample_coverage(&bmp.coverage, bmp.width, bmp.height, nw, nh)
-                };
-                let left = ((box_w as f32 - nw as f32) / 2.0).round() as i32;
-                let top = base - ((box_h as f32 - nh as f32) / 2.0).round() as i32;
-                return GlyphBitmap {
-                    left,
-                    top,
-                    width: nw,
-                    height: nh,
-                    coverage,
-                    color: bmp.color,
-                    upscale_fallback: false,
-                };
-            }
-        }
         if !h_over && !v_over {
             return bmp; // fits as-is
         }
@@ -973,10 +944,9 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     // A MONO fallback symbol only SLIGHTLY wider than the narrow cell, and no taller
     // (e.g. ✻ ~9px wide in a 7px cell): center it and let the blit clip the ~1px overhang,
     // keeping FULL height. Downscaling to the cell width (below) would shrink it well under
-    // its natural size — Windows Terminal renders these at full size and lets them overflow
-    // the cell. Capped at +3px overflow so a genuinely oversized glyph (or a colour emoji)
-    // still scales down rather than losing big chunks to the clip; taller-than-cell glyphs
-    // also fall through to the scale-down (vertical clipping is far more noticeable).
+    // its natural size — Windows Terminal renders these at full size and lets them overflow.
+    // Capped at +3px so a genuinely oversized glyph (or a colour emoji) still scales down
+    // rather than losing big chunks to the clip; taller-than-cell glyphs scale down too.
     if !bmp.color && bmp.height <= box_h && bmp.width > box_w && bmp.width <= box_w + 3 {
         let left = ((box_w as f32 - bmp.width as f32) / 2.0).round() as i32; // negative → clipped
         let top = base - ((box_h as f32 - bmp.height as f32) / 2.0).round() as i32;
@@ -995,7 +965,7 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     };
     let left = ((box_w as f32 - nw as f32) / 2.0).round() as i32;
     let top = base - ((box_h as f32 - nh as f32) / 2.0).round() as i32;
-    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color, upscale_fallback: false }
+    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color }
 }
 
 /// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
@@ -1079,15 +1049,7 @@ mod tests {
     use crate::raster::GlyphBitmap;
 
     fn glyph(w: u32, h: u32) -> GlyphBitmap {
-        GlyphBitmap {
-            left: 0,
-            top: h as i32,
-            width: w,
-            height: h,
-            coverage: vec![200u8; (w * h) as usize],
-            color: false,
-            upscale_fallback: false,
-        }
+        GlyphBitmap { left: 0, top: h as i32, width: w, height: h, coverage: vec![200u8; (w * h) as usize], color: false }
     }
 
     #[test]
@@ -1110,15 +1072,7 @@ mod tests {
     fn position_overflow_recentered_without_scaling() {
         // ⏵-like: fits by size (5≤7, 8≤14) but a left bearing of 4 pushes the right
         // tip past the 7-wide cell (4+5=9). Recenter horizontally, no scaling.
-        let bmp = GlyphBitmap {
-            left: 4,
-            top: 8,
-            width: 5,
-            height: 8,
-            coverage: vec![200u8; 5 * 8],
-            color: false,
-            upscale_fallback: false,
-        };
+        let bmp = GlyphBitmap { left: 4, top: 8, width: 5, height: 8, coverage: vec![200u8; 5 * 8], color: false };
         let out = fit_to_box(bmp, 7, 14, 11.0);
         assert_eq!((out.width, out.height), (5, 8)); // unchanged — no rescale
         assert_eq!(out.left, 1); // (7-5)/2, centered
@@ -1126,59 +1080,24 @@ mod tests {
     }
 
     #[test]
-    fn oversized_color_glyph_scaled_and_stays_rgba() {
-        // A 16×16 colour glyph in a 1-cell (8×16) region → 8×8 RGBA, centered.
-        let bmp = GlyphBitmap {
-            left: 0,
-            top: 16,
-            width: 16,
-            height: 16,
-            coverage: vec![180u8; 16 * 16 * 4],
-            color: true,
-            upscale_fallback: false,
-        };
-        let out = fit_to_box(bmp, 8, 16, 13.0);
-        assert_eq!((out.width, out.height), (8, 8));
-        assert!(out.color);
-        assert_eq!(out.coverage.len(), 8 * 8 * 4);
-    }
-
-    #[test]
-    fn undersized_fallback_symbol_scaled_up() {
-        // A tiny 5×5 fallback symbol (e.g. ✻) in a narrow 7×14 cell with upscale_fallback
-        // grows to fill the cell WIDTH (the limiting axis here: s = min(10/5, 7/5, 14/5)
-        // = 1.4), instead of staying tiny.
-        let mut bmp = glyph(5, 5);
-        bmp.upscale_fallback = true;
-        let out = fit_to_box(bmp, 7, 14, 11.0);
-        assert!(out.width > 5, "should enlarge: {}x{}", out.width, out.height);
-        assert!(out.width <= 7 && out.height <= 14, "within cell: {}x{}", out.width, out.height);
-        assert_eq!((out.width, out.height), (7, 7));
-    }
-
-    #[test]
     fn wide_mono_symbol_centered_not_shrunk() {
         // ✻-like: 9px wide in a 7px cell, fits in height. Keep the full 9×10 (centered,
         // left<0 so the blit clips the ~1px overhang) instead of downscaling to ~7×8 —
-        // matching Windows Terminal's full-size rendering.
+        // matching Windows Terminal's full-size rendering. (A far-wider glyph, e.g. the
+        // 14×14 in oversized_glyph_scaled_into_cell_keeping_aspect, still scales down.)
         let out = fit_to_box(glyph(9, 10), 7, 14, 11.0);
         assert_eq!((out.width, out.height), (9, 10)); // not shrunk
         assert_eq!(out.left, -1); // (7-9)/2 → 1px clipped each side
     }
 
     #[test]
-    fn very_wide_mono_glyph_still_scaled_down() {
-        // Far wider than the cell (14px in 8px): clipping would gut it, so it still scales
-        // down to fit (the +3px center-clip cap doesn't apply).
-        let out = fit_to_box(glyph(14, 14), 8, 16, 13.0);
+    fn oversized_color_glyph_scaled_and_stays_rgba() {
+        // A 16×16 colour glyph in a 1-cell (8×16) region → 8×8 RGBA, centered.
+        let bmp = GlyphBitmap { left: 0, top: 16, width: 16, height: 16, coverage: vec![180u8; 16 * 16 * 4], color: true };
+        let out = fit_to_box(bmp, 8, 16, 13.0);
         assert_eq!((out.width, out.height), (8, 8));
-    }
-
-    #[test]
-    fn undersized_glyph_without_flag_unchanged() {
-        // Same tiny glyph WITHOUT the flag (normal text/punctuation) is left as-is.
-        let out = fit_to_box(glyph(5, 5), 7, 14, 11.0);
-        assert_eq!((out.width, out.height), (5, 5));
+        assert!(out.color);
+        assert_eq!(out.coverage.len(), 8 * 8 * 4);
     }
 
     #[test]
