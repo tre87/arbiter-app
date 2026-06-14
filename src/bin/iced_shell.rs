@@ -5651,7 +5651,8 @@ fn overview_view(state: &State) -> Element<'_, Message> {
                 .padding([8, 12])
                 .center_x(Length::Fill)
                 .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1e, 0x1e, 0x1e))),
+                    // Same configurable background as the list area above it.
+                    background: Some(iced::Background::Color(app_bg())),
                     border: iced::Border {
                         radius: iced::border::Radius {
                             top_left: 0.0,
