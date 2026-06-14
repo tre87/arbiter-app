@@ -442,7 +442,8 @@ mod dwrite {
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
-        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGR, GUID_WICPixelFormat32bppPBGRA,
+        IWICImagingFactory, WICBitmapCacheOnLoad,
         WICBitmapLockRead, WICRect,
     };
     use windows::Win32::System::Com::{
@@ -567,8 +568,29 @@ mod dwrite {
             if subpixel {
                 if let Some(g) = &glyph {
                     if !g.color {
-                        if let Ok(Some(sp)) = render_cleartype(ctx, &layout, w, h, baseline) {
-                            return Ok(Some(sp));
+                        let dbg = std::env::var_os("ARBITER_GLYPH_DEBUG").is_some();
+                        match render_cleartype(ctx, &layout, w, h, baseline) {
+                            Ok(Some(sp)) => {
+                                if dbg {
+                                    // Subpixel actually engaged iff some pixel's R/G/B
+                                    // differ; all-equal means ClearType fell back to
+                                    // grayscale (e.g. system ClearType off).
+                                    let variance =
+                                        sp.coverage.chunks_exact(4).any(|p| p[0] != p[1] || p[1] != p[2]);
+                                    eprintln!("[cleartype] {ch:?} ok subpixel_variance={variance}");
+                                }
+                                return Ok(Some(sp));
+                            }
+                            Ok(None) => {
+                                if dbg {
+                                    eprintln!("[cleartype] {ch:?} produced no ink");
+                                }
+                            }
+                            Err(e) => {
+                                if dbg {
+                                    eprintln!("[cleartype] {ch:?} FAILED: {e:?}");
+                                }
+                            }
                         }
                     }
                 }
@@ -588,8 +610,11 @@ mod dwrite {
         baseline: f32,
     ) -> Result<Option<GlyphBitmap>> {
         unsafe {
+            // OPAQUE WIC format (no alpha) to pair with the RT's IGNORE alpha mode —
+            // the combination ClearType requires. (A premultiplied-alpha bitmap here
+            // makes the ClearType draw fail, silently falling back to grayscale.)
             let bitmap =
-                ctx.wic.CreateBitmap(w, h, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)?;
+                ctx.wic.CreateBitmap(w, h, &GUID_WICPixelFormat32bppBGR, WICBitmapCacheOnLoad)?;
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
