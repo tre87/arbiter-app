@@ -1,9 +1,9 @@
 [package]
 name = "arbiter-native"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 publish = false
-description = "Run many Claude Code sessions side by side"
+description = "Cross-platform terminal application with Claude support"
 # Don't auto-discover bins: src/bin/file_icons.rs is a *module* of iced_shell
 # (sibling of the crate root), not a binary. List the real bins explicitly.
 autobins = false

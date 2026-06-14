@@ -4,7 +4,7 @@
 
 # Arbiter
 
-**Run many Claude Code sessions side by side.**
+**Cross-platform terminal application with Claude support.**
 
 One window. Many agents. You decide who works on what.
 

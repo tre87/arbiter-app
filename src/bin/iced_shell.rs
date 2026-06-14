@@ -310,6 +310,9 @@ struct State {
     explorer_menu: Option<ExplorerMenu>,
     explorer_rename: Option<ExplorerRename>,
     explorer_delete: Option<ExplorerDelete>,
+    /// Pending "close this workspace?" confirmation (the tab × / context-menu Close) — so a
+    /// stray click can't silently drop a workspace and its terminals.
+    close_confirm: Option<CloseConfirm>,
     /// Live keyboard modifiers (Shift/Ctrl/Cmd) for multi-select clicks in the
     /// file explorer. Tracked app-wide via ModifiersChanged.
     modifiers: iced::keyboard::Modifiers,
@@ -372,6 +375,13 @@ struct ExplorerRename {
 struct ExplorerDelete {
     paths: Vec<String>,
     label: String,
+}
+
+/// The workspace-close confirmation: which tab + its name (for the prompt). Closing a
+/// workspace drops its terminals, so confirm rather than nuke it on a stray × click.
+struct CloseConfirm {
+    index: usize,
+    name: String,
 }
 
 /// State of the "rename workspace" modal: which tab, and the name being typed.
@@ -600,6 +610,9 @@ enum Message {
     TabDragEnd,
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
+    /// Ask before closing (opens the confirm dialog); its Close button sends CloseWorkspace.
+    RequestCloseWorkspace(usize),
+    CancelCloseWorkspace,
     /// New project workspace: pick a folder, then validate it's a git repo.
     NewProjectWorkspace,
     ProjectFolderPicked(Option<String>),
@@ -1823,8 +1836,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             save_session(state); // the `ws`/`p` borrow has ended
         }
+        Message::RequestCloseWorkspace(i) => {
+            // Don't close on the click — a stray × already lost a workspace once. Open a
+            // confirm dialog; its Close button sends CloseWorkspace(i) to actually close.
+            state.ws_tab_menu = None;
+            if let Some(ws) = state.workspaces.get(i) {
+                state.close_confirm = Some(CloseConfirm { index: i, name: ws.name.clone() });
+            }
+        }
+        Message::CancelCloseWorkspace => state.close_confirm = None,
         Message::CloseWorkspace(i) => {
             state.ws_tab_menu = None;
+            state.close_confirm = None;
             if i < state.workspaces.len() {
                 if state.workspaces.len() == 1 {
                     // Closing the only workspace resets to a fresh "Workspace 1"
@@ -2235,6 +2258,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if known {
                 save_session(state);
+            }
+            if id == state.main_window {
+                // Launched from `cargo run` (no `.app` bundle) the app starts inactive, so
+                // the window opens behind the terminal and never grabs focus. Activate the
+                // app (macOS) + focus the window so it pops to the front on launch.
+                #[cfg(target_os = "macos")]
+                trafficlights::activate_app();
+                return iced::window::gain_focus(state.main_window);
             }
         }
         Message::WindowFocusChanged(id, focused) => {
@@ -3315,6 +3346,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if let Some(d) = &state.explorer_delete {
         return Some(explorer_delete_view(d));
     }
+    if let Some(c) = &state.close_confirm {
+        return Some(close_confirm_view(c));
+    }
     if let Some(m) = &state.explorer_menu {
         if let Some(p) = state.active().project.as_ref() {
             return Some(explorer_menu_view(&p.explorer, m.x, m.y, state.main_size));
@@ -4159,7 +4193,7 @@ fn tab_pill(
         content = content.push(
             button(cmdi(mdi_path::CLOSE, 13.0, fg))
                 .padding(2)
-                .on_press(Message::CloseWorkspace(i))
+                .on_press(Message::RequestCloseWorkspace(i))
                 .style(|_t: &iced::Theme, s| button::Style {
                     background: matches!(s, button::Status::Hovered)
                         .then(|| iced::Background::Color(white_a(0.10))),
@@ -5053,7 +5087,7 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
 fn ws_tab_menu_view(state: &State, index: usize, x0: f32, y0: f32) -> Element<'static, Message> {
     let mut items = column![].spacing(0).padding([4, 0]);
     items = items.push(explorer_menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::RenameWorkspaceStart(index)), false));
-    items = items.push(explorer_menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::CloseWorkspace(index)), true));
+    items = items.push(explorer_menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::RequestCloseWorkspace(index)), true));
     context_menu_card(items, 176.0, 76.0, x0, y0, state.main_size, Message::WorkspaceTabMenuClose)
 }
 
@@ -5141,6 +5175,47 @@ fn explorer_delete_view(d: &ExplorerDelete) -> Element<'static, Message> {
     .padding(18)
     .width(Length::Fixed(380.0));
     modal_scrim(modal_panel(panel.into()), Message::ExplorerDeleteCancel)
+}
+
+fn close_confirm_view(c: &CloseConfirm) -> Element<'static, Message> {
+    let index = c.index;
+    let panel = column![
+        text(format!("Close workspace “{}”?", c.name)).size(15).font(ui_semibold()),
+        text("Its open terminals will be closed.").size(13).color(TXT_SECONDARY),
+        row![
+            horizontal_space(),
+            button(text("Cancel").size(13))
+                .on_press(Message::CancelCloseWorkspace)
+                .style(button::secondary)
+                .padding([6, 14]),
+            button(text("Close").size(13))
+                .on_press(Message::CloseWorkspace(index))
+                // Gray like Cancel but with red text; becomes a full red button (white
+                // text) on hover/press.
+                .style(|t: &iced::Theme, s| match s {
+                    button::Status::Hovered | button::Status::Pressed => {
+                        button::Style { text_color: iced::Color::WHITE, ..button::danger(t, s) }
+                    }
+                    _ => button::Style { text_color: t.palette().danger, ..button::secondary(t, s) },
+                })
+                .padding([6, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(380.0));
+    // Borderless card (modal_panel draws a 1px border; this dialog wants none).
+    let card = mouse_area(
+        container(panel).style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
+            border: iced::Border { radius: 10.0.into(), ..Default::default() },
+            ..Default::default()
+        }),
+    )
+    .on_press(Message::Noop);
+    modal_scrim(card.into(), Message::CancelCloseWorkspace)
 }
 
 /// The whole titlebar row, laid out for the available width `avail_w` (from
@@ -6187,6 +6262,19 @@ mod trafficlights {
         unsafe {
             ensure_resize_observer();
             position_inner();
+        }
+    }
+
+    /// Bring the app to the foreground. Launched from `cargo run` (no `.app` bundle) the
+    /// process starts INACTIVE, so the window opens behind the launching terminal and
+    /// never takes focus. Call once after the main window opens so it pops to the front.
+    pub fn activate_app() {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
         }
     }
 
@@ -8347,6 +8435,7 @@ fn main() -> iced::Result {
                 explorer_menu: None,
                 explorer_rename: None,
                 explorer_delete: None,
+                close_confirm: None,
                 modifiers: iced::keyboard::Modifiers::default(),
                 term_menu: None,
                 ws_tab_menu: None,

@@ -5,14 +5,19 @@ All notable changes to Arbiter are documented here. The format roughly follows
 `Cargo.toml`. This changelog covers the **native** app (1.0.0 onward); earlier
 history belongs to the prior Tauri/Vue web app it replaced.
 
-## [Unreleased]
+## [1.0.7] — 2026-06-14
 
 ### Added
+- **Close-workspace confirmation:** closing a workspace — the tab ×, either type, or the
+  right-click "Close" — now asks for confirmation first, so a stray click can't silently
+  drop a workspace and its open terminals.
 - **Workspace tab status dot:** a workspace tab now shows a pulsing dot (after its name,
   before the close button) when one of its terminals has Claude working (azure) or needing
   attention (amber). Attention takes priority across the workspace's terminals.
 
 ### Fixed
+- **Launch focus:** the main window now reliably comes to the front and takes focus on
+  launch, instead of sometimes opening unfocused behind other windows.
 - **Windows glyphs:** fallback symbols like ✻ (Claude's working spinner) keep their full
   height instead of being squashed into the narrow cell — sized like Windows Terminal.
 - **Windows Claude working-detection:** newline / mode edit keys (Shift+Enter, Ctrl+Enter,
