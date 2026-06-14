@@ -5729,14 +5729,20 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     }
 
     // Same chrome as the main window: a transparent titlebar over the app-wide azure
-    // glow (so the gradient sits behind the logo + Overview and fades downward), with
-    // the content inset 6px on the sides/bottom so the glow frames it. The brand is
-    // centred (see overview_titlebar), so a small symmetric pad is enough — the centred
-    // brand clears the macOS traffic lights on its own.
+    // glow (so the gradient sits behind the logo + Overview and fades downward).
+    // Left inset: on Windows the brand is left-aligned, so use the main window's
+    // TITLEBAR_LEFT_PAD (8) so it starts at the same indent as the main titlebar. macOS
+    // centres the brand, so a small 6px symmetric pad is enough (the centred brand
+    // clears the traffic lights on its own; the 88px main-window inset would push the
+    // centre off).
+    #[cfg(target_os = "windows")]
+    let ov_left = TITLEBAR_LEFT_PAD;
+    #[cfg(not(target_os = "windows"))]
+    let ov_left = 6.0;
     let titlebar = container(overview_titlebar(state))
         .width(Length::Fill)
         .height(Length::Fixed(40.0))
-        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: 6.0 });
+        .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: ov_left });
     let framed = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
