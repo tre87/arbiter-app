@@ -91,16 +91,6 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  // Subpixel (Windows ClearType): per-channel coverage from the colour atlas, tinted
-  // with fg over bg independently per R/G/B (composited in gamma/sRGB space, the
-  // space ClearType's white-on-black coverage was produced in).
-  if (in.kind > 1.5) {
-    let cov = textureSample(catlas, samp, in.uv).rgb;
-    let p = mix(in.bg, in.fg, cov);
-    var out = p;
-    if (u.srgb > 0.5) { out = to_linear(p); }
-    return vec4<f32>(out, 1.0);
-  }
   if (u.gamma_blend > 0.5) {
     // Gamma-space blend: flatter/thinner edges, matching Windows Terminal. fg/bg
     // (and colour-glyph texels) are sRGB, so composite directly in sRGB.
@@ -143,10 +133,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 struct Glyph {
     slot: u32,
     color: bool,
-    /// Windows ClearType subpixel glyph: lives in the colour atlas (RGB = per-channel
-    /// coverage) but blended per-channel tinted with the fg, not as a self-coloured
-    /// emoji. Always false elsewhere (macOS/Linux use grayscale `color: false`).
-    subpixel: bool,
     cells: u32,
 }
 
@@ -422,7 +408,7 @@ impl TermGpu {
     /// RGBA atlas spanning `wide_hint ? 2 : 1` cells.
     fn slot_for(&mut self, ch: char, bold: bool, wide_hint: bool) -> Glyph {
         if ch == ' ' || ch == '\0' {
-            return Glyph { slot: SLOT_BLANK, color: false, subpixel: false, cells: 1 };
+            return Glyph { slot: SLOT_BLANK, color: false, cells: 1 };
         }
         if let Some(&g) = self.glyphs.get(&(ch, bold)) {
             return g;
@@ -442,7 +428,7 @@ impl TermGpu {
         {
             self.next_slot += 1;
             self.atlas_dirty = true;
-            let g = Glyph { slot: mslot, color: false, subpixel: false, cells: 1 };
+            let g = Glyph { slot: mslot, color: false, cells: 1 };
             self.glyphs.insert((ch, bold), g);
             return g;
         }
@@ -452,12 +438,7 @@ impl TermGpu {
             (true, Some(b)) => (b.0.as_slice(), b.1),
             _ => (self.regular.0.as_slice(), self.regular.1),
         };
-        // Windows: request ClearType subpixel coverage for mono text (crisper, WT-style).
-        // Other platforms ignore it (macOS grayscale / swash). (Step 2 makes this
-        // scale-aware; for now it's on whenever we're on Windows.)
-        let want_subpixel = cfg!(target_os = "windows");
-        let raster =
-            crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold, want_subpixel);
+        let raster = crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold);
         // Diagnostic: ARBITER_GLYPH_DEBUG logs how non-ASCII symbols (e.g. ✻ U+273B,
         // ⏵ U+23F5) rasterise — mono vs colour, size + bearing vs the cell, and the
         // width flag — so glyph-fit issues can be seen instead of guessed. Fires once
@@ -491,21 +472,7 @@ impl TermGpu {
                     &mut self.color_atlas_cpu, &bmp, self.baseline, cells * self.cell_w, self.cell_h, cox, coy,
                 );
                 self.color_dirty = true;
-                Glyph { slot, color: true, subpixel: false, cells }
-            }
-            Some(bmp) if bmp.subpixel => {
-                // Windows ClearType subpixel glyph → colour atlas (RGB = per-channel
-                // coverage), spanning 2 cells for wide (CJK) chars like the colour path.
-                let cells = if wide_hint { 2 } else { 1 };
-                let bmp = fit_to_box(bmp, cells * self.cell_w, self.cell_h, self.baseline);
-                let slot = self.alloc_color(cells);
-                let cox = (slot % self.per_row) * self.cell_w;
-                let coy = (slot / self.per_row) * self.cell_h;
-                blit_color(
-                    &mut self.color_atlas_cpu, &bmp, self.baseline, cells * self.cell_w, self.cell_h, cox, coy,
-                );
-                self.color_dirty = true;
-                Glyph { slot, color: false, subpixel: true, cells }
+                Glyph { slot, color: true, cells }
             }
             Some(bmp) => {
                 // Scale oversized fallback symbols to fit the cell — WINDOWS ONLY.
@@ -518,10 +485,10 @@ impl TermGpu {
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
                 self.next_slot += 1;
                 self.atlas_dirty = true;
-                Glyph { slot: mslot, color: false, subpixel: false, cells: 1 }
+                Glyph { slot: mslot, color: false, cells: 1 }
             }
             // No glyph anywhere → blank (don't consume the mono slot).
-            None => Glyph { slot: SLOT_BLANK, color: false, subpixel: false, cells: 1 },
+            None => Glyph { slot: SLOT_BLANK, color: false, cells: 1 },
         };
         self.glyphs.insert((ch, bold), g);
         g
@@ -572,7 +539,7 @@ impl TermGpu {
         for (row, col, c, fg, bg, bold, wide) in &cells {
             let g = self.slot_for(*c, *bold, *wide);
             let (u, v) = self.uv(g.slot);
-            let kind = if g.color { 1.0 } else if g.subpixel { 2.0 } else { 0.0 };
+            let kind = if g.color { 1.0 } else { 0.0 };
             self.scratch.extend_from_slice(&[
                 *col as f32 * cw, *row as f32 * ch, u, v,
                 fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
@@ -958,15 +925,14 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     let s = (box_w as f32 / bmp.width as f32).min(box_h as f32 / bmp.height as f32);
     let nw = ((bmp.width as f32 * s).round() as u32).max(1);
     let nh = ((bmp.height as f32 * s).round() as u32).max(1);
-    // Colour and subpixel coverage are both 4 bytes/px (RGBA); mono is 1.
-    let coverage = if bmp.color || bmp.subpixel {
+    let coverage = if bmp.color {
         resample_rgba(&bmp.coverage, bmp.width, bmp.height, nw, nh)
     } else {
         resample_coverage(&bmp.coverage, bmp.width, bmp.height, nw, nh)
     };
     let left = ((box_w as f32 - nw as f32) / 2.0).round() as i32;
     let top = base - ((box_h as f32 - nh as f32) / 2.0).round() as i32;
-    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color, subpixel: bmp.subpixel }
+    GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color }
 }
 
 /// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
@@ -1050,7 +1016,7 @@ mod tests {
     use crate::raster::GlyphBitmap;
 
     fn glyph(w: u32, h: u32) -> GlyphBitmap {
-        GlyphBitmap { left: 0, top: h as i32, width: w, height: h, coverage: vec![200u8; (w * h) as usize], color: false, subpixel: false }
+        GlyphBitmap { left: 0, top: h as i32, width: w, height: h, coverage: vec![200u8; (w * h) as usize], color: false }
     }
 
     #[test]
@@ -1073,7 +1039,7 @@ mod tests {
     fn position_overflow_recentered_without_scaling() {
         // ⏵-like: fits by size (5≤7, 8≤14) but a left bearing of 4 pushes the right
         // tip past the 7-wide cell (4+5=9). Recenter horizontally, no scaling.
-        let bmp = GlyphBitmap { left: 4, top: 8, width: 5, height: 8, coverage: vec![200u8; 5 * 8], color: false, subpixel: false };
+        let bmp = GlyphBitmap { left: 4, top: 8, width: 5, height: 8, coverage: vec![200u8; 5 * 8], color: false };
         let out = fit_to_box(bmp, 7, 14, 11.0);
         assert_eq!((out.width, out.height), (5, 8)); // unchanged — no rescale
         assert_eq!(out.left, 1); // (7-5)/2, centered
@@ -1083,7 +1049,7 @@ mod tests {
     #[test]
     fn oversized_color_glyph_scaled_and_stays_rgba() {
         // A 16×16 colour glyph in a 1-cell (8×16) region → 8×8 RGBA, centered.
-        let bmp = GlyphBitmap { left: 0, top: 16, width: 16, height: 16, coverage: vec![180u8; 16 * 16 * 4], color: true, subpixel: false };
+        let bmp = GlyphBitmap { left: 0, top: 16, width: 16, height: 16, coverage: vec![180u8; 16 * 16 * 4], color: true };
         let out = fit_to_box(bmp, 8, 16, 13.0);
         assert_eq!((out.width, out.height), (8, 8));
         assert!(out.color);
