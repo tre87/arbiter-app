@@ -2135,6 +2135,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::WindowResized(id, s) => {
             let is_overview = state.overview_window == Some(id);
+            // A main-window resize re-lays-out the panes + resizes their PTYs, which makes
+            // Claude repaint; suppress spinner detection briefly so that repaint (incl. a
+            // drag-resize's rapid redraws) doesn't read as "working". A drag keeps firing
+            // resizes, each extending the window.
+            if id == state.main_window {
+                for ws in &state.workspaces {
+                    for (_, d) in ws.panes.iter() {
+                        d.session.suppress_claude_activity(500);
+                    }
+                }
+            }
             // The overview is borderless and winit's min_inner_size isn't reliably
             // enforced for it, so clamp here: snap a real sub-minimum resize back up.
             // The width>50/height>20 guard skips the degenerate size a *minimized*

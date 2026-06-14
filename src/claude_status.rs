@@ -63,6 +63,13 @@ pub struct ClaudeHandle {
     /// Last-event times (ms since epoch); 0 = never.
     activity_ms: AtomicU64, // spinner / "esc to interrupt" (working)
     stop_ms: AtomicU64,     // Stop hook (turn end)
+    /// Time of the previous detected spinner frame — entering "working" requires TWO
+    /// frames an animation-gap apart, so a one-shot repaint (Shift+Tab/Enter, a single
+    /// resize) that emits the star glyph once can't false-trigger working.
+    last_spinner_ms: AtomicU64,
+    /// Spinner detection is ignored until this time — set briefly on app-initiated
+    /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
+    suppress_until_ms: AtomicU64,
     /// A text menu/approval prompt is currently on the visible screen — level-
     /// triggered by the reader's grid scan, so it clears the instant the prompt
     /// leaves (the user escapes/answers). Covers AskUserQuestion / plan / proceed.
@@ -85,6 +92,14 @@ const WORKING_TTL_MS: u64 = 2000;
 /// final redraw) and force ready for this long, so the turn-end can't flicker
 /// working→ready→working.
 const STOP_SUPPRESS_MS: u64 = 700;
+/// Two spinner detections closer than this are one screen split across ConPTY reads,
+/// not two animation frames.
+const MIN_FRAME_GAP_MS: u64 = 20;
+/// Two detections farther apart than this aren't a continuous animation; the later one
+/// re-arms as a fresh first frame instead of confirming working. Covers the fast bloom
+/// cadence; well below WORKING_TTL_MS so a one-shot can't accidentally pair with a much
+/// later unrelated repaint.
+const MAX_FRAME_GAP_MS: u64 = 600;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -107,6 +122,8 @@ impl ClaudeHandle {
             last_nonce: Mutex::new(0),
             activity_ms: AtomicU64::new(0),
             stop_ms: AtomicU64::new(0),
+            last_spinner_ms: AtomicU64::new(0),
+            suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
         })
@@ -116,14 +133,42 @@ impl ClaudeHandle {
     /// permission attention — Claude has resumed, so it's working, not waiting.
     pub fn note_activity(&self) {
         let now = now_ms();
+        let stop = self.stop_ms.load(Ordering::Relaxed);
         // A spinner frame inside the post-Stop window is the turn's FINAL redraw —
         // ignore it so it can't revive "working" after Stop already ended the turn.
         // (A genuinely new turn's frames land well after the window.)
-        if now.saturating_sub(self.stop_ms.load(Ordering::Relaxed)) < STOP_SUPPRESS_MS {
+        if now.saturating_sub(stop) < STOP_SUPPRESS_MS {
             return;
         }
-        self.activity_ms.store(now, Ordering::Relaxed);
-        self.hook_attention.store(false, Ordering::Relaxed);
+        // Ignore frames during an app-initiated repaint window (a resize), whose rapid
+        // redraws would otherwise look like a cycling spinner.
+        if now < self.suppress_until_ms.load(Ordering::Relaxed) {
+            return;
+        }
+        let act = self.activity_ms.load(Ordering::Relaxed);
+        let working_now = act > stop && now.saturating_sub(act) < WORKING_TTL_MS;
+        if working_now {
+            // Already working: any frame sustains it (bridging the slow `·` frames that
+            // aren't in the star range) — the established behaviour.
+            self.activity_ms.store(now, Ordering::Relaxed);
+            self.hook_attention.store(false, Ordering::Relaxed);
+        } else {
+            // Not working: require a SECOND frame an animation-gap after the first to
+            // ENTER working. A one-shot repaint (Shift+Tab/Enter, single resize) emits
+            // the star glyph once and never pairs, so it can't false-trigger.
+            let prev = self.last_spinner_ms.swap(now, Ordering::Relaxed);
+            let gap = now.saturating_sub(prev);
+            if prev != 0 && (MIN_FRAME_GAP_MS..=MAX_FRAME_GAP_MS).contains(&gap) {
+                self.activity_ms.store(now, Ordering::Relaxed);
+                self.hook_attention.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Ignore spinner detection for `dur_ms` (called when the app itself triggers a
+    /// repaint — a window/PTY resize — so the rapid Claude redraws don't read as working).
+    pub fn suppress_activity(&self, dur_ms: u64) {
+        self.suppress_until_ms.store(now_ms() + dur_ms, Ordering::Relaxed);
     }
 
     /// Reader: whether a menu/approval prompt is currently on the visible screen.

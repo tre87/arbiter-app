@@ -163,6 +163,12 @@ impl Session {
         self.claude_running.load(Ordering::Relaxed)
     }
 
+    /// Ignore Claude spinner detection for `dur_ms` — called when the app triggers a
+    /// repaint (window/PTY resize) so the rapid redraws don't read as "working".
+    pub fn suppress_claude_activity(&self, dur_ms: u64) {
+        self.claude.suppress_activity(dur_ms);
+    }
+
     /// The Claude session id to resume on restore IF Claude is running here AND a
     /// real conversation has happened (else `None`, so restore launches a clean
     /// `claude` rather than `--resume`ing a non-existent empty session).
