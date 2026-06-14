@@ -441,8 +441,7 @@ mod dwrite {
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
     };
     use windows::Win32::Graphics::Direct2D::{
-        D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS,
-        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NONE,
+        D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
         D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
         D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     };
@@ -457,7 +456,9 @@ mod dwrite {
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_ENABLED,
         DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
         DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+        DWRITE_UNICODE_RANGE,
     };
+    use windows::Win32::Graphics::DirectWrite::IDWriteFontFallbackBuilder;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
@@ -553,6 +554,12 @@ mod dwrite {
         /// regular — instead of DirectWrite synthesising a soft faux-bold by name. None
         /// if the bytes weren't supplied or failed to load.
         bold: Option<BoldFont>,
+        /// Font fallback used to resolve symbols Cascadia lacks (⏸ etc.). A CUSTOM builder
+        /// that maps the media-control range to a monochrome symbol font (Segoe UI Symbol)
+        /// *before* chaining the system fallback — otherwise DirectWrite resolves those
+        /// text-default emoji to Segoe UI Emoji and we get a boxed colour glyph. Falls back
+        /// to the plain system fallback if the builder can't be created.
+        fallback: Option<IDWriteFontFallback>,
     }
 
     /// The bundled bold face + the private collection wrapping it (for CreateTextFormat)
@@ -664,6 +671,9 @@ mod dwrite {
             // Load the bundled bold into a private collection (best-effort; falls back
             // to the by-name path if it fails).
             let bold = bold_data.and_then(|d| build_bold_face(&dwrite, d));
+            // Custom fallback that keeps text-default media controls (⏸ etc.) monochrome;
+            // fall back to the plain system fallback if it can't be built.
+            let fallback = build_symbol_fallback(&dwrite).ok();
             Ok(Ctx {
                 dwrite,
                 d2d,
@@ -673,8 +683,28 @@ mod dwrite {
                 em: em_px,
                 params,
                 bold,
+                fallback,
             })
         }
+    }
+
+    /// Build a font fallback that maps the media-control range (⏯⏸⏹⏺⏭⏮…, U+23E9..=U+23FA)
+    /// to **Segoe UI Symbol** (a monochrome symbol font that draws these as plain glyphs)
+    /// BEFORE chaining the system fallback. Without this, DirectWrite's system fallback
+    /// resolves these text-default emoji to Segoe UI Emoji — a boxed colour button whose
+    /// monochrome outline is a tiny square. (Cascadia lacks the glyphs, so passing it as
+    /// the base family — what Windows Terminal relies on — can't help us here.) The
+    /// system fallback is chained after, so anything not in our mapping still resolves.
+    unsafe fn build_symbol_fallback(dwrite: &IDWriteFactory) -> Result<IDWriteFontFallback> {
+        let f2: IDWriteFactory2 = dwrite.cast()?;
+        let system = f2.GetSystemFontFallback()?;
+        let builder: IDWriteFontFallbackBuilder = f2.CreateFontFallbackBuilder()?;
+        let ranges = [DWRITE_UNICODE_RANGE { first: 0x23E9, last: 0x23FA }];
+        let family: Vec<u16> = "Segoe UI Symbol\0".encode_utf16().collect();
+        let targets = [family.as_ptr()];
+        builder.AddMapping(&ranges, &targets, None, PCWSTR::null(), PCWSTR::null(), 1.0)?;
+        builder.AddMappings(&system)?; // everything else → the normal system fallback
+        builder.CreateFontFallback()
     }
 
     fn render(ctx: &Ctx, ch: char, bold: bool) -> Result<Option<GlyphBitmap>> {
@@ -764,13 +794,18 @@ mod dwrite {
             let brush = rt.CreateSolidColorBrush(&white, None)?;
             let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
 
-            // Draw the layout with `opts` and read back the cropped glyph. Factored so a
-            // text-presentation symbol can be drawn MONOCHROME first (no colour-font
-            // substitution) and only fall back to the colour path if that left no ink.
-            let draw_read = |opts: D2D1_DRAW_TEXT_OPTIONS| -> Result<Option<GlyphBitmap>> {
+            // Draw the layout (colour fonts enabled → emoji render in colour) and read back
+            // the cropped glyph. Used for ordinary glyphs and as the last resort for a
+            // media-control symbol whose mono font couldn't be resolved (never blank).
+            let draw_read = || -> Result<Option<GlyphBitmap>> {
                 rt.BeginDraw();
                 rt.Clear(Some(&clear));
-                rt.DrawTextLayout(D2D_POINT_2F { x: 0.0, y: 0.0 }, &layout, &brush, opts);
+                rt.DrawTextLayout(
+                    D2D_POINT_2F { x: 0.0, y: 0.0 },
+                    &layout,
+                    &brush,
+                    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                );
                 rt.EndDraw(None, None)?;
                 let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
                 let stride = lock.GetStride()? as usize;
@@ -822,23 +857,19 @@ mod dwrite {
             };
 
             if wants_text_presentation(ch) {
-                // ⏸ etc.: resolve a real MONOCHROME font the way Windows Terminal does
-                // (MapCharacters on the bare codepoint picks a mono symbol font, not the
-                // colour-emoji font), then draw the glyph run. The layout path instead
-                // landed on Segoe UI Emoji and drew its boxed base glyph (small) — wrong.
+                // ⏸ etc.: resolve a MONOCHROME font via our custom fallback (Segoe UI
+                // Symbol mapped ahead of the system fallback, so these text-default emoji
+                // don't land on Segoe UI Emoji's boxed colour glyph), then draw the glyph
+                // run (DrawGlyphRun paints the outline, never colour).
                 if let Some((face, gid)) = resolve_mono_face(ctx, ch) {
                     if let Ok(Some(g)) = draw_run(&face, gid) {
                         return Ok(Some(g));
                     }
                 }
-                // Resolution/raster failed: fall back to the mono layout outline, then to
-                // colour, so the cell is never blank.
-                match draw_read(D2D1_DRAW_TEXT_OPTIONS_NONE)? {
-                    Some(g) => Ok(Some(g)),
-                    None => draw_read(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT),
-                }
+                // Couldn't resolve/raster a mono glyph: draw it (colour) so it's not blank.
+                draw_read()
             } else {
-                draw_read(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT)
+                draw_read()
             }
         }
     }
@@ -848,8 +879,7 @@ mod dwrite {
     /// codepoint picks a MONOCHROME font for text-default symbols (⏸ etc.) rather than a
     /// colour-emoji font. Returns the face + glyph id, or None if unresolved/uncovered.
     unsafe fn resolve_mono_face(ctx: &Ctx, ch: char) -> Option<(IDWriteFontFace, u16)> {
-        let factory2: IDWriteFactory2 = ctx.dwrite.cast().ok()?;
-        let fallback: IDWriteFontFallback = factory2.GetSystemFontFallback().ok()?;
+        let fallback = ctx.fallback.as_ref()?; // custom (Segoe UI Symbol mapping) + system
         let mut sys: Option<IDWriteFontCollection> = None;
         ctx.dwrite.GetSystemFontCollection(&mut sys, false).ok()?;
         let sys = sys?;
@@ -880,10 +910,37 @@ mod dwrite {
                 &mut scale,
             )
             .ok()?;
-        let face: IDWriteFontFace = font?.CreateFontFace().ok()?;
+        let dbg = std::env::var_os("ARBITER_GLYPH_DEBUG").is_some();
+        let font = match font {
+            Some(f) => f,
+            None => {
+                if dbg {
+                    eprintln!("[resolve] U+{:04X} {:?}: MapCharacters returned no font", ch as u32, ch);
+                }
+                return None;
+            }
+        };
+        if dbg {
+            let mut name = String::from("<unknown>");
+            if let Ok(fam) = font.GetFontFamily() {
+                if let Ok(names) = fam.GetFamilyNames() {
+                    if let Ok(len) = names.GetStringLength(0) {
+                        let mut b = vec![0u16; len as usize + 1];
+                        if names.GetString(0, &mut b).is_ok() {
+                            name = String::from_utf16_lossy(&b[..len as usize]);
+                        }
+                    }
+                }
+            }
+            eprintln!("[resolve] U+{:04X} {:?} -> font={:?} scale={}", ch as u32, ch, name, scale);
+        }
+        let face: IDWriteFontFace = font.CreateFontFace().ok()?;
         let cps = [ch as u32];
         let mut gids = [0u16; 1];
         face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).ok()?;
+        if dbg {
+            eprintln!("[resolve] U+{:04X} gid={}", ch as u32, gids[0]);
+        }
         if gids[0] == 0 {
             return None;
         }
@@ -892,8 +949,9 @@ mod dwrite {
 
     /// Media-control symbols Claude/TUIs use (⏯⏸⏹⏺⏭⏮…, U+23E9..=U+23FA). These are
     /// "text-default" in Unicode (emoji presentation only with VS16), so they should be
-    /// MONOCHROME. We force that by drawing without the colour-font option (see `render`),
-    /// matching Windows Terminal. Real emoji are outside this range → unaffected.
+    /// MONOCHROME. We get that by resolving them through the custom symbol fallback (see
+    /// `build_symbol_fallback`) and drawing a glyph run. Real emoji are outside this range.
+    /// Keep this range in sync with the mapping in `build_symbol_fallback`.
     fn wants_text_presentation(ch: char) -> bool {
         matches!(ch as u32, 0x23E9..=0x23FA)
     }

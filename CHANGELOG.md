@@ -14,10 +14,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ### Fixed
 - **Windows glyphs (matching Windows Terminal):** media-control symbols like ⏸ render
-  **monochrome** instead of as a colour emoji. They're resolved through the system font
-  fallback (`IDWriteFontFallback::MapCharacters`) to a real monochrome font and drawn as a
-  glyph run — exactly how WT does it — rather than letting the text layout pick Segoe UI
-  Emoji. Real emoji are unaffected. Fallback symbols like ✻ (Claude's working spinner)
+  **monochrome** instead of as a boxed colour emoji. A custom DirectWrite font fallback
+  maps that range to **Segoe UI Symbol** ahead of the system fallback (which otherwise
+  hands these text-default emoji to Segoe UI Emoji), and they're drawn as a monochrome
+  glyph run. Real emoji are unaffected. Fallback symbols like ✻ (Claude's working spinner)
   also keep their **full height** instead of being squashed into the narrow cell.
 - **Windows Claude working-detection:** pressing Shift+Tab / Shift+Enter (even in rapid
   succession), or resizing the window, no longer falsely starts Claude's "working"
