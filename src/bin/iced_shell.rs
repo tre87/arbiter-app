@@ -6614,13 +6614,10 @@ fn azure_at(t: f32) -> iced::Color {
     iced::Color::from_rgb8(mix(c0.0, c1.0), mix(c0.1, c1.1), mix(c0.2, c1.2))
 }
 
-/// The animated "Arbiter" wordmark: an azure gradient shimmering across the
-/// letters (the web's `title-shimmer`). Iced can't gradient-fill text, so each
-/// letter samples the gradient at a phase that eases back and forth over ~12s.
+/// The "Arbiter" wordmark: a STATIC azure gradient across the letters. It used to
+/// shimmer (phase eased over ~12s from now_ms()), but that animated every frame and
+/// kept the whole window repainting at 60fps; a fixed gradient lets the app idle.
 fn arbiter_wordmark() -> Element<'static, Message> {
-    let p = (now_ms() % 12_000) as f32 / 6_000.0; // 0→2 over 12s
-    let tri = if p <= 1.0 { p } else { 2.0 - p }; // triangle 0→1→0
-    let phase = tri * tri * (3.0 - 2.0 * tri); // smoothstep (ease-in-out)
     const WORD: &str = "Arbiter";
     let n = WORD.chars().count() as f32;
     // Match the web `.titlebar-title`: DM Sans 700, 15px, letter-spacing 0.06em
@@ -6628,7 +6625,8 @@ fn arbiter_wordmark() -> Element<'static, Message> {
     // iced can't gradient-fill a single text run.
     let mut r = row![].spacing(0.9).align_y(iced::Center);
     for (i, ch) in WORD.chars().enumerate() {
-        let col = azure_at(phase * 0.6 + (i as f32 / n) * 0.6);
+        // Static left→right gradient (baby → azure → deep), the shimmer's phase-0 frame.
+        let col = azure_at((i as f32 / n) * 0.6);
         r = r.push(text(ch.to_string()).size(15).color(col).font(wordmark_font()));
     }
     r.into()
