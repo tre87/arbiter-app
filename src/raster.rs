@@ -480,14 +480,16 @@ mod dwrite {
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
             let mut family: Vec<u16> = font_name.encode_utf16().collect();
             family.push(0);
-            // Start from the system defaults (the user's ClearType gamma/contrast, same
-            // as Windows Terminal uses) but force GDI_NATURAL — a grid-fitting mode — so
-            // counters/stems land on the pixel grid and stay crisp at small sizes.
+            // We want RAW grayscale coverage here: the gamma-correction is applied in the
+            // GPU shader (Windows Terminal's DirectWrite algorithm), so baking it in twice
+            // would over-darken. Hence gamma 1.0 + no enhanced contrast. We do keep
+            // GDI_NATURAL — a grid-fitting mode — so counters/stems land on the pixel grid
+            // and stay crisp at small sizes (fixes the soft `B` counter).
             let def = dwrite.CreateRenderingParams()?;
             let params = dwrite.CreateCustomRenderingParams(
-                def.GetGamma(),
-                def.GetEnhancedContrast(),
-                def.GetClearTypeLevel(),
+                1.0, // gamma 1.0: capture raw coverage (shader applies WT's gamma 1.8)
+                0.0, // no enhanced contrast baked in (shader applies it against fg/bg)
+                0.0, // no ClearType level (grayscale AA, no subpixel)
                 def.GetPixelGeometry(),
                 DWRITE_RENDERING_MODE_GDI_NATURAL,
             )?;

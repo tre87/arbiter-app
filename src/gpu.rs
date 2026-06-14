@@ -33,8 +33,9 @@ struct Uniforms {
     cell: [f32; 2],
     glyph: [f32; 2],
     srgb: f32,
-    // 1.0 = blend glyph coverage in gamma space (flatter/thinner — matches Windows
-    // Terminal); 0.0 = linear space (fuller — the macOS look). Was the alignment pad.
+    // >0.5 = composite text with Windows Terminal's DirectWrite grayscale gamma-
+    // correction (gamma-1.8 alpha correction; Windows). 0.0 = linear-space blend
+    // (fuller, the macOS look). Was the alignment pad.
     gamma_blend: f32,
 }
 
@@ -92,14 +93,28 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   if (u.gamma_blend > 0.5) {
-    // Gamma-space blend: flatter/thinner edges, matching Windows Terminal. fg/bg
-    // (and colour-glyph texels) are sRGB, so composite directly in sRGB.
+    // Windows: composite in gamma (sRGB) space, but run the RAW glyph coverage through
+    // Windows Terminal's DirectWrite grayscale gamma-correction first (ported verbatim
+    // from WT's dwrite_helpers.hlsl / shader_ps.hlsl). This is the gamma-1.8 alpha-
+    // correction polynomial DirectWrite uses for grayscale AA: it makes light-on-dark
+    // text as full + legible as WT — fuller than the naive blend (which read hazy/thin)
+    // without the heaviness of the full-linear blend. fg/bg (+ colour texels) are sRGB.
     var p: vec3<f32>;
     if (in.kind > 0.5) {
+      // Colour glyph (emoji): straight-alpha sRGB over the cell bg, no text gamma.
       let s = textureSample(catlas, samp, in.uv);
       p = mix(in.bg, s.rgb, s.a);
     } else {
-      let a = textureSample(atlas, samp, in.uv).r;
+      let cov = textureSample(atlas, samp, in.uv).r;
+      // DWrite_GrayscaleBlend: gamma-1.8 ratios + grayscale enhanced contrast 1.0.
+      let g = vec4<f32>(0.148054421, -0.894594550, 1.47590804, -0.324668258);
+      // Light-on-dark contrast adjustment (× grayscale enhanced contrast 1.0); 0 for
+      // white text, ramps up as the fg darkens. Then EnhanceContrast on the coverage.
+      let k = clamp(dot(in.fg, vec3<f32>(0.30, 0.59, 0.11) * -4.0) + 3.0, 0.0, 1.0);
+      let intensity = dot(in.fg, vec3<f32>(0.25, 0.5, 0.25));
+      let c = cov * (k + 1.0) / (cov * k + 1.0);
+      // ApplyAlphaCorrection: the gamma-correct coverage to composite in sRGB space.
+      let a = c + c * (1.0 - c) * ((g.x * intensity + g.y) * c + (g.z * intensity + g.w));
       p = mix(in.bg, in.fg, a);
     }
     // p is the desired sRGB pixel: a non-sRGB target stores it as-is; an sRGB
@@ -602,11 +617,10 @@ impl TermGpu {
             cell: [cw, ch],
             glyph: [cw / ATLAS as f32, ch / ATLAS as f32],
             srgb: if self.is_srgb { 1.0 } else { 0.0 },
-            // Linear (gamma-correct) AA blend on every platform — the fuller, smoother
-            // look that matches iTerm2/Terminal.app on macOS. Windows previously used
-            // the gamma-space blend (thinner, to mimic Windows Terminal), but it read
-            // as hazy/washed; the linear blend is fuller + crisper there too.
-            gamma_blend: 0.0,
+            // Windows (> 0.5): composite text with Windows Terminal's DirectWrite
+            // grayscale gamma-correction (see the fragment shader). macOS (0.0): the
+            // fuller linear-space blend that matches iTerm2/Terminal.app.
+            gamma_blend: if cfg!(target_os = "windows") { 1.0 } else { 0.0 },
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
     }
