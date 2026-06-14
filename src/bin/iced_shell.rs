@@ -428,6 +428,17 @@ fn app_bg() -> iced::Color {
     iced::Color::from_rgb8(r, g, b)
 }
 
+/// Terminal-header background: the chosen app background lightened by the same per-
+/// channel offset the header historically had over the #121212 default (its #181818 =
+/// +6 per channel). So the header keeps that relative step above the terminal whatever
+/// background is chosen (e.g. #050a0f → #0b1015).
+fn app_header_bg() -> iced::Color {
+    const D: i32 = 0x18 - 0x12; // header #181818 − reference bg #121212 = +6 per channel
+    let (r, g, b) = arbiter_native::term::bg();
+    let f = |v: u8| (v as i32 + D).clamp(0, 255) as u8;
+    iced::Color::from_rgb8(f(r), f(g), f(b))
+}
+
 /// Foundational dark theme matching Arbiter's palette (#121212 bg, azure accent).
 /// The detailed chrome polish comes after the status/footer are functional.
 fn arbiter_theme() -> iced::Theme {
@@ -6757,7 +6768,8 @@ fn pane_header(
         .width(Length::Fill)
         .center_y(Length::Fixed(34.0))
         .style(move |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x18, 0x18, 0x18))),
+            // Header sits one step above the chosen terminal background (see app_header_bg).
+            background: Some(iced::Background::Color(app_header_bg())),
             border: iced::Border { radius: round, ..Default::default() },
             ..Default::default()
         })
