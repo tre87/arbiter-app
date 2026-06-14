@@ -3671,9 +3671,14 @@ fn settings_bg_row(current: &str) -> Element<'static, Message> {
             text("Terminals, sidebars and the overview. Pick a preset or enter a hex colour.")
                 .size(11)
                 .color(TXT_MUTED),
-            row![preset("Default", "#121212"), preset("Black", "#000000"), input]
-                .spacing(8)
-                .align_y(iced::Center),
+            row![
+                preset("Default", "#0a0a0c"),
+                preset("Gray", "#121212"),
+                preset("Black", "#000000"),
+                input
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
         ]
         .spacing(8),
     )

@@ -28,8 +28,8 @@ pub fn set_intense_style(v: u8) {
 
 /// App-wide terminal background colour, packed `0x00RRGGBB`. Drives the terminal cells
 /// here AND the iced surfaces (read via [`bg`]) so they stay in lock-step. Set from
-/// Settings on load + change. Default `#050a0f`.
-static TERM_BG: AtomicU32 = AtomicU32::new(0x0005_0a0f);
+/// Settings on load + change. Default `#0a0a0c`.
+static TERM_BG: AtomicU32 = AtomicU32::new(0x000a_0a0c);
 
 /// Set the terminal/app background colour (packed `0x00RRGGBB`) from Settings.
 pub fn set_bg(rgb: u32) {

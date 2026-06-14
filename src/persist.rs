@@ -135,9 +135,9 @@ pub struct Settings {
     pub background: String,
 }
 
-/// Default background colour. `#050a0f` — a near-black with a faint blue cast.
+/// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
 pub fn default_bg_hex() -> String {
-    "#050a0f".to_string()
+    "#0a0a0c".to_string()
 }
 
 impl Settings {
