@@ -434,7 +434,9 @@ mod mac {
 mod dwrite {
     use super::GlyphBitmap;
     use std::cell::RefCell;
-    use windows::core::{Result, PCWSTR};
+    use std::mem::ManuallyDrop;
+    use windows::core::{implement, Result, PCWSTR};
+    use windows::Win32::Foundation::BOOL;
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
     };
@@ -446,12 +448,15 @@ mod dwrite {
     };
     use windows::core::Interface;
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection,
-        IDWriteFontFace, IDWriteFontFile, IDWriteFontSetBuilder1, IDWriteInMemoryFontFileLoader,
-        IDWriteRenderingParams3, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE_TRUETYPE,
-        DWRITE_FONT_SIMULATIONS_NONE, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GRID_FIT_MODE_ENABLED,
-        DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+        DWriteCreateFactory, IDWriteFactory, IDWriteFactory2, IDWriteFactory3, IDWriteFactory5,
+        IDWriteFont, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback, IDWriteFontFile,
+        IDWriteFontSetBuilder1, IDWriteInMemoryFontFileLoader, IDWriteNumberSubstitution,
+        IDWriteRenderingParams3, IDWriteTextAnalysisSource, IDWriteTextAnalysisSource_Impl,
+        DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE_TRUETYPE, DWRITE_FONT_SIMULATIONS_NONE,
+        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_ENABLED,
+        DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
+        DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
@@ -461,6 +466,74 @@ mod dwrite {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
+
+    /// Minimal `IDWriteTextAnalysisSource` over a single short UTF-16 string, the input
+    /// `IDWriteFontFallback::MapCharacters` needs to resolve which font covers a codepoint.
+    /// (Same shape as servo/dwrote's, adapted to windows-rs's `#[implement]`.)
+    #[implement(IDWriteTextAnalysisSource)]
+    struct AnalysisSource {
+        text: Vec<u16>,   // the codepoint's UTF-16 units (no NUL)
+        locale: Vec<u16>, // NUL-terminated locale, e.g. "en-us\0"
+    }
+
+    impl IDWriteTextAnalysisSource_Impl for AnalysisSource_Impl {
+        fn GetTextAtPosition(
+            &self,
+            pos: u32,
+            text: *mut *mut u16,
+            len: *mut u32,
+        ) -> Result<()> {
+            unsafe {
+                if pos as usize >= self.text.len() {
+                    *text = std::ptr::null_mut();
+                    *len = 0;
+                } else {
+                    *text = self.text.as_ptr().add(pos as usize) as *mut u16;
+                    *len = self.text.len() as u32 - pos;
+                }
+            }
+            Ok(())
+        }
+        fn GetTextBeforePosition(
+            &self,
+            pos: u32,
+            text: *mut *mut u16,
+            len: *mut u32,
+        ) -> Result<()> {
+            unsafe {
+                if pos == 0 || pos as usize > self.text.len() {
+                    *text = std::ptr::null_mut();
+                    *len = 0;
+                } else {
+                    *text = self.text.as_ptr() as *mut u16;
+                    *len = pos;
+                }
+            }
+            Ok(())
+        }
+        fn GetParagraphReadingDirection(&self) -> DWRITE_READING_DIRECTION {
+            DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
+        }
+        fn GetLocaleName(&self, _pos: u32, len: *mut u32, locale: *mut *mut u16) -> Result<()> {
+            unsafe {
+                *len = self.text.len() as u32;
+                *locale = self.locale.as_ptr() as *mut u16;
+            }
+            Ok(())
+        }
+        fn GetNumberSubstitution(
+            &self,
+            _pos: u32,
+            len: *mut u32,
+            sub: *mut Option<IDWriteNumberSubstitution>,
+        ) -> Result<()> {
+            unsafe {
+                *len = self.text.len() as u32;
+                *sub = None; // no number substitution
+            }
+            Ok(())
+        }
+    }
 
     struct Ctx {
         dwrite: IDWriteFactory,
@@ -711,12 +784,55 @@ mod dwrite {
                 Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
             };
 
+            // Draw a single resolved glyph as a MONOCHROME run (DrawGlyphRun paints the
+            // outline in the brush colour and never substitutes colour), then read it back.
+            let draw_run = |face: &IDWriteFontFace, gid: u16| -> Result<Option<GlyphBitmap>> {
+                let advance = 0.0f32;
+                let offset = DWRITE_GLYPH_OFFSET { advanceOffset: 0.0, ascenderOffset: 0.0 };
+                let mut run = DWRITE_GLYPH_RUN {
+                    fontFace: ManuallyDrop::new(Some(face.clone())),
+                    fontEmSize: ctx.em,
+                    glyphCount: 1,
+                    glyphIndices: &gid,
+                    glyphAdvances: &advance,
+                    glyphOffsets: &offset,
+                    isSideways: BOOL(0),
+                    bidiLevel: 0,
+                };
+                rt.BeginDraw();
+                rt.Clear(Some(&clear));
+                rt.DrawGlyphRun(
+                    D2D_POINT_2F { x: 0.0, y: baseline },
+                    &run,
+                    &brush,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                ManuallyDrop::drop(&mut run.fontFace); // release the clone the run held
+                rt.EndDraw(None, None)?;
+                let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
+                let stride = lock.GetStride()? as usize;
+                let mut size = 0u32;
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                lock.GetDataPointer(&mut size, &mut ptr)?;
+                if ptr.is_null() {
+                    return Ok(None);
+                }
+                let data = std::slice::from_raw_parts(ptr, size as usize);
+                Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
+            };
+
             if wants_text_presentation(ch) {
-                // ⏸ and other text-default media controls: render the MONOCHROME outline,
-                // not a colour emoji — DrawTextLayout without ENABLE_COLOR_FONT draws the
-                // glyph outline in the brush colour, the same mono result Windows Terminal
-                // gets (it draws these via DrawGlyphRun). If the resolved font's glyph is
-                // colour-only (no plain outline → no ink), fall back to colour so it shows.
+                // ⏸ etc.: resolve a real MONOCHROME font the way Windows Terminal does
+                // (MapCharacters on the bare codepoint picks a mono symbol font, not the
+                // colour-emoji font), then draw the glyph run. The layout path instead
+                // landed on Segoe UI Emoji and drew its boxed base glyph (small) — wrong.
+                if let Some((face, gid)) = resolve_mono_face(ctx, ch) {
+                    if let Ok(Some(g)) = draw_run(&face, gid) {
+                        return Ok(Some(g));
+                    }
+                }
+                // Resolution/raster failed: fall back to the mono layout outline, then to
+                // colour, so the cell is never blank.
                 match draw_read(D2D1_DRAW_TEXT_OPTIONS_NONE)? {
                     Some(g) => Ok(Some(g)),
                     None => draw_read(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT),
@@ -725,6 +841,53 @@ mod dwrite {
                 draw_read(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT)
             }
         }
+    }
+
+    /// Resolve the system font face that covers `ch` (which the bundled Cascadia lacks),
+    /// the way Windows Terminal does: `IDWriteFontFallback::MapCharacters` on the bare
+    /// codepoint picks a MONOCHROME font for text-default symbols (⏸ etc.) rather than a
+    /// colour-emoji font. Returns the face + glyph id, or None if unresolved/uncovered.
+    unsafe fn resolve_mono_face(ctx: &Ctx, ch: char) -> Option<(IDWriteFontFace, u16)> {
+        let factory2: IDWriteFactory2 = ctx.dwrite.cast().ok()?;
+        let fallback: IDWriteFontFallback = factory2.GetSystemFontFallback().ok()?;
+        let mut sys: Option<IDWriteFontCollection> = None;
+        ctx.dwrite.GetSystemFontCollection(&mut sys, false).ok()?;
+        let sys = sys?;
+
+        let mut tbuf = [0u16; 2];
+        let n = ch.encode_utf16(&mut tbuf).len();
+        let source: IDWriteTextAnalysisSource = AnalysisSource {
+            text: tbuf[..n].to_vec(),
+            locale: "en-us\0".encode_utf16().collect(),
+        }
+        .into();
+
+        let mut mapped_len = 0u32;
+        let mut font: Option<IDWriteFont> = None;
+        let mut scale = 0.0f32;
+        fallback
+            .MapCharacters(
+                &source,
+                0,
+                n as u32,
+                &sys,
+                PCWSTR(ctx.family.as_ptr()), // prefer our font; falls back for chars it lacks
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                &mut mapped_len,
+                &mut font,
+                &mut scale,
+            )
+            .ok()?;
+        let face: IDWriteFontFace = font?.CreateFontFace().ok()?;
+        let cps = [ch as u32];
+        let mut gids = [0u16; 1];
+        face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).ok()?;
+        if gids[0] == 0 {
+            return None;
+        }
+        Some((face, gids[0]))
     }
 
     /// Media-control symbols Claude/TUIs use (⏯⏸⏹⏺⏭⏮…, U+23E9..=U+23FA). These are

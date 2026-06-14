@@ -140,6 +140,9 @@ block2 = "0.5"
 iced_winit = { path = "vendor/iced_winit" }
 
 [target.'cfg(windows)'.dependencies]
+# windows-core is pulled in transitively by `windows`, but the `#[implement]` macro's
+# expansion references the `windows_core` crate by name, so it must be a direct dep.
+windows-core = "0.58"
 windows = { version = "0.58", features = [
     "Foundation_Numerics",
     "Win32_Foundation",
