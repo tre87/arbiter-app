@@ -6655,39 +6655,21 @@ fn azure_at(t: f32) -> iced::Color {
 /// palette (`azure_at`) and kept in its deeper half — a random walk through the
 /// medium/deep blues with both ends pinned near the deepest azure, so it never starts
 /// or ends on the pale baby-blue. Computed once (no animation → the app still idles).
-fn wordmark_colors() -> &'static [iced::Color] {
-    static COLORS: std::sync::OnceLock<Vec<iced::Color>> = std::sync::OnceLock::new();
-    COLORS.get_or_init(|| {
-        let mut s = now_ms() | 1; // non-zero xorshift seed; differs per launch
-        let mut rnd = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 40) as f32 / (1u64 << 24) as f32 // [0, 1)
-        };
-        const N: usize = 7; // "Arbiter"
-        let mut t = [0f32; N];
-        // azure_at is pale (~#88D1F1) near t=0/1 and deepest (~#027DFF) at t≈0.5. Stay in
-        // [0.25, 0.75] (saturated/deep blues, no pale) and pin the ends to [0.40, 0.60].
-        t[0] = 0.40 + rnd() * 0.20;
-        for i in 1..N - 1 {
-            t[i] = (t[i - 1] + (rnd() - 0.5) * 0.5).clamp(0.25, 0.75);
-        }
-        t[N - 1] = 0.40 + rnd() * 0.20;
-        t.iter().map(|&v| azure_at(v)).collect()
-    })
-}
-
-/// The "Arbiter" wordmark: the static random azure gradient (see `wordmark_colors`).
+/// The "Arbiter" wordmark: a simple linear right→left azure gradient. Sampled from
+/// azure_at over [0.25, 0.75] — i.e. excluding the pale baby-blue at its t=0/1 ends —
+/// so it runs through the saturated/deep blues only. Static (no animation).
 fn arbiter_wordmark() -> Element<'static, Message> {
     const WORD: &str = "Arbiter";
-    let cols = wordmark_colors();
+    let n = WORD.chars().count();
+    let last = (n - 1).max(1) as f32;
     // Match the web `.titlebar-title`: DM Sans 700, 15px, letter-spacing 0.06em
     // (≈0.9px at 15px → the per-letter row gap). Per-letter is required because
     // iced can't gradient-fill a single text run.
     let mut r = row![].spacing(0.9).align_y(iced::Center);
     for (i, ch) in WORD.chars().enumerate() {
-        let col = cols.get(i).copied().unwrap_or(AZURE);
+        // Right→left: rightmost letter = 0.25, leftmost = 0.75.
+        let t = 0.25 + ((n - 1 - i) as f32 / last) * 0.50;
+        let col = azure_at(t);
         r = r.push(text(ch.to_string()).size(15).color(col).font(wordmark_font()));
     }
     r.into()
