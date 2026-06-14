@@ -7,6 +7,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Windows glyphs:** media-control symbols like ⏸ render monochrome instead of as a
+  colour emoji, and fallback symbols like ✻ (Claude's working spinner) are scaled up to
+  fill the cell like Windows Terminal instead of rendering tiny.
+- **Windows Claude:** pressing Shift+Tab / Shift+Enter, or resizing the window, no longer
+  falsely starts Claude's "working" animation — entering the working state now requires
+  the spinner to actually animate.
+
 ## [1.0.6] — 2026-06-14
 
 ### Changed
