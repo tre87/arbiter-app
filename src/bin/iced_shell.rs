@@ -4640,15 +4640,16 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
             let mut row = row![].spacing(12).align_y(iced::Center);
             for ((label, color, p), reset) in shown.iter().zip(&resets) {
                 let r = if show_reset { reset.as_str() } else { "" };
-                // Overview: a #121212 border frames the bars against the (configurable,
-                // possibly very dark) footer background. Track colour is static (as main).
+                // Overview: a lighter #2c2c2c border (the app's card/divider colour)
+                // frames the bars so they're visible against the dark configurable
+                // footer. Track colour is static (#121212, as on the main titlebar).
                 row = row.push(usage_stat(
                     label,
                     p.utilization.round() as u16,
                     *color,
                     r,
                     track_w,
-                    Some(iced::Color::from_rgb8(0x12, 0x12, 0x12)),
+                    Some(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)),
                 ));
             }
             // Centered group (not stretched); the centred margin yields before the bars.
