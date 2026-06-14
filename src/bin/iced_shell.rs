@@ -4130,6 +4130,11 @@ fn tab_pill(
         .spacing(4)
         .align_y(iced::Center)
         .height(Length::Fixed(26.0));
+    // After the name, before the close: a pulsing dot when a terminal in this workspace
+    // has Claude working (azure) or needing attention (amber, takes priority).
+    if let Some(dot) = workspace_claude_dot(ws) {
+        content = content.push(tab_status_dot(dot));
+    }
     if show_close {
         content = content.push(
             button(cmdi(mdi_path::CLOSE, 13.0, fg))
@@ -6778,6 +6783,34 @@ fn header_dot(dot: Dot) -> Element<'static, Message> {
         Dot::Idle => rgba(0x6b, 0x7a, 0x8d, 0.5),      // dim grey — no Claude
     };
     text("●").size(11).color(c).into()
+}
+
+/// Aggregate Claude status across a workspace's panes, for the tab dot. Attention (a
+/// terminal needs input) wins over Working; None when no pane is working or waiting.
+fn workspace_claude_dot(ws: &Workspace) -> Option<Dot> {
+    let mut working = false;
+    for (_, d) in ws.panes.iter() {
+        if d.session.claude_running() {
+            match d.session.claude_status().lifecycle {
+                Lifecycle::Attention => return Some(Dot::Attention), // priority
+                Lifecycle::Working => working = true,
+                _ => {}
+            }
+        }
+    }
+    working.then_some(Dot::Working)
+}
+
+/// A small pulsing status dot for the workspace tab: amber when a terminal needs
+/// attention, azure (blue) while one is working. It pulses via the fast tick, which is
+/// already active whenever a pane is working/attention (see `needs_fast_tick`).
+fn tab_status_dot(dot: Dot) -> Element<'static, Message> {
+    let rgba = iced::Color::from_rgba8;
+    let c = match dot {
+        Dot::Attention => rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200)), // amber — needs input
+        _ => rgba(0x4d, 0xa6, 0xff, pulse_alpha(1500)),             // azure — Claude working
+    };
+    text("●").size(8).color(c).into()
 }
 
 /// The Claude starburst icon at `size` px.

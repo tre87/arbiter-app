@@ -7,6 +7,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Workspace tab status dot:** a workspace tab now shows a pulsing dot (after its name,
+  before the close button) when one of its terminals has Claude working (azure) or needing
+  attention (amber). Attention takes priority across the workspace's terminals.
+
 ### Fixed
 - **Windows glyphs:** media-control symbols like ⏸ render monochrome instead of as a
   colour emoji, and fallback symbols like ✻ (Claude's working spinner) are scaled up to
