@@ -557,18 +557,15 @@ impl VtTerm {
     /// palette entries, 256-cube, and explicit RGB) is left as the user set it.
     fn intense_fg(&self, color: Color) -> Rgb {
         match color {
-            Color::Named(NamedColor::Foreground) => lighten(self.default_fg),
+            // Default foreground → bright white (palette 15), the classic "bold = bright"
+            // behaviour. The default fg is already light (#ccc), so merely lightening it
+            // was barely visible; the bright-white entry is clearly brighter.
+            Color::Named(NamedColor::Foreground) => self.palette[15],
             Color::Named(n) if (n as usize) < 8 => self.palette[n as usize + 8],
             Color::Indexed(i) if (i as usize) < 8 => self.palette[i as usize + 8],
             other => self.resolve(other, true),
         }
     }
-}
-
-/// Lighten a colour toward white (used for intense default-foreground text).
-fn lighten(c: Rgb) -> Rgb {
-    let f = |v: u8| (v as f32 + (255.0 - v as f32) * 0.4).round() as u8;
-    Rgb { r: f(c.r), g: f(c.g), b: f(c.b) }
 }
 
 fn rgbf(c: Rgb) -> [f32; 3] {
