@@ -163,10 +163,17 @@ impl Session {
         self.claude_running.load(Ordering::Relaxed)
     }
 
-    /// Ignore Claude spinner detection for `dur_ms` — called when the app triggers a
-    /// repaint (window/PTY resize) so the rapid redraws don't read as "working".
+    /// Ignore Claude spinner detection for `dur_ms` — called for a repaint that doesn't
+    /// start work (window/PTY resize, or a newline/mode edit key on Windows ConPTY) so the
+    /// rapid redraws don't read as "working".
     pub fn suppress_claude_activity(&self, dur_ms: u64) {
         self.claude.suppress_activity(dur_ms);
+    }
+
+    /// Resume Claude spinner detection immediately — called on Enter/submit, where real
+    /// working is imminent and must not be delayed by a suppression window.
+    pub fn clear_claude_suppression(&self) {
+        self.claude.clear_suppression();
     }
 
     /// The Claude session id to resume on restore IF Claude is running here AND a

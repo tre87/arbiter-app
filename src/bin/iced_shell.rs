@@ -885,6 +885,12 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 const OVERVIEW_MIN_W: f32 = 200.0;
 const OVERVIEW_MIN_H: f32 = 100.0;
 
+/// How long a newline/mode edit key (Shift+Enter, Ctrl+Enter, Shift+Tab) suppresses
+/// Claude spinner-detection — long enough to cover the keystroke→ConPTY-repaint round-trip
+/// on Windows, so a burst can't pair into a false "working". Only these keys suppress;
+/// Enter/submit clears it, so real working detection is never delayed.
+const EDIT_KEY_SUPPRESS_MS: u64 = 300;
+
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
     settings.min_size = Some(iced::Size::new(OVERVIEW_MIN_W, OVERVIEW_MIN_H));
@@ -1078,6 +1084,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     t.scroll_to_bottom();
                     t.clear_selection();
                 }
+                // Enter (CR) submits → real working is imminent, so resume spinner
+                // detection at once. Ctrl+Enter (LF) inserts a newline and Shift+Tab (CSI Z)
+                // cycles Claude's mode — like Shift+Enter, both make Windows ConPTY repaint
+                // and re-emit a stale ✻, so suppress briefly so a burst can't pair into a
+                // false "working". Plain typing is left alone (no delay anywhere).
+                match bytes.as_slice() {
+                    b"\r" => p.session.clear_claude_suppression(),
+                    b"\n" | b"\x1b[Z" => p.session.suppress_claude_activity(EDIT_KEY_SUPPRESS_MS),
+                    _ => {}
+                }
                 p.session.write(&bytes);
             }
         }
@@ -1090,6 +1106,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 if let Ok(mut t) = p.session.term().lock() {
                     t.scroll_to_bottom();
                 }
+                // Inserting a newline makes Windows ConPTY repaint the region and re-emit a
+                // stale ✻; suppress detection briefly so rapid Shift+Enter can't pair into a
+                // false "working". A subsequent Enter/submit clears it (see Message::Input).
+                p.session.suppress_claude_activity(EDIT_KEY_SUPPRESS_MS);
                 let bytes: &[u8] = if p.session.claude_running() { b"\x1b[13;2u" } else { b"\r" };
                 p.session.write(bytes);
             }

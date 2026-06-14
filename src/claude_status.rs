@@ -165,10 +165,26 @@ impl ClaudeHandle {
         }
     }
 
-    /// Ignore spinner detection for `dur_ms` (called when the app itself triggers a
-    /// repaint — a window/PTY resize — so the rapid Claude redraws don't read as working).
+    /// Ignore spinner detection for `dur_ms` — called when an action that doesn't start
+    /// Claude working causes a repaint: a window/PTY resize, or an edit key (Shift+Enter
+    /// newline, Shift+Tab mode-cycle) on Windows, where ConPTY repaints the region and
+    /// re-emits an on-screen ✻ that would otherwise pair into a false "working".
     pub fn suppress_activity(&self, dur_ms: u64) {
-        self.suppress_until_ms.store(now_ms() + dur_ms, Ordering::Relaxed);
+        // Extend, never shorten, an existing window — a burst of edit keys each pushes it
+        // out, so every repaint stays covered.
+        let until = now_ms() + dur_ms;
+        if until > self.suppress_until_ms.load(Ordering::Relaxed) {
+            self.suppress_until_ms.store(until, Ordering::Relaxed);
+        }
+        // Drop any half-formed pair so a frame landing just past the window can't pair
+        // with one from before it.
+        self.last_spinner_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Resume spinner detection immediately — called on a SUBMIT (Enter). Real working is
+    /// imminent after a submit, so an edit-key/resize suppression window must not delay it.
+    pub fn clear_suppression(&self) {
+        self.suppress_until_ms.store(0, Ordering::Relaxed);
     }
 
     /// Reader: whether a menu/approval prompt is currently on the visible screen.

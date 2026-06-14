@@ -15,9 +15,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ### Fixed
 - **Windows glyphs:** fallback symbols like ✻ (Claude's working spinner) keep their full
   height instead of being squashed into the narrow cell — sized like Windows Terminal.
-- **Windows Claude:** pressing Shift+Tab / Shift+Enter, or resizing the window, no longer
-  falsely starts Claude's "working" animation — entering the working state now requires
-  the spinner to actually animate.
+- **Windows Claude working-detection:** newline / mode edit keys (Shift+Enter, Ctrl+Enter,
+  Shift+Tab), even pressed in rapid succession, or resizing the window, no longer falsely
+  start Claude's "working" animation. Those keys make Windows ConPTY repaint and re-emit an
+  on-screen ✻; they now briefly suppress spinner-detection so a burst can't pair into a
+  false positive — while a plain Enter/submit clears the suppression, so genuine working is
+  still detected immediately (no delay).
 
 ## [1.0.6] — 2026-06-14
 
