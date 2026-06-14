@@ -453,7 +453,12 @@ impl TermGpu {
             (true, Some(b)) => (b.0.as_slice(), b.1),
             _ => (self.regular.0.as_slice(), self.regular.1),
         };
-        let raster = crate::raster::rasterize(&self.font_name, data, index, self.em_px, ch, bold);
+        // Also hand over the bold-face bytes regardless of weight: the DirectWrite
+        // path loads them into a real bold IDWriteFontFace so bold renders the bundled
+        // bold (not a synthesised faux-bold). Other platforms ignore this.
+        let bold_data = self.bold_face.as_ref().map(|(b, _)| b.as_slice());
+        let raster =
+            crate::raster::rasterize(&self.font_name, data, index, bold_data, self.em_px, ch, bold);
         // Diagnostic: ARBITER_GLYPH_DEBUG logs how non-ASCII symbols (e.g. ✻ U+273B,
         // ⏵ U+23F5) rasterise — mono vs colour, size + bearing vs the cell, and the
         // width flag — so glyph-fit issues can be seen instead of guessed. Fires once
