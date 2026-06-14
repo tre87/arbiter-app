@@ -129,7 +129,9 @@ impl VtTerm {
             // Arbiter's signature terminal background (CUSTOM_TERMINAL_BG in the
             // web app). The Iced shell's surface is this colour too, so skipped
             // (empty, default-bg) cells show through seamlessly.
-            default_bg: Rgb { r: 0x12, g: 0x12, b: 0x12 },
+            // TEMP: pure black to compare glyph rendering against Windows Terminal
+            // (revert to { 0x12, 0x12, 0x12 } — and the pane bg in iced_shell.rs).
+            default_bg: Rgb { r: 0x00, g: 0x00, b: 0x00 },
             search: None,
             last_scroll: None,
             responses,

@@ -5212,7 +5212,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill)
             .style(move |_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+                // TEMP: pure black to compare glyph rendering vs Windows Terminal
+                // (revert to from_rgb8(0x12, 0x12, 0x12) — matches term.rs default_bg).
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x00, 0x00, 0x00))),
                 border: iced::Border { radius: pane_round, ..Default::default() },
                 ..Default::default()
             });
