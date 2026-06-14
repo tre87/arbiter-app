@@ -5185,8 +5185,11 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         tabs = tabs.push(tab_drop_line());
     }
 
-    // Tabs sit right after the wordmark (just the row's 6px gap) so the title→tabs
-    // space matches the logo→title gap instead of dwarfing it.
+    // Give the tabs clear breathing room from the wordmark — the same kind of gap the
+    // brand has (traffic-lights→logo, logo→title), instead of butting up against the
+    // title. 6px row gap + 8px leading pad ≈ a 14px title→tabs space.
+    let tabs =
+        container(tabs).padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 8.0 });
     let mut bar = row![brand, tabs, tab_add_button()]
         .spacing(6)
         .align_y(iced::Center)
@@ -6647,19 +6650,44 @@ fn azure_at(t: f32) -> iced::Color {
     iced::Color::from_rgb8(mix(c0.0, c1.0), mix(c0.1, c1.1), mix(c0.2, c1.2))
 }
 
-/// The "Arbiter" wordmark: a STATIC azure gradient across the letters. It used to
-/// shimmer (phase eased over ~12s from now_ms()), but that animated every frame and
-/// kept the whole window repainting at 60fps; a fixed gradient lets the app idle.
+/// Per-letter colours for the "Arbiter" wordmark: a STATIC but RANDOM gradient,
+/// different each launch (seeded from the start time). Sampled only from our azure
+/// palette (`azure_at`) and kept in its deeper half — a random walk through the
+/// medium/deep blues with both ends pinned near the deepest azure, so it never starts
+/// or ends on the pale baby-blue. Computed once (no animation → the app still idles).
+fn wordmark_colors() -> &'static [iced::Color] {
+    static COLORS: std::sync::OnceLock<Vec<iced::Color>> = std::sync::OnceLock::new();
+    COLORS.get_or_init(|| {
+        let mut s = now_ms() | 1; // non-zero xorshift seed; differs per launch
+        let mut rnd = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 // [0, 1)
+        };
+        const N: usize = 7; // "Arbiter"
+        let mut t = [0f32; N];
+        // azure_at is pale (~#88D1F1) near t=0/1 and deepest (~#027DFF) at t≈0.5. Stay in
+        // [0.25, 0.75] (saturated/deep blues, no pale) and pin the ends to [0.40, 0.60].
+        t[0] = 0.40 + rnd() * 0.20;
+        for i in 1..N - 1 {
+            t[i] = (t[i - 1] + (rnd() - 0.5) * 0.5).clamp(0.25, 0.75);
+        }
+        t[N - 1] = 0.40 + rnd() * 0.20;
+        t.iter().map(|&v| azure_at(v)).collect()
+    })
+}
+
+/// The "Arbiter" wordmark: the static random azure gradient (see `wordmark_colors`).
 fn arbiter_wordmark() -> Element<'static, Message> {
     const WORD: &str = "Arbiter";
-    let n = WORD.chars().count() as f32;
+    let cols = wordmark_colors();
     // Match the web `.titlebar-title`: DM Sans 700, 15px, letter-spacing 0.06em
     // (≈0.9px at 15px → the per-letter row gap). Per-letter is required because
     // iced can't gradient-fill a single text run.
     let mut r = row![].spacing(0.9).align_y(iced::Center);
     for (i, ch) in WORD.chars().enumerate() {
-        // Static left→right gradient (baby → azure → deep), the shimmer's phase-0 frame.
-        let col = azure_at((i as f32 / n) * 0.6);
+        let col = cols.get(i).copied().unwrap_or(AZURE);
         r = r.push(text(ch.to_string()).size(15).color(col).font(wordmark_font()));
     }
     r.into()
