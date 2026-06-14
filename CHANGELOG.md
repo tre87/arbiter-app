@@ -11,6 +11,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 - **Bold text style** setting (Settings → Display → Terminal), mirroring Windows
   Terminal's `intenseTextStyle`: render bold/intense (SGR 1) text as a **bold font**,
   a **brighter colour** (regular weight, the classic xterm look), **both**, or **none**.
+- **Background colour** setting (Settings → Display → Terminal): presets (`#121212`,
+  black) or a custom hex, applied live to the terminals, sidebars and overview.
 
 ### Fixed
 - **Windows terminal text** is sharper and now matches Windows Terminal. Grayscale

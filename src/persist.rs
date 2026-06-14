@@ -129,6 +129,36 @@ pub struct Settings {
     /// `intenseTextStyle`. Default: a bold font face.
     #[serde(default)]
     pub intense_text_style: IntenseStyle,
+    /// Background colour (hex `#rrggbb`) for the terminals, sidebars and overview.
+    /// Presets in the UI: `#121212` (signature), `#000000`; or any custom hex.
+    #[serde(default = "default_bg_hex")]
+    pub background: String,
+}
+
+/// Default background colour. `#050a0f` — a near-black with a faint blue cast.
+pub fn default_bg_hex() -> String {
+    "#050a0f".to_string()
+}
+
+impl Settings {
+    /// The background colour as RGB bytes, falling back to `#121212` if the stored hex
+    /// is malformed (e.g. mid-edit in the custom field).
+    pub fn bg_rgb(&self) -> (u8, u8, u8) {
+        parse_hex(&self.background).unwrap_or((0x12, 0x12, 0x12))
+    }
+}
+
+/// Parse a `#rrggbb` (or `rrggbb`) hex colour into RGB bytes. None if malformed.
+pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&h[0..2], 16).ok()?,
+        u8::from_str_radix(&h[2..4], 16).ok()?,
+        u8::from_str_radix(&h[4..6], 16).ok()?,
+    ))
 }
 
 /// How "intense" (SGR 1 / bold) terminal text is rendered. Mirrors Windows Terminal's
@@ -198,6 +228,7 @@ impl Default for Settings {
             screenshot_folder: None,
             docs_folder: None,
             intense_text_style: IntenseStyle::Bold,
+            background: default_bg_hex(),
         }
     }
 }

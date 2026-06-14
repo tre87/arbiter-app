@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::EventListener;
@@ -24,6 +24,27 @@ static INTENSE_STYLE: AtomicU8 = AtomicU8::new(1);
 /// Set the intense-text rendering mode from Settings (`IntenseStyle::as_u8`).
 pub fn set_intense_style(v: u8) {
     INTENSE_STYLE.store(v, Ordering::Relaxed);
+}
+
+/// App-wide terminal background colour, packed `0x00RRGGBB`. Drives the terminal cells
+/// here AND the iced surfaces (read via [`bg`]) so they stay in lock-step. Set from
+/// Settings on load + change. Default `#050a0f`.
+static TERM_BG: AtomicU32 = AtomicU32::new(0x0005_0a0f);
+
+/// Set the terminal/app background colour (packed `0x00RRGGBB`) from Settings.
+pub fn set_bg(rgb: u32) {
+    TERM_BG.store(rgb & 0x00ff_ffff, Ordering::Relaxed);
+}
+
+/// The current background colour as RGB bytes (terminal cells + iced chrome read this).
+pub fn bg() -> (u8, u8, u8) {
+    let v = TERM_BG.load(Ordering::Relaxed);
+    ((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+fn term_bg() -> Rgb {
+    let (r, g, b) = bg();
+    Rgb { r, g, b }
 }
 
 /// Active in-terminal find: the matched cell ranges (incl. scrollback), which is
@@ -116,7 +137,6 @@ pub struct VtTerm {
     parser: Processor,
     palette: [Rgb; 256],
     default_fg: Rgb,
-    default_bg: Rgb,
     search: Option<Search>,
     /// When the view was last scrolled BY THE USER (wheel / drag-autoscroll), to
     /// fade the scroll indicator out. Not set by output or jump-to-bottom, so the
@@ -138,12 +158,9 @@ impl VtTerm {
             parser: Processor::new(),
             palette: build_palette(),
             default_fg: default_fg(),
-            // Arbiter's signature terminal background (CUSTOM_TERMINAL_BG in the
-            // web app). The Iced shell's surface is this colour too, so skipped
-            // (empty, default-bg) cells show through seamlessly.
-            // TEMP: pure black to compare glyph rendering against Windows Terminal
-            // (revert to { 0x12, 0x12, 0x12 } — and the pane bg in iced_shell.rs).
-            default_bg: Rgb { r: 0x00, g: 0x00, b: 0x00 },
+            // Background is the app-wide configurable colour (TERM_BG / Settings), read
+            // live via term_bg() so changing it updates every terminal. The Iced shell's
+            // surfaces read the same value so skipped (empty, default-bg) cells blend.
             search: None,
             last_scroll: None,
             responses,
@@ -389,7 +406,7 @@ impl VtTerm {
         false
     }
 
-    pub fn default_bg(&self) -> [f32; 3] { rgbf(self.default_bg) }
+    pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
     /// (row, col, visible) for the block cursor.
@@ -519,7 +536,7 @@ impl VtTerm {
             Color::Indexed(i) => self.palette[i as usize],
             Color::Named(named) => match named {
                 NamedColor::Foreground => self.default_fg,
-                NamedColor::Background => self.default_bg,
+                NamedColor::Background => term_bg(),
                 other => {
                     let idx = other as usize;
                     if idx < 256 {
@@ -527,7 +544,7 @@ impl VtTerm {
                     } else if is_fg {
                         self.default_fg
                     } else {
-                        self.default_bg
+                        term_bg()
                     }
                 }
             },

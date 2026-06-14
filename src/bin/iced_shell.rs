@@ -420,13 +420,20 @@ struct WorktreeDialog {
 /// window doesn't reach the terminal). Set once at startup.
 static MAIN_WINDOW: std::sync::OnceLock<iced::window::Id> = std::sync::OnceLock::new();
 
-/// Foundational dark theme matching Arbiter's palette (#121212 bg, azure accent).
+/// The app-wide background colour (terminals, sidebars, overview), read from the
+/// shared `term` global so every surface stays in lock-step with the terminal cells.
+fn app_bg() -> iced::Color {
+    let (r, g, b) = arbiter_native::term::bg();
+    iced::Color::from_rgb8(r, g, b)
+}
+
+/// Foundational dark theme matching Arbiter's palette (configurable bg, azure accent).
 /// The detailed chrome polish comes after the status/footer are functional.
-fn arbiter_theme() -> iced::Theme {
+fn arbiter_theme(bg: iced::Color) -> iced::Theme {
     iced::Theme::custom(
         "Arbiter".to_string(),
         iced::theme::Palette {
-            background: iced::Color::from_rgb8(0x12, 0x12, 0x12),
+            background: bg,
             text: iced::Color::from_rgb8(0xcc, 0xcc, 0xcc),
             primary: iced::Color::from_rgb8(0x33, 0x99, 0xff),
             success: iced::Color::from_rgb8(0x2d, 0xbd, 0x6e),
@@ -483,6 +490,8 @@ enum Message {
     ToggleShowTerminalButtons(bool),
     /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
     SetIntenseStyle(persist::IntenseStyle),
+    /// Settings → background colour (hex `#rrggbb`); from a preset button or the input.
+    SetBackground(String),
     /// Settings → scrollback lines (text input; parsed + clamped).
     SetScrollback(String),
     /// Settings → screenshot-attach folder (Files tab): set / browse / reset.
@@ -1219,6 +1228,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             arbiter_native::term::set_intense_style(s.as_u8());
             save_session(state);
             // Existing terminals re-render from the global on the next frame.
+        }
+        Message::SetBackground(hex) => {
+            let hex = hex.trim().to_string();
+            state.settings.background = hex.clone();
+            // Apply only when it parses (live as-you-type; partial input is kept in the
+            // field but doesn't change the colour until valid). Terminals + surfaces read
+            // the global; the theme (window base / overview) is rebuilt from it.
+            if let Some((r, g, b)) = persist::parse_hex(&hex) {
+                arbiter_native::term::set_bg((r as u32) << 16 | (g as u32) << 8 | b as u32);
+                state.theme = arbiter_theme(app_bg());
+            }
+            save_session(state);
         }
         Message::SetScrollback(s) => {
             // Keep only digits, clamp to the supported range; new terminals pick it
@@ -2548,7 +2569,7 @@ fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'stati
 /// radius 8.
 fn sidebar_style(_t: &iced::Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+        background: Some(iced::Background::Color(app_bg())),
         border: iced::Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
@@ -3617,6 +3638,35 @@ fn settings_intense_row(
         .into()
 }
 
+/// Background-colour row: label + hint, then two preset buttons (#121212, black) and a
+/// custom hex input. The active preset is highlighted; a custom hex selects neither.
+fn settings_bg_row(current: &str) -> Element<'static, Message> {
+    let norm = |s: &str| s.trim().trim_start_matches('#').to_lowercase();
+    let cur = norm(current);
+    let preset = |label: &str, hex: &str| {
+        let kind = if norm(hex) == cur { BtnKind::Primary } else { BtnKind::Secondary };
+        settings_btn(label, Message::SetBackground(hex.to_string()), kind)
+    };
+    let labels = column![
+        text("Background").size(13).color(TXT_SECONDARY),
+        text("Terminals, sidebars and the overview. Pick a preset or enter a hex colour.")
+            .size(11)
+            .color(TXT_MUTED),
+    ]
+    .spacing(2);
+    let input = text_input("#rrggbb", current)
+        .on_input(Message::SetBackground)
+        .width(Length::Fixed(96.0))
+        .padding([6, 8])
+        .size(13)
+        .style(settings_input_style);
+    let controls =
+        row![preset("Default", "#121212"), preset("Black", "#000000"), input].spacing(8).align_y(iced::Center);
+    container(row![labels, horizontal_space(), controls].spacing(12).align_y(iced::Center))
+        .padding([10, 4])
+        .into()
+}
+
 /// One `label  value` line in the account block (web `.account-meta-row`).
 fn settings_account_line(label: &str, value: &str) -> Element<'static, Message> {
     row![
@@ -3809,6 +3859,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     "How bold (SGR 1) text renders: Bold = bold font, Bright = brighter colour, both, or none.",
                     state.settings.intense_text_style,
                 ),
+                settings_bg_row(&state.settings.background),
             ]
             .spacing(12);
             // The header shell-switch button only exists when Git Bash is found, so
@@ -5246,9 +5297,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill)
             .style(move |_t: &iced::Theme| container::Style {
-                // TEMP: pure black to compare glyph rendering vs Windows Terminal
-                // (revert to from_rgb8(0x12, 0x12, 0x12) — matches term.rs default_bg).
-                background: Some(iced::Background::Color(iced::Color::from_rgb8(0x00, 0x00, 0x00))),
+                // The configurable app background (Settings → Display); matches the
+                // terminal cells so empty (skipped) cells blend seamlessly.
+                background: Some(iced::Background::Color(app_bg())),
                 border: iced::Border { radius: pane_round, ..Default::default() },
                 ..Default::default()
             });
@@ -5634,9 +5685,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
 /// cwd-tracked git info). Claude model/context/tokens land here later.
 fn footer_style(_t: &iced::Theme) -> container::Style {
     container::Style {
-        // Same as the terminal (web `--color-bg` #121212); the 1px #2c2c2c top
-        // border is the `hline()` added above the footer in the pane's content column.
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
+        // Same colour as the terminal (the configurable app background); the 1px
+        // #2c2c2c top border is the `hline()` added above the footer in the pane column.
+        background: Some(iced::Background::Color(app_bg())),
         text_color: Some(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
         ..Default::default()
     }
@@ -7965,6 +8016,14 @@ fn main() -> iced::Result {
                 .store(saved_settings.scrollback, std::sync::atomic::Ordering::Relaxed);
             // Apply the saved intense-text (bold/bright) mode before the first render.
             arbiter_native::term::set_intense_style(saved_settings.intense_text_style.as_u8());
+            // Apply the saved background colour before the first render (terminals +
+            // iced surfaces both read this), and the theme below is built from it.
+            {
+                let (r, g, b) = saved_settings.bg_rgb();
+                arbiter_native::term::set_bg(
+                    (r as u32) << 16 | (g as u32) << 8 | b as u32,
+                );
+            }
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
@@ -8057,7 +8116,7 @@ fn main() -> iced::Result {
                 active,
                 font: font.clone(),
                 git_bash: git_bash.clone(),
-                theme: arbiter_theme(),
+                theme: arbiter_theme(app_bg()),
                 main_window: main_id,
                 overview_window,
                 main_size,
