@@ -428,7 +428,7 @@ mod dwrite {
     use windows::Win32::Graphics::DirectWrite::{
         DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED,
         DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE_GDI_NATURAL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
@@ -482,16 +482,20 @@ mod dwrite {
             family.push(0);
             // We want RAW grayscale coverage here: the gamma-correction is applied in the
             // GPU shader (Windows Terminal's DirectWrite algorithm), so baking it in twice
-            // would over-darken. Hence gamma 1.0 + no enhanced contrast. We do keep
-            // GDI_NATURAL — a grid-fitting mode — so counters/stems land on the pixel grid
-            // and stay crisp at small sizes (fixes the soft `B` counter).
+            // would over-darken. Hence gamma 1.0 + no enhanced contrast.
+            //
+            // Rendering mode DEFAULT lets DirectWrite auto-select the recommended NATURAL
+            // mode for the font+size — exactly what WT does via GetRecommendedRenderingMode
+            // (BackendD3D.cpp). We previously forced GDI_NATURAL (GDI-compatible grid-fit),
+            // but that snaps stems to whole pixels and over-thickens BOLD glyphs; natural
+            // hinting + the shader's gamma give crisp counters without that distortion.
             let def = dwrite.CreateRenderingParams()?;
             let params = dwrite.CreateCustomRenderingParams(
                 1.0, // gamma 1.0: capture raw coverage (shader applies WT's gamma 1.8)
                 0.0, // no enhanced contrast baked in (shader applies it against fg/bg)
                 0.0, // no ClearType level (grayscale AA, no subpixel)
                 def.GetPixelGeometry(),
-                DWRITE_RENDERING_MODE_GDI_NATURAL,
+                DWRITE_RENDERING_MODE_DEFAULT,
             )?;
             Ok(Ctx { dwrite, d2d, wic, family, name: font_name.to_string(), em: em_px, params })
         }
