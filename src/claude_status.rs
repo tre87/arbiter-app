@@ -140,25 +140,22 @@ impl ClaudeHandle {
         if now.saturating_sub(stop) < STOP_SUPPRESS_MS {
             return;
         }
+        // Ignore frames during an app-initiated repaint window (a resize), whose rapid
+        // redraws would otherwise look like a cycling spinner.
+        if now < self.suppress_until_ms.load(Ordering::Relaxed) {
+            return;
+        }
         let act = self.activity_ms.load(Ordering::Relaxed);
         let working_now = act > stop && now.saturating_sub(act) < WORKING_TTL_MS;
         if working_now {
             // Already working: any frame sustains it (bridging the slow `·` frames that
-            // aren't in the star range). Note we do NOT gate sustain on the suppression
-            // window — only ENTERING is gated below — so typing a follow-up (or resizing)
-            // mid-run can't flicker the working dot off.
+            // aren't in the star range) — the established behaviour.
             self.activity_ms.store(now, Ordering::Relaxed);
             self.hook_attention.store(false, Ordering::Relaxed);
         } else {
-            // Not working yet. Ignore frames inside an input/resize repaint window: those
-            // redraws re-emit spinner glyphs already on screen (Shift+Enter inserting a
-            // line, a drag-resize) — especially on Windows, where ConPTY repaints whole
-            // regions rather than diffing — and would otherwise pair into a false "working".
-            if now < self.suppress_until_ms.load(Ordering::Relaxed) {
-                return;
-            }
-            // Require a SECOND frame an animation-gap after the first to ENTER working, so
-            // a lone repaint never pairs and can't false-trigger.
+            // Not working: require a SECOND frame an animation-gap after the first to
+            // ENTER working. A one-shot repaint (Shift+Tab/Enter, single resize) emits
+            // the star glyph once and never pairs, so it can't false-trigger.
             let prev = self.last_spinner_ms.swap(now, Ordering::Relaxed);
             let gap = now.saturating_sub(prev);
             if prev != 0 && (MIN_FRAME_GAP_MS..=MAX_FRAME_GAP_MS).contains(&gap) {
@@ -171,15 +168,7 @@ impl ClaudeHandle {
     /// Ignore spinner detection for `dur_ms` (called when the app itself triggers a
     /// repaint — a window/PTY resize — so the rapid Claude redraws don't read as working).
     pub fn suppress_activity(&self, dur_ms: u64) {
-        // Extend, never shorten, an existing window (e.g. typing during a resize, or a
-        // burst of keystrokes) so the latest input always covers its own repaint.
-        let until = now_ms() + dur_ms;
-        if until > self.suppress_until_ms.load(Ordering::Relaxed) {
-            self.suppress_until_ms.store(until, Ordering::Relaxed);
-        }
-        // Drop any half-formed pair so a frame from before the window can't pair with one
-        // after it the moment suppression lifts.
-        self.last_spinner_ms.store(0, Ordering::Relaxed);
+        self.suppress_until_ms.store(now_ms() + dur_ms, Ordering::Relaxed);
     }
 
     /// Reader: whether a menu/approval prompt is currently on the visible screen.

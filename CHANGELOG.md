@@ -13,17 +13,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
   attention (amber). Attention takes priority across the workspace's terminals.
 
 ### Fixed
-- **Windows glyphs (matching Windows Terminal):** media-control symbols like ⏸ render
-  **monochrome** instead of as a boxed colour emoji. A custom DirectWrite font fallback
-  maps that range to **Segoe UI Symbol** ahead of the system fallback (which otherwise
-  hands these text-default emoji to Segoe UI Emoji), and they're drawn as a monochrome
-  glyph run. Real emoji are unaffected. Fallback symbols like ✻ (Claude's working spinner)
-  also keep their **full height** instead of being squashed into the narrow cell.
-- **Windows Claude working-detection:** pressing Shift+Tab / Shift+Enter (even in rapid
-  succession), or resizing the window, no longer falsely starts Claude's "working"
-  animation. Every keystroke now briefly suppresses spinner-detection, because Windows
-  ConPTY repaints whole regions on a line insert and re-emits on-screen spinner glyphs;
-  genuine working keeps emitting frames past the window, so it still confirms.
+- **Windows glyphs:** fallback symbols like ✻ (Claude's working spinner) keep their full
+  height instead of being squashed into the narrow cell — sized like Windows Terminal.
+- **Windows Claude:** pressing Shift+Tab / Shift+Enter, or resizing the window, no longer
+  falsely starts Claude's "working" animation — entering the working state now requires
+  the spinner to actually animate.
 
 ## [1.0.6] — 2026-06-14
 

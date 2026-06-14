@@ -434,9 +434,7 @@ mod mac {
 mod dwrite {
     use super::GlyphBitmap;
     use std::cell::RefCell;
-    use std::mem::ManuallyDrop;
-    use windows::core::{implement, Result, PCWSTR};
-    use windows::Win32::Foundation::BOOL;
+    use windows::core::{Result, PCWSTR};
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
     };
@@ -447,18 +445,13 @@ mod dwrite {
     };
     use windows::core::Interface;
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, IDWriteFactory2, IDWriteFactory3, IDWriteFactory5,
-        IDWriteFont, IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback, IDWriteFontFile,
-        IDWriteFontSetBuilder1, IDWriteInMemoryFontFileLoader, IDWriteNumberSubstitution,
-        IDWriteRenderingParams3, IDWriteTextAnalysisSource, IDWriteTextAnalysisSource_Impl,
-        DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE_TRUETYPE, DWRITE_FONT_SIMULATIONS_NONE,
-        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_ENABLED,
-        DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
-        DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-        DWRITE_UNICODE_RANGE,
+        DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection,
+        IDWriteFontFace, IDWriteFontFile, IDWriteFontSetBuilder1, IDWriteInMemoryFontFileLoader,
+        IDWriteRenderingParams3, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FACE_TYPE_TRUETYPE,
+        DWRITE_FONT_SIMULATIONS_NONE, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GRID_FIT_MODE_ENABLED,
+        DWRITE_LINE_METRICS, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
     };
-    use windows::Win32::Graphics::DirectWrite::IDWriteFontFallbackBuilder;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
@@ -467,74 +460,6 @@ mod dwrite {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
-
-    /// Minimal `IDWriteTextAnalysisSource` over a single short UTF-16 string, the input
-    /// `IDWriteFontFallback::MapCharacters` needs to resolve which font covers a codepoint.
-    /// (Same shape as servo/dwrote's, adapted to windows-rs's `#[implement]`.)
-    #[implement(IDWriteTextAnalysisSource)]
-    struct AnalysisSource {
-        text: Vec<u16>,   // the codepoint's UTF-16 units (no NUL)
-        locale: Vec<u16>, // NUL-terminated locale, e.g. "en-us\0"
-    }
-
-    impl IDWriteTextAnalysisSource_Impl for AnalysisSource_Impl {
-        fn GetTextAtPosition(
-            &self,
-            pos: u32,
-            text: *mut *mut u16,
-            len: *mut u32,
-        ) -> Result<()> {
-            unsafe {
-                if pos as usize >= self.text.len() {
-                    *text = std::ptr::null_mut();
-                    *len = 0;
-                } else {
-                    *text = self.text.as_ptr().add(pos as usize) as *mut u16;
-                    *len = self.text.len() as u32 - pos;
-                }
-            }
-            Ok(())
-        }
-        fn GetTextBeforePosition(
-            &self,
-            pos: u32,
-            text: *mut *mut u16,
-            len: *mut u32,
-        ) -> Result<()> {
-            unsafe {
-                if pos == 0 || pos as usize > self.text.len() {
-                    *text = std::ptr::null_mut();
-                    *len = 0;
-                } else {
-                    *text = self.text.as_ptr() as *mut u16;
-                    *len = pos;
-                }
-            }
-            Ok(())
-        }
-        fn GetParagraphReadingDirection(&self) -> DWRITE_READING_DIRECTION {
-            DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
-        }
-        fn GetLocaleName(&self, _pos: u32, len: *mut u32, locale: *mut *mut u16) -> Result<()> {
-            unsafe {
-                *len = self.text.len() as u32;
-                *locale = self.locale.as_ptr() as *mut u16;
-            }
-            Ok(())
-        }
-        fn GetNumberSubstitution(
-            &self,
-            _pos: u32,
-            len: *mut u32,
-            sub: *mut Option<IDWriteNumberSubstitution>,
-        ) -> Result<()> {
-            unsafe {
-                *len = self.text.len() as u32;
-                *sub = None; // no number substitution
-            }
-            Ok(())
-        }
-    }
 
     struct Ctx {
         dwrite: IDWriteFactory,
@@ -554,12 +479,6 @@ mod dwrite {
         /// regular — instead of DirectWrite synthesising a soft faux-bold by name. None
         /// if the bytes weren't supplied or failed to load.
         bold: Option<BoldFont>,
-        /// Font fallback used to resolve symbols Cascadia lacks (⏸ etc.). A CUSTOM builder
-        /// that maps the media-control range to a monochrome symbol font (Segoe UI Symbol)
-        /// *before* chaining the system fallback — otherwise DirectWrite resolves those
-        /// text-default emoji to Segoe UI Emoji and we get a boxed colour glyph. Falls back
-        /// to the plain system fallback if the builder can't be created.
-        fallback: Option<IDWriteFontFallback>,
     }
 
     /// The bundled bold face + the private collection wrapping it (for CreateTextFormat)
@@ -671,9 +590,6 @@ mod dwrite {
             // Load the bundled bold into a private collection (best-effort; falls back
             // to the by-name path if it fails).
             let bold = bold_data.and_then(|d| build_bold_face(&dwrite, d));
-            // Custom fallback that keeps text-default media controls (⏸ etc.) monochrome;
-            // fall back to the plain system fallback if it can't be built.
-            let fallback = build_symbol_fallback(&dwrite).ok();
             Ok(Ctx {
                 dwrite,
                 d2d,
@@ -683,28 +599,8 @@ mod dwrite {
                 em: em_px,
                 params,
                 bold,
-                fallback,
             })
         }
-    }
-
-    /// Build a font fallback that maps the media-control range (⏯⏸⏹⏺⏭⏮…, U+23E9..=U+23FA)
-    /// to **Segoe UI Symbol** (a monochrome symbol font that draws these as plain glyphs)
-    /// BEFORE chaining the system fallback. Without this, DirectWrite's system fallback
-    /// resolves these text-default emoji to Segoe UI Emoji — a boxed colour button whose
-    /// monochrome outline is a tiny square. (Cascadia lacks the glyphs, so passing it as
-    /// the base family — what Windows Terminal relies on — can't help us here.) The
-    /// system fallback is chained after, so anything not in our mapping still resolves.
-    unsafe fn build_symbol_fallback(dwrite: &IDWriteFactory) -> Result<IDWriteFontFallback> {
-        let f2: IDWriteFactory2 = dwrite.cast()?;
-        let system = f2.GetSystemFontFallback()?;
-        let builder: IDWriteFontFallbackBuilder = f2.CreateFontFallbackBuilder()?;
-        let ranges = [DWRITE_UNICODE_RANGE { first: 0x23E9, last: 0x23FA }];
-        let family: Vec<u16> = "Segoe UI Symbol\0".encode_utf16().collect();
-        let targets = [family.as_ptr()];
-        builder.AddMapping(&ranges, &targets, None, PCWSTR::null(), PCWSTR::null(), 1.0)?;
-        builder.AddMappings(&system)?; // everything else → the normal system fallback
-        builder.CreateFontFallback()
     }
 
     fn render(ctx: &Ctx, ch: char, bold: bool) -> Result<Option<GlyphBitmap>> {
@@ -750,13 +646,18 @@ mod dwrite {
                 PCWSTR(locale.as_ptr()),
             )?;
 
-            // Encode the glyph as-is — no variation selector. Windows Terminal appends
-            // none; text-presentation is achieved by DRAWING without the colour-font
-            // option (below), not by VS15 (which DirectWrite was ignoring here anyway).
-            let mut buf = [0u16; 2];
+            // Encode the glyph; for media-control symbols (⏸ etc.) append VS15 (U+FE0E)
+            // so DirectWrite renders the MONOCHROME text presentation, not a colour emoji.
+            let mut buf = [0u16; 3];
             let n = ch.len_utf16();
             ch.encode_utf16(&mut buf[..n]);
-            let text: &[u16] = &buf[..n];
+            let len = if wants_text_presentation(ch) {
+                buf[n] = 0xFE0E;
+                n + 1
+            } else {
+                n
+            };
+            let text: &[u16] = &buf[..len];
             let boxw = (ctx.em * 2.5).ceil() + 4.0;
             let boxh = (ctx.em * 2.0).ceil() + 4.0;
             let layout = ctx.dwrite.CreateTextLayout(text, &format, boxw, boxh)?;
@@ -792,166 +693,35 @@ mod dwrite {
             let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
             let clear = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
             let brush = rt.CreateSolidColorBrush(&white, None)?;
+            rt.BeginDraw();
+            rt.Clear(Some(&clear));
+            rt.DrawTextLayout(
+                D2D_POINT_2F { x: 0.0, y: 0.0 },
+                &layout,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+            );
+            rt.EndDraw(None, None)?;
+
+            // Read the rendered PBGRA pixels.
             let rect = WICRect { X: 0, Y: 0, Width: w as i32, Height: h as i32 };
-
-            // Draw the layout (colour fonts enabled → emoji render in colour) and read back
-            // the cropped glyph. Used for ordinary glyphs and as the last resort for a
-            // media-control symbol whose mono font couldn't be resolved (never blank).
-            let draw_read = || -> Result<Option<GlyphBitmap>> {
-                rt.BeginDraw();
-                rt.Clear(Some(&clear));
-                rt.DrawTextLayout(
-                    D2D_POINT_2F { x: 0.0, y: 0.0 },
-                    &layout,
-                    &brush,
-                    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-                );
-                rt.EndDraw(None, None)?;
-                let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
-                let stride = lock.GetStride()? as usize;
-                let mut size = 0u32;
-                let mut ptr: *mut u8 = std::ptr::null_mut();
-                lock.GetDataPointer(&mut size, &mut ptr)?;
-                if ptr.is_null() {
-                    return Ok(None);
-                }
-                let data = std::slice::from_raw_parts(ptr, size as usize);
-                Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
-            };
-
-            // Draw a single resolved glyph as a MONOCHROME run (DrawGlyphRun paints the
-            // outline in the brush colour and never substitutes colour), then read it back.
-            let draw_run = |face: &IDWriteFontFace, gid: u16| -> Result<Option<GlyphBitmap>> {
-                let advance = 0.0f32;
-                let offset = DWRITE_GLYPH_OFFSET { advanceOffset: 0.0, ascenderOffset: 0.0 };
-                let mut run = DWRITE_GLYPH_RUN {
-                    fontFace: ManuallyDrop::new(Some(face.clone())),
-                    fontEmSize: ctx.em,
-                    glyphCount: 1,
-                    glyphIndices: &gid,
-                    glyphAdvances: &advance,
-                    glyphOffsets: &offset,
-                    isSideways: BOOL(0),
-                    bidiLevel: 0,
-                };
-                rt.BeginDraw();
-                rt.Clear(Some(&clear));
-                rt.DrawGlyphRun(
-                    D2D_POINT_2F { x: 0.0, y: baseline },
-                    &run,
-                    &brush,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-                ManuallyDrop::drop(&mut run.fontFace); // release the clone the run held
-                rt.EndDraw(None, None)?;
-                let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
-                let stride = lock.GetStride()? as usize;
-                let mut size = 0u32;
-                let mut ptr: *mut u8 = std::ptr::null_mut();
-                lock.GetDataPointer(&mut size, &mut ptr)?;
-                if ptr.is_null() {
-                    return Ok(None);
-                }
-                let data = std::slice::from_raw_parts(ptr, size as usize);
-                Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
-            };
-
-            if wants_text_presentation(ch) {
-                // ⏸ etc.: resolve a MONOCHROME font via our custom fallback (Segoe UI
-                // Symbol mapped ahead of the system fallback, so these text-default emoji
-                // don't land on Segoe UI Emoji's boxed colour glyph), then draw the glyph
-                // run (DrawGlyphRun paints the outline, never colour).
-                if let Some((face, gid)) = resolve_mono_face(ctx, ch) {
-                    if let Ok(Some(g)) = draw_run(&face, gid) {
-                        return Ok(Some(g));
-                    }
-                }
-                // Couldn't resolve/raster a mono glyph: draw it (colour) so it's not blank.
-                draw_read()
-            } else {
-                draw_read()
+            let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32)?;
+            let stride = lock.GetStride()? as usize;
+            let mut size = 0u32;
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            lock.GetDataPointer(&mut size, &mut ptr)?;
+            if ptr.is_null() {
+                return Ok(None);
             }
+            let data = std::slice::from_raw_parts(ptr, size as usize);
+
+            Ok(build_glyph(data, stride, w, h, baseline, upscale_hint))
         }
     }
 
-    /// Resolve the system font face that covers `ch` (which the bundled Cascadia lacks),
-    /// the way Windows Terminal does: `IDWriteFontFallback::MapCharacters` on the bare
-    /// codepoint picks a MONOCHROME font for text-default symbols (⏸ etc.) rather than a
-    /// colour-emoji font. Returns the face + glyph id, or None if unresolved/uncovered.
-    unsafe fn resolve_mono_face(ctx: &Ctx, ch: char) -> Option<(IDWriteFontFace, u16)> {
-        let fallback = ctx.fallback.as_ref()?; // custom (Segoe UI Symbol mapping) + system
-        let mut sys: Option<IDWriteFontCollection> = None;
-        ctx.dwrite.GetSystemFontCollection(&mut sys, false).ok()?;
-        let sys = sys?;
-
-        let mut tbuf = [0u16; 2];
-        let n = ch.encode_utf16(&mut tbuf).len();
-        let source: IDWriteTextAnalysisSource = AnalysisSource {
-            text: tbuf[..n].to_vec(),
-            locale: "en-us\0".encode_utf16().collect(),
-        }
-        .into();
-
-        let mut mapped_len = 0u32;
-        let mut font: Option<IDWriteFont> = None;
-        let mut scale = 0.0f32;
-        fallback
-            .MapCharacters(
-                &source,
-                0,
-                n as u32,
-                &sys,
-                PCWSTR(ctx.family.as_ptr()), // prefer our font; falls back for chars it lacks
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                &mut mapped_len,
-                &mut font,
-                &mut scale,
-            )
-            .ok()?;
-        let dbg = std::env::var_os("ARBITER_GLYPH_DEBUG").is_some();
-        let font = match font {
-            Some(f) => f,
-            None => {
-                if dbg {
-                    eprintln!("[resolve] U+{:04X} {:?}: MapCharacters returned no font", ch as u32, ch);
-                }
-                return None;
-            }
-        };
-        if dbg {
-            let mut name = String::from("<unknown>");
-            if let Ok(fam) = font.GetFontFamily() {
-                if let Ok(names) = fam.GetFamilyNames() {
-                    if let Ok(len) = names.GetStringLength(0) {
-                        let mut b = vec![0u16; len as usize + 1];
-                        if names.GetString(0, &mut b).is_ok() {
-                            name = String::from_utf16_lossy(&b[..len as usize]);
-                        }
-                    }
-                }
-            }
-            eprintln!("[resolve] U+{:04X} {:?} -> font={:?} scale={}", ch as u32, ch, name, scale);
-        }
-        let face: IDWriteFontFace = font.CreateFontFace().ok()?;
-        let cps = [ch as u32];
-        let mut gids = [0u16; 1];
-        face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).ok()?;
-        if dbg {
-            eprintln!("[resolve] U+{:04X} gid={}", ch as u32, gids[0]);
-        }
-        if gids[0] == 0 {
-            return None;
-        }
-        Some((face, gids[0]))
-    }
-
-    /// Media-control symbols Claude/TUIs use (⏯⏸⏹⏺⏭⏮…, U+23E9..=U+23FA). These are
-    /// "text-default" in Unicode (emoji presentation only with VS16), so they should be
-    /// MONOCHROME. We get that by resolving them through the custom symbol fallback (see
-    /// `build_symbol_fallback`) and drawing a glyph run. Real emoji are outside this range.
-    /// Keep this range in sync with the mapping in `build_symbol_fallback`.
+    /// Codepoints with Unicode "emoji presentation by default" that we want rendered
+    /// MONOCHROME (media-control symbols Claude/TUIs use, incl. ⏸ U+23F8). Appending VS15
+    /// (U+FE0E) makes DirectWrite pick the text presentation, not a colour emoji font.
     fn wants_text_presentation(ch: char) -> bool {
         matches!(ch as u32, 0x23E9..=0x23FA)
     }

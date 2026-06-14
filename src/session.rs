@@ -24,12 +24,6 @@ type GitWatcher = Debouncer<RecommendedWatcher>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// How long after a PTY write to ignore spinner glyphs when deciding whether Claude has
-/// *entered* the working state (see `Session::write` / `ClaudeHandle::note_activity`).
-/// Long enough to cover the keystroke→ConPTY-repaint round-trip; well under the point
-/// where a genuine run (which keeps emitting frames) would be missed.
-const INPUT_SUPPRESS_MS: u64 = 500;
-
 /// UI redraw hook: a PTY reader calls this after feeding new output so the UI can
 /// redraw *on output* instead of polling the grid every frame. The iced shell wires
 /// it to a redraw message at startup; it's a no-op until then (early output is covered
@@ -211,13 +205,6 @@ impl Session {
     pub fn shell_idle(&self) -> Option<bool> { *self.shell_idle.lock().unwrap() }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        // Every byte we send to the PTY is user/app-initiated (keystrokes, paste, the
-        // launch command). The redraw Claude emits in response can re-show spinner glyphs
-        // already on screen — on Windows ConPTY repaints whole regions on a line insert,
-        // so e.g. rapid Shift+Enter re-emits a ✻ each time — which would pair into a false
-        // "working". Briefly suppress spinner detection; genuine working keeps emitting
-        // frames past the window, so it still confirms.
-        self.claude.suppress_activity(INPUT_SUPPRESS_MS);
         let _ = self.writer_tx.send(bytes.to_vec());
     }
 
