@@ -7,6 +7,15 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Per-terminal command history:** each terminal now keeps its own private command history
+  that persists across app exit and relaunch — a reopened terminal recalls only the commands
+  it ran, and a brand-new terminal starts empty. Each pane gets a stable id (saved in the
+  layout) backing a private history file under `<data-dir>/history/`; the file is removed when
+  the terminal/workspace is permanently closed. Works on macOS (zsh + bash) and Windows
+  (PowerShell + Git Bash). Note: this is a deliberate departure from the usual shared-history
+  model (iTerm2 et al. share one history file across tabs).
+
 ### Fixed
 - **Git footer across sibling terminals:** a git command (staging, commit, branch switch) in
   one terminal now refreshes the git footer of *other* terminals open in the same repo, not

@@ -40,6 +40,12 @@ pub enum SavedNode {
         claude_running: bool,
         #[serde(default)]
         claude_session: Option<String>,
+        /// Stable per-pane id keying this terminal's PRIVATE command-history file
+        /// (`<data-dir>/history/<id>`), so each terminal keeps its own history across
+        /// app exit + relaunch. Defaulted so older saves load (they get a fresh id on
+        /// restore → an empty history, which is the intended "new terminal" behaviour).
+        #[serde(default)]
+        history_id: Option<String>,
     },
 }
 
@@ -313,6 +319,7 @@ mod tests {
                             cwd: Some("/tmp".into()),
                             claude_running: true,
                             claude_session: Some("sess-abc-123".into()),
+                            history_id: Some("hist-abc-1".into()),
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
@@ -320,6 +327,7 @@ mod tests {
                             cwd: None,
                             claude_running: false,
                             claude_session: None,
+                            history_id: None,
                         }),
                     },
                     project: None,
@@ -332,6 +340,7 @@ mod tests {
                         cwd: None,
                         claude_running: false,
                         claude_session: None,
+                        history_id: None,
                     },
                     project: None,
                 },
@@ -348,9 +357,10 @@ mod tests {
                 assert!(*vertical);
                 assert!((*ratio - 0.4).abs() < 1e-6);
                 match a.as_ref() {
-                    SavedNode::Leaf { claude_running, claude_session, .. } => {
+                    SavedNode::Leaf { claude_running, claude_session, history_id, .. } => {
                         assert!(*claude_running);
                         assert_eq!(claude_session.as_deref(), Some("sess-abc-123"));
+                        assert_eq!(history_id.as_deref(), Some("hist-abc-1"));
                     }
                     _ => panic!("expected a leaf"),
                 }
@@ -370,9 +380,10 @@ mod tests {
         assert!(s.settings.hide_sonnet_usage);
         assert!(!s.settings.hide_usage_bar);
         match &s.workspaces[0].layout {
-            SavedNode::Leaf { claude_running, claude_session, .. } => {
+            SavedNode::Leaf { claude_running, claude_session, history_id, .. } => {
                 assert!(!claude_running);
                 assert!(claude_session.is_none());
+                assert!(history_id.is_none()); // absent in old saves → fresh id on restore
             }
             _ => panic!("expected a leaf"),
         }

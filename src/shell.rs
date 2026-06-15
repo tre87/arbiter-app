@@ -102,6 +102,16 @@ fi
 # Re-prepend Arbiter's claude-shim dir LAST (after the user's rc + path_helper),
 # so `claude` resolves to our launcher. No-op until the shim sets ARBITER_SHIM_BIN.
 [[ -n "$ARBITER_SHIM_BIN" ]] && export PATH="$ARBITER_SHIM_BIN:$PATH"
+
+# Private per-pane command history: switch to a fresh history list backed by this
+# pane's file (set AFTER the user's rc, so an oh-my-zsh HISTFILE can't win). `fc -p`
+# pushes a new, isolated list read from the file — empty for a new terminal, the
+# pane's prior commands on restore — so panes don't share each other's up-arrow and
+# history survives relaunch. Set HISTFILE too so SAVEHIST writes back to our file.
+if [[ -n "$ARBITER_HISTFILE" ]]; then
+  export HISTFILE="$ARBITER_HISTFILE"
+  fc -p "$ARBITER_HISTFILE" 2>/dev/null
+fi
 "#;
 
 #[cfg(not(target_os = "windows"))]
@@ -166,6 +176,10 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
             cmd.env(
                 "PROMPT_COMMAND",
                 concat!(
+                    // One-time: switch to this pane's private history (Windows path →
+                    // POSIX via cygpath for Git Bash). `history -c; history -r` isolates
+                    // + loads our file. No-op until ARBITER_HISTFILE is set.
+                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; fi; "#,
                     r#"printf '\e]133;D\a\e]7;file:///%s\a\e]133;A\a' "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
                     // Re-prepend Arbiter's claude-shim dir LAST (after Git Bash's
                     // profile/rc, which may reorder PATH so the real claude wins), so
@@ -200,6 +214,17 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                             "[Console]::Write([char]27 + ']133;C' + [char]7); ",
                             "[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() ",
                         "} ",
+                    "}",
+                    // Private per-pane history: drop the shared in-memory recall, load
+                    // ONLY this pane's file (empty for a new terminal, prior commands on
+                    // restore), then point PSReadLine's save path at it. SaveNothing while
+                    // loading avoids re-writing the lines we just read back. No-op until
+                    // ARBITER_HISTFILE is set / PSReadLine is present.
+                    "; if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) { ",
+                        "[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory(); ",
+                        "Set-PSReadLineOption -HistorySaveStyle SaveNothing; ",
+                        "if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) { Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object { if ($_ -ne '') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) } } }; ",
+                        "Set-PSReadLineOption -HistorySavePath $env:ARBITER_HISTFILE -HistorySaveStyle SaveIncrementally ",
                     "}",
                     // Re-prepend Arbiter's claude-shim dir AFTER $PROFILE has run (it
                     // may reorder PATH so the real claude wins), so `claude` resolves to
@@ -242,7 +267,14 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
         } else {
             cmd.env(
                 "PROMPT_COMMAND",
-                r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
+                concat!(
+                    // One-time: switch to this pane's private history. Runs at the first
+                    // prompt (after .bashrc, so a bashrc HISTFILE can't win). `history -c`
+                    // drops the shared history loaded at startup, `history -r` loads ONLY
+                    // our file → isolated + persistent. No-op until ARBITER_HISTFILE is set.
+                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; fi; "#,
+                    r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
+                ),
             );
             cmd.env("PS0", "\x1b]133;C\x07");
         }

@@ -51,6 +51,9 @@ struct PaneData {
     session: Session,
     name: String,
     shell: ShellKind,
+    /// Stable id keying this terminal's private command-history file (persisted in
+    /// the saved leaf), so each terminal keeps its own history across relaunch.
+    history_id: String,
 }
 
 struct Workspace {
@@ -87,10 +90,12 @@ struct Worktree {
 
 impl Workspace {
     fn new(name: String) -> Self {
+        let history_id = new_history_id();
         let first_pane = PaneData {
-            session: spawn_session(None, None),
+            session: spawn_session(None, None, &history_id),
             name: "Terminal 1".to_string(),
             shell: ShellKind::PowerShell,
+            history_id,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
         Workspace { panes, focus: first, name, project: None }
@@ -154,17 +159,21 @@ fn build_worktree_grid(path: &str) -> (pane_grid::State<PaneData>, pane_grid::Pa
     // The "Claude" pane auto-launches Claude (queued in the PTY; runs at the shell's
     // first prompt once rc sets the shim PATH) so the worktree's status, model, and
     // "ask Claude to merge" have a live Claude — like the web's Claude pane.
-    let mut claude_session = spawn_session(None, Some(path));
+    let claude_history = new_history_id();
+    let mut claude_session = spawn_session(None, Some(path), &claude_history);
     claude_session.write(b"claude\r");
     let claude = PaneData {
         session: claude_session,
         name: "Claude".to_string(),
         shell: ShellKind::PowerShell,
+        history_id: claude_history,
     };
+    let term_history = new_history_id();
     let term = PaneData {
-        session: spawn_session(None, Some(path)),
+        session: spawn_session(None, Some(path), &term_history),
         name: "Terminal".to_string(),
         shell: ShellKind::PowerShell,
+        history_id: term_history,
     };
     let config = Configuration::Split {
         axis: pane_grid::Axis::Horizontal,
@@ -713,12 +722,39 @@ enum Message {
 /// Spawn a session running `shell` (None = the platform default / PowerShell;
 /// Some(path) = Git Bash) starting in `cwd` if given. OSC-7/OSC-133 emitters are
 /// injected so the Session tracks cwd + busy/idle.
-fn spawn_session(shell: Option<&str>, cwd: Option<&str>) -> Session {
+fn spawn_session(shell: Option<&str>, cwd: Option<&str>, history_id: &str) -> Session {
     let mut cmd = arbiter_native::shell::build_shell_command(shell);
     if let Some(dir) = cwd {
         cmd.cwd(dir);
     }
+    // Point the shell at this pane's private history file; the shell integration
+    // (zsh/bash/PowerShell, see shell.rs) reads ARBITER_HISTFILE. Best-effort — if
+    // the data dir can't be resolved the shell just uses its normal shared HISTFILE.
+    if let Some(path) = history_file(history_id) {
+        cmd.env("ARBITER_HISTFILE", path.to_string_lossy().to_string());
+    }
     Session::spawn(80, 24, cmd).expect("spawn session")
+}
+
+/// A process-unique id for a pane's private history file, stable across restarts
+/// via persistence (stored on the saved leaf). SystemTime + a counter so two panes
+/// born in the same instant — and panes across separate runs — never collide.
+fn new_history_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Absolute path to a pane's private history file under `<data-dir>/history/`.
+/// Creates the dir. None if the data dir can't be resolved.
+fn history_file(id: &str) -> Option<std::path::PathBuf> {
+    let dir = arbiter_native::shell::app_data_dir()?.join("history");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(id))
 }
 
 // ── Session persistence ──────────────────────────────────────────────────────
@@ -735,6 +771,7 @@ fn spawn_restored(
     git_bash: Option<&str>,
     claude_running: bool,
     claude_session: Option<&str>,
+    history_id: &str,
 ) -> (Session, ShellKind) {
     // Prefer the saved cwd; if it's missing or gone, fall back (a project worktree
     // passes its path, so its terminals reopen in the worktree even when the saved
@@ -744,10 +781,12 @@ fn spawn_restored(
         .or_else(|| fallback_cwd.filter(|d| std::path::Path::new(d).is_dir()));
     let (mut session, kind) = match shell {
         persist::SavedShell::GitBash => match git_bash {
-            Some(gb) => (spawn_session(Some(gb), cwd), ShellKind::GitBash),
-            None => (spawn_session(None, cwd), ShellKind::PowerShell),
+            Some(gb) => (spawn_session(Some(gb), cwd, history_id), ShellKind::GitBash),
+            None => (spawn_session(None, cwd, history_id), ShellKind::PowerShell),
         },
-        persist::SavedShell::PowerShell => (spawn_session(None, cwd), ShellKind::PowerShell),
+        persist::SavedShell::PowerShell => {
+            (spawn_session(None, cwd, history_id), ShellKind::PowerShell)
+        }
     };
     if claude_running {
         // Relaunch Claude here — resuming the previous conversation if one was bound,
@@ -776,7 +815,9 @@ fn saved_to_config(
             a: Box::new(saved_to_config(*a, git_bash, fallback_cwd)),
             b: Box::new(saved_to_config(*b, git_bash, fallback_cwd)),
         },
-        persist::SavedNode::Leaf { name, shell, cwd, claude_running, claude_session } => {
+        persist::SavedNode::Leaf { name, shell, cwd, claude_running, claude_session, history_id } => {
+            // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
+            let history_id = history_id.unwrap_or_else(new_history_id);
             let (session, kind) = spawn_restored(
                 shell,
                 cwd.as_deref(),
@@ -784,8 +825,9 @@ fn saved_to_config(
                 git_bash,
                 claude_running,
                 claude_session.as_deref(),
+                &history_id,
             );
-            pane_grid::Configuration::Pane(PaneData { session, name, shell: kind })
+            pane_grid::Configuration::Pane(PaneData { session, name, shell: kind, history_id })
         }
     }
 }
@@ -882,6 +924,7 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                 cwd: data.and_then(|d| d.session.cwd()),
                 claude_running: data.map(|d| d.session.claude_running()).unwrap_or(false),
                 claude_session: data.and_then(|d| d.session.claude_session_id()),
+                history_id: data.map(|d| d.history_id.clone()),
             }
         }
     }
@@ -1046,6 +1089,41 @@ fn save_session(state: &State) {
             })
             .collect(),
     });
+    gc_history_files(state);
+}
+
+/// Delete orphaned per-pane history files: any file in `<data-dir>/history/` whose
+/// id is no longer live in any workspace. This is how "delete on close" happens —
+/// closing a pane / workspace / worktree drops its `PaneData`, so its id leaves the
+/// live set and its file is swept on the next save. Best-effort; never fatal. Runs
+/// only on save (layout change / exit), so no idle cost.
+fn gc_history_files(state: &State) {
+    let Some(dir) = arbiter_native::shell::app_data_dir().map(|d| d.join("history")) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let mut live = std::collections::HashSet::new();
+    for ws in &state.workspaces {
+        // The active grid (active worktree, for a project) lives in ws.panes…
+        for (_, d) in ws.panes.iter() {
+            live.insert(d.history_id.clone());
+        }
+        // …the other worktrees stash theirs.
+        if let Some(p) = &ws.project {
+            for wt in &p.worktrees {
+                if let Some((grid, _)) = &wt.stash {
+                    for (_, d) in grid.iter() {
+                        live.insert(d.history_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().map_or(false, |n| !live.contains(n)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Handle an app-quit gesture: pop the confirm modal when `confirm_on_quit` is on
@@ -2491,7 +2569,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 };
                 if let Some((kind, shell_arg)) = target {
                     let cwd = data.session.cwd();
-                    data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref());
+                    // Same pane → keep its history_id so its history carries across the switch.
+                    let hid = data.history_id.clone();
+                    data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
                     data.shell = kind;
                 }
             }
@@ -2529,8 +2609,13 @@ fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     // (the web sets the split's cwd to the worktree path); plain workspaces default.
     let cwd =
         ws.project.as_ref().and_then(|p| p.worktrees.get(p.active)).map(|w| w.path.clone());
-    let pane =
-        PaneData { session: spawn_session(None, cwd.as_deref()), name, shell: ShellKind::PowerShell };
+    let history_id = new_history_id();
+    let pane = PaneData {
+        session: spawn_session(None, cwd.as_deref(), &history_id),
+        name,
+        shell: ShellKind::PowerShell,
+        history_id,
+    };
     if let Some((new_pane, _)) = ws.panes.split(axis, ws.focus, pane) {
         ws.focus = new_pane;
     }
