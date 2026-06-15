@@ -5,7 +5,7 @@ All notable changes to Arbiter are documented here. The format roughly follows
 `Cargo.toml`. This changelog covers the **native** app (1.0.0 onward); earlier
 history belongs to the prior Tauri/Vue web app it replaced.
 
-## [Unreleased]
+## [1.0.8] — 2026-06-15
 
 ### Added
 - **Quit confirmation:** closing Arbiter (the window close button, Cmd+Q on macOS, Alt+F4 on
