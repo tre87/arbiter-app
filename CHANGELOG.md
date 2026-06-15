@@ -21,6 +21,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   look (matching the quit / close-workspace confirmations).
 
 ### Fixed
+- **False Claude detection from dev servers:** running a node tool (e.g. `npm run dev`) no
+  longer false-detects Claude in that pane (it showed an idle Claude dot). On macOS a process
+  that rewrites its title (npm) makes `sysinfo` report its *environment* among its args, which
+  surfaced Arbiter's own injected `ARBITER_*` vars — whose values point at `claude-shim` /
+  `claude-sessions` / the real claude bin and so contained "claude". Detection now ignores
+  `KEY=VALUE` env assignments and matches only the genuine claude-code CLI (its package dir or
+  a `claude`-named bin).
 - **Workspace tab alignment:** the activity dot is nudged down 1px so it sits level with the
   type icon + title (which don't move); the close (×) is sized down to 12px (its top-heavy
   glyph read high at 13px) and left centred.
