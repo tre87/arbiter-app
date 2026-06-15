@@ -133,6 +133,10 @@ pub struct Settings {
     /// Presets in the UI: `#121212` (signature), `#000000`; or any custom hex.
     #[serde(default = "default_bg_hex")]
     pub background: String,
+    /// Ask for confirmation before quitting the app (window close button / Cmd+Q /
+    /// Alt+F4). On by default so a stray close can't silently drop every terminal.
+    #[serde(default = "default_true")]
+    pub confirm_on_quit: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -229,6 +233,7 @@ impl Default for Settings {
             docs_folder: None,
             intense_text_style: IntenseStyle::Bold,
             background: default_bg_hex(),
+            confirm_on_quit: true,
         }
     }
 }

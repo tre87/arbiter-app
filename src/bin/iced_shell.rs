@@ -313,6 +313,9 @@ struct State {
     /// Pending "close this workspace?" confirmation (the tab × / context-menu Close) — so a
     /// stray click can't silently drop a workspace and its terminals.
     close_confirm: Option<CloseConfirm>,
+    /// Whether the "Quit Arbiter?" confirmation modal is showing (gated by the
+    /// `confirm_on_quit` setting; armed by any app-close gesture).
+    quit_confirm: bool,
     /// Live keyboard modifiers (Shift/Ctrl/Cmd) for multi-select clicks in the
     /// file explorer. Tracked app-wide via ModifiersChanged.
     modifiers: iced::keyboard::Modifiers,
@@ -513,6 +516,7 @@ enum Message {
     ToggleOverviewUsageFooter(bool),
     ToggleHideShellButton(bool),
     ToggleShowTerminalButtons(bool),
+    ToggleConfirmOnQuit(bool),
     /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
     SetIntenseStyle(persist::IntenseStyle),
     /// Settings → background colour (hex `#rrggbb`); from a preset button or the input.
@@ -613,6 +617,13 @@ enum Message {
     /// Ask before closing (opens the confirm dialog); its Close button sends CloseWorkspace.
     RequestCloseWorkspace(usize),
     CancelCloseWorkspace,
+    /// An app-quit gesture (window close button / Cmd+Q / Alt+F4): show the confirm
+    /// modal if `confirm_on_quit` is set, else close the main window straight away.
+    RequestQuit,
+    /// Confirm button in the quit modal → close the main window (→ save + exit).
+    ConfirmQuit,
+    /// Dismiss the quit modal.
+    CancelQuit,
     /// New project workspace: pick a folder, then validate it's a git repo.
     NewProjectWorkspace,
     ProjectFolderPicked(Option<String>),
@@ -1037,6 +1048,49 @@ fn save_session(state: &State) {
     });
 }
 
+/// Handle an app-quit gesture: pop the confirm modal when `confirm_on_quit` is on
+/// (and it isn't already up), otherwise close the main window — which triggers the
+/// `WindowClosed(main)` path that saves the session and exits. Shared by the macOS
+/// close button / Cmd+Q (via `RequestQuit`) and the Windows caption × (`WinClose`).
+fn begin_quit(state: &mut State) -> Task<Message> {
+    if state.settings.confirm_on_quit {
+        state.quit_confirm = true;
+        Task::none()
+    } else {
+        iced::window::close(state.main_window)
+    }
+}
+
+/// Close the top-most open modal / menu / dialog, returning true if one was closed.
+/// Mirrors `modal_overlay`'s stacking order so Escape dismisses whatever is visually
+/// on top; every handler here is a plain field reset (no extra cleanup). Lets Escape
+/// close an overlay before falling through to the terminal (which else gets a raw ESC).
+fn dismiss_top_overlay(state: &mut State) -> bool {
+    macro_rules! take {
+        ($field:expr) => {{
+            $field = Default::default();
+            return true;
+        }};
+    }
+    if state.explorer_rename.is_some() { take!(state.explorer_rename) }
+    if state.explorer_delete.is_some() { take!(state.explorer_delete) }
+    if state.close_confirm.is_some() { take!(state.close_confirm) }
+    if state.quit_confirm { take!(state.quit_confirm) }
+    if state.explorer_menu.is_some() { take!(state.explorer_menu) }
+    if state.rename_terminal.is_some() { take!(state.rename_terminal) }
+    if state.term_menu.is_some() { take!(state.term_menu) }
+    if state.ws_tab_menu.is_some() { take!(state.ws_tab_menu) }
+    if state.new_ws_menu { take!(state.new_ws_menu) }
+    if state.usage_org_menu { take!(state.usage_org_menu) }
+    if state.rename_ws.is_some() { take!(state.rename_ws) }
+    if state.rename_confirm.is_some() { take!(state.rename_confirm) }
+    if state.shortcuts_open { take!(state.shortcuts_open) }
+    if state.settings_open { take!(state.settings_open) }
+    if state.worktree_dialog.is_some() { take!(state.worktree_dialog) }
+    if state.worktree_menu.is_some() { take!(state.worktree_menu) }
+    false
+}
+
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         // A no-op: processing any message makes iced redraw, which is the whole point
@@ -1060,7 +1114,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 #[cfg(target_os = "windows")]
                 winround::round_our_windows();
                 #[cfg(target_os = "macos")]
-                trafficlights::position();
+                {
+                    trafficlights::position();
+                    // Backup install point (in case Opened fired before the delegate
+                    // was ready); idempotent with the WindowOpened call.
+                    trafficlights::install_quit_hook();
+                }
             }
             // Drive the usage refresh from the app: once the 120s countdown hits 0,
             // ask the helper to refetch and restart the countdown. (The helper's own
@@ -1272,6 +1331,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleShowTerminalButtons(v) => {
             state.settings.show_terminal_buttons = v;
+            save_session(state);
+        }
+        Message::ToggleConfirmOnQuit(v) => {
+            state.settings.confirm_on_quit = v;
             save_session(state);
         }
         Message::SetIntenseStyle(s) => {
@@ -1845,6 +1908,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CancelCloseWorkspace => state.close_confirm = None,
+        Message::RequestQuit => return begin_quit(state),
+        Message::ConfirmQuit => {
+            state.quit_confirm = false;
+            // Close the main window → WindowClosed(main) saves the session + exits.
+            return iced::window::close(state.main_window);
+        }
+        Message::CancelQuit => state.quit_confirm = false,
         Message::CloseWorkspace(i) => {
             state.ws_tab_menu = None;
             state.close_confirm = None;
@@ -1975,7 +2045,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             with_focused_term(state, |t| t.clear_search());
         }
         Message::EscapeKey => {
-            if state.find_open {
+            if dismiss_top_overlay(state) {
+                // Closed a modal / menu / dialog; swallow the ESC.
+            } else if state.find_open {
                 state.find_open = false;
                 with_focused_term(state, |t| t.clear_search());
             } else {
@@ -2264,7 +2336,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // the window opens behind the terminal and never grabs focus. Activate the
                 // app (macOS) + focus the window so it pops to the front on launch.
                 #[cfg(target_os = "macos")]
-                trafficlights::activate_app();
+                {
+                    trafficlights::activate_app();
+                    // Intercept Cmd+Q / Dock-Quit now the app delegate exists.
+                    trafficlights::install_quit_hook();
+                }
                 return iced::window::gain_focus(state.main_window);
             }
         }
@@ -2327,7 +2403,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.main_maximized = m;
         }
         #[cfg(target_os = "windows")]
-        Message::WinClose => return iced::window::close(state.main_window),
+        Message::WinClose => return begin_quit(state),
         #[cfg(target_os = "windows")]
         Message::OverviewMinimize => {
             if let Some(id) = state.overview_window {
@@ -3349,6 +3425,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if let Some(c) = &state.close_confirm {
         return Some(close_confirm_view(c));
     }
+    if state.quit_confirm {
+        return Some(quit_confirm_view());
+    }
     if let Some(m) = &state.explorer_menu {
         if let Some(p) = state.active().project.as_ref() {
             return Some(explorer_menu_view(&p.explorer, m.x, m.y, state.main_size));
@@ -3433,16 +3512,13 @@ fn modal_scrim<'a>(panel: Element<'a, Message>, dismiss: Message) -> Element<'a,
     .into()
 }
 
-/// Wrap modal `content` in the panel card (bg #1c1c1c, hairline border, radius 10).
-/// A `Noop`-pressing mouse_area swallows clicks so they don't dismiss the scrim.
+/// Wrap modal `content` in the panel card (bg #1c1c1c, radius 10, borderless — the
+/// scrim already separates it from the window). A `Noop`-pressing mouse_area
+/// swallows clicks so they don't dismiss the scrim.
 fn modal_panel<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
     mouse_area(container(content).style(|_t: &iced::Theme| container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
-        border: iced::Border {
-            color: iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.08),
-            width: 1.0,
-            radius: 10.0.into(),
-        },
+        border: iced::Border { radius: 10.0.into(), ..Default::default() },
         ..Default::default()
     }))
     .on_press(Message::Noop)
@@ -3896,6 +3972,14 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
 
     let body = match state.settings_tab {
         SettingsTab::General => column![
+            settings_section("Quitting"),
+            settings_toggle(
+                "Confirm before quitting",
+                Some("Ask for confirmation before closing Arbiter, so a stray close doesn't drop your terminals."),
+                state.settings.confirm_on_quit,
+                Message::ToggleConfirmOnQuit,
+            ),
+            Space::with_height(Length::Fixed(8.0)),
             settings_section("Saved Data"),
             settings_hint(
                 "Forget the workspace layout and window geometry Arbiter remembers between launches. \
@@ -4164,6 +4248,14 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
     s
 }
 
+/// Nudge `el` down 1px inside a vertically-centred row without changing the row
+/// height (so its neighbours don't move): a centre-aligned child's content shifts
+/// by (top − bottom)/2, so a 2px top pad = +1px. Used for the tab close × + status
+/// dot, which read 1px high against the icon + title.
+fn nudge_down_1px(el: Element<'static, Message>) -> Element<'static, Message> {
+    container(el).padding(iced::Padding { top: 2.0, ..iced::Padding::ZERO }).into()
+}
+
 /// One workspace tab pill (web `.tab`): type icon + name + (×) close, 26px tall,
 /// translucent-white border, tinted bg when active. The close is a nested button
 /// (it captures its own clicks, so the tab's select fires only elsewhere). The
@@ -4187,11 +4279,13 @@ fn tab_pill(
     // After the name, before the close: a pulsing dot when a terminal in this workspace
     // has Claude working (azure) or needing attention (amber, takes priority).
     if let Some(dot) = workspace_claude_dot(ws) {
-        content = content.push(tab_status_dot(dot));
+        content = content.push(nudge_down_1px(tab_status_dot(dot)));
     }
     if show_close {
+        // 12px (down from 13) and centred — no nudge: the × glyph box is top-heavy,
+        // so the smaller size already seats it level with the icon + title.
         content = content.push(
-            button(cmdi(mdi_path::CLOSE, 13.0, fg))
+            button(cmdi(mdi_path::CLOSE, 12.0, fg))
                 .padding(2)
                 .on_press(Message::RequestCloseWorkspace(i))
                 .style(|_t: &iced::Theme, s| button::Style {
@@ -4425,6 +4519,30 @@ fn usage_show_login() {
 /// into a single `Redraw` so heavy output isn't one redraw per byte.
 fn term_wake_subscription() -> Subscription<Message> {
     Subscription::run(term_wake_worker)
+}
+
+/// macOS Cmd+Q / Dock-Quit bridge: the `applicationShouldTerminate:` override
+/// (see `trafficlights`) cancels the OS terminate and pings this channel, which
+/// emits `RequestQuit` so the quit gate runs just like the window close button.
+#[cfg(target_os = "macos")]
+fn quit_request_subscription() -> Subscription<Message> {
+    Subscription::run(quit_request_worker)
+}
+
+#[cfg(target_os = "macos")]
+fn quit_request_worker() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(4, |mut output| async move {
+        use iced::futures::{SinkExt, StreamExt};
+        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<()>();
+        trafficlights::set_quit_waker(tx);
+        loop {
+            if rx.next().await.is_none() {
+                break;
+            }
+            while rx.try_recv().is_ok() {}
+            let _ = output.send(Message::RequestQuit).await;
+        }
+    })
 }
 
 fn term_wake_worker() -> impl iced::futures::Stream<Item = Message> {
@@ -5206,16 +5324,39 @@ fn close_confirm_view(c: &CloseConfirm) -> Element<'static, Message> {
     .spacing(14)
     .padding(18)
     .width(Length::Fixed(380.0));
-    // Borderless card (modal_panel draws a 1px border; this dialog wants none).
-    let card = mouse_area(
-        container(panel).style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x1c, 0x1c, 0x1c))),
-            border: iced::Border { radius: 10.0.into(), ..Default::default() },
-            ..Default::default()
-        }),
-    )
-    .on_press(Message::Noop);
-    modal_scrim(card.into(), Message::CancelCloseWorkspace)
+    modal_scrim(modal_panel(panel.into()), Message::CancelCloseWorkspace)
+}
+
+/// "Quit Arbiter?" confirmation (the app-close gesture), gated by `confirm_on_quit`.
+/// Mirrors `close_confirm_view`; the scrim / Cancel dismiss, Quit closes the app.
+fn quit_confirm_view() -> Element<'static, Message> {
+    let panel = column![
+        text("Quit Arbiter?").size(15).font(ui_semibold()),
+        text("All open terminals will be closed.").size(13).color(TXT_SECONDARY),
+        row![
+            horizontal_space(),
+            button(text("Cancel").size(13))
+                .on_press(Message::CancelQuit)
+                .style(button::secondary)
+                .padding([6, 14]),
+            button(text("Quit").size(13))
+                .on_press(Message::ConfirmQuit)
+                // Gray like Cancel but with red text; full red (white text) on hover/press.
+                .style(|t: &iced::Theme, s| match s {
+                    button::Status::Hovered | button::Status::Pressed => {
+                        button::Style { text_color: iced::Color::WHITE, ..button::danger(t, s) }
+                    }
+                    _ => button::Style { text_color: t.palette().danger, ..button::secondary(t, s) },
+                })
+                .padding([6, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(380.0));
+    modal_scrim(modal_panel(panel.into()), Message::CancelQuit)
 }
 
 /// The whole titlebar row, laid out for the available width `avail_w` (from
@@ -6275,6 +6416,74 @@ mod trafficlights {
                 return;
             }
             let _: () = msg_send![app, activateIgnoringOtherApps: true];
+        }
+    }
+
+    // ── Cmd+Q / Dock-Quit interception ───────────────────────────────────────
+    // macOS routes Cmd+Q (and the Dock menu's Quit) straight to AppKit's
+    // `terminate:`, which never surfaces to winit/iced as a key or close event —
+    // so the app would quit bypassing our confirm. We override
+    // `applicationShouldTerminate:` on winit's app-delegate class to CANCEL the
+    // terminate and instead ping the UI (→ Message::RequestQuit), running the same
+    // quit gate as the window close button. On confirm, iced::exit() ends the run
+    // loop (a normal exit, not AppKit terminate), so the cancel doesn't block it.
+    static QUIT_TX: Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<()>>> =
+        Mutex::new(None);
+
+    /// Wire the quit-request subscription's sender so the ObjC callback can reach it.
+    pub fn set_quit_waker(tx: iced::futures::channel::mpsc::UnboundedSender<()>) {
+        *QUIT_TX.lock().unwrap() = Some(tx);
+    }
+
+    fn notify_quit() {
+        if let Some(tx) = QUIT_TX.lock().unwrap().as_ref() {
+            let _ = tx.unbounded_send(());
+        }
+    }
+
+    /// Install the `applicationShouldTerminate:` override on the live app delegate.
+    /// Idempotent and cheap to call repeatedly (an atomic load short-circuits once
+    /// done); a no-op until the delegate exists, so call it from a post-launch spot.
+    pub fn install_quit_hook() {
+        use objc2::runtime::Sel;
+        static DONE: AtomicBool = AtomicBool::new(false);
+        unsafe {
+            if DONE.load(Ordering::SeqCst) {
+                return;
+            }
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let delegate: *mut AnyObject = msg_send![app, delegate];
+            if delegate.is_null() {
+                return; // not set yet — a later call retries
+            }
+            let cls: *mut AnyObject = msg_send![delegate, class];
+            if cls.is_null() {
+                return;
+            }
+            // -(NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)
+            // Return 0 = NSTerminateCancel. Encoding: NSUInteger (Q) ret, self/_cmd/sender.
+            extern "C" fn should_terminate(
+                _this: *mut AnyObject,
+                _sel: Sel,
+                _sender: *mut AnyObject,
+            ) -> usize {
+                notify_quit();
+                0
+            }
+            let imp: objc2::ffi::IMP = Some(std::mem::transmute::<
+                extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+                unsafe extern "C" fn(),
+            >(should_terminate));
+            objc2::ffi::class_replaceMethod(
+                cls as *mut objc2::ffi::objc_class,
+                objc2::sel!(applicationShouldTerminate:).as_ptr(),
+                imp,
+                c"Q@:@".as_ptr(),
+            );
+            DONE.store(true, Ordering::SeqCst);
         }
     }
 
@@ -7551,9 +7760,19 @@ fn subscription(state: &State) -> Subscription<Message> {
         {
             Message::FileDropped(path)
         }
+        // Main window close request (native macOS close button / Cmd+Q, Alt+F4).
+        // Only fires because the main window sets `exit_on_close_request = false`;
+        // route it through the quit gate instead of letting it auto-close.
+        iced::window::Event::CloseRequested if MAIN_WINDOW.get().copied() == Some(id) => {
+            Message::RequestQuit
+        }
         _ => Message::Noop,
     });
-    Subscription::batch([tick, keys, closes, geom, usage_subscription(), term_wake_subscription()])
+    let base =
+        Subscription::batch([tick, keys, closes, geom, usage_subscription(), term_wake_subscription()]);
+    #[cfg(target_os = "macos")]
+    let base = Subscription::batch([base, quit_request_subscription()]);
+    base
 }
 
 /// xterm modifier code: 1 + shift + 2·alt + 4·ctrl (matches Alacritty's
@@ -7682,6 +7901,15 @@ fn handle_key(event: iced::Event) -> Option<Message> {
         // Copy/paste: Cmd+C/V (macOS), Ctrl+Shift+C/V, and Ctrl+C/V. Plain Ctrl+C
         // copies only if there's a selection, else sends interrupt (^C).
         Key::Character(s) if modifiers.control() || modifiers.logo() => {
+            // macOS Cmd+Q → quit gate. Cmd (not Ctrl), so the terminal's Ctrl+Q
+            // (XOFF flow control) is untouched. Backs up the CloseRequested route
+            // in case winit delivers Cmd+Q as a key event rather than a close req.
+            #[cfg(target_os = "macos")]
+            if modifiers.logo() && !modifiers.control() && !modifiers.shift() {
+                if s.chars().next().map(|c| c.to_ascii_lowercase()) == Some('q') {
+                    return Some(Message::RequestQuit);
+                }
+            }
             // App shortcuts use Ctrl on all platforms (web parity), never Cmd.
             if modifiers.control() && modifiers.shift() && !modifiers.logo() {
                 match s.chars().next().map(|c| c.to_ascii_lowercase()) {
@@ -8307,6 +8535,10 @@ fn main() -> iced::Result {
 
             // Open the main window at its saved size/position (or the default).
             let mut settings = iced::window::Settings::default();
+            // Don't let the OS close the main window on its own — a close request
+            // (red traffic light / Cmd+Q / Alt+F4) is surfaced as a CloseRequested
+            // event so we can run the quit-confirm gate before actually closing.
+            settings.exit_on_close_request = false;
             // macOS: unified titlebar — hide the title, make the titlebar
             // transparent, and let the content extend behind it, so the app's top
             // bar IS the titlebar (traffic lights overlay on the left).
@@ -8436,6 +8668,7 @@ fn main() -> iced::Result {
                 explorer_rename: None,
                 explorer_delete: None,
                 close_confirm: None,
+                quit_confirm: false,
                 modifiers: iced::keyboard::Modifiers::default(),
                 term_menu: None,
                 ws_tab_menu: None,

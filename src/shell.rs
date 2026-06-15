@@ -60,7 +60,7 @@ fn apply_claude_shim(cmd: &mut CommandBuilder) {
         s.settings_file.display(),
     ));
     // zsh re-applies this last, after sourcing the user's rc (see ZSH_ZSHRC).
-    cmd.env("ARBITER_SHIM_BIN", s.bin_dir.display().to_string());
+    cmd.env(claude_shim::SHIM_BIN_ENV, s.bin_dir.display().to_string());
     if let Some(rc) = &s.real_claude {
         cmd.env(claude_shim::REAL_CLAUDE_ENV, rc.display().to_string());
     }
@@ -224,6 +224,13 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
         let mut cmd = CommandBuilder::new(&sh);
         cmd.arg("-l");
         cmd.env("TERM", "xterm-256color");
+        // Advertise 24-bit colour so programs (e.g. Claude Code) emit their true
+        // truecolor palette instead of a duller 256-colour approximation. Set it
+        // ourselves rather than relying on inheriting it from whatever launched
+        // Arbiter — a Finder-launched .app has no COLORTERM, so without this the
+        // colours depend on the parent terminal (vivid from iTerm2, dull from the
+        // app / a nested launch). The renderer is full truecolor regardless.
+        cmd.env("COLORTERM", "truecolor");
 
         if shell_name.ends_with("zsh") {
             if let Some(zdotdir) = ensure_zsh_integration_dir() {

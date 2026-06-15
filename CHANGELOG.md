@@ -5,6 +5,37 @@ All notable changes to Arbiter are documented here. The format roughly follows
 `Cargo.toml`. This changelog covers the **native** app (1.0.0 onward); earlier
 history belongs to the prior Tauri/Vue web app it replaced.
 
+## [Unreleased]
+
+### Added
+- **Quit confirmation:** closing Arbiter (the window close button, Cmd+Q on macOS, Alt+F4 on
+  Windows) now asks for confirmation first, so a stray close can't silently drop every open
+  terminal. Also fires on macOS logout / restart / shutdown, so a system quit can't silently
+  kill running sessions. On by default; turn it off under Settings → General → Quitting.
+
+### Changed
+- **Escape closes dialogs:** pressing Escape now dismisses the open Settings, shortcuts,
+  confirmation, and other modal dialogs / menus (falling through to the terminal only when
+  none is open).
+- **Borderless dialogs:** modal dialogs drop their hairline border for a cleaner, consistent
+  look (matching the quit / close-workspace confirmations).
+
+### Fixed
+- **Workspace tab alignment:** the activity dot is nudged down 1px so it sits level with the
+  type icon + title (which don't move); the close (×) is sized down to 12px (its top-heavy
+  glyph read high at 13px) and left centred.
+- **Truecolor advertisement:** spawned shells now export `COLORTERM=truecolor`, so programs
+  like Claude Code emit their real 24-bit palette (e.g. the vivid orange ✻) instead of a
+  duller 256-colour approximation. Previously Arbiter relied on inheriting `COLORTERM`, which
+  a Finder-launched app doesn't have — so colours looked vivid only when launched from a
+  terminal that set it (iTerm2) and dull otherwise.
+- **Nested Arbiter launches:** running `cargo run --bin arbiter` (or any Arbiter) from inside
+  another Arbiter's terminal left `claude` hanging — the child inherited the parent's
+  `claude`-shim dir at the front of `PATH` and resolved *it* as the "real" claude, so the
+  shim `exec`'d itself in an infinite loop. The shim resolver now skips the parent shim
+  (`ARBITER_SHIM_BIN`) and any directory whose `claude` is an Arbiter launcher, falling
+  through to the genuine binary. Stats/statusLine/hooks are unchanged.
+
 ## [1.0.7] — 2026-06-14
 
 ### Added
