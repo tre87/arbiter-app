@@ -203,7 +203,6 @@ if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
   }
 }
 if ($env:ARBITER_SHIM_BIN -and ($env:PATH -split ';')[0] -ne $env:ARBITER_SHIM_BIN) { $env:PATH = $env:ARBITER_SHIM_BIN + ';' + $env:PATH }
-if ($env:ARBITER_HIST_DEBUG) { try { [Console]::Error.WriteLine('[arbiter-hist] save=' + (Get-PSReadLineOption).HistorySavePath + ' style=' + (Get-PSReadLineOption).HistorySaveStyle) } catch {} }
 "#;
 
 /// Write the PowerShell init script and return its path (run via `-File`).
@@ -235,7 +234,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // on every prompt so commands persist immediately — Arbiter kills the
                     // shell on quit, so a save-on-exit would lose everything (the bug you saw:
                     // up-arrow empty after restart). No-op until ARBITER_HISTFILE is set.
-                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; [ -n "$ARBITER_HIST_DEBUG" ] && echo "[arbiter-hist] HISTFILE=$HISTFILE (from $ARBITER_HISTFILE)" >&2; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
+                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
                     r#"printf '\e]133;D\a\e]7;file:///%s\a\e]133;A\a' "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
                     // Re-prepend Arbiter's claude-shim dir LAST (after Git Bash's
                     // profile/rc, which may reorder PATH so the real claude wins), so
@@ -306,7 +305,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // EVERY prompt appends new commands to the file immediately, so they
                     // persist even though Arbiter kills the shell on quit (bash otherwise
                     // only saves on a clean exit). No-op until ARBITER_HISTFILE is set.
-                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; [ -n "$ARBITER_HIST_DEBUG" ] && echo "[arbiter-hist] HISTFILE=$HISTFILE" >&2; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
+                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
                     r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
                 ),
             );
