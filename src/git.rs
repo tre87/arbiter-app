@@ -43,7 +43,7 @@ fn git_checked(cwd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitInfo {
     pub branch: Option<String>,
     pub staged: u32,
@@ -75,7 +75,12 @@ pub fn repo_root(cwd: &str) -> Option<String> {
 /// Run git in `cwd`. Returns None if not a repo / git missing.
 pub fn repo_info(cwd: &str) -> Option<GitInfo> {
     let mut cmd = Command::new("git");
-    cmd.args(["status", "--porcelain=v1", "--branch"]).current_dir(cwd);
+    // `--no-optional-locks`: read status WITHOUT git's usual side effect of
+    // refreshing + rewriting `.git/index`. That write is what would otherwise make
+    // the repo FS watcher (session.rs) re-fire on our own status reads — so with it
+    // disabled the watcher can safely observe `.git/` (staging/commits/branch
+    // switches) and refresh sibling panes in the same repo.
+    cmd.args(["--no-optional-locks", "status", "--porcelain=v1", "--branch"]).current_dir(cwd);
     // Don't flash a console window on Windows.
     #[cfg(windows)]
     {

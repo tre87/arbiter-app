@@ -5,6 +5,17 @@ All notable changes to Arbiter are documented here. The format roughly follows
 `Cargo.toml`. This changelog covers the **native** app (1.0.0 onward); earlier
 history belongs to the prior Tauri/Vue web app it replaced.
 
+## [Unreleased]
+
+### Fixed
+- **Git footer across sibling terminals:** a git command (staging, commit, branch switch) in
+  one terminal now refreshes the git footer of *other* terminals open in the same repo, not
+  just the one that ran it. The repo watcher previously ignored all `.git/` changes to avoid a
+  CPU loop (`git status` rewriting `.git/index`); status reads now use `--no-optional-locks`
+  (read-only, no index write), so the watcher can safely observe meaningful `.git/` metadata
+  while still ignoring object/log/lock churn. No extra idle CPU — the watcher stays purely
+  event-driven.
+
 ## [1.0.8] — 2026-06-15
 
 ### Added

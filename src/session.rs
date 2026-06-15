@@ -411,9 +411,47 @@ fn recompute_git(cwd: Arc<Mutex<Option<String>>>, git: Arc<Mutex<Option<crate::g
     std::thread::spawn(move || {
         let info = crate::git::repo_info(&path);
         if cwd.lock().unwrap().as_deref() == Some(path.as_str()) {
-            *git.lock().unwrap() = info;
+            let mut guard = git.lock().unwrap();
+            if *guard != info {
+                *guard = info;
+                drop(guard);
+                // Redraw the footer. Without this a watcher-driven refresh (a git
+                // command in a SIBLING pane on the same repo) would update the cached
+                // info but never repaint until the next unrelated redraw.
+                wake_ui();
+            }
         }
     });
+}
+
+/// Whether a debounced FS change (path relative to the repo root) should refresh
+/// the git footer. Watched recursively, so we filter here:
+///   - skip gitignored high-churn dirs (`target/`, `node_modules/`, …) git ignores;
+///   - inside `.git/`, take only metadata the footer reflects (HEAD, index, refs,
+///     packed-refs, MERGE_HEAD, …) — skip the object store + logs/reflog that churn
+///     on commits/fetches/gc, and transient `*.lock` files. The `.lock` skip is
+///     scoped to `.git/` so a working-tree `Cargo.lock` / `yarn.lock` still counts.
+/// Our status reads use `--no-optional-locks`, so observing `.git/` can't self-loop.
+fn footer_relevant_change(rel: &std::path::Path) -> bool {
+    use std::path::Component;
+    let names: Vec<&str> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if names
+        .iter()
+        .any(|n| matches!(*n, "target" | "node_modules" | "dist" | ".next" | ".venv" | "__pycache__"))
+    {
+        return false;
+    }
+    if names.first() == Some(&".git") {
+        return !matches!(names.get(1).copied(), Some("objects") | Some("logs"))
+            && !names.last().map_or(false, |f| f.ends_with(".lock"));
+    }
+    true
 }
 
 /// Point the session's FS watcher at the repo containing `cwd_path`, replacing
@@ -439,23 +477,14 @@ fn repoint_watcher(
             let root_path = std::path::PathBuf::from(&root);
             let mut deb = new_debouncer(Duration::from_millis(400), move |res: DebounceEventResult| {
                 let Ok(events) = res else { return };
-                // Only refresh on changes git actually reflects. Crucially, ignore .git/
-                // churn: `git status` rewrites .git/index (stat-cache), which would re-fire
-                // the watcher → another status → a self-sustaining loop pinning the CPU in
-                // ANY repo. Also ignore gitignored build/dep dirs (target/, node_modules/…)
-                // a dev repo writes constantly and git ignores anyway. Terminal git commands
-                // still refresh the footer via the OSC-133 prompt edge.
+                // Refresh only on changes the footer reflects (see footer_relevant_change):
+                // meaningful `.git/` metadata + working-tree files, NOT object/log churn or
+                // gitignored build dirs. This lets a git command (staging/commit/branch) in
+                // one pane refresh SIBLING panes on the same repo — terminal git commands
+                // also still refresh their own pane via the OSC-133 prompt edge.
                 let relevant = events.iter().any(|e| {
                     let rel = e.path.strip_prefix(&root_path).unwrap_or(e.path.as_path());
-                    !rel.components().any(|c| {
-                        matches!(
-                            c.as_os_str().to_str(),
-                            Some(
-                                ".git" | "target" | "node_modules" | "dist" | ".next" | ".venv"
-                                    | "__pycache__"
-                            )
-                        )
-                    })
+                    footer_relevant_change(rel)
                 });
                 if relevant {
                     recompute_git(cwd.clone(), git.clone());
@@ -570,5 +599,50 @@ fn hex(c: u8) -> Option<u8> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::footer_relevant_change;
+    use std::path::Path;
+
+    fn rel(p: &str) -> bool {
+        footer_relevant_change(Path::new(p))
+    }
+
+    #[test]
+    fn git_metadata_that_moves_the_footer_is_relevant() {
+        assert!(rel(".git/index")); // staging (git add)
+        assert!(rel(".git/HEAD")); // branch switch
+        assert!(rel(".git/refs/heads/main")); // commit / branch tip
+        assert!(rel(".git/packed-refs"));
+        assert!(rel(".git/MERGE_HEAD"));
+    }
+
+    #[test]
+    fn git_churn_and_locks_are_ignored() {
+        // Object store + reflog churn on commits/fetches/gc — footer unaffected.
+        assert!(!rel(".git/objects/ab/cdef0123"));
+        assert!(!rel(".git/logs/HEAD"));
+        // Transient lock files that flap on every git op (would self-fire otherwise).
+        assert!(!rel(".git/index.lock"));
+        assert!(!rel(".git/refs/heads/main.lock"));
+    }
+
+    #[test]
+    fn working_tree_changes_are_relevant() {
+        assert!(rel("src/main.rs"));
+        // A working-tree *.lock is a real tracked file — must NOT be caught by the
+        // `.git/`-scoped lock filter.
+        assert!(rel("Cargo.lock"));
+        assert!(rel("frontend/yarn.lock"));
+    }
+
+    #[test]
+    fn gitignored_build_dirs_are_ignored() {
+        assert!(!rel("target/debug/build/x"));
+        assert!(!rel("node_modules/vite/dist/x.js"));
+        assert!(!rel("frontend/.next/cache/x"));
     }
 }
