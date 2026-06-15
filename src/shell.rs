@@ -209,48 +209,42 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                 concat!(
                     "$__arbiter_orig_prompt = $function:prompt; ",
                     "function prompt { ",
-                        // One-time private-history setup, done HERE (not at -Command time)
-                        // so PSReadLine is guaranteed loaded by the first interactive prompt.
-                        // Set the save path FIRST so saves isolate even if the clear/load
-                        // below fails (older PSReadLine may lack ClearHistory/AddToHistory).
+                        // One-time per-pane history setup, done HERE (not at -Command time) so
+                        // PSReadLine is guaranteed loaded by the first interactive prompt. We
+                        // OWN the file: PSReadLine saves NOTHING itself — so it can write
+                        // neither the shared global history NOR the startup -Command (which
+                        // PowerShell records) into the per-pane file. We load the file into
+                        // recall here and append each submitted command in the Enter handler
+                        // below, which the startup script never passes through → no pollution.
                         "if (-not $global:__arb_hist) { $global:__arb_hist = $true; ",
                             "if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) { ",
                                 "try { ",
-                                    // ORDER MATTERS: stop saving + clear the shared global
-                                    // history from memory BEFORE pointing the save path at
-                                    // our file. Otherwise PSReadLine flushes the whole global
-                                    // list into the per-pane file (the "huge script" on recall).
                                     "Set-PSReadLineOption -HistorySaveStyle SaveNothing; ",
                                     "[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory(); ",
-                                    // PowerShell adds the -Command it was launched with to
-                                    // history — i.e. THIS startup script — which then saves to
-                                    // the per-pane file and shows on up-arrow. Reject it (and
-                                    // any line carrying our unique token) from ever being added.
-                                    "Set-PSReadLineOption -AddToHistoryHandler { param($line) $line -notmatch '__arbiter_orig_prompt' }; ",
-                                    // Load this pane's history, skipping any startup line a
-                                    // prior (buggy) build already wrote, so old files self-clean.
+                                    // Load this pane's history (skip any startup line a prior
+                                    // buggy build wrote, so old files self-clean on load).
                                     "if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) { Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object { if ($_ -ne '' -and $_ -notmatch '__arbiter_orig_prompt') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) } } }; ",
-                                    // Memory now holds ONLY this pane's history → safe to
-                                    // point saves here and resume incremental save (survives
-                                    // Arbiter killing the shell on quit).
-                                    "Set-PSReadLineOption -HistorySavePath $env:ARBITER_HISTFILE; ",
-                                    "Set-PSReadLineOption -HistorySaveStyle SaveIncrementally; ",
+                                    // Enter handler: OSC-133 C, append the submitted line to our
+                                    // file (immediate → survives Arbiter killing the shell), then
+                                    // accept. try/catch around capture + write so Enter ALWAYS
+                                    // submits even if history I/O fails.
+                                    "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock { ",
+                                        "param($key, $arg) ",
+                                        "$l = $null; $c = 0; ",
+                                        "try { [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$l, [ref]$c) } catch {}; ",
+                                        "[Console]::Write([char]27 + ']133;C' + [char]7); ",
+                                        "try { if ($env:ARBITER_HISTFILE -and $l -and $l.Trim()) { Add-Content -LiteralPath $env:ARBITER_HISTFILE -Value $l } } catch {}; ",
+                                        "[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() ",
+                                    "}; ",
                                 "} catch {} ",
                             "} ",
-                            "if ($env:ARBITER_HIST_DEBUG) { try { [Console]::Error.WriteLine('[arbiter-hist] file=' + $env:ARBITER_HISTFILE + ' psrl=' + [bool](Get-Module PSReadLine) + ' save=' + (Get-PSReadLineOption).HistorySavePath) } catch { [Console]::Error.WriteLine('[arbiter-hist] probe failed: ' + $_) } } ",
+                            "if ($env:ARBITER_HIST_DEBUG) { try { [Console]::Error.WriteLine('[arbiter-hist] file=' + $env:ARBITER_HISTFILE + ' psrl=' + [bool](Get-Module PSReadLine)) } catch { [Console]::Error.WriteLine('[arbiter-hist] probe failed: ' + $_) } } ",
                         "} ",
                         "$loc = (Get-Location).Path; ",
                         "$uri = 'file:///' + ($loc -replace '\\\\','/'); ",
                         "$e = [char]27; $bel = [char]7; ",
                         "[Console]::Write(\"${e}]133;C${bel}${e}]7;${uri}${bel}${e}]133;A${bel}\"); ",
                         "& $__arbiter_orig_prompt ",
-                    "}; ",
-                    "if (Get-Module PSReadLine -ErrorAction SilentlyContinue) { ",
-                        "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock { ",
-                            "param($key, $arg) ",
-                            "[Console]::Write([char]27 + ']133;C' + [char]7); ",
-                            "[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() ",
-                        "} ",
                     "}",
                     // Re-prepend Arbiter's claude-shim dir AFTER $PROFILE has run (it
                     // may reorder PATH so the real claude wins), so `claude` resolves to
