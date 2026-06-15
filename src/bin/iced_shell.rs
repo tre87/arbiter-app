@@ -731,9 +731,31 @@ fn spawn_session(shell: Option<&str>, cwd: Option<&str>, history_id: &str) -> Se
     // (zsh/bash/PowerShell, see shell.rs) reads ARBITER_HISTFILE. Best-effort — if
     // the data dir can't be resolved the shell just uses its normal shared HISTFILE.
     if let Some(path) = history_file(history_id) {
+        // Bound the file before the shell loads it (race-free — this pane's shell
+        // isn't running yet). The shells append without trimming and Arbiter kills
+        // them on quit, so their own exit-time trim never runs; this keeps growth in
+        // check across restarts. 1000 lines is far past any up-arrow yet ample for
+        // Ctrl+R / search, and trivial on disk.
+        trim_history_file(&path, HISTORY_MAX_LINES);
         cmd.env("ARBITER_HISTFILE", path.to_string_lossy().to_string());
     }
     Session::spawn(80, 24, cmd).expect("spawn session")
+}
+
+/// Max lines kept in a pane's private history file (see `trim_history_file`).
+const HISTORY_MAX_LINES: usize = 1000;
+
+/// Keep a per-pane history file bounded: if it has more than `max_lines`, rewrite it
+/// with only the most recent `max_lines`. Best-effort (skips on any read error, e.g.
+/// non-UTF-8). Called on spawn, before the shell reads the file.
+fn trim_history_file(path: &std::path::Path, max_lines: usize) {
+    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= max_lines {
+        return;
+    }
+    let kept = lines[lines.len() - max_lines..].join("\n");
+    let _ = std::fs::write(path, kept + "\n");
 }
 
 /// A process-unique id for a pane's private history file, stable across restarts
@@ -8767,7 +8789,33 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_model, encode_mouse, hsl_to_rgb, worktree_avatar, MouseModes};
+    use super::{clean_model, encode_mouse, hsl_to_rgb, trim_history_file, worktree_avatar, MouseModes};
+
+    #[test]
+    fn trim_history_keeps_the_last_n_lines() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("arb-hist-trim-{}-{nanos}", std::process::id()));
+
+        // Under the cap → untouched.
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        trim_history_file(&path, 1000);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\n");
+
+        // Over the cap → only the most recent `max_lines` survive, in order.
+        let body: String = (0..1500).map(|i| format!("cmd{i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        trim_history_file(&path, 1000);
+        let lines: Vec<String> =
+            std::fs::read_to_string(&path).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 1000);
+        assert_eq!(lines.first().unwrap(), "cmd500"); // oldest kept
+        assert_eq!(lines.last().unwrap(), "cmd1499"); // newest kept
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn sgr() -> MouseModes {
         MouseModes { reporting: true, sgr: true, ..Default::default() }
