@@ -176,41 +176,34 @@ pub fn detect_git_bash() -> Option<String> {
 /// re-prepends the claude-shim dir after $PROFILE.
 #[cfg(target_os = "windows")]
 const PS_INIT: &str = r#"$global:__arbiter_orig_prompt = $function:prompt
+# Point PSReadLine's history at this pane's file at SCRIPT TOP LEVEL — i.e. before
+# the REPL's first ReadLine, which is when PSReadLine initialises its history. Set
+# here, PSReadLine natively LOADS our file (not the global default, so no leakage)
+# and SAVES to it incrementally. Doing this in the prompt function instead was too
+# late: the engine had already loaded the default, and calling AddToHistory before
+# first ReadLine throws a NullReferenceException. -File keeps the startup out of history.
+if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) {
+  try {
+    Set-PSReadLineOption -HistorySavePath $env:ARBITER_HISTFILE
+    Set-PSReadLineOption -HistorySaveStyle SaveIncrementally
+  } catch {}
+}
 function global:prompt {
-  if (-not $global:__arb_hist) {
-    $global:__arb_hist = $true
-    if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) {
-      try {
-        # We OWN the file: PSReadLine saves nothing; we load it into recall here and
-        # append each command ourselves in the Enter handler. Avoids depending on
-        # PSReadLine's SaveIncrementally (which proved unreliable across versions).
-        Set-PSReadLineOption -HistorySaveStyle SaveNothing
-        [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()
-        $loaded = 0
-        if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) {
-          Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object {
-            if ($_ -ne '' -and $_ -notmatch '__arbiter_orig_prompt') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_); $loaded++ }
-          }
-        }
-        Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
-          param($key, $arg)
-          $line = $null; $cur = 0
-          try { [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cur) } catch {}
-          [Console]::Write([char]27 + ']133;C' + [char]7)
-          try { if ($env:ARBITER_HISTFILE -and $line -and $line.Trim()) { Add-Content -LiteralPath $env:ARBITER_HISTFILE -Value $line; if ($env:ARBITER_HIST_DEBUG) { [Console]::Error.WriteLine('[arbiter-hist] wrote: ' + $line) } } } catch { if ($env:ARBITER_HIST_DEBUG) { [Console]::Error.WriteLine('[arbiter-hist] write error: ' + $_) } }
-          [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
-        }
-        if ($env:ARBITER_HIST_DEBUG) { [Console]::Error.WriteLine('[arbiter-hist] init file=' + $env:ARBITER_HISTFILE + ' exists=' + (Test-Path -LiteralPath $env:ARBITER_HISTFILE) + ' loaded=' + $loaded) }
-      } catch { if ($env:ARBITER_HIST_DEBUG) { [Console]::Error.WriteLine('[arbiter-hist] init error: ' + $_) } }
-    }
-  }
   $loc = (Get-Location).Path
   $uri = 'file:///' + ($loc -replace '\\','/')
   $e = [char]27; $bel = [char]7
   [Console]::Write("${e}]133;C${bel}${e}]7;${uri}${bel}${e}]133;A${bel}")
   & $global:__arbiter_orig_prompt
 }
+if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
+  Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+    param($key, $arg)
+    [Console]::Write([char]27 + ']133;C' + [char]7)
+    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+  }
+}
 if ($env:ARBITER_SHIM_BIN -and ($env:PATH -split ';')[0] -ne $env:ARBITER_SHIM_BIN) { $env:PATH = $env:ARBITER_SHIM_BIN + ';' + $env:PATH }
+if ($env:ARBITER_HIST_DEBUG) { try { [Console]::Error.WriteLine('[arbiter-hist] save=' + (Get-PSReadLineOption).HistorySavePath + ' style=' + (Get-PSReadLineOption).HistorySaveStyle) } catch {} }
 "#;
 
 /// Write the PowerShell init script and return its path (run via `-File`).
