@@ -167,6 +167,59 @@ pub fn detect_git_bash() -> Option<String> {
     }
 }
 
+/// PowerShell startup, run via `-File` (NOT `-Command`). Critical: PowerShell adds
+/// the string passed to `-Command` to PSReadLine's interactive history, so our own
+/// startup script kept showing up on up-arrow. A `-File` script is executed, not
+/// recorded, so it can't pollute history. Functions are declared `global:` so they
+/// survive into the interactive session (a script scope wouldn't). Sets OSC-7/133
+/// emitters, per-pane private history (see the per-terminal-history feature), and
+/// re-prepends the claude-shim dir after $PROFILE.
+#[cfg(target_os = "windows")]
+const PS_INIT: &str = r#"$global:__arbiter_orig_prompt = $function:prompt
+function global:prompt {
+  if (-not $global:__arb_hist) {
+    $global:__arb_hist = $true
+    if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) {
+      try {
+        Set-PSReadLineOption -HistorySaveStyle SaveNothing
+        [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()
+        if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) {
+          Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object {
+            if ($_ -ne '' -and $_ -notmatch '__arbiter_orig_prompt') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) }
+          }
+        }
+        Set-PSReadLineOption -HistorySavePath $env:ARBITER_HISTFILE
+        Set-PSReadLineOption -HistorySaveStyle SaveIncrementally
+      } catch {}
+    }
+    if ($env:ARBITER_HIST_DEBUG) { try { [Console]::Error.WriteLine('[arbiter-hist] file=' + $env:ARBITER_HISTFILE + ' psrl=' + [bool](Get-Module PSReadLine) + ' save=' + (Get-PSReadLineOption).HistorySavePath) } catch {} }
+  }
+  $loc = (Get-Location).Path
+  $uri = 'file:///' + ($loc -replace '\\','/')
+  $e = [char]27; $bel = [char]7
+  [Console]::Write("${e}]133;C${bel}${e}]7;${uri}${bel}${e}]133;A${bel}")
+  & $global:__arbiter_orig_prompt
+}
+if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
+  Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+    param($key, $arg)
+    [Console]::Write([char]27 + ']133;C' + [char]7)
+    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+  }
+}
+if ($env:ARBITER_SHIM_BIN -and ($env:PATH -split ';')[0] -ne $env:ARBITER_SHIM_BIN) { $env:PATH = $env:ARBITER_SHIM_BIN + ';' + $env:PATH }
+"#;
+
+/// Write the PowerShell init script and return its path (run via `-File`).
+#[cfg(target_os = "windows")]
+fn ensure_powershell_init() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_dir()?.join("arbiter-native").join("shell-integration").join("powershell");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("arbiter-init.ps1");
+    std::fs::write(&path, PS_INIT).ok()?;
+    Some(path)
+}
+
 /// Build the interactive shell command with OSC-7/OSC-133 emitters injected.
 /// On Windows: `shell = Some(bash_path)` → Git Bash, else PowerShell.
 #[cfg_attr(target_os = "windows", allow(unused_variables))]
@@ -203,57 +256,16 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
             cmd
         } else {
             let mut cmd = CommandBuilder::new("powershell.exe");
-            cmd.args([
-                "-NoExit",
-                "-Command",
-                concat!(
-                    "$__arbiter_orig_prompt = $function:prompt; ",
-                    "function prompt { ",
-                        // One-time per-pane history setup, done HERE (not at -Command time) so
-                        // PSReadLine is guaranteed loaded by the first interactive prompt. We
-                        // OWN the file: PSReadLine saves NOTHING itself — so it can write
-                        // neither the shared global history NOR the startup -Command (which
-                        // PowerShell records) into the per-pane file. We load the file into
-                        // recall here and append each submitted command in the Enter handler
-                        // below, which the startup script never passes through → no pollution.
-                        "if (-not $global:__arb_hist) { $global:__arb_hist = $true; ",
-                            "if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) { ",
-                                "try { ",
-                                    "Set-PSReadLineOption -HistorySaveStyle SaveNothing; ",
-                                    "[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory(); ",
-                                    // Load this pane's history (skip any startup line a prior
-                                    // buggy build wrote, so old files self-clean on load).
-                                    "if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) { Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object { if ($_ -ne '' -and $_ -notmatch '__arbiter_orig_prompt') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) } } }; ",
-                                    // Enter handler: OSC-133 C, append the submitted line to our
-                                    // file (immediate → survives Arbiter killing the shell), then
-                                    // accept. try/catch around capture + write so Enter ALWAYS
-                                    // submits even if history I/O fails.
-                                    "Set-PSReadLineKeyHandler -Key Enter -ScriptBlock { ",
-                                        "param($key, $arg) ",
-                                        "$l = $null; $c = 0; ",
-                                        "try { [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$l, [ref]$c) } catch {}; ",
-                                        "[Console]::Write([char]27 + ']133;C' + [char]7); ",
-                                        "try { if ($env:ARBITER_HISTFILE -and $l -and $l.Trim()) { Add-Content -LiteralPath $env:ARBITER_HISTFILE -Value $l } } catch {}; ",
-                                        "[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() ",
-                                    "}; ",
-                                "} catch {} ",
-                            "} ",
-                            "if ($env:ARBITER_HIST_DEBUG) { try { [Console]::Error.WriteLine('[arbiter-hist] file=' + $env:ARBITER_HISTFILE + ' psrl=' + [bool](Get-Module PSReadLine)) } catch { [Console]::Error.WriteLine('[arbiter-hist] probe failed: ' + $_) } } ",
-                        "} ",
-                        "$loc = (Get-Location).Path; ",
-                        "$uri = 'file:///' + ($loc -replace '\\\\','/'); ",
-                        "$e = [char]27; $bel = [char]7; ",
-                        "[Console]::Write(\"${e}]133;C${bel}${e}]7;${uri}${bel}${e}]133;A${bel}\"); ",
-                        "& $__arbiter_orig_prompt ",
-                    "}",
-                    // Re-prepend Arbiter's claude-shim dir AFTER $PROFILE has run (it
-                    // may reorder PATH so the real claude wins), so `claude` resolves to
-                    // our launcher and our --settings → statusLine/hook capture applies.
-                    // Mirrors the macOS zsh precmd re-prepend. No-op until the shim sets
-                    // ARBITER_SHIM_BIN, or when it's already first.
-                    "; if ($env:ARBITER_SHIM_BIN -and ($env:PATH -split ';')[0] -ne $env:ARBITER_SHIM_BIN) { $env:PATH = $env:ARBITER_SHIM_BIN + ';' + $env:PATH }"
-                ),
-            ]);
+            // Run the startup from a FILE, not `-Command` — `-Command` strings get added
+            // to PSReadLine history (our own startup kept appearing on up-arrow). `-File`
+            // is executed, not recorded. `-ExecutionPolicy Bypass` so a Restricted policy
+            // can't block our own script. Falls back to a plain shell if the write fails.
+            if let Some(init) = ensure_powershell_init() {
+                cmd.args(["-NoExit", "-ExecutionPolicy", "Bypass", "-File"]);
+                cmd.arg(&init);
+            } else {
+                cmd.arg("-NoExit");
+            }
             apply_claude_shim(&mut cmd);
             cmd
         }
