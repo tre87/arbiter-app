@@ -6007,10 +6007,12 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             let busy = data.session.shell_idle() == Some(false);
             let dot = pane_dot(running, lc, busy);
 
-            // Left: Claude icon (when active) + terminal name.
+            // Left: Claude icon (when active) + terminal name. The icon, git stats and
+            // status dot all read ~1px high against the title text (their glyphs/marks
+            // centre higher in the line than alphabetic text), so nudge each down 1px.
             let mut left = row![].spacing(6).align_y(iced::Center);
             if running {
-                left = left.push(claude_icon(13.0));
+                left = left.push(nudge_down_1px(claude_icon(13.0)));
             }
             left = left.push(text(data.name.clone()).size(12));
 
@@ -6018,7 +6020,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
                 left,
                 horizontal_space(),
                 overview_git(&data.session),
-                container(indicator(dot, 12)).width(Length::Fixed(22.0)).center_x(Length::Fixed(22.0)),
+                container(indicator(dot, 12))
+                    .width(Length::Fixed(22.0))
+                    .center_x(Length::Fixed(22.0)),
             ]
             .spacing(8)
             .align_y(iced::Center);
@@ -7179,19 +7183,26 @@ fn pane_dot(claude_running: bool, lc: Lifecycle, shell_busy: bool) -> Dot {
 /// for running/attention). `size` is the dot text size; the glyph is a bit larger.
 fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
     let rgba = iced::Color::from_rgba8;
-    match dot {
+    let glyph: Element<'static, Message> = match dot {
         Dot::Working => {
             let (g, c) = working_frame();
-            // The ✻ bloom glyphs live in a symbols font — Iced's default UI font
-            // lacks them (renders tofu) and won't fall back.
-            text(g).size(size + 1).color(c).font(symbols_font()).into()
+            // The ✻ bloom glyphs live in a symbols font — Iced's default UI font lacks
+            // them (renders tofu) and won't fall back. Same `size` as the dots (was
+            // size+1) so it isn't taller. It also centres ~1px higher in the line than
+            // the round dots, so drop it 1px to sit level with them / the title.
+            nudge_down_1px(text(g).size(size).color(c).font(symbols_font()).into())
         }
         Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200))).into(),
         Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, pulse_alpha(1500))).into(),
         // Claude running but idle (between turns): solid grey — present, not busy.
         Dot::Ready => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.85)).into(),
         Dot::Idle => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.5)).into(),
-    }
+    };
+    // Fixed-height slot so every state occupies the SAME height: showing/hiding the
+    // animated ✻ (working) vs a dot can't change the row height — the cause of the
+    // overview rows jumping by ~1px when the animation appears/disappears.
+    let h = Length::Fixed(size as f32 + 4.0);
+    container(glyph).height(h).center_y(h).into()
 }
 
 /// Static status dot for the pane header. The animated ✻ cycles glyph widths/

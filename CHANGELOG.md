@@ -17,6 +17,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   departure from the usual shared-history model (iTerm2 et al. share one history file across tabs).
 
 ### Fixed
+- **Overview row alignment:** the working ✻ animation no longer makes overview rows jump by a
+  pixel when it shows/hides (its slot is now a fixed height, so a dot and the animation occupy
+  the same space), and the git stats, status dot, and ✻ now sit level with the terminal titles.
 - **Git footer across sibling terminals:** a git command (staging, commit, branch switch) in
   one terminal now refreshes the git footer of *other* terminals open in the same repo, not
   just the one that ran it. The repo watcher previously ignored all `.git/` changes to avoid a
