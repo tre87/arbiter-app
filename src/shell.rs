@@ -111,6 +111,9 @@ fi
 if [[ -n "$ARBITER_HISTFILE" ]]; then
   export HISTFILE="$ARBITER_HISTFILE"
   fc -p "$ARBITER_HISTFILE" 2>/dev/null
+  # Write each command to the file as it's entered, so history survives Arbiter
+  # killing the shell on quit (zsh otherwise saves on exit, which a kill skips).
+  setopt INC_APPEND_HISTORY 2>/dev/null
 fi
 "#;
 
@@ -179,7 +182,11 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // One-time: switch to this pane's private history (Windows path →
                     // POSIX via cygpath for Git Bash). `history -c; history -r` isolates
                     // + loads our file. No-op until ARBITER_HISTFILE is set.
-                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; [ -n "$ARBITER_HIST_DEBUG" ] && echo "[arbiter-hist] HISTFILE=$HISTFILE (from $ARBITER_HISTFILE)" >&2; fi; "#,
+                    // One-time isolate (cygpath → POSIX path for Git Bash), then `history -a`
+                    // on every prompt so commands persist immediately — Arbiter kills the
+                    // shell on quit, so a save-on-exit would lose everything (the bug you saw:
+                    // up-arrow empty after restart). No-op until ARBITER_HISTFILE is set.
+                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; [ -n "$ARBITER_HIST_DEBUG" ] && echo "[arbiter-hist] HISTFILE=$HISTFILE (from $ARBITER_HISTFILE)" >&2; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
                     r#"printf '\e]133;D\a\e]7;file:///%s\a\e]133;A\a' "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
                     // Re-prepend Arbiter's claude-shim dir LAST (after Git Bash's
                     // profile/rc, which may reorder PATH so the real claude wins), so
@@ -208,11 +215,18 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                         // below fails (older PSReadLine may lack ClearHistory/AddToHistory).
                         "if (-not $global:__arb_hist) { $global:__arb_hist = $true; ",
                             "if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) { ",
-                                "try { Set-PSReadLineOption -HistorySavePath $env:ARBITER_HISTFILE } catch {}; ",
                                 "try { ",
-                                    "[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory(); ",
+                                    // ORDER MATTERS: stop saving + clear the shared global
+                                    // history from memory BEFORE pointing the save path at
+                                    // our file. Otherwise PSReadLine flushes the whole global
+                                    // list into the per-pane file (the "huge script" on recall).
                                     "Set-PSReadLineOption -HistorySaveStyle SaveNothing; ",
+                                    "[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory(); ",
                                     "if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) { Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object { if ($_ -ne '') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) } } }; ",
+                                    // Memory now holds ONLY this pane's history → safe to
+                                    // point saves here and resume incremental save (survives
+                                    // Arbiter killing the shell on quit).
+                                    "Set-PSReadLineOption -HistorySavePath $env:ARBITER_HISTFILE; ",
                                     "Set-PSReadLineOption -HistorySaveStyle SaveIncrementally; ",
                                 "} catch {} ",
                             "} ",
@@ -277,7 +291,13 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // prompt (after .bashrc, so a bashrc HISTFILE can't win). `history -c`
                     // drops the shared history loaded at startup, `history -r` loads ONLY
                     // our file → isolated + persistent. No-op until ARBITER_HISTFILE is set.
-                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; [ -n "$ARBITER_HIST_DEBUG" ] && echo "[arbiter-hist] HISTFILE=$HISTFILE" >&2; fi; "#,
+                    // One-time: switch to this pane's private history (after .bashrc, so a
+                    // bashrc HISTFILE can't win). `history -c` drops the shared history,
+                    // `history -r` loads ONLY our file → isolation. Then `history -a` on
+                    // EVERY prompt appends new commands to the file immediately, so they
+                    // persist even though Arbiter kills the shell on quit (bash otherwise
+                    // only saves on a clean exit). No-op until ARBITER_HISTFILE is set.
+                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; [ -n "$ARBITER_HIST_DEBUG" ] && echo "[arbiter-hist] HISTFILE=$HISTFILE" >&2; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
                     r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
                 ),
             );
