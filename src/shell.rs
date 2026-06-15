@@ -222,7 +222,14 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                                     // list into the per-pane file (the "huge script" on recall).
                                     "Set-PSReadLineOption -HistorySaveStyle SaveNothing; ",
                                     "[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory(); ",
-                                    "if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) { Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object { if ($_ -ne '') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) } } }; ",
+                                    // PowerShell adds the -Command it was launched with to
+                                    // history — i.e. THIS startup script — which then saves to
+                                    // the per-pane file and shows on up-arrow. Reject it (and
+                                    // any line carrying our unique token) from ever being added.
+                                    "Set-PSReadLineOption -AddToHistoryHandler { param($line) $line -notmatch '__arbiter_orig_prompt' }; ",
+                                    // Load this pane's history, skipping any startup line a
+                                    // prior (buggy) build already wrote, so old files self-clean.
+                                    "if (Test-Path -LiteralPath $env:ARBITER_HISTFILE) { Get-Content -LiteralPath $env:ARBITER_HISTFILE | ForEach-Object { if ($_ -ne '' -and $_ -notmatch '__arbiter_orig_prompt') { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($_) } } }; ",
                                     // Memory now holds ONLY this pane's history → safe to
                                     // point saves here and resume incremental save (survives
                                     // Arbiter killing the shell on quit).
