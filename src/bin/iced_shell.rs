@@ -575,6 +575,9 @@ enum Message {
     /// Right-click a terminal → context menu (anchored at the click), and the
     /// rename-terminal flow it launches.
     TermMenuOpen(pane_grid::Pane, iced::Point),
+    /// Right-click a terminal's *header* → same context menu, anchored at the last
+    /// recorded cursor position (the header isn't tracked into the message).
+    HeaderMenuOpen(pane_grid::Pane),
     TermMenuClose,
     TermRenameStart,
     TermRenameInput(String),
@@ -2071,6 +2074,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // over the terminal body, so the position rides in the message).
             state.explorer_menu = None;
             state.ws_tab_menu = None;
+            let ws = state.active_mut();
+            if ws.panes.get(pane).is_some() {
+                ws.focus = pane;
+                state.term_menu = Some(TermMenu { x: at.x, y: at.y });
+            }
+        }
+        Message::HeaderMenuOpen(pane) => {
+            // Same menu as a body right-click, but the header isn't in the cursor-tracked
+            // band, so anchor at the last recorded position. Focus the pane first so the
+            // menu's actions (Select All, Copy, …) target this terminal.
+            state.explorer_menu = None;
+            state.ws_tab_menu = None;
+            let at = last_cursor();
             let ws = state.active_mut();
             if ws.panes.get(pane).is_some() {
                 ws.focus = pane;
@@ -5694,10 +5710,15 @@ fn main_view(state: &State) -> Element<'_, Message> {
         let lc = cstatus.lifecycle;
         let status = claude_running.then(|| pane_dot(true, lc, false));
         let info_open = info_pane == Some(pane) && claude_running;
-        let header = pane_header(
+        // Right-clicking the header opens the same context menu as the terminal body
+        // (anchored at the cursor); left-clicks still fall through to focus / the
+        // header's own buttons (mouse_area only captures the right-press).
+        let header: Element<Message> = mouse_area(pane_header(
             &data.name, focused, data.shell, has_git_bash, pane, status, claude_running, info_open,
             header_round,
-        );
+        ))
+        .on_right_press(Message::HeaderMenuOpen(pane))
+        .into();
         // Overlay the Knight-Rider working bar (top edge) + the info popover
         // (top-right) on the terminal when active.
         let working = claude_running && lc == Lifecycle::Working;
@@ -6236,6 +6257,22 @@ fn set_ui_scale(s: f32) {
 fn ui_scale() -> f32 {
     let b = UI_SCALE_BITS.load(std::sync::atomic::Ordering::Relaxed);
     if b == 0 { 2.0 } else { f32::from_bits(b) }
+}
+
+/// Last absolute cursor position over the main window (x|y f32 bits packed into a
+/// u64). Recorded for EVERY move by the global event listener — unlike `state.cursor`
+/// (tracked only over the titlebar/left-strip band), this covers the whole window so a
+/// terminal-header right-click can anchor its context menu at the click. Stashed in a
+/// static instead of a message so it costs no extra view rebuild (the header isn't in
+/// the band, and `mouse_area::on_move` only reports header-relative coordinates).
+static LAST_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn stash_cursor(p: iced::Point) {
+    let bits = ((p.x.to_bits() as u64) << 32) | p.y.to_bits() as u64;
+    LAST_CURSOR.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+fn last_cursor() -> iced::Point {
+    let bits = LAST_CURSOR.load(std::sync::atomic::Ordering::Relaxed);
+    iced::Point::new(f32::from_bits((bits >> 32) as u32), f32::from_bits(bits as u32))
 }
 
 /// Rasterise an SVG to an RGBA `image::Handle` at exactly `px`×`px` physical
@@ -7890,6 +7927,9 @@ fn subscription(state: &State) -> Subscription<Message> {
             if trafficlights::is_dragging() {
                 return Some(Message::CursorMoved(*position));
             }
+            // Record every move (no message → no redraw) so a header right-click can
+            // anchor its menu anywhere; only the band emits a message for live tracking.
+            stash_cursor(*position);
             return (position.y < 44.0 || position.x < 240.0).then(|| Message::CursorMoved(*position));
         }
         // Any left-button release ends an in-progress workspace-tab drag (the drop

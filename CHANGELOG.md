@@ -7,6 +7,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Terminal header right-click menu:** right-clicking a terminal's header now opens the same
+  context menu as right-clicking its body (Rename, Clear Buffer, Split, Select All, Copy,
+  Paste, Close), anchored at the cursor. The menu's actions — including Select All — target
+  the terminal whose header was clicked.
+
 ### Fixed
 - **Overview title alignment / wrapping:** a long terminal title no longer pushes the status
   dot and git stats out of their column or wraps to a second line. The title now truncates
