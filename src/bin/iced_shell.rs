@@ -2582,8 +2582,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Some(text) = text.filter(|t| !t.is_empty()) {
                 let ws = state.active_mut();
                 if let Some(p) = ws.panes.get_mut(ws.focus) {
-                    let bracketed =
-                        p.session.term().lock().map(|t| t.bracketed_paste()).unwrap_or(false);
+                    // Pasting, like typing, returns the view to the live bottom (the paste
+                    // lands at the prompt) and clears the selection.
+                    let bracketed = if let Ok(mut t) = p.session.term().lock() {
+                        t.scroll_to_bottom();
+                        t.clear_selection();
+                        t.bracketed_paste()
+                    } else {
+                        false
+                    };
                     if bracketed {
                         p.session.write(b"\x1b[200~");
                         p.session.write(text.as_bytes());
@@ -7801,6 +7808,12 @@ fn write_attach_paths(state: &mut State, paths: &[String]) {
     let payload: String = paths.iter().map(|p| format!("\x1b[200~{p}\x1b[201~")).collect();
     let ws = state.active_mut();
     if let Some(p) = ws.panes.get_mut(ws.focus) {
+        // Like typing/paste, return the view to the live bottom (the paths land at the
+        // prompt) and clear the selection.
+        if let Ok(mut t) = p.session.term().lock() {
+            t.scroll_to_bottom();
+            t.clear_selection();
+        }
         p.session.write(payload.as_bytes());
     }
 }

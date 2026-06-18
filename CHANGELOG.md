@@ -8,6 +8,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Fixed
+- **Paste jumps to the prompt:** pasting (Cmd/Ctrl+V, middle-click, or a file attach via
+  drag-drop / the pickers) while scrolled up in the scrollback now snaps the view back to
+  the live bottom and clears the selection — matching what typing already did — so the
+  pasted text is visible where it lands at the prompt.
 - **Text selection while scrolling:** dragging a selection past the top/bottom edge now
   auto-scrolls continuously while the mouse is held still (instead of stalling after a
   moment), at a controllable speed, and scrolling the wheel while holding the button keeps
