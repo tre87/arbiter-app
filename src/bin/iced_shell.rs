@@ -4408,7 +4408,7 @@ fn tab_pill(
         .height(Length::Fixed(26.0));
     // After the name, before the close: a pulsing dot when a terminal in this workspace
     // has Claude working (azure) or needing attention (amber, takes priority).
-    if let Some(dot) = workspace_claude_dot(ws) {
+    if let Some(dot) = workspace_dot(ws) {
         content = content.push(nudge_down_1px(tab_status_dot(dot)));
     }
     if show_close {
@@ -7303,29 +7303,41 @@ fn header_dot(dot: Dot) -> Element<'static, Message> {
     text("●").size(11).color(c).into()
 }
 
-/// Aggregate Claude status across a workspace's panes, for the tab dot. Attention (a
-/// terminal needs input) wins over Working; None when no pane is working or waiting.
-fn workspace_claude_dot(ws: &Workspace) -> Option<Dot> {
+/// Aggregate pane status across a workspace, for the tab dot. Priority across the
+/// workspace's terminals: Attention (needs input) > Working (Claude busy) > Running (a
+/// non-Claude command is running, i.e. shell busy). None when every pane is idle (or
+/// only has an idle Claude session). Mirrors `pane_dot` per pane.
+fn workspace_dot(ws: &Workspace) -> Option<Dot> {
     let mut working = false;
+    let mut running = false;
     for (_, d) in ws.panes.iter() {
-        if d.session.claude_running() {
-            match d.session.claude_status().lifecycle {
-                Lifecycle::Attention => return Some(Dot::Attention), // priority
-                Lifecycle::Working => working = true,
-                _ => {}
-            }
+        let busy = d.session.shell_idle() == Some(false);
+        match pane_dot(d.session.claude_running(), d.session.claude_status().lifecycle, busy) {
+            Dot::Attention => return Some(Dot::Attention), // top priority — return at once
+            Dot::Working => working = true,
+            Dot::Running => running = true,
+            Dot::Ready | Dot::Idle => {}
         }
     }
-    working.then_some(Dot::Working)
+    if working {
+        Some(Dot::Working)
+    } else if running {
+        Some(Dot::Running)
+    } else {
+        None
+    }
 }
 
-/// A small pulsing status dot for the workspace tab: amber when a terminal needs
-/// attention, azure (blue) while one is working. It pulses via the fast tick, which is
-/// already active whenever a pane is working/attention (see `needs_fast_tick`).
+/// A small status dot for the workspace tab: amber when a terminal needs attention,
+/// azure (blue) while Claude is working — both pulse via the fast tick (already active
+/// for working/attention, see `needs_fast_tick`). Green (a non-Claude command running)
+/// is SOLID: it appears/disappears event-driven on command start/end, so it needs no
+/// fast tick — keeping a long-running command from pinning the UI at 60fps.
 fn tab_status_dot(dot: Dot) -> Element<'static, Message> {
     let rgba = iced::Color::from_rgba8;
     let c = match dot {
         Dot::Attention => rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200)), // amber — needs input
+        Dot::Running => rgba(0x22, 0xc5, 0x5e, 1.0),                 // green — shell busy (solid)
         _ => rgba(0x4d, 0xa6, 0xff, pulse_alpha(1500)),             // azure — Claude working
     };
     text("●").size(8).color(c).into()

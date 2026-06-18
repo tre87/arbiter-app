@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Workspace tab "running" dot:** a workspace tab now also shows a solid **green** dot when
+  one of its terminals has a (non-Claude) command running — a build, dev server, `sleep`,
+  vim, etc. Full priority across the workspace's terminals is now amber (needs attention) →
+  blue (Claude working) → green (command running). The green dot is solid and appears/hides
+  on command start/end (event-driven), so a long-running command adds no idle CPU.
+
 ### Fixed
 - **Paste jumps to the prompt:** pasting (Cmd/Ctrl+V, middle-click, or a file attach via
   drag-drop / the pickers) while scrolled up in the scrollback now snaps the view back to
