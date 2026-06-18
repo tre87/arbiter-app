@@ -7,6 +7,17 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Text selection while scrolling:** dragging a selection past the top/bottom edge now
+  auto-scrolls continuously while the mouse is held still (instead of stalling after a
+  moment), at a controllable speed, and scrolling the wheel while holding the button keeps
+  extending the selection (instead of stopping after one notch). Root cause: the terminal's
+  overlay layer (working bar / info popover / scroll indicator / find bar) was added or
+  removed as the gesture progressed, which changed the widget tree and reset the terminal's
+  per-widget interaction state mid-drag. The terminal is now always the base layer of a
+  stable stack, so its drag/scroll state survives. The auto-scroll is also event-driven
+  (a self-sustaining frame request), adding no idle CPU.
+
 ### Added
 - **Terminal header right-click menu:** right-clicking a terminal's header now opens the same
   context menu as right-clicking its body (Rename, Clear Buffer, Split, Select All, Copy,

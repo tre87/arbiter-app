@@ -724,4 +724,35 @@ mod tests {
         assert!(matches("just text, no colon-slash").is_empty());
         assert!(matches("http://").is_empty()); // scheme with no body
     }
+
+    /// Scrolling (wheel or drag auto-scroll) while a selection drag is active must
+    /// keep extending the marked region: scroll the view, then re-extend to the same
+    /// screen row — the selection should grow to cover the lines scrolled into view.
+    #[test]
+    fn selection_extends_while_scrolling() {
+        use super::{SelectKind, VtTerm};
+        let mut t = VtTerm::new(10, 4);
+        // 20 lines L00..L19 → last 4 visible, the rest in scrollback.
+        let mut s = String::new();
+        for i in 0..20 {
+            if i > 0 {
+                s.push_str("\r\n");
+            }
+            s.push_str(&format!("L{i:02}"));
+        }
+        t.feed(s.as_bytes());
+
+        // Anchor at the bottom visible row, then scroll up 4 lines and re-extend to the
+        // same screen row (what the wheel / auto-scroll handlers do via drag_cell).
+        t.start_selection(3, 0, false, SelectKind::Simple);
+        let before = t.selection_text().unwrap_or_default();
+        t.scroll(4);
+        t.update_selection(3, 9, true);
+        let after = t.selection_text().unwrap_or_default();
+
+        assert!(
+            after.lines().count() > before.lines().count(),
+            "scrolling while selecting should extend the selection: before={before:?} after={after:?}"
+        );
+    }
 }

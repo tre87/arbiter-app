@@ -5719,45 +5719,43 @@ fn main_view(state: &State) -> Element<'_, Message> {
         ))
         .on_right_press(Message::HeaderMenuOpen(pane))
         .into();
-        // Overlay the Knight-Rider working bar (top edge) + the info popover
-        // (top-right) on the terminal when active.
+        // Overlays stack on top of the terminal: the Knight-Rider working bar (top
+        // edge), the info popover (top-right), the scrollback indicator, and the find
+        // bar. CRITICAL: build a SINGLE stack with `term` always as layer 0 (push the
+        // rest conditionally) so the shader keeps a stable position in the widget tree.
+        // If instead the slot flips between a bare `Shader` and a `Stack` (as it did when
+        // the scroll indicator appeared on the first scroll), iced sees a type change at
+        // that index and resets the shader's per-widget state mid-gesture — dropping the
+        // active selection drag / auto-scroll (it stalled after one step). Layers are
+        // pushed in z-order; the find bar sits on top so it always wins.
         let working = claude_running && lc == Lifecycle::Working;
         let pane_w = pane_widths.get(&pane).copied().unwrap_or(800.0);
-        let term_area: Element<Message> = match (working, info_open) {
-            (true, true) => iced::widget::stack![term, working_bar(pane_w), info_panel(&cstatus)].into(),
-            (true, false) => iced::widget::stack![term, working_bar(pane_w)].into(),
-            (false, true) => iced::widget::stack![term, info_panel(&cstatus)].into(),
-            (false, false) => term.into(),
-        };
-        // Scroll indicator: fades in while scrolling the scrollback, out when it
-        // stops (above the term, below the find bar so find always wins).
-        let term_area: Element<Message> = {
+        let (scroll_off, scroll_hist, scroll_screen, scroll_alpha) = {
             let st = data.session.term();
-            let (off, history, screen, age) = {
-                let g = st.lock().unwrap();
-                let (o, h, s) = g.scroll_state();
-                (o, h, s, g.scroll_age_ms())
-            };
-            let alpha = match age {
+            let g = st.lock().unwrap();
+            let (o, h, s) = g.scroll_state();
+            let alpha = match g.scroll_age_ms() {
                 Some(a) if a < SB_HOLD_MS => 1.0,
                 Some(a) if a < SB_HOLD_MS + SB_FADE_MS => {
                     1.0 - (a - SB_HOLD_MS) as f32 / SB_FADE_MS as f32
                 }
                 _ => 0.0,
             };
-            if alpha > 0.0 && history > 0 {
-                iced::widget::stack![term_area, scroll_indicator(off, history, screen, alpha)].into()
-            } else {
-                term_area
-            }
+            (o, h, s, alpha)
         };
-        // The find bar sits above everything in the focused pane.
-        let term_area: Element<Message> = if focused && find_open {
-            let status = data.session.term().lock().ok().and_then(|t| t.search_status());
-            iced::widget::stack![term_area, find_bar(find_query, status)].into()
-        } else {
-            term_area
-        };
+        let term_area: Element<Message> = iced::widget::Stack::new()
+            .push(term)
+            .push_maybe(working.then(|| working_bar(pane_w)))
+            .push_maybe(info_open.then(|| info_panel(&cstatus)))
+            .push_maybe(
+                (scroll_alpha > 0.0 && scroll_hist > 0)
+                    .then(|| scroll_indicator(scroll_off, scroll_hist, scroll_screen, scroll_alpha)),
+            )
+            .push_maybe((focused && find_open).then(|| {
+                let status = data.session.term().lock().ok().and_then(|t| t.search_status());
+                find_bar(find_query, status)
+            }))
+            .into();
         // 1px #2c2c2c dividers under the header and above the footer (web card look).
         let content = column![header, hline(), term_area, hline(), footer_bar(&data.session, pane, footer_round)]
             .width(Length::Fill)
@@ -8288,10 +8286,11 @@ impl shader::Program<Message> for TermProgram {
         event: shader::Event,
         bounds: Rectangle,
         cursor: iced::mouse::Cursor,
-        _shell: &mut iced::advanced::Shell<'_, Message>,
+        shell: &mut iced::advanced::Shell<'_, Message>,
     ) -> (iced::event::Status, Option<Message>) {
         use iced::event::Status::{Captured, Ignored};
         use iced::mouse::{Button, Event::*, ScrollDelta};
+        use iced::window::RedrawRequest;
         let captured = (Captured, None);
         match event {
             // Track live modifiers so a Cmd/Ctrl+click can open a link. Don't
@@ -8304,7 +8303,9 @@ impl shader::Program<Message> for TermProgram {
             // Shift overrides to local); on the alternate screen with ?1007, send
             // arrow keys; otherwise scroll our scrollback (×3 lines/notch, like
             // Alacritty). Typing jumps back to the bottom (handled in update()).
-            shader::Event::Mouse(WheelScrolled { delta }) if cursor.is_over(bounds) => {
+            // `|| state.dragging`: while selecting, a wheel scroll must extend the
+            // selection even if the held cursor reads a hair outside the bounds.
+            shader::Event::Mouse(WheelScrolled { delta }) if cursor.is_over(bounds) || state.dragging => {
                 let modes = self.term.lock().unwrap().mouse_modes();
                 let rows = self.term.lock().unwrap().size().1.max(1) as f32;
                 let ch = (bounds.height / rows).max(1.0);
@@ -8348,7 +8349,21 @@ impl shader::Program<Message> for TermProgram {
                     }
                     return (Captured, Some(Message::MouseReport(self.pane, out, false)));
                 }
-                self.term.lock().unwrap().scroll(notches * 3);
+                {
+                    let mut t = self.term.lock().unwrap();
+                    t.scroll(notches * 3);
+                    // While selecting, keep the selection tracking the cursor's screen
+                    // row as the viewport moves under it — otherwise scrolling freezes
+                    // the marked region (the end point stays on the old, scrolled-away
+                    // line). drag_cell is the last cursor cell (set on press + each move).
+                    if state.dragging {
+                        let (r, c, right) = state.drag_cell;
+                        t.update_selection(r, c, right);
+                    }
+                }
+                // The scroll only mutated the term behind an Arc (invisible to view
+                // diffing), so request a frame to actually paint the new view + selection.
+                shell.request_redraw(RedrawRequest::NextFrame);
                 captured
             }
             // Press: Cmd/Ctrl+click opens a link; else if a TUI grabbed the mouse,
@@ -8403,6 +8418,9 @@ impl shader::Program<Message> for TermProgram {
                     self.term.lock().unwrap().start_selection(row, col, right, kind);
                     state.dragging = true;
                     state.autoscroll = 0;
+                    // Seed the drag cell so a wheel-scroll before the first move still
+                    // extends the selection to where the button went down.
+                    state.drag_cell = (row, col, right);
                     return (Captured, Some(Message::Focus(self.pane)));
                 }
                 // Right-click (when the app isn't grabbing the mouse) → context menu,
@@ -8420,8 +8438,10 @@ impl shader::Program<Message> for TermProgram {
             shader::Event::Mouse(CursorMoved { .. }) if state.dragging => {
                 if let Some(abs) = cursor.position() {
                     let (rx, ry) = (abs.x - bounds.x, abs.y - bounds.y);
-                    // Scroll speed grows with distance past the edge (1–8 lines/frame).
-                    let speed = |over: f32| ((over / 12.0).ceil() as i32).clamp(1, 8);
+                    // Scroll speed grows gently with distance past the edge: 1 line/frame
+                    // at the edge (≈60/s at 60fps, like alacritty's per-tick step) up to 3
+                    // far out. The old 1–8 ramp hit ~480/s and shot past, hard to reverse.
+                    let speed = |over: f32| ((over / 28.0).ceil() as i32).clamp(1, 3);
                     state.autoscroll = if ry < 0.0 {
                         speed(-ry) // above top → scroll up (positive = into history)
                     } else if ry > bounds.height {
@@ -8429,6 +8449,13 @@ impl shader::Program<Message> for TermProgram {
                     } else {
                         0
                     };
+                    // Kick off the self-sustaining redraw loop (see RedrawRequested
+                    // below) so auto-scroll keeps advancing while the mouse is held
+                    // still — without a frame request iced wouldn't redraw, since the
+                    // scroll only mutates the term behind an Arc that view-diffing can't see.
+                    if state.autoscroll != 0 {
+                        shell.request_redraw(RedrawRequest::NextFrame);
+                    }
                     let cx = rx.clamp(0.0, bounds.width - 0.5);
                     let cy = ry.clamp(0.0, bounds.height - 0.5);
                     let (row, col, right) = cell_at(iced::Point::new(cx, cy), bounds, &self.term);
@@ -8467,12 +8494,23 @@ impl shader::Program<Message> for TermProgram {
                     None => (Ignored, None),
                 }
             }
-            // Continuous auto-scroll while a drag is held past an edge.
+            // Continuous auto-scroll while a drag is held past an edge: advance one step
+            // and request the next frame, forming a redraw loop that runs until the drag
+            // ends or moves back inside (where autoscroll → 0 stops the requests).
             shader::Event::RedrawRequested(_) if state.dragging && state.autoscroll != 0 => {
                 let mut t = self.term.lock().unwrap();
+                let before = t.scroll_state().0; // display offset
                 t.scroll(state.autoscroll);
+                let after = t.scroll_state().0;
                 let (r, c, right) = state.drag_cell;
                 t.update_selection(r, c, right);
+                drop(t);
+                // Sustain the loop only while the view is actually moving — at the top/
+                // bottom of history there's nothing left to scroll, so let it idle until
+                // the mouse moves (which re-arms via the drag handler) instead of spinning.
+                if before != after {
+                    shell.request_redraw(RedrawRequest::NextFrame);
+                }
                 (Ignored, None)
             }
             shader::Event::Mouse(ButtonReleased(btn))
@@ -8496,7 +8534,7 @@ impl shader::Program<Message> for TermProgram {
                     }
                     return captured;
                 }
-                // End a local selection drag.
+                // End a local selection drag (stops the auto-scroll redraw loop).
                 if state.dragging {
                     state.dragging = false;
                     state.autoscroll = 0;
