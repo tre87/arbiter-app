@@ -9,7 +9,7 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
@@ -513,40 +513,55 @@ fn claude_monitor(
     claude_running: Arc<AtomicBool>,
     shell_idle: Arc<Mutex<Option<bool>>>,
 ) {
+    // How long to keep looking for Claude after a command starts. Enough to catch a
+    // slow cold launch (Windows especially: $PROFILE + shim + node + MCP servers,
+    // antivirus scanning node.exe) — well beyond the old 2s that missed them — yet
+    // bounded so a long-running NON-Claude command (a build, a dev server) only gets a
+    // short burst (~7 backed-off checks) and then nothing.
+    const SCAN_WINDOW: Duration = Duration::from_secs(10);
+
     let (lock, cvar) = &*cmd_epoch;
     let mut last = *lock.lock().unwrap();
     loop {
-        // Wait for the next busy edge (epoch advance), with a safety timeout.
+        // Block until a command actually starts (a busy edge bumps the epoch). The 60s
+        // timeout is ONLY a lost-wakeup safety net: on a pure timeout the epoch is
+        // unchanged, so we loop back WITHOUT scanning — nothing runs while idle.
+        let prev = last;
         {
             let guard = lock.lock().unwrap();
-            let prev = last;
-            let (guard, _timeout) = cvar
-                .wait_timeout_while(guard, Duration::from_secs(60), |e| *e == prev)
-                .unwrap();
+            let (guard, _to) =
+                cvar.wait_timeout_while(guard, Duration::from_secs(60), |e| *e == prev).unwrap();
             last = *guard;
         }
-        // A command started — scan for Claude, retrying through its exec delay.
+        if last == prev {
+            continue; // woke on the timeout with no new command → don't scan
+        }
+        // A command started. Look for Claude with BACKOFF until we find it, the shell
+        // returns to idle (command ended → wasn't Claude), or the window elapses. The
+        // loop stops the instant Claude appears, so a running Claude is never scanned,
+        // and it never runs while idle (that's the blocking wait above).
         crate::claude_shim::debug_log(&format!(
             "claude_monitor: busy edge on shell_pid={shell_pid}, scanning"
         ));
-        for i in 0..8 {
-            let found = crate::claude::running_under(shell_pid);
-            crate::claude_shim::debug_log(&format!(
-                "claude_monitor: scan {i} shell_pid={shell_pid} running_under={found}"
-            ));
-            if found {
+        let started = Instant::now();
+        let mut delay = Duration::from_millis(250);
+        loop {
+            if crate::claude::running_under(shell_pid) {
                 claude_running.store(true, Ordering::Relaxed);
-                // Persist that Claude is now running here (even before a session
-                // binds), so a restore relaunches it.
+                // Persist that Claude is running here (even before a session binds) so
+                // a restore relaunches it.
                 crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
+                crate::claude_shim::debug_log(&format!("claude_monitor: found on shell_pid={shell_pid}"));
                 break;
             }
             if *shell_idle.lock().unwrap() == Some(true) {
-                break; // finished already → wasn't Claude
+                break; // command finished → it wasn't Claude
             }
-            if i + 1 < 8 {
-                std::thread::sleep(Duration::from_millis(250));
+            if started.elapsed() >= SCAN_WINDOW {
+                break; // give up for this command — don't scan a long non-Claude one forever
             }
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(2)); // 250ms → 500ms → 1s → 2s cap
         }
     }
 }

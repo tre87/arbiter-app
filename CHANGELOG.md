@@ -5,6 +5,19 @@ All notable changes to Arbiter are documented here. The format roughly follows
 `Cargo.toml`. This changelog covers the **native** app (1.0.0 onward); earlier
 history belongs to the prior Tauri/Vue web app it replaced.
 
+## [Unreleased]
+
+### Fixed
+- **Claude not relaunching on restart (intermittent, mainly Windows):** when restoring a
+  session, a Claude that was slow to launch (cold start: shell profile + shim + node + MCP
+  servers, antivirus) could be missed by the process monitor — it only scanned for ~2s after a
+  command started and then never re-checked, since a running Claude keeps the shell busy (no
+  new "command started" edge). So `claude_running` stayed false, wasn't persisted, and the next
+  reopen didn't relaunch Claude. The monitor now keeps looking with backoff until Claude is
+  found, the command ends, or a 10s window elapses — covering slow launches. It still does
+  nothing while idle (it blocks on the prompt→command signal) and stops the instant Claude is
+  found, so a running Claude is never scanned.
+
 ## [1.0.9] — 2026-06-15
 
 ### Added
