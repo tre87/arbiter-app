@@ -8,6 +8,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Fixed
+- **Overview title alignment / wrapping:** a long terminal title no longer pushes the status
+  dot and git stats out of their column or wraps to a second line. The title now truncates
+  with an "…" (shorter still when git stats are present, since those take priority), and the
+  row is clamped to a single line and clipped, so it can never grow to two lines regardless
+  of title length. The status dot and git stats stay pinned to a fixed right column.
 - **Usage "Sign in" flash on slow loads:** when the usage helper was slow to respond, the
   titlebar/overview briefly showed the "Sign in" button, then it vanished and the real usage
   appeared. It came from an 8s "still Loading → assume Sign in" fallback that a slow-but-

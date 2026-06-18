@@ -6022,6 +6022,19 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             let busy = data.session.shell_idle() == Some(false);
             let dot = pane_dot(running, lc, busy);
 
+            // Truncate the title so it can't push the right cluster (git stats + status
+            // dot) out of its column or wrap to a second line. Width-aware char budget:
+            // reserve the dot (~22), the git stats (so they take priority — title gets
+            // shorter when present), the Claude icon, and chrome/padding/gaps. The Fill
+            // container below pins the right cluster regardless; this just lands the "…".
+            let git = data.session.git();
+            let git_px = git.as_ref().map_or(0.0, |g| {
+                let seg = |n: u32| if n > 0 { (1 + n.to_string().len()) as f32 * 6.5 + 6.0 } else { 0.0 };
+                seg(g.staged) + seg(g.unstaged) + seg(g.untracked)
+            });
+            let reserved = 66.0 + git_px + if running { 19.0 } else { 0.0 };
+            let max_chars = (((state.overview_size.width - reserved) / 6.0) as i32).max(6) as usize;
+
             // Left: Claude icon (when active) + terminal name. The icon, git stats and
             // status dot all read ~1px high against the title text (their glyphs/marks
             // centre higher in the line than alphabetic text), so nudge each down 1px.
@@ -6029,11 +6042,24 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             if running {
                 left = left.push(nudge_down_1px(claude_icon(13.0)));
             }
-            left = left.push(text(data.name.clone()).size(12));
+            left = left.push(
+                text(truncate_name(&data.name, max_chars))
+                    .size(12)
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            );
 
             let r = row![
-                left,
-                horizontal_space(),
+                // Fill → the left cluster takes the remaining width, pinning git + dot to a
+                // fixed right column (always aligned). The fixed height + clip is the hard
+                // guarantee against a second line: iced's wrapping(None) isn't honoured for
+                // a Fill-width text in this flex layout, so an over-long title still wraps —
+                // clamping to one line's height (16px) and clipping renders only that first
+                // line, so the row can never grow to two lines regardless.
+                container(left)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(16.0))
+                    .clip(true),
                 overview_git(&data.session),
                 container(indicator(dot, 12))
                     .width(Length::Fixed(22.0))
