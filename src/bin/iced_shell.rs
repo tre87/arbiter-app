@@ -4682,8 +4682,8 @@ fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
         use iced::futures::{SinkExt, StreamExt};
         // Re-spawn THIS binary as the usage helper (own process, hosts the webview)
         // — one binary, no separate build/placement. Without `--features
-        // usage-helper` the child sees the flag, no-ops and exits, so the bars just
-        // stay idle (→ "Sign in" after the timeout).
+        // usage-helper` the child sees the flag, no-ops and exits — handled below
+        // (its stdout closes → we surface "Sign in").
         let exe = std::env::current_exe().unwrap_or_default();
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--usage-helper")
@@ -4715,6 +4715,16 @@ fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
                 let _ = output.send(Message::UsageUpdated(data)).await;
             }
         }
+        // Helper's stdout closed → it exited (no `--features usage-helper`, or it
+        // crashed). Surface "Sign in" now rather than leaving the bars on "Loading"
+        // until the long fallback timeout — that timeout is only for a helper that's
+        // still ALIVE but silent.
+        let _ = output
+            .send(Message::UsageUpdated(UsageData {
+                state: UsageState::NeedsLogin,
+                ..Default::default()
+            }))
+            .await;
         let _ = child.kill();
         std::future::pending::<()>().await;
     })
@@ -4990,9 +5000,14 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
 /// the Tick (the helper's own background timer throttles while hidden).
 const USAGE_REFRESH_MS: u64 = 120_000;
 
-/// How long the titlebar shows "Loading" before falling back to "Sign in" if no
-/// usage data has arrived (helper not built/running, offline). Real data wins sooner.
-const USAGE_PENDING_TIMEOUT_MS: u64 = 8_000;
+/// Last-resort fallback: how long the titlebar shows "Loading" before offering
+/// "Sign in" when the helper is ALIVE but silent (e.g. the claude.ai webview is
+/// hung / offline). Long, because a slow-but-successful load must finish first or
+/// "Sign in" flashes then vanishes. The common cases don't wait this out: a
+/// logged-out helper reports `needs_login` explicitly, and a helper that exits
+/// (not built / crashed) surfaces "Sign in" immediately (see usage_worker). Real
+/// data always wins sooner.
+const USAGE_PENDING_TIMEOUT_MS: u64 = 30_000;
 
 /// The usage refresh button (web `.refresh-btn`): shows the countdown to the next
 /// auto-poll and, when clicked, refetches now + restarts the countdown.

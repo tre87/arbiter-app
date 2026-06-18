@@ -8,6 +8,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Fixed
+- **Usage "Sign in" flash on slow loads:** when the usage helper was slow to respond, the
+  titlebar/overview briefly showed the "Sign in" button, then it vanished and the real usage
+  appeared. It came from an 8s "still Loading → assume Sign in" fallback that a slow-but-
+  successful load tripped. "Sign in" is now driven by what actually happened: the helper
+  reporting `needs_login` (logged out) or the helper process exiting (not built / crashed,
+  surfaced immediately), with the speculative timeout lengthened to 30s purely for a helper
+  that's alive but silent — so a slow load just stays "Loading" until the data arrives.
 - **Claude not relaunching on restart (intermittent, mainly Windows):** detecting that Claude
   is running in a pane is now driven by the statusLine capture Claude writes via our injected
   settings, rather than a process scan. The scan only looked for ~2s after a command started
