@@ -8,15 +8,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Fixed
-- **Claude not relaunching on restart (intermittent, mainly Windows):** when restoring a
-  session, a Claude that was slow to launch (cold start: shell profile + shim + node + MCP
-  servers, antivirus) could be missed by the process monitor — it only scanned for ~2s after a
-  command started and then never re-checked, since a running Claude keeps the shell busy (no
-  new "command started" edge). So `claude_running` stayed false, wasn't persisted, and the next
-  reopen didn't relaunch Claude. The monitor now keeps looking with backoff until Claude is
-  found, the command ends, or a 10s window elapses — covering slow launches. It still does
-  nothing while idle (it blocks on the prompt→command signal) and stops the instant Claude is
-  found, so a running Claude is never scanned.
+- **Claude not relaunching on restart (intermittent, mainly Windows):** detecting that Claude
+  is running in a pane is now driven by the statusLine capture Claude writes via our injected
+  settings, rather than a process scan. The scan only looked for ~2s after a command started
+  and then never re-checked (a running Claude keeps the shell busy, so no new "command started"
+  edge), so a slow cold launch (shell profile + shim + node + MCP, antivirus) was missed —
+  `claude_running` stayed false, wasn't persisted, and the next reopen didn't relaunch Claude.
+  Now a capture appearing for a pane marks it running, independent of launch speed and fully
+  event-driven; stale files can't false-trigger (capture dirs are cleared on startup and a
+  pane's capture is deleted when its command ends). The process scan remains a fallback (now
+  with backoff to 10s) for Claude started outside the shim.
 
 ## [1.0.9] — 2026-06-15
 

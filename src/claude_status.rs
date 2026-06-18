@@ -201,6 +201,18 @@ impl ClaudeHandle {
         self.hook_attention.store(false, Ordering::Relaxed);
     }
 
+    /// Delete this pane's statusLine capture file. Called when its command ends (the
+    /// OSC-133 idle edge) so a capture left on disk after Claude exits can't keep
+    /// re-marking the pane "running" on the next watcher pass. No-op if there's none.
+    pub fn clear_capture(&self) {
+        if let Some(dir) = crate::shell::app_data_dir() {
+            let path = dir
+                .join(crate::claude_shim::CAPTURE_SUBDIR)
+                .join(format!("{}.json", self.pane_id));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// The bound Claude session id (set once a capture matches this pane), for
     /// `claude --resume` on restore.
     pub fn session_id(&self) -> Option<String> {
@@ -289,6 +301,17 @@ pub fn start_watcher() -> Option<Watcher> {
     let hooks_dir = data_dir.join(crate::claude_shim::HOOKS_SUBDIR);
     let _ = std::fs::create_dir_all(&capture_dir);
     let _ = std::fs::create_dir_all(&hooks_dir);
+    // Drop leftovers from a previous run before we start binding. Capture/hook files
+    // are keyed by pane id, and pane ids reuse across runs, so a stale file could
+    // falsely bind to a new pane (and now mark Claude "running"). They're transient —
+    // the durable resume id lives in session.json — so clearing them loses nothing.
+    for d in [&capture_dir, &hooks_dir] {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 
     let (cap, hk) = (capture_dir.clone(), hooks_dir.clone());
     let mut deb = new_debouncer(Duration::from_millis(80), move |res: DebounceEventResult| {
@@ -318,13 +341,19 @@ fn process_captures(dir: &Path) {
     let caps = crate::claude_shim::read_captures(dir);
     crate::claude_shim::debug_log(&format!("process_captures: {} capture(s)", caps.len()));
     for h in &handles {
-        if !h.claude_running.load(Ordering::Relaxed) {
-            continue;
-        }
         let pid = h.pane_id.to_string();
         let Some(c) = caps.iter().find(|c| c.key == pid) else {
             continue;
         };
+        // A capture for this pane means Claude wrote its statusLine here → it's
+        // running. This is the reliable, event-driven launch signal: Claude (via our
+        // injected --settings) writes the capture itself, so we no longer depend on the
+        // process scan, which missed slow cold launches. Stale files can't false-trigger
+        // — the dir is cleared on startup and a pane's capture is removed when its
+        // command ends (ClaudeHandle::clear_capture), so a present capture == live.
+        if !h.claude_running.swap(true, Ordering::Relaxed) {
+            SAVE_DIRTY.store(true, Ordering::Relaxed); // newly running → persist for restore
+        }
         crate::claude_shim::debug_log(&format!(
             "process_captures: pane {pid} -> capture key={} session={}",
             c.key, c.session_id

@@ -349,8 +349,11 @@ fn reader_loop(
                                     // (incl. Claude) ended.
                                     let was = claude_running.swap(false, Ordering::Relaxed);
                                     if was {
-                                        // Claude stopped → persist so a restore doesn't relaunch it.
+                                        // Claude stopped → persist so a restore doesn't relaunch it,
+                                        // and remove its statusLine capture so a lingering file can't
+                                        // re-mark this pane as running on the next watcher pass.
                                         crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
+                                        claude.clear_capture();
                                     }
                                     // A command just finished — it may have changed
                                     // files, so refresh git for the footer.
