@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.0.10] — 2026-06-18
+
 ### Added
 - **Workspace tab "running" dot:** a workspace tab now also shows a solid **green** dot when
   one of its terminals has a (non-Claude) command running — a build, dev server, `sleep`,
