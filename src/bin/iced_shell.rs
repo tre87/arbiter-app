@@ -283,12 +283,6 @@ struct State {
     new_ws_menu_x: f32,
     /// Latest Claude usage from the sidecar helper (drives the titlebar meters).
     usage: UsageData,
-    /// When `usage` was last updated (epoch ms) — for the refresh countdown.
-    usage_updated_ms: u64,
-    /// A usage fetch was sent but its data hasn't come back yet. If the NEXT poll
-    /// finds this still set, the helper's renderer likely died (Windows discards a
-    /// long-suspended one), so we escalate to a page reload to respawn it.
-    usage_fetch_pending: bool,
     /// When the usage subscription started (epoch ms) — if no data arrives within
     /// a timeout the bar drops out of "Loading" to "Sign in" (e.g. the helper isn't
     /// built/running), so it never hangs indefinitely.
@@ -1198,7 +1192,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         // A no-op: processing any message makes iced redraw, which is the whole point
         // (the terminal-output wake fires this so new PTY output renders on-demand).
-        Message::Redraw => {}
+        Message::Redraw => {
+            // Persist a newly-bound Claude session here too, not only on the Tick:
+            // now that an idle app emits no repaint Ticks, the save must ride the
+            // event-driven wake. A bind always coincides with PTY output, which is
+            // exactly what fires this Redraw. Cheap atomic read; saves only on the
+            // rare bind, never per frame.
+            if arbiter_native::claude_status::SAVE_DIRTY
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                save_session(state);
+            }
+        }
         Message::Tick => {
             // Persist when a Claude session newly bound in a pane (the watcher sets
             // this on an FS event; the tick just reacts to the flag — a cheap atomic
@@ -1224,24 +1229,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     trafficlights::install_quit_hook();
                 }
             }
-            // Drive the usage refresh from the app: once the 120s countdown hits 0,
-            // ask the helper to refetch and restart the countdown. (The helper's own
-            // setInterval is unreliable while its window is hidden — webviews
-            // throttle background timers — so the app owns the cadence.)
-            if state.usage.state == UsageState::Ok
-                && state.usage_updated_ms != 0
-                && now_ms().saturating_sub(state.usage_updated_ms) >= USAGE_REFRESH_MS
-            {
-                if state.usage_fetch_pending {
-                    // Last poll's fetch was never answered → the renderer likely died;
-                    // a navigation respawns it. (Cleared when data arrives.)
-                    usage_helper_cmd("reload");
-                } else {
-                    usage_helper_cmd("fetch");
-                    state.usage_fetch_pending = true;
-                }
-                state.usage_updated_ms = now_ms(); // restart the countdown immediately
-            }
+            // The 120s usage auto-refresh poll runs on a background thread now (see
+            // `usage_worker`), NOT here — so an idle app emits no frames at all.
             // If the first usage fetch never lands (helper not built/running, no
             // network), stop "Loading" after a timeout and offer Sign in instead of
             // hanging forever. Real data (incl. needs_login) overrides this sooner.
@@ -1347,16 +1336,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::UsageUpdated(mut data) => {
             // The helper posted, so its renderer is alive → clear the pending guard
             // (a still-set guard at the next poll is what triggers the reload).
-            state.usage_fetch_pending = false;
-            // Seed the countdown on the FIRST successful data only (the Tick
-            // auto-poll needs a non-zero stamp to start). Don't re-stamp on later
-            // arrivals: the countdown is owned by the request side (Tick auto-poll +
-            // RefreshUsage), and re-stamping here — ~1s after the request, when the
-            // fetch returns — bumps it back up, which reads as the timer "gaining a
-            // few seconds" just as the numbers refresh.
-            if data.state == UsageState::Ok && state.usage_updated_ms == 0 {
-                state.usage_updated_ms = now_ms();
-            }
+            USAGE_FETCH_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
             // Multi-org: if we have a saved choice that's still valid, auto-apply it
             // (handles page reloads) instead of re-showing the picker; if it's stale,
             // drop it and show the picker.
@@ -1372,6 +1352,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
             state.usage = data;
+            // The background poll only pokes the helper while we're showing live data;
+            // mirror that here so it pauses the moment we drop out of Ok.
+            USAGE_POLL_OK.store(
+                matches!(state.usage.state, UsageState::Ok),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         Message::ShowUsageLogin => usage_show_login(),
         Message::ShowUsageOrgMenu => state.usage_org_menu = true,
@@ -1390,14 +1376,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // leaves an actionable state even if the helper isn't running.
             state.usage = UsageData { state: UsageState::NeedsLogin, ..Default::default() };
             state.usage_started_ms = now_ms();
+            USAGE_POLL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             save_session(state);
         }
         Message::RefreshUsage => {
             // Manual refresh always RELOADs (not just a refetch): it respawns the
             // renderer, so it recovers even if the hidden one died — the button can
-            // never silently "do nothing". Restart the 2-minute countdown.
+            // never silently "do nothing". Mark a fetch in flight so the background
+            // poll escalates to another reload if this one never answers.
             usage_helper_cmd("reload");
-            state.usage_updated_ms = now_ms();
+            USAGE_FETCH_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Message::OpenSettings => state.settings_open = true,
         Message::CloseSettings => state.settings_open = false,
@@ -4628,6 +4616,19 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
 /// ("show\n") when the user clicks the titlebar Sign-in button.
 static HELPER_STDIN: std::sync::Mutex<Option<std::process::ChildStdin>> = std::sync::Mutex::new(None);
 
+/// Whether the background usage poll should poke the helper — true only while we're
+/// showing live data (logged in). Mirrors `state.usage.state == Ok`; the poll thread
+/// stays quiet otherwise (signed out / loading / error) so it never disturbs a
+/// sign-in in progress.
+static USAGE_POLL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A usage fetch was sent but its data hasn't come back yet. If the next 120s poll
+/// finds this still set, the helper's renderer likely died (Windows discards a
+/// long-suspended one), so the poll escalates to a page reload to respawn it.
+/// Lives outside `State` because the 120s cadence runs on a background thread (off the
+/// UI loop, so an idle app emits zero frames); `UsageUpdated` clears it.
+static USAGE_FETCH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Send a line to the usage helper's stdin.
 fn usage_helper_cmd(line: &str) {
     if let Some(s) = HELPER_STDIN.lock().unwrap().as_mut() {
@@ -4719,6 +4720,32 @@ fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
         };
         // Keep the helper's stdin so the Sign-in button can raise its window.
         *HELPER_STDIN.lock().unwrap() = child.stdin.take();
+        // Own the 120s auto-refresh cadence on a BACKGROUND thread, not the UI tick —
+        // so an idle app emits zero frames. It pokes the helper directly via stdin;
+        // fresh data returns through the same stdout path as any other update. While
+        // signed out / loading it stays quiet (USAGE_POLL_OK). If the previous fetch
+        // was never answered (USAGE_FETCH_PENDING still set), the hidden renderer
+        // likely died, so it escalates to a reload to respawn it. (The helper's own
+        // setInterval is unreliable while hidden — webviews throttle background timers
+        // — so the app owns the cadence.) Started once; this worker runs once.
+        static POLL_THREAD_STARTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !POLL_THREAD_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::spawn(|| {
+                use std::sync::atomic::Ordering::Relaxed;
+                loop {
+                    std::thread::sleep(Duration::from_millis(USAGE_REFRESH_MS));
+                    if !USAGE_POLL_OK.load(Relaxed) {
+                        continue;
+                    }
+                    if USAGE_FETCH_PENDING.swap(true, Relaxed) {
+                        usage_helper_cmd("reload");
+                    } else {
+                        usage_helper_cmd("fetch");
+                    }
+                }
+            });
+        }
         // Bridge the helper's (blocking) stdout lines into this async task.
         let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<String>();
         if let Some(stdout) = child.stdout.take() {
@@ -4776,7 +4803,6 @@ fn fmt_reset(resets_at_ms: Option<i64>) -> String {
 /// (5h blue / 7d green / Opus green / Sonnet blue) + the refresh button.
 fn usage_section(
     u: &UsageData,
-    updated_ms: u64,
     hide_sonnet: bool,
 ) -> Option<(Element<'static, Message>, f32)> {
     // The separator between the usage section and the action buttons is added by
@@ -4817,7 +4843,7 @@ fn usage_section(
             if n == 0 {
                 return None;
             }
-            row = row.push(refresh_btn(updated_ms));
+            row = row.push(refresh_btn());
             // +10 for the group separator titlebar_row adds after the usage section.
             Some((row.into(), 70.0 + n as f32 * 150.0))
         }
@@ -5032,33 +5058,12 @@ const USAGE_REFRESH_MS: u64 = 120_000;
 /// data always wins sooner.
 const USAGE_PENDING_TIMEOUT_MS: u64 = 30_000;
 
-/// The usage refresh button (web `.refresh-btn`): shows the countdown to the next
-/// auto-poll and, when clicked, refetches now + restarts the countdown.
-fn refresh_btn(updated_ms: u64) -> Element<'static, Message> {
-    let secs = USAGE_REFRESH_MS / 1000;
-    let cd = if updated_ms == 0 {
-        secs
-    } else {
-        secs.saturating_sub(now_ms().saturating_sub(updated_ms) / 1000).min(secs)
-    };
-    let label = format!("{}:{:02}", cd / 60, cd % 60);
-    button(
-        row![
-            cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED),
-            // Fixed-width slot so varying digit widths don't resize the button
-            // (iced has no tabular-nums); right-aligned like a timer.
-            container(
-                text(label)
-                    .size(11)
-                    .color(TXT_SECONDARY)
-                    .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(13.0))),
-            )
-            .width(Length::Fixed(26.0))
-            .align_x(iced::alignment::Horizontal::Right),
-        ]
-        .spacing(4)
-        .align_y(iced::Center),
-    )
+/// The usage refresh button: a plain refresh icon that refetches now when clicked.
+/// (No live countdown to the next auto-poll: a per-second countdown would need a
+/// ~1Hz repaint, which is exactly the idle clock we removed — so the app would never
+/// be truly idle. The auto-refresh still runs every 120s on a background thread.)
+fn refresh_btn() -> Element<'static, Message> {
+    button(cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED))
     .padding([5, 7])
     .on_press(Message::RefreshUsage)
     .style(|_t: &iced::Theme, s| button::Style {
@@ -5542,7 +5547,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let usage_el = if state.settings.hide_usage_bar {
         None
     } else {
-        usage_section(&state.usage, state.usage_updated_ms, state.settings.hide_sonnet_usage)
+        usage_section(&state.usage, state.settings.hide_sonnet_usage)
     };
     let usage_w = usage_el.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
     let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
@@ -6104,9 +6109,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         }
     }
 
-    // Usage footer (toggleable): the SAME 5h/7d bars + refresh as the main titlebar,
-    // fed by the same fetch + countdown (state.usage / usage_updated_ms; refresh →
-    // RefreshUsage), so it tracks the timer and the manual button with no extra polling.
+    // Usage footer (toggleable): the SAME 5h/7d bars + refresh button as the main
+    // titlebar, fed by the same shared state (state.usage; refresh → RefreshUsage), so
+    // it tracks the live data and the manual button with no extra polling.
     let footer = if state.settings.overview_usage_footer {
         overview_usage(&state.usage, state.settings.hide_sonnet_usage, state.overview_size.width)
     } else {
@@ -7262,8 +7267,8 @@ fn pane_dot(claude_running: bool, lc: Lifecycle, shell_busy: bool) -> Dot {
     }
 }
 
-/// The status indicator widget: the animated ✻ for working, else a dot (pulsing
-/// for running/attention). `size` is the dot text size; the glyph is a bit larger.
+/// The status indicator widget: the animated ✻ for working, else a solid coloured
+/// dot. `size` is the dot text size; the glyph is a bit larger.
 fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
     let rgba = iced::Color::from_rgba8;
     let glyph: Element<'static, Message> = match dot {
@@ -7275,8 +7280,11 @@ fn indicator(dot: Dot, size: u16) -> Element<'static, Message> {
             // the round dots, so drop it 1px to sit level with them / the title.
             nudge_down_1px(text(g).size(size).color(c).font(symbols_font()).into())
         }
-        Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200))).into(),
-        Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, pulse_alpha(1500))).into(),
+        // Solid, not pulsing: both are steady "waiting" states (a prompt awaiting
+        // input / a command running), so they must not require an animation clock —
+        // that's what lets the app go fully idle. Working is the only animated dot.
+        Dot::Attention => text("●").size(size).color(rgba(0xe5, 0xa0, 0x3c, 1.0)).into(),
+        Dot::Running => text("●").size(size).color(rgba(0x22, 0xc5, 0x5e, 1.0)).into(),
         // Claude running but idle (between turns): solid grey — present, not busy.
         Dot::Ready => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.85)).into(),
         Dot::Idle => text("●").size(size).color(rgba(0x6b, 0x7a, 0x8d, 0.5)).into(),
@@ -7328,15 +7336,15 @@ fn workspace_dot(ws: &Workspace) -> Option<Dot> {
     }
 }
 
-/// A small status dot for the workspace tab: amber when a terminal needs attention,
-/// azure (blue) while Claude is working — both pulse via the fast tick (already active
-/// for working/attention, see `needs_fast_tick`). Green (a non-Claude command running)
-/// is SOLID: it appears/disappears event-driven on command start/end, so it needs no
-/// fast tick — keeping a long-running command from pinning the UI at 60fps.
+/// A small status dot for the workspace tab: azure (blue) pulses while Claude is
+/// working (the fast tick is active for `Working`, see `needs_fast_tick`). Amber
+/// (needs attention) and green (a non-Claude command running) are SOLID — both are
+/// steady "waiting" states that appear/disappear event-driven, so neither needs a
+/// fast tick, keeping a prompt or a long-running command from pinning the UI at 60fps.
 fn tab_status_dot(dot: Dot) -> Element<'static, Message> {
     let rgba = iced::Color::from_rgba8;
     let c = match dot {
-        Dot::Attention => rgba(0xe5, 0xa0, 0x3c, pulse_alpha(1200)), // amber — needs input
+        Dot::Attention => rgba(0xe5, 0xa0, 0x3c, 1.0),               // amber — needs input (solid)
         Dot::Running => rgba(0x22, 0xc5, 0x5e, 1.0),                 // green — shell busy (solid)
         _ => rgba(0x4d, 0xa6, 0xff, pulse_alpha(1500)),             // azure — Claude working
     };
@@ -7876,22 +7884,23 @@ fn default_screenshot_dir_label() -> String {
         .unwrap_or_else(|| "System default".to_string())
 }
 
-/// Whether the 16ms (60fps) tick is needed, vs a slow 1s tick. Fast only while
-/// something is actually animating: the first-frame chrome init, the usage loading
-/// dots, any pane with Claude working (bar/dingbat/avatar) or needing attention
-/// (pulsing dot), or a scroll indicator still fading. Terminal *output* no longer
-/// needs the fast tick — it redraws via the event-driven wake (term_wake_subscription).
+/// Whether the 16ms (60fps) animation tick is needed. True only while something is
+/// actually animating: the first-frame chrome init, the usage loading dots, any pane
+/// with Claude *working* (bar/dingbat/avatar), or a scroll indicator still fading.
+/// When this is false there is NO 60fps clock — the app repaints only on event-driven
+/// wakes (term_wake_subscription for PTY output, plus input / window events); see
+/// `subscription`. A pane merely *needing attention* is now a static (non-pulsing)
+/// dot, so a session parked at a prompt no longer pins the UI at 60fps — it's idle.
 fn needs_fast_tick(state: &State) -> bool {
     if !state.chrome_init || state.usage.state == UsageState::Pending {
         return true;
     }
     state.workspaces.iter().any(|ws| {
         ws.panes.iter().any(|(_, d)| {
+            // Only *Working* animates (the ✻ bloom / avatar bob). Attention is a
+            // static dot, so a pane waiting at a prompt does not force the fast tick.
             if d.session.claude_running()
-                && matches!(
-                    d.session.claude_status().lifecycle,
-                    Lifecycle::Working | Lifecycle::Attention
-                )
+                && matches!(d.session.claude_status().lifecycle, Lifecycle::Working)
             {
                 return true;
             }
@@ -7908,10 +7917,18 @@ fn needs_fast_tick(state: &State) -> bool {
 }
 
 fn subscription(state: &State) -> Subscription<Message> {
-    // 60fps only while animating; otherwise 1s (just the usage countdown / save flag).
-    // Idle drops from a constant 60fps repaint to ~1 redraw/sec.
-    let interval = if needs_fast_tick(state) { 16 } else { 1000 };
-    let tick = iced::time::every(Duration::from_millis(interval)).map(|_| Message::Tick);
+    // True idle: a repaint clock runs ONLY while something is animating. When idle the
+    // app emits zero frames — the swapchain goes quiet, so the GPU driver drops the
+    // raised (1ms) timer resolution and lets Windows sleep the display even while we're
+    // focused. Everything else repaints event-driven (PTY output via term_wake, input,
+    // window events). Even the usage auto-refresh no longer needs a tick here: its 120s
+    // cadence runs on a background thread (see `usage_worker`) that pokes the helper
+    // directly, so a logged-in idle window still emits nothing.
+    let tick = if needs_fast_tick(state) {
+        iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
+    } else {
+        Subscription::none()
+    };
     // Only the main window's keys drive the terminal (not the overview window),
     // and not when a widget already consumed the key — e.g. a focused text input
     // in the new-worktree modal (else the branch name leaks into the terminal).
@@ -8912,8 +8929,6 @@ fn main() -> iced::Result {
                 cursor: iced::Point::ORIGIN,
                 new_ws_menu_x: 0.0,
                 usage: UsageData::default(),
-                usage_updated_ms: 0,
-                usage_fetch_pending: false,
                 usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
