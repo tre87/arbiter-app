@@ -7,6 +7,27 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Changed
+- **True idle when idle (lower CPU/GPU; lets the display sleep while focused).** The UI
+  no longer runs on a repaint clock when nothing is animating. Previously even an idle
+  window repainted ~1×/sec, which kept the wgpu swapchain presenting; on Windows the GPU
+  driver responds to continuous presentation by raising the global timer resolution to
+  1 ms (defeating CPU power management) and keeping the display/GPU awake — so a focused
+  window never let the machine idle or sleep. Now, when idle, the app emits **zero
+  frames** and repaints only on real events (terminal output, input, window events); the
+  swapchain goes quiet, the driver drops the raised timer, and Windows can sleep the
+  display even while Arbiter is focused. A pane **waiting at a prompt** (`Attention`) is
+  now a **solid** amber dot instead of a pulsing one — a waiting prompt is idle, so it no
+  longer pins the UI at 60fps (the overview's green "running" dot is likewise solid now,
+  matching the tab/header). The usage auto-refresh no longer rides a UI tick at all: its
+  120s cadence runs on a background thread that pokes the helper directly, so a logged-in
+  idle window also emits **zero** frames. Claude actively *working* still animates (the ✻
+  bloom / avatar) as before. macOS behaviour is unchanged in feel; the same idle path applies.
+- **Usage refresh button is now just an icon** (no live `M:SS` countdown). A per-second
+  countdown requires a ~1Hz repaint, which is exactly the idle clock that was removed, so
+  it can't coexist with true idle. The button still refetches on click, the auto-refresh
+  still runs every 120s, and the per-meter reset times (e.g. "7d: 1h 41m") are unchanged.
+
 ## [1.0.10] — 2026-06-18
 
 ### Added
