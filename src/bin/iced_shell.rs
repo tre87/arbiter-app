@@ -2557,7 +2557,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 };
                 match text {
                     Some(text) => return iced::clipboard::write(text),
-                    None if allow_interrupt => p.session.write(b"\x03"),
+                    None if allow_interrupt => {
+                        // ^C is real keyboard input → snap to the live bottom, like typing
+                        // (Message::Input) does, so an interrupt while scrolled up jumps
+                        // back to the prompt.
+                        if let Ok(mut t) = p.session.term().lock() {
+                            t.scroll_to_bottom();
+                        }
+                        p.session.write(b"\x03");
+                    }
                     None => {}
                 }
             }
@@ -4374,6 +4382,12 @@ fn nudge_down_1px(el: Element<'static, Message>) -> Element<'static, Message> {
     container(el).padding(iced::Padding { top: 2.0, ..iced::Padding::ZERO }).into()
 }
 
+/// Mirror of `nudge_down_1px`: a 2px bottom pad shifts a centre-aligned child up 1px
+/// without changing the row height. Used to raise the overview Claude avatar.
+fn nudge_up_1px(el: Element<'static, Message>) -> Element<'static, Message> {
+    container(el).padding(iced::Padding { bottom: 2.0, ..iced::Padding::ZERO }).into()
+}
+
 /// One workspace tab pill (web `.tab`): type icon + name + (×) close, 26px tall,
 /// translucent-white border, tinted bg when active. The close is a nested button
 /// (it captures its own clicks, so the tab's select fires only elsewhere). The
@@ -6066,12 +6080,11 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             let reserved = 66.0 + git_px + if running { 19.0 } else { 0.0 };
             let max_chars = (((state.overview_size.width - reserved) / 6.0) as i32).max(6) as usize;
 
-            // Left: Claude icon (when active) + terminal name. The icon, git stats and
-            // status dot all read ~1px high against the title text (their glyphs/marks
-            // centre higher in the line than alphabetic text), so nudge each down 1px.
+            // Left: Claude icon (when active) + terminal name. Raised 1px so the
+            // starburst sits level with the title (centred read a touch low).
             let mut left = row![].spacing(6).align_y(iced::Center);
             if running {
-                left = left.push(nudge_down_1px(claude_icon(13.0)));
+                left = left.push(nudge_up_1px(claude_icon(13.0)));
             }
             left = left.push(
                 text(truncate_name(&data.name, max_chars))

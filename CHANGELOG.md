@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Ctrl+C returns to the prompt:** pressing Ctrl+C (the `^C` interrupt, when there's no
+  selection) while scrolled up in the scrollback now snaps the view back to the live bottom,
+  matching what typing already did — so an interrupt jumps you to the prompt.
+- **Overview Claude avatar alignment:** the static Claude starburst shown left of a terminal's
+  title in the overview is raised 1px so it sits level with the title.
+
 ## [1.0.11] — 2026-06-23
 
 ### Changed
