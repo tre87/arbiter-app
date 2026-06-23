@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.0.11] — 2026-06-23
+
 ### Changed
 - **True idle when idle (lower CPU/GPU; lets the display sleep while focused).** The UI
   no longer runs on a repaint clock when nothing is animating. Previously even an idle
