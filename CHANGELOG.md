@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.0.12] — 2026-06-23
+
 ### Fixed
 - **Ctrl+C returns to the prompt:** pressing Ctrl+C (the `^C` interrupt, when there's no
   selection) while scrolled up in the scrollback now snaps the view back to the live bottom,
