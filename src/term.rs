@@ -47,6 +47,23 @@ fn term_bg() -> Rgb {
     Rgb { r, g, b }
 }
 
+/// App-wide terminal font size in points (CSS-style em; the GPU renderer multiplies
+/// this by the display DPR and rasterises at that resolution — see `crate::gpu`).
+/// Set from Settings on load + change; the renderer reads it when it (re)builds, and
+/// the host rebuilds every pane's renderer when this changes (like a DPI change), so
+/// cell size + the PTY grid stay in lock-step. Default 12pt.
+static FONT_PX: AtomicU32 = AtomicU32::new(12);
+
+/// Set the terminal font size (points) from Settings.
+pub fn set_font_px(n: u32) {
+    FONT_PX.store(n, Ordering::Relaxed);
+}
+
+/// The current terminal font size in points.
+pub fn font_px() -> u32 {
+    FONT_PX.load(Ordering::Relaxed)
+}
+
 /// Active in-terminal find: the matched cell ranges (incl. scrollback), which is
 /// the current one, and the precomputed cell sets for O(1) render highlighting.
 struct Search {

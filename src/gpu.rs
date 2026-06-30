@@ -18,12 +18,12 @@ const SLOT_SOLID: u32 = 0; // fully-covered cell (block cursor)
 const SLOT_BLANK: u32 = 1; // empty coverage (bg-only cells)
 
 /// Terminal type metrics — matched to the web (which the webview renders with
-/// `line-height: normal`): a 12px em, and a cell height equal to the font's
-/// natural line box (ascent − descent + line_gap), which for Menlo is ~14px.
-/// `font_px` is multiplied by the DPR (`scale`) and rasterised at that
-/// resolution so text is crisp on retina/HiDPI. LINE_HEIGHT is an extra leading
-/// multiplier on top of the natural box (1.0 = match the web exactly).
-const FONT_PX: f32 = 12.0;
+/// `line-height: normal`): a 12px em (now user-configurable via
+/// [`crate::term::font_px`]), and a cell height equal to the font's natural line
+/// box (ascent − descent + line_gap), which for Menlo is ~14px. The point size is
+/// multiplied by the DPR (`scale`) and rasterised at that resolution so text is
+/// crisp on retina/HiDPI. LINE_HEIGHT is an extra leading multiplier on top of the
+/// natural box (1.0 = match the web exactly).
 const LINE_HEIGHT: f32 = 1.0;
 
 #[repr(C)]
@@ -169,6 +169,9 @@ pub struct TermGpu {
     bold_face: Option<(Vec<u8>, u32)>,
     em_px: f32,
     scale: f32,
+    /// Font size (points) this renderer was built with — compared against
+    /// [`crate::term::font_px`] so the host can rebuild on a size change.
+    built_pts: u32,
     pub cell_w: u32,
     pub cell_h: u32,
     baseline: f32,
@@ -200,7 +203,7 @@ fn abglyph_scale(font: &FontVec, em_px: f32) -> f32 {
 /// Iced shell) can map a window size to cols/rows without constructing a GPU.
 pub fn measure_cell(font_bytes: &[u8], font_index: u32, scale: f32) -> (u32, u32) {
     let font = FontVec::try_from_vec_and_index(font_bytes.to_vec(), font_index).expect("load font");
-    let em_px = (FONT_PX * scale).round().max(8.0);
+    let em_px = (crate::term::font_px() as f32 * scale).round().max(8.0);
     let px = abglyph_scale(&font, em_px);
     let s = font.as_scaled(px);
     let w = s.h_advance(font.glyph_id('M')).round().max(1.0) as u32;
@@ -220,7 +223,8 @@ impl TermGpu {
         // baseline), from the regular face; glyphs are rasterised by the platform
         // engine (see `crate::raster`). Bold/regular share metrics (monospace).
         let font = FontVec::try_from_vec_and_index(spec.regular.0.clone(), spec.regular.1).expect("load font");
-        let em_px = (FONT_PX * scale).round().max(8.0);
+        let built_pts = crate::term::font_px();
+        let em_px = (built_pts as f32 * scale).round().max(8.0);
         let px = abglyph_scale(&font, em_px);
         let scaled = font.as_scaled(px);
         // Cell width = the rounded glyph advance, matching the web's per-character
@@ -391,7 +395,7 @@ impl TermGpu {
         Self {
             pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex, color_atlas_tex,
             font_name: spec.name.clone(), regular: spec.regular.clone(), bold_face: spec.bold.clone(),
-            em_px, scale, cell_w, cell_h, baseline,
+            em_px, scale, built_pts, cell_w, cell_h, baseline,
             is_srgb: format.is_srgb(),
             atlas_cpu, color_atlas_cpu, glyphs: HashMap::new(), next_slot: 2, color_next: 0,
             per_row, atlas_dirty: true, color_dirty: true,
@@ -404,6 +408,13 @@ impl TermGpu {
     /// font px / cell size track the new DPI (otherwise text halves/doubles).
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// The font size (points) this renderer was built with. The host rebuilds the
+    /// renderer when the Settings font size changes (like a DPI change), so the cell
+    /// size + PTY grid track the new size.
+    pub fn built_pts(&self) -> u32 {
+        self.built_pts
     }
 
     /// Reserve `cells` horizontally-contiguous slots in the colour atlas (a wide
