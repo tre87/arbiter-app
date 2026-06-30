@@ -296,6 +296,10 @@ struct State {
     /// Whether the Settings modal is open, and which tab it's showing.
     settings_open: bool,
     settings_tab: SettingsTab,
+    /// Raw text of the font-size input while it's being edited. Decoupled from the
+    /// clamped `settings.font_size` so typing a multi-digit value isn't clamped
+    /// mid-keystroke (e.g. "1" → 8 → "19" → "89"). Re-synced from settings on open.
+    font_size_input: String,
     /// Whether the keyboard-shortcuts cheat-sheet modal is open.
     shortcuts_open: bool,
     /// The pane whose Claude info popover is open (header info button), if any.
@@ -526,6 +530,8 @@ enum Message {
     SetBackground(String),
     /// Settings → scrollback lines (text input; parsed + clamped).
     SetScrollback(String),
+    /// Settings → terminal font size in points (text input; parsed + clamped).
+    SetFontSize(String),
     /// Settings → screenshot-attach folder (Files tab): set / browse / reset.
     SetScreenshotFolder(String),
     BrowseScreenshotFolder,
@@ -1387,7 +1393,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             usage_helper_cmd("reload");
             USAGE_FETCH_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Message::OpenSettings => state.settings_open = true,
+        Message::OpenSettings => {
+            // Re-sync the font-size edit buffer to the clamped value so a prior
+            // out-of-range edit doesn't reappear in the field.
+            state.font_size_input = state.settings.font_size.to_string();
+            state.settings_open = true;
+        }
         Message::CloseSettings => state.settings_open = false,
         Message::SettingsSelectTab(tab) => state.settings_tab = tab,
         Message::ToggleHideUsageBar(v) => {
@@ -1456,6 +1467,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.settings.scrollback = n;
             arbiter_native::term::SCROLLBACK.store(n, std::sync::atomic::Ordering::Relaxed);
             save_session(state);
+        }
+        Message::SetFontSize(s) => {
+            // Keep the raw digits in the edit buffer so multi-digit typing isn't
+            // clamped mid-keystroke (the box shows exactly what you type). Apply +
+            // persist only the clamped value, and only once the field parses — an
+            // empty/partial field leaves the live size untouched. On the next frame
+            // every pane's renderer rebuilds (see `built_pts`) and the cols/rows
+            // reflow resizes each PTY, so alignment stays exact.
+            let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(3).collect();
+            state.font_size_input = digits.clone();
+            if let Ok(parsed) = digits.parse::<u32>() {
+                let n = parsed.clamp(persist::FONT_SIZE_MIN, persist::FONT_SIZE_MAX);
+                if n != state.settings.font_size {
+                    state.settings.font_size = n;
+                    arbiter_native::term::set_font_px(n);
+                    save_session(state);
+                }
+            }
         }
         Message::ClearSavedData => {
             // Forget the on-disk layout only — live workspaces are untouched.
@@ -3901,6 +3930,31 @@ fn settings_number_row(
         .into()
 }
 
+/// Like `settings_number_row` but the input shows a caller-owned string rather than
+/// a clamped number — for fields whose edit buffer is decoupled from the stored
+/// value (e.g. font size, so multi-digit typing isn't clamped per keystroke).
+fn settings_str_row(
+    label: &str,
+    sub: &str,
+    value: &str,
+    on_input: fn(String) -> Message,
+) -> Element<'static, Message> {
+    let labels = column![
+        text(label.to_string()).size(13).color(TXT_SECONDARY),
+        text(sub.to_string()).size(11).color(TXT_MUTED),
+    ]
+    .spacing(2);
+    let input = text_input("", value)
+        .on_input(on_input)
+        .width(Length::Fixed(90.0))
+        .padding([6, 8])
+        .size(13)
+        .style(settings_input_style);
+    container(row![labels, horizontal_space(), input].spacing(12).align_y(iced::Center))
+        .padding([10, 4])
+        .into()
+}
+
 /// A `label  [picker]` row for the intense-text style (label + hint on the left, a
 /// pick_list on the right) — mirrors `settings_number_row`'s layout.
 fn settings_intense_row(
@@ -4153,6 +4207,15 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     ),
                     state.settings.scrollback,
                     Message::SetScrollback,
+                ),
+                settings_str_row(
+                    "Font size",
+                    &format!(
+                        "Terminal font size in points ({}–{}). Applies to every terminal immediately.",
+                        persist::FONT_SIZE_MIN, persist::FONT_SIZE_MAX
+                    ),
+                    &state.font_size_input,
+                    Message::SetFontSize,
                 ),
                 settings_intense_row(
                     "Bold text style",
@@ -8663,9 +8726,12 @@ impl shader::Primitive for TermPrimitive {
             .or_insert_with(|| {
                 TermGpu::new(device, format, &self.font, scale)
             });
-        // Rebuild when the window moves to a display with a different scale, so
-        // the font px / cell size match the new DPI (else text halves/doubles).
-        if (gpu.scale() - scale).abs() > 0.01 {
+        // Rebuild when the window moves to a display with a different scale (so the
+        // font px / cell size match the new DPI, else text halves/doubles), or when
+        // the Settings font size changed (same kind of change — re-rasterise the
+        // atlas at the new size; the cols/rows reflow below then resizes the PTY).
+        let want_pts = arbiter_native::term::font_px();
+        if (gpu.scale() - scale).abs() > 0.01 || gpu.built_pts() != want_pts {
             *gpu = TermGpu::new(device, format, &self.font, scale);
         }
 
@@ -8814,6 +8880,9 @@ fn main() -> iced::Result {
             // sessions get the configured history depth.
             arbiter_native::term::SCROLLBACK
                 .store(saved_settings.scrollback, std::sync::atomic::Ordering::Relaxed);
+            // Apply the saved font size before the first render so cell size + the
+            // initial PTY grid are computed at the configured size.
+            arbiter_native::term::set_font_px(saved_settings.font_size);
             // Apply the saved intense-text (bold/bright) mode before the first render.
             arbiter_native::term::set_intense_style(saved_settings.intense_text_style.as_u8());
             // Apply the saved background colour before the first render (terminals +
@@ -8945,6 +9014,7 @@ fn main() -> iced::Result {
                 usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
+                font_size_input: saved_settings.font_size.to_string(),
                 settings: saved_settings,
                 settings_open: false,
                 settings_tab: SettingsTab::General,

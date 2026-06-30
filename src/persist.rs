@@ -119,6 +119,10 @@ pub struct Settings {
     /// Scrollback lines kept per terminal (web `devStore.scrollback`).
     #[serde(default = "default_scrollback")]
     pub scrollback: usize,
+    /// Terminal font size in points. Applies to every terminal live (the renderer
+    /// rebuilds + the PTY reflows). Bounded by `FONT_SIZE_MIN`/`MAX`.
+    #[serde(default = "default_font_size")]
+    pub font_size: u32,
     /// Show the terminal split/close buttons (+ their separator) in the titlebar.
     /// Off by default — the split/close shortcuts cover it.
     #[serde(default)]
@@ -224,6 +228,14 @@ fn default_scrollback() -> usize {
 pub const SCROLLBACK_MIN: usize = 100;
 pub const SCROLLBACK_MAX: usize = 100_000;
 
+fn default_font_size() -> u32 {
+    12
+}
+
+/// Bounds for the terminal font size setting (points).
+pub const FONT_SIZE_MIN: u32 = 8;
+pub const FONT_SIZE_MAX: u32 = 32;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -234,6 +246,7 @@ impl Default for Settings {
             overview_usage_footer: true,
             hide_shell_button: false,
             scrollback: default_scrollback(),
+            font_size: default_font_size(),
             show_terminal_buttons: false,
             screenshot_folder: None,
             docs_folder: None,

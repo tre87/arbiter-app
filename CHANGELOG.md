@@ -7,6 +7,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Terminal font size setting (Settings → Display → Terminal).** Pick a point size
+  (8–32); it applies to every open terminal immediately — the renderer rebuilds at the new
+  size and each terminal reflows its columns/rows, so cell alignment and box-drawing stay
+  exact. Persists across restarts.
+
 ## [1.0.12] — 2026-06-23
 
 ### Fixed
