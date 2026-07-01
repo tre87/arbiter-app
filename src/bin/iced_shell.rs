@@ -323,6 +323,9 @@ struct State {
     /// Whether the "Quit Arbiter?" confirmation modal is showing (gated by the
     /// `confirm_on_quit` setting; armed by any app-close gesture).
     quit_confirm: bool,
+    /// Whether the short Claude-usage sign-in explanation modal is showing (opened
+    /// by the header "Sign in" pill; Cancel/Escape dismisses without signing in).
+    usage_login_prompt: bool,
     /// Live keyboard modifiers (Shift/Ctrl/Cmd) for multi-select clicks in the
     /// file explorer. Tracked app-wide via ModifiersChanged.
     modifiers: iced::keyboard::Modifiers,
@@ -500,8 +503,16 @@ enum Message {
     CursorMoved(iced::Point),
     /// New Claude usage data from the sidecar helper.
     UsageUpdated(UsageData),
-    /// Raise the helper's claude.ai sign-in window (titlebar Sign-in button).
+    /// Raise the helper's claude.ai sign-in window (Settings / overview / recover).
     ShowUsageLogin,
+    /// Header "Sign in" pill → open the short sign-in explanation modal (which then
+    /// offers Sign in / Cancel) instead of jumping straight to the login window.
+    ShowUsageLoginPrompt,
+    /// Dismiss the sign-in explanation modal (Cancel / scrim / Escape) — the header
+    /// keeps its Sign in / hide buttons.
+    CancelUsageLoginPrompt,
+    /// Confirm from the sign-in explanation modal → raise the claude.ai login window.
+    ConfirmUsageLogin,
     /// Open / dismiss the org-selection modal.
     ShowUsageOrgMenu,
     CloseUsageOrgMenu,
@@ -532,6 +543,10 @@ enum Message {
     SetScrollback(String),
     /// Settings → terminal font size in points (text input; parsed + clamped).
     SetFontSize(String),
+    /// Settings → open Claude's user `settings.json` in the default editor.
+    OpenClaudeSettings,
+    /// Settings → open Claude's main `.claude.json` in the default editor.
+    OpenClaudeJson,
     /// Settings → screenshot-attach folder (Files tab): set / browse / reset.
     SetScreenshotFolder(String),
     BrowseScreenshotFolder,
@@ -1179,6 +1194,7 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
     if state.explorer_delete.is_some() { take!(state.explorer_delete) }
     if state.close_confirm.is_some() { take!(state.close_confirm) }
     if state.quit_confirm { take!(state.quit_confirm) }
+    if state.usage_login_prompt { take!(state.usage_login_prompt) }
     if state.explorer_menu.is_some() { take!(state.explorer_menu) }
     if state.rename_terminal.is_some() { take!(state.rename_terminal) }
     if state.term_menu.is_some() { take!(state.term_menu) }
@@ -1366,6 +1382,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             );
         }
         Message::ShowUsageLogin => usage_show_login(),
+        Message::ShowUsageLoginPrompt => state.usage_login_prompt = true,
+        Message::CancelUsageLoginPrompt => state.usage_login_prompt = false,
+        Message::ConfirmUsageLogin => {
+            state.usage_login_prompt = false;
+            usage_show_login();
+        }
         Message::ShowUsageOrgMenu => state.usage_org_menu = true,
         Message::CloseUsageOrgMenu => state.usage_org_menu = false,
         Message::SelectUsageOrg(uuid) => {
@@ -1485,6 +1507,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     save_session(state);
                 }
             }
+        }
+        Message::OpenClaudeSettings => {
+            open_or_create_config(claude_settings_json_path(), "{\n}\n");
+        }
+        Message::OpenClaudeJson => {
+            open_or_create_config(claude_main_json_path(), "{\n}\n");
         }
         Message::ClearSavedData => {
             // Forget the on-disk layout only — live workspaces are untouched.
@@ -1820,7 +1848,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         .set_title("Merge complete")
                         .set_description(format!(
                             "Merged '{feature_branch}' into '{main_branch}'. The worktree is kept \
-                             and marked merged — use \"Merge & delete\" to remove it."
+                             and marked merged. Use \"Merge & delete\" to remove it."
                         ))
                         .show();
                 }
@@ -3564,6 +3592,37 @@ fn reveal_label() -> &'static str {
     }
 }
 
+/// Path to Claude's user `settings.json` — inside `$CLAUDE_CONFIG_DIR` or `~/.claude`
+/// (resolved by `claude_shim::claude_config_dir`).
+fn claude_settings_json_path() -> Option<std::path::PathBuf> {
+    arbiter_native::claude_shim::claude_config_dir().map(|d| d.join("settings.json"))
+}
+
+/// Path to Claude's main `.claude.json` — `$CLAUDE_CONFIG_DIR/.claude.json` if that env
+/// var is set, else `~/.claude.json` (a sibling of `~/.claude`, not inside it).
+fn claude_main_json_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".claude.json"))
+}
+
+/// Ensure a config file exists (creating parents + `default` contents if missing) and
+/// open it in the OS default editor, so the Settings "Open …" buttons always land on a
+/// real file. Best-effort — a missing path or failed write just no-ops the open.
+fn open_or_create_config(path: Option<std::path::PathBuf>, default: &str) {
+    let Some(path) = path else { return };
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, default);
+    }
+    open_path(&path.to_string_lossy());
+}
+
 /// The text_input id of the explorer rename dialog's name field (for autofocus).
 const EXPLORER_RENAME_INPUT: &str = "explorer-rename-input";
 
@@ -3582,6 +3641,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     }
     if state.quit_confirm {
         return Some(quit_confirm_view());
+    }
+    if state.usage_login_prompt {
+        return Some(usage_login_prompt_view());
     }
     if let Some(m) = &state.explorer_menu {
         if let Some(p) = state.active().project.as_ref() {
@@ -4045,7 +4107,7 @@ fn settings_account(u: &UsageData) -> Element<'static, Message> {
         .into(),
         UsageState::NeedsOrg => column![
             head("Signed in"),
-            settings_hint("Your account has multiple organizations — pick the one to track usage for."),
+            settings_hint("Your account has multiple organizations. Pick the one to track usage for."),
             row![
                 settings_btn("Choose organization", Message::ShowUsageOrgMenu, BtnKind::Primary),
                 settings_btn("Sign out", Message::UsageSignOut, BtnKind::Danger),
@@ -4056,7 +4118,7 @@ fn settings_account(u: &UsageData) -> Element<'static, Message> {
         .into(),
         UsageState::Error => column![
             head("Signed in"),
-            settings_account_line("Usage", "Unavailable — try reconnecting"),
+            settings_account_line("Usage", "Unavailable, try reconnecting"),
             row![
                 settings_btn("Reconnect", Message::ShowUsageLogin, BtnKind::Secondary),
                 settings_btn("Sign out", Message::UsageSignOut, BtnKind::Danger),
@@ -4163,7 +4225,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             settings_section("Saved Data"),
             settings_hint(
                 "Forget the workspace layout and window geometry Arbiter remembers between launches. \
-                 This clears data on disk only — your open terminals aren't affected."
+                 This clears data on disk only; your open terminals aren't affected."
             ),
             row![settings_btn("Clear all saved data", Message::ClearSavedData, BtnKind::Danger)],
         ]
@@ -4190,12 +4252,6 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     Some("Keep the overview window above other windows."),
                     state.settings.overview_topmost,
                     Message::ToggleOverviewTopmost,
-                ),
-                settings_toggle(
-                    "Show usage footer",
-                    Some("Show the Claude usage bars at the bottom of the overview window."),
-                    state.settings.overview_usage_footer,
-                    Message::ToggleOverviewUsageFooter,
                 ),
                 Space::with_height(Length::Fixed(8.0)),
                 settings_section("Terminal"),
@@ -4274,10 +4330,27 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             settings_toggle("Hide usage bar", None, state.settings.hide_usage_bar, Message::ToggleHideUsageBar),
             settings_toggle(
                 "Hide Sonnet usage",
-                Some("Hide the per-model Sonnet meter — Sonnet is rarely the binding limit."),
+                Some("Hide the per-model Sonnet meter; Sonnet is rarely the binding limit."),
                 state.settings.hide_sonnet_usage,
                 Message::ToggleHideSonnetUsage,
             ),
+            settings_toggle(
+                "Show usage footer in overview",
+                Some("Show the Claude usage bars at the bottom of the overview window, when usage isn't hidden."),
+                state.settings.overview_usage_footer,
+                Message::ToggleOverviewUsageFooter,
+            ),
+            Space::with_height(Length::Fixed(8.0)),
+            settings_section("Config"),
+            settings_hint(
+                "Open Claude's config files in your default editor. Changes take effect the next \
+                 time Claude starts. Missing files are created empty."
+            ),
+            row![
+                settings_btn("Open settings.json", Message::OpenClaudeSettings, BtnKind::Secondary),
+                settings_btn("Open .claude.json", Message::OpenClaudeJson, BtnKind::Secondary),
+            ]
+            .spacing(8),
         ]
         .spacing(12),
     };
@@ -4859,7 +4932,7 @@ fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
 
 /// A reset timestamp (epoch ms) → "1d 22h" / "1h 41m" / "15m" (web `formatReset`).
 fn fmt_reset(resets_at_ms: Option<i64>) -> String {
-    let Some(t) = resets_at_ms else { return "—".to_string() };
+    let Some(t) = resets_at_ms else { return "-".to_string() };
     let ms = t - now_ms() as i64;
     if ms <= 0 {
         return "now".to_string();
@@ -4886,7 +4959,7 @@ fn usage_section(
     // `titlebar_row` (a `group_sep`), so the sections here don't carry a trailing one.
     match u.state {
         UsageState::Pending => Some((usage_loading(), 60.0)),
-        UsageState::NeedsLogin => Some((sign_in_button(), 178.0)),
+        UsageState::NeedsLogin => Some((header_signin_row(), 190.0)),
         UsageState::NeedsOrg => {
             Some((tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu), 170.0))
         }
@@ -4971,8 +5044,54 @@ fn tinted_pill_button(label: &str, msg: Message) -> Element<'static, Message> {
 }
 
 /// Sign-in button shown when not authenticated → raises the helper's webview.
+/// Used by the overview footer; the main titlebar uses `header_signin_row` so it
+/// can pair the pill (which opens an explanation first) with a hide button.
 fn sign_in_button() -> Element<'static, Message> {
     tinted_pill_button("Claude Usage Sign In", Message::ShowUsageLogin)
+}
+
+/// Main-titlebar not-signed-in pill: "Claude Usage Sign In" (opens the explanation
+/// modal) with a trailing × — sized and seated exactly like a workspace tab's close
+/// button — that hides the usage section (the persisted `hide_usage_bar` setting).
+/// The azure fill/border is drawn by the container; the label and × are nested
+/// buttons so each captures its own click (like the tab's close vs. select).
+fn header_signin_row() -> Element<'static, Message> {
+    // Azure text tint, matching `tinted_pill_button`.
+    let tint = iced::Color::from_rgb8(0x8f, 0xc4, 0xff);
+    let label = button(text("Claude Usage Sign In").size(12))
+        .padding(0)
+        .on_press(Message::ShowUsageLoginPrompt)
+        .style(move |_t: &iced::Theme, s| button::Style {
+            text_color: if matches!(s, button::Status::Hovered) {
+                iced::Color::from_rgb8(0xc2, 0xdf, 0xff) // brighten the label on hover
+            } else {
+                tint
+            },
+            ..Default::default()
+        });
+    // × at 12px, centred, padding 2 — the same seating as the workspace-tab close.
+    let hide = button(cmdi(mdi_path::CLOSE, 12.0, tint))
+        .padding(2)
+        .on_press(Message::ToggleHideUsageBar(true))
+        .style(|_t: &iced::Theme, s| button::Style {
+            background: matches!(s, button::Status::Hovered)
+                .then(|| iced::Background::Color(white_a(0.18))),
+            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            ..Default::default()
+        });
+    let content = row![label, hide].spacing(6).align_y(iced::Center).height(Length::Fixed(26.0));
+    container(content)
+        .padding([0, 10])
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.15))),
+            border: iced::Border {
+                color: iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.35),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Warning shown when signed in but the usage fetch failed (amber icon + text);
@@ -5586,6 +5705,34 @@ fn quit_confirm_view() -> Element<'static, Message> {
     modal_scrim(modal_panel(panel.into()), Message::CancelQuit)
 }
 
+/// Short, plain-language explanation shown when the header "Sign in" pill is
+/// clicked. Sign in raises the claude.ai login window; Cancel/scrim/Escape closes
+/// it and leaves the header's Sign in / hide buttons in place.
+fn usage_login_prompt_view() -> Element<'static, Message> {
+    let panel = column![
+        text("Claude usage").size(15).font(ui_semibold()),
+        text(
+            "Arbiter can show how much of your Claude limits you've used, like your 5-hour and \
+             weekly allowance, right in the titlebar.\n\nSign in opens a Claude sign-in window. \
+             After you sign in, Arbiter reads only those usage numbers, nothing else, and your \
+             login stays on this computer."
+        )
+        .size(13)
+        .color(TXT_SECONDARY),
+        row![
+            horizontal_space(),
+            settings_btn("Cancel", Message::CancelUsageLoginPrompt, BtnKind::Secondary),
+            settings_btn("Sign in", Message::ConfirmUsageLogin, BtnKind::Primary),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(400.0));
+    modal_scrim(modal_panel(panel.into()), Message::CancelUsageLoginPrompt)
+}
+
 /// The whole titlebar row, laid out for the available width `avail_w` (from
 /// `responsive`): the right-side action buttons always show and take priority;
 /// the usage bars + refresh drop out first when space is tight; the tabs shrink
@@ -6185,10 +6332,12 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         }
     }
 
-    // Usage footer (toggleable): the SAME 5h/7d bars + refresh button as the main
-    // titlebar, fed by the same shared state (state.usage; refresh → RefreshUsage), so
-    // it tracks the live data and the manual button with no extra polling.
-    let footer = if state.settings.overview_usage_footer {
+    // Usage footer: the SAME 5h/7d bars + refresh button as the main titlebar, fed by
+    // the same shared state (state.usage; refresh → RefreshUsage), so it tracks the live
+    // data and the manual button with no extra polling. Hidden whenever usage is hidden
+    // globally (the shared `hide_usage_bar` setting the titlebar uses); when usage is
+    // shown, the overview's own "Show usage footer" toggle still gates it independently.
+    let footer = if !state.settings.hide_usage_bar && state.settings.overview_usage_footer {
         overview_usage(&state.usage, state.settings.hide_sonnet_usage, state.overview_size.width)
     } else {
         None
@@ -8855,7 +9004,7 @@ fn main() -> iced::Result {
 
     let title = |state: &State, id: iced::window::Id| {
         if state.overview_window == Some(id) {
-            "Arbiter — Overview".to_string()
+            "Arbiter · Overview".to_string()
         } else {
             "Arbiter native".to_string()
         }
@@ -9029,6 +9178,7 @@ fn main() -> iced::Result {
                 explorer_delete: None,
                 close_confirm: None,
                 quit_confirm: false,
+                usage_login_prompt: false,
                 modifiers: iced::keyboard::Modifiers::default(),
                 term_menu: None,
                 ws_tab_menu: None,
