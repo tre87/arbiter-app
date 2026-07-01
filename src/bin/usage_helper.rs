@@ -189,7 +189,7 @@ pub fn run() {
     });
 
     let window = WindowBuilder::new()
-        .with_title("Arbiter — Claude sign-in")
+        .with_title("Arbiter · Claude sign-in")
         .with_inner_size(LogicalSize::new(460.0, 680.0))
         .with_visible(false) // stay hidden unless the user asks to sign in
         .build(&event_loop)

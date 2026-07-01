@@ -105,8 +105,8 @@ fi
 
 # Private per-pane command history: switch to a fresh history list backed by this
 # pane's file (set AFTER the user's rc, so an oh-my-zsh HISTFILE can't win). `fc -p`
-# pushes a new, isolated list read from the file — empty for a new terminal, the
-# pane's prior commands on restore — so panes don't share each other's up-arrow and
+# pushes a new, isolated list read from the file (empty for a new terminal, the
+# pane's prior commands on restore), so panes don't share each other's up-arrow and
 # history survives relaunch. Set HISTFILE too so SAVEHIST writes back to our file.
 if [[ -n "$ARBITER_HISTFILE" ]]; then
   export HISTFILE="$ARBITER_HISTFILE"
@@ -176,7 +176,7 @@ pub fn detect_git_bash() -> Option<String> {
 /// re-prepends the claude-shim dir after $PROFILE.
 #[cfg(target_os = "windows")]
 const PS_INIT: &str = r#"$global:__arbiter_orig_prompt = $function:prompt
-# Point PSReadLine's history at this pane's file at SCRIPT TOP LEVEL — i.e. before
+# Point PSReadLine's history at this pane's file at SCRIPT TOP LEVEL, i.e. before
 # the REPL's first ReadLine, which is when PSReadLine initialises its history. Set
 # here, PSReadLine natively LOADS our file (not the global default, so no leakage)
 # and SAVES to it incrementally. Doing this in the prompt function instead was too

@@ -9,9 +9,21 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ### Added
 - **Terminal font size setting (Settings → Display → Terminal).** Pick a point size
-  (8–32); it applies to every open terminal immediately — the renderer rebuilds at the new
+  (8–32); it applies to every open terminal immediately. The renderer rebuilds at the new
   size and each terminal reflows its columns/rows, so cell alignment and box-drawing stay
   exact. Persists across restarts.
+- **Open Claude config from Settings (Settings → Claude Usage → Config).** Buttons that open
+  Claude's `settings.json` and `~/.claude.json` in your default editor (resolving
+  `$CLAUDE_CONFIG_DIR` / `~/.claude`), on macOS and Windows. A missing file is created empty
+  so the button always opens something.
+- **Hiding usage now hides it everywhere.** The overview usage footer is hidden whenever
+  usage is hidden globally (the same "Hide usage bar" setting the titlebar × toggles). The
+  overview's own "Show usage footer" toggle still hides just the footer independently when
+  usage is shown.
+- **Dismiss & explain the titlebar usage sign-in.** The header "Claude Usage Sign In" prompt
+  now has a small × to hide it outright (the same "Hide usage bar" setting, persisted).
+  Clicking Sign in first shows a short, plain-language explanation of what signing in does
+  and what data is read, with Sign in / Cancel. Cancel leaves the header as-is.
 
 ## [1.0.12] — 2026-06-23
 
