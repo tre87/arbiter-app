@@ -1260,6 +1260,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 && now_ms().saturating_sub(state.usage_started_ms) >= USAGE_PENDING_TIMEOUT_MS
             {
                 state.usage.state = UsageState::NeedsLogin;
+                set_usage_poll(state.usage.state); // quiet the poll (incl. any retry)
             }
         }
         Message::Input(bytes) => {
@@ -1374,12 +1375,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
             state.usage = data;
-            // The background poll only pokes the helper while we're showing live data;
-            // mirror that here so it pauses the moment we drop out of Ok.
-            USAGE_POLL_OK.store(
-                matches!(state.usage.state, UsageState::Ok),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            // Re-sync the background poll to the new state: normal cadence while Ok,
+            // reload-to-recover while Error, quiet otherwise.
+            set_usage_poll(state.usage.state);
         }
         Message::ShowUsageLogin => usage_show_login(),
         Message::ShowUsageLoginPrompt => state.usage_login_prompt = true,
@@ -1394,6 +1392,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.usage_org = Some(uuid.clone());
             state.usage_org_menu = false;
             state.usage.state = UsageState::Pending; // loading until the helper replies
+            set_usage_poll(state.usage.state);
             usage_helper_cmd(&format!("org:{uuid}"));
             save_session(state);
         }
@@ -1404,7 +1403,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // leaves an actionable state even if the helper isn't running.
             state.usage = UsageData { state: UsageState::NeedsLogin, ..Default::default() };
             state.usage_started_ms = now_ms();
-            USAGE_POLL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            set_usage_poll(state.usage.state);
             save_session(state);
         }
         Message::RefreshUsage => {
@@ -1414,6 +1413,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // poll escalates to another reload if this one never answers.
             usage_helper_cmd("reload");
             USAGE_FETCH_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Refreshing from the error pill: show "Loading…" as feedback and re-arm the
+            // pending timeout, so a reload that never answers falls back to Sign in
+            // rather than sticking on "Usage unavailable". (From Ok we leave the bars in
+            // place: no jarring flash to loading on a routine manual refresh.)
+            if state.usage.state == UsageState::Error {
+                state.usage.state = UsageState::Pending;
+                state.usage_started_ms = now_ms();
+                set_usage_poll(state.usage.state);
+            }
         }
         Message::OpenSettings => {
             // Re-sync the font-size edit buffer to the clamped value so a prior
@@ -4766,11 +4774,19 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
 /// ("show\n") when the user clicks the titlebar Sign-in button.
 static HELPER_STDIN: std::sync::Mutex<Option<std::process::ChildStdin>> = std::sync::Mutex::new(None);
 
-/// Whether the background usage poll should poke the helper — true only while we're
-/// showing live data (logged in). Mirrors `state.usage.state == Ok`; the poll thread
-/// stays quiet otherwise (signed out / loading / error) so it never disturbs a
-/// sign-in in progress.
+/// Whether the background usage poll should run its normal refetch cadence: true
+/// only while we're showing live data (logged in). Mirrors `state.usage.state == Ok`.
+/// In the `Error` state the poll switches to `USAGE_POLL_RETRY` instead; in every
+/// other state (signed out / loading / needs-login) it stays quiet so it never
+/// disturbs a sign-in in progress.
 static USAGE_POLL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the background poll should keep trying to *recover*: true only in the
+/// `Error` state (signed in, but the usage fetch failed). Each cycle it issues a
+/// reload to respawn a likely-dead renderer and re-run the fetch, until it recovers
+/// (→ `Ok`) or the user signs out. Without this the error state was a dead end: no
+/// refresh button and a paused poll, so it never healed on its own.
+static USAGE_POLL_RETRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A usage fetch was sent but its data hasn't come back yet. If the next 120s poll
 /// finds this still set, the helper's renderer likely died (Windows discards a
@@ -4778,6 +4794,16 @@ static USAGE_POLL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Lives outside `State` because the 120s cadence runs on a background thread (off the
 /// UI loop, so an idle app emits zero frames); `UsageUpdated` clears it.
 static USAGE_FETCH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep the poll's gate flags in lockstep with the usage state: `Ok` runs the normal
+/// refetch cadence, `Error` keeps reloading to recover, everything else stays quiet.
+/// Call after every assignment to `state.usage.state` so the background thread (which
+/// can't see `state`) always agrees with the UI.
+fn set_usage_poll(usage: UsageState) {
+    use std::sync::atomic::Ordering::Relaxed;
+    USAGE_POLL_OK.store(matches!(usage, UsageState::Ok), Relaxed);
+    USAGE_POLL_RETRY.store(matches!(usage, UsageState::Error), Relaxed);
+}
 
 /// Send a line to the usage helper's stdin.
 fn usage_helper_cmd(line: &str) {
@@ -4885,14 +4911,20 @@ fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
                 use std::sync::atomic::Ordering::Relaxed;
                 loop {
                     std::thread::sleep(Duration::from_millis(USAGE_REFRESH_MS));
-                    if !USAGE_POLL_OK.load(Relaxed) {
-                        continue;
-                    }
-                    if USAGE_FETCH_PENDING.swap(true, Relaxed) {
+                    if USAGE_POLL_OK.load(Relaxed) {
+                        // Live data: normal refetch, escalating to a reload if the
+                        // previous fetch went unanswered (hidden renderer likely died).
+                        if USAGE_FETCH_PENDING.swap(true, Relaxed) {
+                            usage_helper_cmd("reload");
+                        } else {
+                            usage_helper_cmd("fetch");
+                        }
+                    } else if USAGE_POLL_RETRY.load(Relaxed) {
+                        // Error state (signed in, fetch failed): keep reloading to
+                        // respawn the renderer and re-run the fetch until it recovers.
                         usage_helper_cmd("reload");
-                    } else {
-                        usage_helper_cmd("fetch");
                     }
+                    // else: signed out / loading / needs-login → stay quiet.
                 }
             });
         }
@@ -5094,8 +5126,12 @@ fn header_signin_row() -> Element<'static, Message> {
         .into()
 }
 
-/// Warning shown when signed in but the usage fetch failed (amber icon + text);
-/// clicking re-opens the sign-in webview to recover.
+/// Warning shown when signed in but the usage fetch failed (amber icon + text).
+/// Clicking RETRIES (reloads the helper → respawns the renderer + refetches) rather
+/// than opening the sign-in webview: the failure is a transient fetch error, not a
+/// logout, so a retry is the right recovery. If the reload reveals a genuine logout
+/// the state flips to NeedsLogin and the Sign-in button takes over. (Settings →
+/// "Reconnect" still opens the webview for the heavier re-auth path.)
 fn usage_warning() -> Element<'static, Message> {
     let amber = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
     button(
@@ -5104,7 +5140,7 @@ fn usage_warning() -> Element<'static, Message> {
             .align_y(iced::Center),
     )
     .padding([3, 6])
-    .on_press(Message::ShowUsageLogin)
+    .on_press(Message::RefreshUsage)
     .style(|_t: &iced::Theme, s| button::Style {
         background: matches!(s, button::Status::Hovered)
             .then(|| iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),

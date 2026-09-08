@@ -25,6 +25,18 @@ history belongs to the prior Tauri/Vue web app it replaced.
   Clicking Sign in first shows a short, plain-language explanation of what signing in does
   and what data is read, with Sign in / Cancel. Cancel leaves the header as-is.
 
+### Fixed
+- **"Usage unavailable" now recovers on its own, and clicking it retries.** This state means
+  you're still signed in but the usage fetch failed transiently (network blip, a 5xx/429 from
+  claude.ai, or the hidden WebView2 renderer being discarded), which is why opening it showed a
+  working Claude chat. Previously it was a dead end: the error state had no refresh button and
+  the 120s background poll paused (it only ran while usage was `Ok`), so nothing retried.
+  Clicking the "Usage unavailable" pill now retries (reloads the helper → respawns the renderer
+  + refetches) instead of opening the sign-in webview, showing "Loading…" as feedback; if the
+  reload reveals a genuine logout it flips to Sign in. The background poll also keeps reloading
+  while in the error state until it recovers. (Settings → "Reconnect" still opens the webview
+  for the heavier re-auth path.)
+
 ## [1.0.12] — 2026-06-23
 
 ### Fixed
