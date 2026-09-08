@@ -46,6 +46,13 @@ pub enum SavedNode {
         /// restore → an empty history, which is the intended "new terminal" behaviour).
         #[serde(default)]
         history_id: Option<String>,
+        /// The command that put this terminal where it is, replayed on restore. Set
+        /// when the pane is detected as remote, so a relaunch re-establishes the same
+        /// ssh session instead of dropping you at a local prompt. Kept as the literal
+        /// line the user typed, which is what makes it work for any host, jump-host
+        /// chain or wrapper without Arbiter needing to model connections.
+        #[serde(default)]
+        startup_cmd: Option<String>,
     },
 }
 
@@ -307,6 +314,7 @@ mod tests {
                             claude_running: true,
                             claude_session: Some("sess-abc-123".into()),
                             history_id: Some("hist-abc-1".into()),
+                            startup_cmd: None,
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
@@ -315,6 +323,7 @@ mod tests {
                             claude_running: false,
                             claude_session: None,
                             history_id: None,
+                            startup_cmd: Some("ssh mini".into()),
                         }),
                     },
                 },
@@ -327,6 +336,7 @@ mod tests {
                         claude_running: false,
                         claude_session: None,
                         history_id: None,
+                        startup_cmd: None,
                     },
                 },
             ],
@@ -338,14 +348,30 @@ mod tests {
         assert_eq!(back.workspaces.len(), 2);
         assert_eq!(back.main_window.unwrap().width, 1200.0);
         match &back.workspaces[0].layout {
-            SavedNode::Split { vertical, ratio, a, .. } => {
+            SavedNode::Split { vertical, ratio, a, b } => {
                 assert!(*vertical);
                 assert!((*ratio - 0.4).abs() < 1e-6);
                 match a.as_ref() {
-                    SavedNode::Leaf { claude_running, claude_session, history_id, .. } => {
+                    SavedNode::Leaf {
+                        claude_running,
+                        claude_session,
+                        history_id,
+                        startup_cmd,
+                        ..
+                    } => {
                         assert!(*claude_running);
                         assert_eq!(claude_session.as_deref(), Some("sess-abc-123"));
                         assert_eq!(history_id.as_deref(), Some("hist-abc-1"));
+                        assert!(startup_cmd.is_none(), "a local pane saves no startup command");
+                    }
+                    _ => panic!("expected a leaf"),
+                }
+                match b.as_ref() {
+                    // The remote pane: its ssh line round-trips so a relaunch can
+                    // replay it.
+                    SavedNode::Leaf { startup_cmd, claude_running, .. } => {
+                        assert_eq!(startup_cmd.as_deref(), Some("ssh mini"));
+                        assert!(!claude_running, "a remote pane must not ask for a local claude");
                     }
                     _ => panic!("expected a leaf"),
                 }
@@ -365,10 +391,11 @@ mod tests {
         assert!(s.settings.hide_sonnet_usage);
         assert!(!s.settings.hide_usage_bar);
         match &s.workspaces[0].layout {
-            SavedNode::Leaf { claude_running, claude_session, history_id, .. } => {
+            SavedNode::Leaf { claude_running, claude_session, history_id, startup_cmd, .. } => {
                 assert!(!claude_running);
                 assert!(claude_session.is_none());
                 assert!(history_id.is_none()); // absent in old saves → fresh id on restore
+                assert!(startup_cmd.is_none());
             }
             _ => panic!("expected a leaf"),
         }

@@ -66,6 +66,18 @@ pub struct Session {
     claude_running: Arc<AtomicBool>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
     claude: Arc<crate::claude_status::ClaudeHandle>,
+    /// The shell exited (the PTY reader hit EOF). Nothing can be written to this
+    /// session any more; the pane shows it as disconnected and offers Reconnect,
+    /// which respawns rather than trying to revive it.
+    exited: Arc<AtomicBool>,
+    /// The input line being typed, and the last line submitted with Enter. Fed only
+    /// from real keystrokes (see `note_typed`), so PTY query replies and program
+    /// output can never pollute them.
+    typed_line: Arc<Mutex<TypedLine>>,
+    last_command: Arc<Mutex<Option<String>>>,
+    /// A startup command seeded from the saved layout on restore, so a replayed
+    /// command survives the next save even though nobody typed it this run.
+    seeded_cmd: Arc<Mutex<Option<String>>>,
     _watcher: Arc<Mutex<Option<GitWatcher>>>,
     _child: Box<dyn Child + Send + Sync>,
 }
@@ -107,6 +119,7 @@ impl Session {
         let git = Arc::new(Mutex::new(None));
         let watcher: Arc<Mutex<Option<GitWatcher>>> = Arc::new(Mutex::new(None));
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
+        let exited = Arc::new(AtomicBool::new(false));
 
         // Shared Claude status, updated by the capture/hook watcher (registered
         // here so it routes by cwd / session id) + the reader (spinner/menu →
@@ -124,8 +137,11 @@ impl Session {
             let watcher = watcher.clone();
             let cmd_epoch = cmd_epoch.clone();
             let writer_tx = writer_tx.clone();
+            let exited = exited.clone();
             std::thread::spawn(move || {
-                reader_loop(reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch)
+                reader_loop(
+                    reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch, exited,
+                )
             });
         }
 
@@ -151,9 +167,53 @@ impl Session {
             claude_running,
             git,
             claude,
+            exited,
+            typed_line: Arc::new(Mutex::new(TypedLine::default())),
+            last_command: Arc::new(Mutex::new(None)),
+            seeded_cmd: Arc::new(Mutex::new(None)),
             _watcher: watcher,
             _child: child,
         })
+    }
+
+    /// True once this pane's shell has exited. The screen keeps its last contents but
+    /// nothing can be written to it any more, so the pane offers Reconnect (which
+    /// respawns the session) rather than pretending to still be live.
+    pub fn exited(&self) -> bool {
+        self.exited.load(Ordering::Relaxed)
+    }
+
+    /// Record keystrokes on their way to the PTY, so the pane can remember the command
+    /// that is currently running in it. Enter promotes the line, backspace edits it,
+    /// and anything else non-printable clears it.
+    ///
+    /// Deliberately crude: this tracks a plain typed line and gives up on arrow keys,
+    /// history recall, tab completion or a multi-line entry. Giving up means the pane
+    /// remembers nothing and restores to a plain shell, which is the safe direction. It
+    /// must never end up holding a line the user did not actually run.
+    pub fn note_typed(&self, bytes: &[u8]) {
+        let mut line = self.typed_line.lock().unwrap();
+        if let Some(cmd) = line.fold(bytes) {
+            *self.last_command.lock().unwrap() = Some(cmd);
+        }
+    }
+
+    /// Seed the startup command on restore, so a replayed ssh line is still known to
+    /// this session (nobody typed it) and survives the next save.
+    pub fn set_startup_cmd(&self, cmd: &str) {
+        *self.seeded_cmd.lock().unwrap() = Some(cmd.to_string());
+    }
+
+    /// The command to replay to rebuild this pane, if there is one.
+    ///
+    /// Only remote panes ever report one. A local pane is fully described by its shell
+    /// and cwd, which the saved layout already carries, and replaying its last command
+    /// could re-run something with side effects on every launch.
+    pub fn startup_cmd(&self) -> Option<String> {
+        if let Some(seeded) = self.seeded_cmd.lock().unwrap().clone() {
+            return Some(seeded);
+        }
+        self.is_remote().then(|| self.last_command.lock().unwrap().clone()).flatten()
     }
 
     /// Current Claude status for this pane (stats + derived lifecycle). Cheap;
@@ -259,6 +319,51 @@ impl Session {
 
 const MAX_UTF8_REMAINDER: usize = 8;
 
+/// The input line being typed into a pane, tracked well enough to recognise a plain
+/// command and to know when it can no longer be trusted.
+///
+/// Printable ASCII accumulates, backspace deletes, Enter submits. Any control byte
+/// POISONS the line: it submits nothing until the next Enter starts a fresh one. That
+/// is what makes this safe rather than clever. An arrow key, history recall, tab
+/// completion or Ctrl+C means the line on screen is no longer the line seen here, so
+/// the pane must remember nothing rather than something the user never ran. Poisoning
+/// (not merely clearing) matters because the tail of an escape sequence is itself
+/// printable: without it, an up-arrow leaves `[A` behind and submits *that*.
+#[derive(Default)]
+struct TypedLine {
+    line: String,
+    poisoned: bool,
+}
+
+impl TypedLine {
+    /// Fold typed bytes in, returning the last command submitted with Enter, if any.
+    /// Pure state machine, so it is tested without a PTY.
+    fn fold(&mut self, bytes: &[u8]) -> Option<String> {
+        let mut submitted = None;
+        for &b in bytes {
+            match b {
+                b'\r' | b'\n' => {
+                    let cmd = std::mem::take(&mut self.line).trim().to_string();
+                    let trusted = !std::mem::take(&mut self.poisoned);
+                    if trusted && !cmd.is_empty() {
+                        submitted = Some(cmd);
+                    }
+                }
+                0x08 | 0x7f => {
+                    self.line.pop();
+                }
+                0x20..=0x7e if !self.poisoned => self.line.push(b as char),
+                0x20..=0x7e => {}
+                _ => {
+                    self.line.clear();
+                    self.poisoned = true;
+                }
+            }
+        }
+        submitted
+    }
+}
+
 /// Bit index for one spinner glyph, or `None` if the char isn't one. The animated
 /// bloom frames are the star/asterisk dingbats U+2722..U+273F (verified by capturing
 /// the CLI); tool spinners and Claude's window-title spinner use Braille
@@ -299,6 +404,7 @@ fn reader_loop(
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
     watcher: Arc<Mutex<Option<GitWatcher>>>,
     cmd_epoch: CmdEpoch,
+    exited: Arc<AtomicBool>,
 ) {
     let claude_running = claude.claude_running.clone();
     let mut buf = [0u8; 8192];
@@ -311,7 +417,17 @@ fn reader_loop(
 
     loop {
         let n = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            // EOF (or a dead PTY): the shell is gone. Publish that and wake the UI, so
+            // a pane whose shell exited can render as such and offer to reconnect
+            // instead of sitting on a frozen screen forever. Writes to this PTY are
+            // silently dropped from here on, so recovery has to respawn the session.
+            Ok(0) | Err(_) => {
+                exited.store(true, Ordering::Relaxed);
+                claude_running.store(false, Ordering::Relaxed);
+                claude.set_remote(false);
+                wake_ui();
+                break;
+            }
             Ok(n) => n,
         };
         // Stitch any partial UTF-8 from last read onto this chunk.
@@ -717,11 +833,56 @@ fn hex(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_spinner_key, git_relevant_change};
+    use super::{chunk_spinner_key, git_relevant_change, TypedLine};
     use std::path::Path;
 
     fn key(s: &str) -> Option<u64> {
         chunk_spinner_key(s.as_bytes())
+    }
+
+    /// Type `s` a byte at a time (as real keystrokes arrive) and return the last
+    /// command submitted.
+    fn typed(s: &str) -> Option<String> {
+        let mut t = TypedLine::default();
+        let mut last = None;
+        for b in s.bytes() {
+            if let Some(cmd) = t.fold(&[b]) {
+                last = Some(cmd);
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn remembers_the_submitted_command() {
+        assert_eq!(typed("ssh mini\r").as_deref(), Some("ssh mini"));
+        // Surrounding whitespace is trimmed, and the last submission wins.
+        assert_eq!(typed("  ssh mini  \r").as_deref(), Some("ssh mini"));
+        assert_eq!(typed("ls\rssh mini\r").as_deref(), Some("ssh mini"));
+        // Backspace edits before submitting.
+        assert_eq!(typed("ssh minx\u{7f}i\r").as_deref(), Some("ssh mini"));
+    }
+
+    #[test]
+    fn nothing_is_remembered_without_a_submission() {
+        assert_eq!(typed("ssh mini"), None); // still being typed
+        assert_eq!(typed(""), None);
+        assert_eq!(typed("   \r"), None); // a bare Enter submits nothing
+    }
+
+    // The safety property. Tracking a plain typed line cannot survive history recall,
+    // completion or cursor movement, so those must abandon the line rather than leave a
+    // half-formed one that could be replayed on restore as if the user had run it.
+    #[test]
+    fn control_sequences_abandon_the_line() {
+        // Up-arrow (history recall): the real command never passed through here.
+        assert_eq!(typed("ssh mini\u{1b}[A\r"), None);
+        // Tab completion.
+        assert_eq!(typed("ssh mi\t\r"), None);
+        // Ctrl+C on a half-typed line.
+        assert_eq!(typed("ssh mini\u{3}\r"), None);
+        // A line abandoned mid-way still lets the NEXT clean line be remembered.
+        assert_eq!(typed("ssh mi\u{1b}[A\rssh mini\r").as_deref(), Some("ssh mini"));
     }
 
     #[test]

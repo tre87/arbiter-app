@@ -452,6 +452,9 @@ enum Message {
     /// Dismiss the quit modal.
     CancelQuit,
     SwitchShell(pane_grid::Pane),
+    /// Respawn a pane and replay its startup command. Offered when its shell has
+    /// exited (a dropped ssh session, a slept remote host) or from the context menu.
+    Reconnect(pane_grid::Pane),
     ShiftEnter,
     /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
     /// no selection (plain Ctrl+C).
@@ -581,6 +584,7 @@ fn spawn_restored(
     claude_running: bool,
     claude_session: Option<&str>,
     history_id: &str,
+    startup_cmd: Option<&str>,
 ) -> (Session, ShellKind) {
     // A saved cwd that no longer exists falls back to the shell's default dir.
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
@@ -593,7 +597,14 @@ fn spawn_restored(
             (spawn_session(None, cwd, history_id), ShellKind::PowerShell)
         }
     };
-    if claude_running {
+    // A remote pane replays the command that built it (its ssh line) and stops there:
+    // it lands at the far host's prompt in the right place, and the user starts Claude.
+    // Nothing here has to discover or guess a remote session id, so there is nothing to
+    // go stale and no chance of attaching to the wrong conversation.
+    if let Some(cmd) = startup_cmd {
+        session.set_startup_cmd(cmd);
+        session.write(format!("{cmd}\r").as_bytes());
+    } else if claude_running {
         // Relaunch Claude here — resuming the previous conversation if one was bound,
         // else a fresh session. The command queues in the PTY and runs at the shell's
         // first prompt (after rc sets the shim PATH), so it goes through our launcher
@@ -619,7 +630,15 @@ fn saved_to_config(
             a: Box::new(saved_to_config(*a, git_bash)),
             b: Box::new(saved_to_config(*b, git_bash)),
         },
-        persist::SavedNode::Leaf { name, shell, cwd, claude_running, claude_session, history_id } => {
+        persist::SavedNode::Leaf {
+            name,
+            shell,
+            cwd,
+            claude_running,
+            claude_session,
+            history_id,
+            startup_cmd,
+        } => {
             // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
             let history_id = history_id.unwrap_or_else(new_history_id);
             let (session, kind) = spawn_restored(
@@ -629,6 +648,7 @@ fn saved_to_config(
                 claude_running,
                 claude_session.as_deref(),
                 &history_id,
+                startup_cmd.as_deref(),
             );
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind, history_id })
         }
@@ -674,6 +694,7 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                 claude_running: data.map(|d| d.session.claude_running_local()).unwrap_or(false),
                 claude_session: data.and_then(|d| d.session.claude_session_id()),
                 history_id: data.map(|d| d.history_id.clone()),
+                startup_cmd: data.and_then(|d| d.session.startup_cmd()),
             }
         }
     }
@@ -950,6 +971,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     b"\n" | b"\x1b[Z" => p.session.suppress_claude_activity(EDIT_KEY_SUPPRESS_MS),
                     _ => {}
                 }
+                // Track the typed line so a remote pane can remember the ssh command
+                // that built it (see `Session::startup_cmd`). Only real keystrokes go
+                // through here, which is why it isn't done inside `write`.
+                p.session.note_typed(&bytes);
                 p.session.write(&bytes);
             }
         }
@@ -1855,6 +1880,33 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let hid = data.history_id.clone();
                     data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
                     data.shell = kind;
+                }
+            }
+            save_session(state);
+        }
+        Message::Reconnect(pane) => {
+            // Respawn the pane and replay the command that built it. A dead PTY can't be
+            // revived and writes to it are silently dropped, so reconnecting has to mean
+            // a fresh session: assigning over `data.session` drops the old one, which
+            // drops its child and master PTY and releases the reader thread.
+            //
+            // The pane keeps its identity (name, position, history file), so this reads
+            // as the same terminal coming back rather than a new one appearing. Its
+            // scrollback does reset, exactly as it does for a shell switch.
+            let git_bash = state.git_bash.clone();
+            let ws = state.active_mut();
+            if let Some(data) = ws.panes.get_mut(pane) {
+                let cmd = data.session.startup_cmd();
+                let cwd = data.session.cwd();
+                let hid = data.history_id.clone();
+                let shell_arg = match data.shell {
+                    ShellKind::GitBash => git_bash,
+                    ShellKind::PowerShell => None,
+                };
+                data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
+                if let Some(cmd) = cmd {
+                    data.session.set_startup_cmd(&cmd);
+                    data.session.write(format!("{cmd}\r").as_bytes());
                 }
             }
             save_session(state);
@@ -3704,6 +3756,20 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
         false,
     ));
     items = items.push(menu_divider());
+    // Reconnect respawns the shell, so it is offered only where that is what the user
+    // would want: the shell has exited, or the pane has a startup command to replay
+    // (i.e. it is remote). On a healthy local pane it would silently kill a live shell
+    // and its scrollback, so it stays disabled there.
+    let can_reconnect = ws
+        .panes
+        .get(ws.focus)
+        .map_or(false, |d| d.session.exited() || d.session.startup_cmd().is_some());
+    items = items.push(menu_item(
+        mdi_path::REFRESH,
+        "Reconnect".into(),
+        can_reconnect.then_some(Message::Reconnect(ws.focus)),
+        false,
+    ));
     items = items.push(menu_item(mdi_path::BROOM, "Clear Buffer".into(), Some(Message::ClearBuffer), false));
     items = items.push(menu_divider());
     items = items.push(menu_item(mdi_path::ARROW_RIGHT, "Split Pane Vertically".into(), Some(Message::SplitRight), false));
@@ -4054,7 +4120,8 @@ fn main_view(state: &State) -> Element<'_, Message> {
         // (anchored at the cursor); left-clicks still fall through to focus / the
         // header's own buttons (mouse_area only captures the right-press).
         let header: Element<Message> = mouse_area(pane_header(
-            &data.name, focused, data.shell, has_git_bash, pane, status, header_round,
+            &data.name, focused, data.shell, has_git_bash, pane, status, data.session.exited(),
+            header_round,
         ))
         .on_right_press(Message::HeaderMenuOpen(pane))
         .into();
@@ -5427,6 +5494,7 @@ fn pane_header(
     has_git_bash: bool,
     pane: pane_grid::Pane,
     status: Option<Dot>,
+    exited: bool,
     round: iced::border::Radius,
 ) -> Element<'static, Message> {
     let color = if focused {
@@ -5472,6 +5540,12 @@ fn pane_header(
                 }),
         );
     }
+    // Shell gone: the only useful action left on this pane is to bring it back, so the
+    // button shows only then and is tinted amber to read as "needs attention" rather
+    // than as ordinary chrome.
+    if exited {
+        right = right.push(header_reconnect_btn(pane));
+    }
     let sides = container(row![horizontal_space(), right].align_y(iced::Center))
         .center_y(Length::Fill)
         .padding(iced::Padding { top: 2.0, right: 6.0, bottom: 0.0, left: 6.0 });
@@ -5490,7 +5564,22 @@ fn pane_header(
         .into()
 }
 
-
+/// The pane header's Reconnect button, shown only once the shell has exited. Amber
+/// (the attention colour) so a dropped connection is visible across a grid of panes
+/// without having to read each one.
+fn header_reconnect_btn(pane: pane_grid::Pane) -> Element<'static, Message> {
+    let amber = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
+    button(container(cmdi(mdi_path::REFRESH, 13.0, amber)).center_y(Length::Fixed(18.0)))
+        .padding(2)
+        .on_press(Message::Reconnect(pane))
+        .style(move |_t: &iced::Theme, s| button::Style {
+            background: matches!(s, button::Status::Hovered)
+                .then(|| iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
+            border: iced::Border { color: amber, width: 1.0, radius: 3.0.into() },
+            ..Default::default()
+        })
+        .into()
+}
 
 /// How long the scroll indicator stays fully opaque after the last scroll, then
 /// how long it takes to fade out.

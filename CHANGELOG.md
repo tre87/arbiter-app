@@ -33,6 +33,31 @@ history belongs to the prior Tauri/Vue web app it replaced.
   gives ground truth to compare against. That is how to check the markers still match if a
   future Claude release changes its interface.
 
+- **SSH terminals come back on restart, and can be reconnected.** A remote terminal now
+  remembers the command that built it and replays it on relaunch, so a workspace full of
+  SSH panes reopens connected to the right hosts instead of at local prompts. The command
+  is stored as the literal line you typed, which is what makes it work for any host, jump
+  chain or wrapper script without Arbiter needing to understand connections.
+
+  It stops there deliberately: the pane lands at the remote prompt and you start Claude.
+  Nothing has to discover or guess a session id on the far host, so there is nothing that
+  can go stale and no way to attach to the wrong conversation. Local terminals are
+  unchanged, still restoring by respawning their shell in the saved directory, and never
+  replay a command, since re-running an arbitrary last command on every launch could have
+  side effects.
+
+  Only plainly typed commands are remembered. Recalling one with the up-arrow, completing
+  it with Tab, or interrupting it abandons tracking, so the pane restores to a plain shell
+  rather than replaying something you did not run.
+
+- **A terminal whose shell exits now says so, and offers to come back.** Previously the
+  pane sat on a frozen screen with no sign anything had happened, and typing into it did
+  nothing at all, silently. A dropped SSH connection or a slept remote host now puts an
+  amber Reconnect button in the terminal's header, which respawns it and replays its
+  startup command, keeping its name, position and command history. There is also a
+  Reconnect entry in the right-click menu, enabled for remote terminals and any whose
+  shell has exited.
+
 ### Fixed
 - **An SSH terminal no longer shows a permanently green "running" dot.** That dot comes
   from the local shell's integration, and from its point of view `ssh` is a single command
