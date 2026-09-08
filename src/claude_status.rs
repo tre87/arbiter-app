@@ -85,6 +85,9 @@ pub struct ClaudeHandle {
     /// accepted as its startup command (persisted). See `latch_startup_cmd`.
     last_command: Mutex<Option<String>>,
     startup_cmd: Mutex<Option<String>>,
+    /// This pane's private command-history file, consulted when the typed line was
+    /// abandoned (an up-arrow recall). See `histfile_last_remote_cmd`.
+    histfile: Option<std::path::PathBuf>,
     /// Claude's own UI chrome is on this pane's screen (`VtTerm::claude_chrome`).
     /// This is how a REMOTE Claude is recognised, where the local process scan sees
     /// only `ssh` and no statusLine capture is ever written. Latched rather than
@@ -124,6 +127,7 @@ impl ClaudeHandle {
         shell_pid: Option<u32>,
         cwd: Arc<Mutex<Option<String>>>,
         claude_running: Arc<AtomicBool>,
+        histfile: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             pane_id,
@@ -144,6 +148,7 @@ impl ClaudeHandle {
             was_remote: AtomicBool::new(false),
             last_command: Mutex::new(None),
             startup_cmd: Mutex::new(None),
+            histfile,
             on_screen: AtomicBool::new(false),
         })
     }
@@ -181,17 +186,45 @@ impl ClaudeHandle {
         if startup.is_some() {
             return;
         }
-        if let Some(cmd) = self.last_command.lock().unwrap().clone() {
-            if crate::claude::looks_like_remote_cmd(&cmd) {
-                *startup = Some(cmd);
-            }
-        }
+        // Prefer the line we watched being typed; otherwise ask the shell's own history.
+        let typed = self.last_command.lock().unwrap().clone();
+        *startup = typed
+            .filter(|c| crate::claude::looks_like_remote_cmd(c))
+            .or_else(|| self.histfile_last_remote_cmd());
+    }
+
+    /// The most recent line in this pane's private history file, if it invokes a remote
+    /// client.
+    ///
+    /// This is what makes the feature usable in practice. Keystroke tracking refuses to
+    /// guess after an up-arrow recall or a tab completion, and reconnecting by pressing
+    /// up is the common case, so without this a retried `ssh` would never be remembered.
+    /// PowerShell's PSReadLine appends each command as it is accepted, so the line is
+    /// there immediately. bash only appends at its *next* prompt, which for a
+    /// long-running ssh has not happened yet, so there the typed line is what counts.
+    fn histfile_last_remote_cmd(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.histfile.as_ref()?).ok()?;
+        text.lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .filter(|l| crate::claude::looks_like_remote_cmd(l))
+            .map(str::to_string)
     }
 
     /// Seed the startup command from a saved layout on restore, where the command was
-    /// replayed rather than typed.
-    pub fn set_startup_cmd(&self, cmd: &str) {
+    /// replayed rather than typed. Returns whether it was accepted.
+    ///
+    /// Validated by the same whitelist as the live latch, which matters because a save
+    /// written by an earlier build could hold anything that had been typed last. Without
+    /// this check such a value would be replayed AND written straight back out on the
+    /// next save, so it would outlive the fix instead of healing itself.
+    pub fn set_startup_cmd(&self, cmd: &str) -> bool {
+        if !crate::claude::looks_like_remote_cmd(cmd) {
+            return false;
+        }
         *self.startup_cmd.lock().unwrap() = Some(cmd.to_string());
+        true
     }
 
     /// The command that rebuilds this pane, if one was accepted.
@@ -539,7 +572,7 @@ mod tests {
     const FRAME: Duration = Duration::from_millis(40);
 
     fn handle() -> Arc<ClaudeHandle> {
-        ClaudeHandle::new(1, None, Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(true)))
+        ClaudeHandle::new(1, None, Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(true)), None)
     }
 
     // Scrolling Claude's transcript redraws its screen every notch, re-emitting the
@@ -617,6 +650,46 @@ mod tests {
 
         h.note_screen(false);
         assert!(h.on_screen(), "a working turn must keep the pane marked as Claude");
+    }
+
+    // The startup command is latched the moment ssh is detected, not when something
+    // reads it. A save only happens on a layout change, so a lazy latch ran at quit time
+    // and captured whatever had been typed since: `claude` at the remote prompt.
+    #[test]
+    fn latches_the_ssh_command_not_what_was_typed_afterwards() {
+        let h = handle();
+        h.note_command("ssh mini".into());
+        h.set_remote(true); // busy-edge scan finds the ssh client
+        h.note_command("claude".into()); // typed at the remote prompt
+        assert_eq!(h.startup_cmd().as_deref(), Some("ssh mini"));
+    }
+
+    // Everything typed while connecting goes through the same tracking, passphrases
+    // included, so only a recognised client invocation may ever be latched.
+    #[test]
+    fn refuses_to_latch_anything_that_is_not_a_remote_client() {
+        for typed in ["correct horse battery staple", "claude", "cd ~/src"] {
+            let h = handle();
+            h.note_command(typed.into());
+            h.set_remote(true);
+            assert!(h.startup_cmd().is_none(), "{typed:?} must not be latched");
+        }
+    }
+
+    // A save written before the whitelist existed can hold anything. Seeding it on
+    // restore has to reject it, or it would be replayed and written straight back out,
+    // outliving the fix.
+    #[test]
+    fn a_poisoned_saved_command_is_rejected_on_restore() {
+        let h = handle();
+        assert!(!h.set_startup_cmd("claude"), "must not be accepted");
+        assert!(h.startup_cmd().is_none());
+        // A legitimate one still seeds, and then wins over any later typing.
+        assert!(h.set_startup_cmd("ssh mini"));
+        assert_eq!(h.startup_cmd().as_deref(), Some("ssh mini"));
+        h.note_command("ssh other-host".into());
+        h.set_remote(true);
+        assert_eq!(h.startup_cmd().as_deref(), Some("ssh mini"), "first command wins");
     }
 
     // Leaving the ssh session drops both, so the far host's Claude can't linger on a

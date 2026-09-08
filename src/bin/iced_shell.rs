@@ -601,8 +601,12 @@ fn spawn_restored(
     // it lands at the far host's prompt in the right place, and the user starts Claude.
     // Nothing here has to discover or guess a remote session id, so there is nothing to
     // go stale and no chance of attaching to the wrong conversation.
-    if let Some(cmd) = startup_cmd {
-        session.set_startup_cmd(cmd);
+    // Replay only what the whitelist accepts. `set_startup_cmd` reports that, and the
+    // replay is gated on it: a save from an earlier build can hold whatever was typed
+    // last (that bug persisted `claude`), and replaying it would run an unrelated
+    // command in a local shell on every launch.
+    if startup_cmd.is_some_and(|cmd| session.set_startup_cmd(cmd)) {
+        let cmd = session.startup_cmd().unwrap_or_default();
         session.write(format!("{cmd}\r").as_bytes());
     } else if claude_running {
         // Relaunch Claude here — resuming the previous conversation if one was bound,
@@ -1904,8 +1908,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     ShellKind::PowerShell => None,
                 };
                 data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
-                if let Some(cmd) = cmd {
-                    data.session.set_startup_cmd(&cmd);
+                // Same whitelist gate as restore: only replay a recognised remote client.
+                if cmd.as_deref().is_some_and(|c| data.session.set_startup_cmd(c)) {
+                    let cmd = cmd.unwrap_or_default();
                     data.session.write(format!("{cmd}\r").as_bytes());
                 }
             }

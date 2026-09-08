@@ -86,6 +86,10 @@ impl Session {
         // when many Claudes launch at once or several share a cwd.
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         cmd.env(crate::claude_shim::PANE_ID_ENV, id.to_string());
+        // Read before `cmd` is consumed by the spawn. The pane's private history file
+        // (set on the command by the shell layer) is a second source for its startup
+        // command when keystroke tracking gives up on an up-arrow recall.
+        let histfile = cmd.get_env("ARBITER_HISTFILE").map(std::path::PathBuf::from);
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -121,8 +125,13 @@ impl Session {
         // Shared Claude status, updated by the capture/hook watcher (registered
         // here so it routes by cwd / session id) + the reader (spinner/menu →
         // activity/attention). Created before the reader so it gets a clone.
-        let claude =
-            crate::claude_status::ClaudeHandle::new(id, shell_pid, cwd.clone(), claude_running.clone());
+        let claude = crate::claude_status::ClaudeHandle::new(
+            id,
+            shell_pid,
+            cwd.clone(),
+            claude_running.clone(),
+            histfile,
+        );
         crate::claude_status::register(&claude);
 
         {
@@ -195,8 +204,8 @@ impl Session {
 
     /// Seed the startup command on restore, so a replayed ssh line is still known to
     /// this session (nobody typed it) and survives the next save.
-    pub fn set_startup_cmd(&self, cmd: &str) {
-        self.claude.set_startup_cmd(cmd);
+    pub fn set_startup_cmd(&self, cmd: &str) -> bool {
+        self.claude.set_startup_cmd(cmd)
     }
 
     /// The command to replay to rebuild this pane, if there is one.
