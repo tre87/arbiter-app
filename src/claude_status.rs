@@ -166,10 +166,20 @@ impl ClaudeHandle {
         }
     }
 
-    /// Record a command the user submitted in this pane. Kept in memory only; nothing
-    /// reaches disk unless `latch_startup_cmd` accepts it.
+    /// Record a command the user submitted in this pane, if it invokes a remote client.
+    ///
+    /// Filtered HERE, at the point of capture, rather than only when the value is used.
+    /// Keystrokes reach this from the input path, which includes what is typed at ssh's
+    /// own prompts, so a key passphrase or a login password would otherwise sit in
+    /// memory until the next command displaced it. Nothing but a recognised client
+    /// invocation is worth keeping, so nothing else is kept.
+    ///
+    /// It also makes the capture more robust: a passphrase entered after `ssh mini` no
+    /// longer overwrites it, so the connection command is still there to be latched.
     pub fn note_command(&self, cmd: String) {
-        *self.last_command.lock().unwrap() = Some(cmd);
+        if crate::claude::looks_like_remote_cmd(&cmd) {
+            *self.last_command.lock().unwrap() = Some(cmd);
+        }
     }
 
     /// Promote the last submitted command to this pane's startup command, if it invokes
@@ -674,6 +684,20 @@ mod tests {
             h.set_remote(true);
             assert!(h.startup_cmd().is_none(), "{typed:?} must not be latched");
         }
+    }
+
+    // A key passphrase or login password is typed at ssh's own prompt and submitted
+    // with Enter, so it arrives here exactly like a command would. It must not be
+    // retained at all, and it must not displace the connection command that preceded
+    // it, which is still needed for the latch.
+    #[test]
+    fn a_passphrase_entered_after_the_ssh_command_is_not_retained() {
+        let h = handle();
+        h.note_command("ssh tre@10.0.0.16".into());
+        h.note_command("correct horse battery staple".into()); // key passphrase
+        h.note_command("hunter2".into()); // login password
+        h.set_remote(true);
+        assert_eq!(h.startup_cmd().as_deref(), Some("ssh tre@10.0.0.16"));
     }
 
     // A save written before the whitelist existed can hold anything. Seeding it on
