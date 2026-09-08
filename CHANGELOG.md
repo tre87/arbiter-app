@@ -36,6 +36,17 @@ history belongs to the prior Tauri/Vue web app it replaced.
   reload reveals a genuine logout it flips to Sign in. The background poll also keeps reloading
   while in the error state until it recovers. (Settings → "Reconnect" still opens the webview
   for the heavier re-auth path.)
+- **Scrolling a Claude pane no longer shows it as "working".** Claude Code enables mouse
+  reporting, so a wheel notch scrolls *its* transcript: every notch makes it redraw the whole
+  screen, re-emitting whichever "✻ Brewed for 7s" thinking summaries are on it. Those repeats
+  paired into a false working state (azure bar and dot, plus the 60fps clock they force) for
+  as long as you kept scrolling. Entering "working" now also requires the paired spinner frames
+  to draw *different* glyphs, which the ✻ bloom does every frame and a repaint of the same
+  static star never does; a wheel notch handed to a mouse-reporting pane additionally holds off
+  detection for 300ms. Scrolling during a turn that really is working still keeps it working:
+  suppression only blocks *entering* the state, never sustaining it. Most visible on Windows,
+  where every wheel notch reaches the app (a macOS trackpad's pixel deltas usually round to no
+  notch at all).
 
 ## [1.0.12] — 2026-06-23
 

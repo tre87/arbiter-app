@@ -225,15 +225,34 @@ impl Session {
 
 const MAX_UTF8_REMAINDER: usize = 8;
 
-/// True if the chunk contains Claude's working spinner. The animated ✻ bloom
-/// frames are the star/asterisk dingbats U+2722–273F (verified by capturing the
-/// CLI); tool spinners use Braille U+2800–28FF. Deliberately NOT the whole
-/// U+2700–27BF range — that includes the input prompt arrow ❯ (U+276F), which
-/// would make typing read as working. Plain typing/output carries no such glyph.
-fn chunk_has_spinner(bytes: &[u8]) -> bool {
+/// Bit index for one spinner glyph, or `None` if the char isn't one. The animated
+/// bloom frames are the star/asterisk dingbats U+2722..U+273F (verified by capturing
+/// the CLI); tool spinners and Claude's window-title spinner use Braille
+/// U+2800..U+28FF. Deliberately NOT the whole U+2700..U+27BF range: that includes the
+/// input prompt arrow (U+276F), which would make typing read as working.
+///
+/// Each star gets its own bit; the 256 Braille frames fold into the upper 34, so two
+/// of those can collide. Harmless: a collision costs one animation frame before the
+/// next differing pair confirms working.
+fn spinner_bit(c: char) -> Option<u32> {
+    match c as u32 {
+        u @ 0x2722..=0x273F => Some(u - 0x2722),
+        u @ 0x2800..=0x28FF => Some(30 + (u - 0x2800) % 34),
+        _ => None,
+    }
+}
+
+/// Fingerprint of the DISTINCT spinner glyphs in a chunk, or `None` if it has none.
+/// Two chunks fingerprint alike iff they drew the same *set* of spinner glyphs, which
+/// is what separates a real animation frame from a plain repaint: the bloom draws a
+/// different frame every time, while a repaint re-emits whatever static stars are on
+/// screen. Chief among those are the thinking summaries Claude leaves in the
+/// transcript ("* Brewed for 7s"), which use the very glyph the animation cycles
+/// through.
+fn chunk_spinner_key(bytes: &[u8]) -> Option<u64> {
     let text = unsafe { std::str::from_utf8_unchecked(bytes) };
-    text.chars()
-        .any(|c| ('\u{2722}'..='\u{273F}').contains(&c) || ('\u{2800}'..='\u{28FF}').contains(&c))
+    let key = text.chars().filter_map(spinner_bit).fold(0u64, |k, bit| k | 1 << bit);
+    (key != 0).then_some(key)
 }
 
 fn reader_loop(
@@ -322,8 +341,10 @@ fn reader_loop(
                 claude.clear_hook_attention();
             }
             prev_menu = menu;
-            if !menu && chunk_has_spinner(valid) {
-                claude.note_activity();
+            if !menu {
+                if let Some(glyphs) = chunk_spinner_key(valid) {
+                    claude.note_activity(glyphs);
+                }
             }
         }
 
@@ -622,8 +643,43 @@ fn hex(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::footer_relevant_change;
+    use super::{chunk_spinner_key, footer_relevant_change};
     use std::path::Path;
+
+    fn key(s: &str) -> Option<u64> {
+        chunk_spinner_key(s.as_bytes())
+    }
+
+    #[test]
+    fn plain_output_carries_no_spinner() {
+        assert_eq!(key("cargo build --bin arbiter\r\n"), None);
+        // The input prompt arrow sits just outside the star range on purpose: typing
+        // must never read as working.
+        assert_eq!(key("\u{1b}[2K\u{276F} write the file"), None);
+    }
+
+    #[test]
+    fn bloom_frames_fingerprint_differently() {
+        // Consecutive frames of the animation Claude draws at its status line.
+        assert_ne!(key("\u{1b}[23;1H\u{273B}"), key("\u{1b}[23;1H\u{273D}"));
+        // The window-title spinner is Braille, and its frames differ from each other
+        // and from the stars.
+        assert_ne!(key("\u{1b}]0;\u{2802} Claude Code\u{7}"), key("\u{1b}]0;\u{2810} Claude Code\u{7}"));
+        assert_ne!(key("\u{1b}]0;\u{2802} Claude Code\u{7}"), key("\u{1b}[23;1H\u{273B}"));
+    }
+
+    #[test]
+    fn repainting_a_thinking_summary_fingerprints_the_same() {
+        // Scrolling Claude's transcript redraws the screen, re-emitting whichever
+        // "thinking summary" lines are on it. They all use the same star, so however
+        // many land in a chunk the fingerprint is identical: no false animation.
+        let a = key("\u{1b}[14;1H\u{273B} Brewed for 7s");
+        let b = key("\u{1b}[9;1H\u{273B} Crunched for 2m 5s");
+        let both = key("\u{1b}[9;1H\u{273B} Crunched for 2m 5s\u{1b}[14;1H\u{273B} Brewed for 7s");
+        assert!(a.is_some());
+        assert_eq!(a, b);
+        assert_eq!(a, both);
+    }
 
     fn rel(p: &str) -> bool {
         footer_relevant_change(Path::new(p))

@@ -18,7 +18,7 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
 pub type Watcher = Debouncer<RecommendedWatcher>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Lifecycle {
     #[default]
     Closed,
@@ -67,6 +67,11 @@ pub struct ClaudeHandle {
     /// frames an animation-gap apart, so a one-shot repaint (Shift+Tab/Enter, a single
     /// resize) that emits the star glyph once can't false-trigger working.
     last_spinner_ms: AtomicU64,
+    /// Glyph fingerprint of that frame (see `session::chunk_spinner_key`). The pair
+    /// must draw DIFFERENT glyphs to count as an animation, so a repaint that keeps
+    /// re-emitting the same static star can't false-trigger working however often it
+    /// repeats. 0 = none yet.
+    last_spinner_glyphs: AtomicU64,
     /// Spinner detection is ignored until this time — set briefly on app-initiated
     /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
     suppress_until_ms: AtomicU64,
@@ -123,15 +128,17 @@ impl ClaudeHandle {
             activity_ms: AtomicU64::new(0),
             stop_ms: AtomicU64::new(0),
             last_spinner_ms: AtomicU64::new(0),
+            last_spinner_glyphs: AtomicU64::new(0),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
         })
     }
 
-    /// Reader: Claude's working spinner is on screen. Also resolves any pending
-    /// permission attention — Claude has resumed, so it's working, not waiting.
-    pub fn note_activity(&self) {
+    /// Reader: a chunk carrying spinner glyphs arrived, `glyphs` being the fingerprint
+    /// of the distinct ones in it (`session::chunk_spinner_key`). Also resolves any
+    /// pending permission attention: Claude has resumed, so it's working, not waiting.
+    pub fn note_activity(&self, glyphs: u64) {
         let now = now_ms();
         let stop = self.stop_ms.load(Ordering::Relaxed);
         // A spinner frame inside the post-Stop window is the turn's FINAL redraw —
@@ -140,35 +147,47 @@ impl ClaudeHandle {
         if now.saturating_sub(stop) < STOP_SUPPRESS_MS {
             return;
         }
-        // Ignore frames during an app-initiated repaint window (a resize), whose rapid
-        // redraws would otherwise look like a cycling spinner.
-        if now < self.suppress_until_ms.load(Ordering::Relaxed) {
-            return;
-        }
         let act = self.activity_ms.load(Ordering::Relaxed);
         let working_now = act > stop && now.saturating_sub(act) < WORKING_TTL_MS;
         if working_now {
             // Already working: any frame sustains it (bridging the slow `·` frames that
-            // aren't in the star range) — the established behaviour.
+            // aren't in the star range), the established behaviour. Sustaining is
+            // deliberately NOT suppressed: a resize or a scroll during a real turn must
+            // not drop the working state Claude is genuinely in.
             self.activity_ms.store(now, Ordering::Relaxed);
             self.hook_attention.store(false, Ordering::Relaxed);
-        } else {
-            // Not working: require a SECOND frame an animation-gap after the first to
-            // ENTER working. A one-shot repaint (Shift+Tab/Enter, single resize) emits
-            // the star glyph once and never pairs, so it can't false-trigger.
-            let prev = self.last_spinner_ms.swap(now, Ordering::Relaxed);
-            let gap = now.saturating_sub(prev);
-            if prev != 0 && (MIN_FRAME_GAP_MS..=MAX_FRAME_GAP_MS).contains(&gap) {
-                self.activity_ms.store(now, Ordering::Relaxed);
-                self.hook_attention.store(false, Ordering::Relaxed);
-            }
+            return;
+        }
+        // Not working, so this pair would ENTER it. Skip frames inside an app-initiated
+        // repaint window (resize, edit key, scroll), whose rapid redraws would otherwise
+        // look like a cycling spinner.
+        if now < self.suppress_until_ms.load(Ordering::Relaxed) {
+            return;
+        }
+        // Entering needs a SECOND frame an animation-gap after the first, drawing a
+        // DIFFERENT glyph. A one-shot repaint (Shift+Tab/Enter, single resize) emits the
+        // star once and never pairs; a repeated repaint (scrolling Claude's transcript
+        // past a "✻ Brewed for 7s" thinking summary) re-emits the SAME star and so never
+        // pairs either. The bloom advances a frame each time, so it always does.
+        let prev = self.last_spinner_ms.swap(now, Ordering::Relaxed);
+        let prev_glyphs = self.last_spinner_glyphs.swap(glyphs, Ordering::Relaxed);
+        let gap = now.saturating_sub(prev);
+        if prev != 0
+            && glyphs != prev_glyphs
+            && (MIN_FRAME_GAP_MS..=MAX_FRAME_GAP_MS).contains(&gap)
+        {
+            self.activity_ms.store(now, Ordering::Relaxed);
+            self.hook_attention.store(false, Ordering::Relaxed);
         }
     }
 
-    /// Ignore spinner detection for `dur_ms` — called when an action that doesn't start
-    /// Claude working causes a repaint: a window/PTY resize, or an edit key (Shift+Enter
-    /// newline, Shift+Tab mode-cycle) on Windows, where ConPTY repaints the region and
-    /// re-emits an on-screen ✻ that would otherwise pair into a false "working".
+    /// Don't let spinner frames START working for `dur_ms`. Called when an action that
+    /// doesn't start Claude working causes a repaint: a window/PTY resize, an edit key
+    /// (Shift+Enter newline, Shift+Tab mode-cycle) on Windows where ConPTY repaints the
+    /// region, or a wheel notch handed to a mouse-reporting Claude, which redraws its
+    /// whole screen. Each re-emits on-screen stars that would otherwise pair into a
+    /// false "working". An already-working turn keeps being sustained (see
+    /// `note_activity`), so this can never blank a genuine working state.
     pub fn suppress_activity(&self, dur_ms: u64) {
         // Extend, never shorten, an existing window — a burst of edit keys each pushes it
         // out, so every repaint stays covered.
@@ -179,6 +198,7 @@ impl ClaudeHandle {
         // Drop any half-formed pair so a frame landing just past the window can't pair
         // with one from before it.
         self.last_spinner_ms.store(0, Ordering::Relaxed);
+        self.last_spinner_glyphs.store(0, Ordering::Relaxed);
     }
 
     /// Resume spinner detection immediately — called on a SUBMIT (Enter). Real working is
@@ -418,7 +438,64 @@ fn process_hooks(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_project_dir;
+    use super::{encode_project_dir, ClaudeHandle, Lifecycle};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// One animation-gap between frames: over MIN_FRAME_GAP_MS, well under MAX.
+    const FRAME: Duration = Duration::from_millis(40);
+
+    fn handle() -> Arc<ClaudeHandle> {
+        ClaudeHandle::new(1, None, Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(true)))
+    }
+
+    // Scrolling Claude's transcript redraws its screen every notch, re-emitting the
+    // static star of any "thinking summary" line on it. Same glyph every time, so it
+    // must never pair into working however long the user keeps scrolling.
+    #[test]
+    fn repeated_identical_frames_never_start_working() {
+        let h = handle();
+        for _ in 0..6 {
+            h.note_activity(0b1000);
+            std::thread::sleep(FRAME);
+        }
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+    }
+
+    #[test]
+    fn two_differing_frames_an_animation_gap_apart_start_working() {
+        let h = handle();
+        h.note_activity(0b1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0100);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+    }
+
+    #[test]
+    fn suppression_blocks_entering_working() {
+        let h = handle();
+        h.suppress_activity(1000);
+        h.note_activity(0b1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0100);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+    }
+
+    // A scroll (or resize) during a real turn suppresses, but must not blank the
+    // working state Claude is genuinely in.
+    #[test]
+    fn suppression_still_sustains_an_active_turn() {
+        let h = handle();
+        h.note_activity(0b1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0100);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.suppress_activity(1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0010);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+    }
 
     #[test]
     fn encodes_cwd_like_claude() {

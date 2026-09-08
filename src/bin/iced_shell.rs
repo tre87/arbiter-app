@@ -632,6 +632,10 @@ enum Message {
     /// A mouse event encoded for a TUI that enabled mouse reporting: write the
     /// bytes to the pane's PTY, focusing it first when the bool is set (press).
     MouseReport(pane_grid::Pane, Vec<u8>, bool),
+    /// A wheel notch handed to the app running in the pane (a mouse report, or arrow
+    /// keys under alternate-scroll). Separate from `MouseReport` because scrolling a
+    /// TUI makes it repaint, which must not read as Claude working.
+    WheelReport(pane_grid::Pane, Vec<u8>),
     /// Workspace-tab drag-reorder: press a tab (selects + arms the drag), drag over
     /// another tab (drop target), release anywhere (commit the move). The press also
     /// serves as the plain "select this workspace" click.
@@ -997,6 +1001,11 @@ const OVERVIEW_MIN_H: f32 = 100.0;
 /// on Windows, so a burst can't pair into a false "working". Only these keys suppress;
 /// Enter/submit clears it, so real working detection is never delayed.
 const EDIT_KEY_SUPPRESS_MS: u64 = 300;
+
+/// How long one wheel notch handed to a mouse-reporting TUI holds off spinner-detection.
+/// Covers the notch to repaint round-trip; each further notch extends it, so a long
+/// scroll gesture stays covered end to end.
+const SCROLL_SUPPRESS_MS: u64 = 300;
 
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
@@ -2339,6 +2348,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 ws.focus = pane;
             }
             if let Some(p) = ws.panes.get_mut(pane) {
+                p.session.write(&bytes);
+            }
+        }
+        Message::WheelReport(pane, bytes) => {
+            // Claude enables mouse reporting, so the wheel scrolls ITS transcript: every
+            // notch makes it redraw the whole screen, re-emitting any static "✻ Brewed
+            // for 7s" thinking summary on it. Those repeats would otherwise pair into a
+            // false "working" for as long as the user keeps scrolling, so hold off
+            // spinner-detection across the gesture (each notch extends the window). A
+            // turn that's genuinely working still sustains itself.
+            if let Some(p) = state.active_mut().panes.get_mut(pane) {
+                p.session.suppress_claude_activity(SCROLL_SUPPRESS_MS);
                 p.session.write(&bytes);
             }
         }
@@ -8633,7 +8654,7 @@ impl shader::Program<Message> for TermProgram {
                             }
                         }
                         if !out.is_empty() {
-                            return (Captured, Some(Message::MouseReport(self.pane, out, false)));
+                            return (Captured, Some(Message::WheelReport(self.pane, out)));
                         }
                     }
                     return captured;
@@ -8650,7 +8671,7 @@ impl shader::Program<Message> for TermProgram {
                     for _ in 0..notches.unsigned_abs().min(16) {
                         out.extend_from_slice(arrow);
                     }
-                    return (Captured, Some(Message::MouseReport(self.pane, out, false)));
+                    return (Captured, Some(Message::WheelReport(self.pane, out)));
                 }
                 {
                     let mut t = self.term.lock().unwrap();
