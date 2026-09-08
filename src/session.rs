@@ -210,10 +210,23 @@ impl Session {
     /// and cwd, which the saved layout already carries, and replaying its last command
     /// could re-run something with side effects on every launch.
     pub fn startup_cmd(&self) -> Option<String> {
-        if let Some(seeded) = self.seeded_cmd.lock().unwrap().clone() {
-            return Some(seeded);
+        let mut seeded = self.seeded_cmd.lock().unwrap();
+        // Latch on first sight of a remote pane, rather than deriving this live from
+        // `is_remote`. When the far host sleeps or the link drops, ssh dies and the pane
+        // falls back to a LOCAL prompt, which clears `is_remote`, and a live derivation
+        // would forget the command at exactly the moment Reconnect needs it.
+        if seeded.is_none() && self.is_remote() {
+            *seeded = self.last_command.lock().unwrap().clone();
         }
-        self.is_remote().then(|| self.last_command.lock().unwrap().clone()).flatten()
+        seeded.clone()
+    }
+
+    /// Whether this pane should be offering to reconnect: its shell has exited, or it
+    /// was a remote pane whose session has ended (ssh is gone but the command that
+    /// built it is still known). The `was_remote` half is what keeps a freshly restored
+    /// pane from flashing the affordance before its ssh has started.
+    pub fn needs_reconnect(&self) -> bool {
+        self.exited() || (self.claude.was_remote() && !self.is_remote())
     }
 
     /// Current Claude status for this pane (stats + derived lifecycle). Cheap;

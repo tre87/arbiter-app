@@ -79,6 +79,8 @@ pub struct ClaudeHandle {
     /// another machine. Set from the same busy-edge scan as `claude_running`; gates
     /// the on-screen probe below, which only remote panes need.
     remote: AtomicBool,
+    /// Sticky version of `remote`: true once this pane has been remote, never cleared.
+    was_remote: AtomicBool,
     /// Claude's own UI chrome is on this pane's screen (`VtTerm::claude_chrome`).
     /// This is how a REMOTE Claude is recognised, where the local process scan sees
     /// only `ssh` and no statusLine capture is ever written. Latched rather than
@@ -135,6 +137,7 @@ impl ClaudeHandle {
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
             remote: AtomicBool::new(false),
+            was_remote: AtomicBool::new(false),
             on_screen: AtomicBool::new(false),
         })
     }
@@ -144,13 +147,23 @@ impl ClaudeHandle {
     /// remote session can't keep reporting the far host's Claude.
     pub fn set_remote(&self, on: bool) {
         self.remote.store(on, Ordering::Relaxed);
-        if !on {
+        if on {
+            self.was_remote.store(true, Ordering::Relaxed);
+        } else {
             self.on_screen.store(false, Ordering::Relaxed);
         }
     }
 
     pub fn is_remote(&self) -> bool {
         self.remote.load(Ordering::Relaxed)
+    }
+
+    /// Whether this pane has EVER been remote. Never cleared, so a pane whose ssh
+    /// session has ended can still be told apart from one that was always local. That
+    /// is the difference between "your connection dropped, reconnect?" and a perfectly
+    /// ordinary local shell sitting at its prompt.
+    pub fn was_remote(&self) -> bool {
+        self.was_remote.load(Ordering::Relaxed)
     }
 
     /// Reader: the result of scanning this pane's screen for Claude's chrome.

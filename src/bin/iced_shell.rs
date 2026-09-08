@@ -3763,7 +3763,7 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
     let can_reconnect = ws
         .panes
         .get(ws.focus)
-        .map_or(false, |d| d.session.exited() || d.session.startup_cmd().is_some());
+        .map_or(false, |d| d.session.needs_reconnect() || d.session.startup_cmd().is_some());
     items = items.push(menu_item(
         mdi_path::REFRESH,
         "Reconnect".into(),
@@ -4120,7 +4120,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
         // (anchored at the cursor); left-clicks still fall through to focus / the
         // header's own buttons (mouse_area only captures the right-press).
         let header: Element<Message> = mouse_area(pane_header(
-            &data.name, focused, data.shell, has_git_bash, pane, status, data.session.exited(),
+            &data.name, focused, data.shell, has_git_bash, pane, status, data.session.needs_reconnect(),
             header_round,
         ))
         .on_right_press(Message::HeaderMenuOpen(pane))
@@ -5494,7 +5494,7 @@ fn pane_header(
     has_git_bash: bool,
     pane: pane_grid::Pane,
     status: Option<Dot>,
-    exited: bool,
+    needs_reconnect: bool,
     round: iced::border::Radius,
 ) -> Element<'static, Message> {
     let color = if focused {
@@ -5540,10 +5540,10 @@ fn pane_header(
                 }),
         );
     }
-    // Shell gone: the only useful action left on this pane is to bring it back, so the
-    // button shows only then and is tinted amber to read as "needs attention" rather
-    // than as ordinary chrome.
-    if exited {
+    // Shell gone, or a remote session dropped: the only useful action left on this pane
+    // is to bring it back, so the button shows only then and is tinted amber to read as
+    // "needs attention" rather than as ordinary chrome.
+    if needs_reconnect {
         right = right.push(header_reconnect_btn(pane));
     }
     let sides = container(row![horizontal_space(), right].align_y(iced::Center))
