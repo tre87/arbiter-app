@@ -70,14 +70,11 @@ pub struct Session {
     /// session any more; the pane shows it as disconnected and offers Reconnect,
     /// which respawns rather than trying to revive it.
     exited: Arc<AtomicBool>,
-    /// The input line being typed, and the last line submitted with Enter. Fed only
-    /// from real keystrokes (see `note_typed`), so PTY query replies and program
-    /// output can never pollute them.
+    /// The input line being typed. Fed only from real keystrokes (see `note_typed`),
+    /// so PTY query replies and program output can never pollute it. The submitted
+    /// commands it yields live on the `ClaudeHandle`, which the busy-edge monitor also
+    /// holds and so can latch one the instant it sees an ssh client.
     typed_line: Arc<Mutex<TypedLine>>,
-    last_command: Arc<Mutex<Option<String>>>,
-    /// A startup command seeded from the saved layout on restore, so a replayed
-    /// command survives the next save even though nobody typed it this run.
-    seeded_cmd: Arc<Mutex<Option<String>>>,
     _watcher: Arc<Mutex<Option<GitWatcher>>>,
     _child: Box<dyn Child + Send + Sync>,
 }
@@ -169,8 +166,6 @@ impl Session {
             claude,
             exited,
             typed_line: Arc::new(Mutex::new(TypedLine::default())),
-            last_command: Arc::new(Mutex::new(None)),
-            seeded_cmd: Arc::new(Mutex::new(None)),
             _watcher: watcher,
             _child: child,
         })
@@ -194,31 +189,25 @@ impl Session {
     pub fn note_typed(&self, bytes: &[u8]) {
         let mut line = self.typed_line.lock().unwrap();
         if let Some(cmd) = line.fold(bytes) {
-            *self.last_command.lock().unwrap() = Some(cmd);
+            self.claude.note_command(cmd);
         }
     }
 
     /// Seed the startup command on restore, so a replayed ssh line is still known to
     /// this session (nobody typed it) and survives the next save.
     pub fn set_startup_cmd(&self, cmd: &str) {
-        *self.seeded_cmd.lock().unwrap() = Some(cmd.to_string());
+        self.claude.set_startup_cmd(cmd);
     }
 
     /// The command to replay to rebuild this pane, if there is one.
     ///
-    /// Only remote panes ever report one. A local pane is fully described by its shell
-    /// and cwd, which the saved layout already carries, and replaying its last command
-    /// could re-run something with side effects on every launch.
+    /// Only a recognised remote-client invocation is ever accepted, and only at the
+    /// moment an ssh client is detected (see `ClaudeHandle::latch_startup_cmd`). A local
+    /// pane is fully described by its shell and cwd, which the saved layout already
+    /// carries, and replaying its last command could re-run something with side effects
+    /// on every launch.
     pub fn startup_cmd(&self) -> Option<String> {
-        let mut seeded = self.seeded_cmd.lock().unwrap();
-        // Latch on first sight of a remote pane, rather than deriving this live from
-        // `is_remote`. When the far host sleeps or the link drops, ssh dies and the pane
-        // falls back to a LOCAL prompt, which clears `is_remote`, and a live derivation
-        // would forget the command at exactly the moment Reconnect needs it.
-        if seeded.is_none() && self.is_remote() {
-            *seeded = self.last_command.lock().unwrap().clone();
-        }
-        seeded.clone()
+        self.claude.startup_cmd()
     }
 
     /// Whether this pane should be offering to reconnect: its shell has exited, or it

@@ -81,6 +81,10 @@ pub struct ClaudeHandle {
     remote: AtomicBool,
     /// Sticky version of `remote`: true once this pane has been remote, never cleared.
     was_remote: AtomicBool,
+    /// The last command the user submitted in this pane (memory only), and the one
+    /// accepted as its startup command (persisted). See `latch_startup_cmd`.
+    last_command: Mutex<Option<String>>,
+    startup_cmd: Mutex<Option<String>>,
     /// Claude's own UI chrome is on this pane's screen (`VtTerm::claude_chrome`).
     /// This is how a REMOTE Claude is recognised, where the local process scan sees
     /// only `ssh` and no statusLine capture is ever written. Latched rather than
@@ -138,6 +142,8 @@ impl ClaudeHandle {
             hook_attention: AtomicBool::new(false),
             remote: AtomicBool::new(false),
             was_remote: AtomicBool::new(false),
+            last_command: Mutex::new(None),
+            startup_cmd: Mutex::new(None),
             on_screen: AtomicBool::new(false),
         })
     }
@@ -149,9 +155,48 @@ impl ClaudeHandle {
         self.remote.store(on, Ordering::Relaxed);
         if on {
             self.was_remote.store(true, Ordering::Relaxed);
+            self.latch_startup_cmd();
         } else {
             self.on_screen.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Record a command the user submitted in this pane. Kept in memory only; nothing
+    /// reaches disk unless `latch_startup_cmd` accepts it.
+    pub fn note_command(&self, cmd: String) {
+        *self.last_command.lock().unwrap() = Some(cmd);
+    }
+
+    /// Promote the last submitted command to this pane's startup command, if it invokes
+    /// a remote client.
+    ///
+    /// Called the moment an ssh client is detected, NOT lazily when something reads the
+    /// value. The distinction is the whole point: a save only happens on a layout
+    /// change, so a lazy latch would run at quit time and capture whatever had been
+    /// typed since: `claude` at the remote prompt, or a key passphrase. The whitelist
+    /// in `looks_like_remote_cmd` then makes the guarantee independent of timing
+    /// altogether, which is what keeps a passphrase out of `session.json`.
+    fn latch_startup_cmd(&self) {
+        let mut startup = self.startup_cmd.lock().unwrap();
+        if startup.is_some() {
+            return;
+        }
+        if let Some(cmd) = self.last_command.lock().unwrap().clone() {
+            if crate::claude::looks_like_remote_cmd(&cmd) {
+                *startup = Some(cmd);
+            }
+        }
+    }
+
+    /// Seed the startup command from a saved layout on restore, where the command was
+    /// replayed rather than typed.
+    pub fn set_startup_cmd(&self, cmd: &str) {
+        *self.startup_cmd.lock().unwrap() = Some(cmd.to_string());
+    }
+
+    /// The command that rebuilds this pane, if one was accepted.
+    pub fn startup_cmd(&self) -> Option<String> {
+        self.startup_cmd.lock().unwrap().clone()
     }
 
     pub fn is_remote(&self) -> bool {

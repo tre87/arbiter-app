@@ -168,6 +168,23 @@ fn is_ssh_name(name: &str) -> bool {
     matches!(base, "ssh" | "mosh" | "mosh-client" | "plink")
 }
 
+/// Whether a typed command line invokes a remote client, judged from its first word.
+///
+/// This is the gate on what may be persisted as a pane's startup command, and it is
+/// deliberately a whitelist rather than "whatever was typed last". Everything else
+/// entered while connecting goes through the same keystroke tracking, including **key
+/// passphrases**, so anything but a recognised client must be refused outright: a
+/// timing rule alone could not prevent a secret reaching `session.json`.
+///
+/// The cost is that connecting through a wrapper script is not remembered, and such a
+/// pane restores to a plain local shell.
+pub fn looks_like_remote_cmd(cmd: &str) -> bool {
+    let Some(word) = cmd.split_whitespace().next() else { return false };
+    // Accept a path-qualified client (`/usr/bin/ssh`, `C:\...\ssh.exe`) by its basename.
+    let base = word.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(word);
+    is_ssh_name(base)
+}
+
 /// A readable `pid(name)→parent(name)→…` chain for diagnostics.
 fn ancestry_chain(sys: &System, mut pid: u32) -> String {
     let mut out = Vec::new();
@@ -256,6 +273,36 @@ mod tests {
     fn ignores_non_node_non_claude() {
         assert!(!is_claude_cmdline("bash", &cmd(&["bash", "-lc", "echo claude"])));
         assert!(!is_claude_cmdline("vite", &cmd(&["vite"])));
+    }
+
+    // The gate on what may be written to session.json. Everything typed while
+    // connecting passes through the same keystroke tracking, so this is what keeps a
+    // key passphrase, or whatever was typed at the remote prompt, off disk.
+    #[test]
+    fn only_a_remote_client_invocation_is_accepted_as_a_startup_command() {
+        use super::looks_like_remote_cmd;
+        assert!(looks_like_remote_cmd("ssh mini"));
+        assert!(looks_like_remote_cmd("ssh tre@10.0.0.16"));
+        assert!(looks_like_remote_cmd("ssh -A -J jump host"));
+        assert!(looks_like_remote_cmd("mosh mini"));
+        assert!(looks_like_remote_cmd("  ssh mini  "));
+        // Path-qualified clients still count, by basename.
+        assert!(looks_like_remote_cmd("/usr/bin/ssh mini"));
+        assert!(looks_like_remote_cmd(r"C:\Windows\System32\OpenSSH\ssh.exe mini"));
+
+        // A key passphrase typed at ssh's prompt. This is the case that matters: it
+        // must never be mistaken for the command that built the pane.
+        assert!(!looks_like_remote_cmd("correct horse battery staple"));
+        assert!(!looks_like_remote_cmd("hunter2"));
+        // Whatever was typed at the remote prompt afterwards.
+        assert!(!looks_like_remote_cmd("claude"));
+        assert!(!looks_like_remote_cmd("cd ~/src && claude --resume abc"));
+        // ssh only as a later word, or as an unrelated command.
+        assert!(!looks_like_remote_cmd("echo ssh mini"));
+        assert!(!looks_like_remote_cmd("sshd -t"));
+        assert!(!looks_like_remote_cmd("ssh-add ~/.ssh/id_ed25519"));
+        assert!(!looks_like_remote_cmd(""));
+        assert!(!looks_like_remote_cmd("   "));
     }
 
     #[test]

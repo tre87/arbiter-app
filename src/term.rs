@@ -438,8 +438,13 @@ impl VtTerm {
     /// During a turn Claude replaces the hint with the interrupt hint, so a single
     /// absent scan does not mean it exited (see `ClaudeHandle::note_screen`).
     pub fn claude_chrome(&self) -> bool {
-        const CHROME: &[&str] =
-            &["? for shortcuts", "accept edits on", "plan mode on", "auto mode on"];
+        const CHROME: &[&str] = &[
+            "? for shortcuts",
+            "manual mode on",
+            "accept edits on",
+            "plan mode on",
+            "auto mode on",
+        ];
         /// Rows below the cursor to include. Measured against a real session: the
         /// cursor sits in the input box, and below it come the box's bottom border, an
         /// optional warning line, the user's statusLine, and finally the mode line, so
@@ -844,6 +849,13 @@ mod tests {
         assert!(chrome(&claude_screen("\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)")));
         assert!(chrome(&claude_screen("\u{23f5}\u{23f5} accept edits on (shift+tab to cycle)")));
         assert!(chrome(&claude_screen("\u{23f5} plan mode on (shift+tab to cycle)")));
+        // Observed in v2.1.263: the default mode names itself, and the line carries
+        // both the label and the shortcuts hint.
+        assert!(chrome(&claude_screen(
+            "\u{23f5} manual mode on \u{b7} ? for shortcuts \u{b7} + for agents"
+        )));
+        // The label alone, in case a future layout drops the hint.
+        assert!(chrome(&claude_screen("\u{23f5} manual mode on")));
     }
 
     #[test]
