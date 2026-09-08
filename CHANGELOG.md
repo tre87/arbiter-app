@@ -7,6 +7,23 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Removed
+- **Project workspaces are retired.** Every workspace is now a plain terminal workspace
+  (tabs of terminals). This removes the git-worktree sidebar (with its robot avatars, merge
+  / discard / remove actions and the new-worktree dialog), the file-explorer sidebar (with
+  its right-click menu, rename and delete dialogs, and per-file-type icons), and the "+"
+  dropdown, which had only one remaining choice and so now creates a terminal workspace
+  directly. Roughly 2,100 lines lighter.
+
+  Existing saved sessions keep loading: the `project` data in an older `session.json` is
+  simply ignored, and each workspace restores the terminals its active worktree had, with
+  its name, split layout and per-terminal history intact. Terminals that were open in a
+  *non-active* worktree are not restored, since there is no longer anywhere to put them.
+
+  The overview popout, per-terminal Claude status dots and the titlebar usage bars are
+  unaffected. The main restore path is now a single shape rather than two, which is
+  groundwork for the SSH work that follows.
+
 ### Added
 - **Terminal font size setting (Settings → Display → Terminal).** Pick a point size
   (8–32); it applies to every open terminal immediately. The renderer rebuilds at the new

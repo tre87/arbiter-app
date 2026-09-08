@@ -31,8 +31,6 @@ use arbiter_native::session::{Session, SharedMaster, SharedTerm};
 use arbiter_native::persist;
 use arbiter_native::term::{MouseModes, SelectKind};
 
-/// File-explorer file-type icons + colours (generated from @mdi/js).
-mod file_icons;
 
 /// The Claude-usage webview helper, run in a re-spawned `--usage-helper` process
 /// (same binary). Only compiled with the `usage-helper` feature (pulls wry/tao).
@@ -60,32 +58,6 @@ struct Workspace {
     panes: pane_grid::State<PaneData>,
     focus: pane_grid::Pane,
     name: String,
-    /// Some → this tab is a project workspace (git repo with worktrees + sidebars).
-    /// `panes`/`focus` above always hold the ACTIVE worktree's grid; the other
-    /// worktrees stash theirs in `Worktree::stash` (swapped on switch), so every
-    /// existing grid handler keeps operating on the visible worktree unchanged.
-    project: Option<Project>,
-}
-
-/// A project workspace: a git repo, its worktrees, and the file-explorer state.
-struct Project {
-    root: String,
-    active: usize,
-    worktrees: Vec<Worktree>,
-    explorer: Explorer,
-}
-
-/// One worktree of a project. The ACTIVE worktree's pane grid lives in
-/// `Workspace.panes` (so `stash` is None); inactive worktrees keep theirs here.
-struct Worktree {
-    branch: String,
-    path: String,
-    stash: Option<(pane_grid::State<PaneData>, pane_grid::Pane)>,
-    /// Whether this worktree's branch has been merged into its parent (strikethrough).
-    merged: bool,
-    /// Bumped by "New robot" to reroll the avatar; mixed into the avatar seed so a
-    /// new (still deterministic) face is drawn. Persisted so it survives restart.
-    avatar_salt: u32,
 }
 
 impl Workspace {
@@ -98,14 +70,12 @@ impl Workspace {
             history_id,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
-        Workspace { panes, focus: first, name, project: None }
+        Workspace { panes, focus: first, name }
     }
 
     /// The next terminal name for THIS workspace: the lowest unused "Terminal N"
-    /// among its current panes. Numbering is therefore per-workspace (and per-
-    /// worktree for projects, since only the active worktree's grid is in `panes`)
-    /// and reuses gaps left by closed terminals — matching the web's
-    /// `nextAvailableNumber`.
+    /// among its current panes. Numbering is therefore per-workspace and reuses
+    /// gaps left by closed terminals, matching the web's `nextAvailableNumber`.
     fn next_name(&self) -> String {
         let mut used: Vec<usize> = self
             .panes
@@ -123,110 +93,6 @@ impl Workspace {
             }
         }
         format!("Terminal {n}")
-    }
-}
-
-/// File-explorer state for a project workspace (lazy tree; phase 4 fills cache).
-#[derive(Default)]
-struct Explorer {
-    /// Directory paths the user has expanded.
-    expanded: std::collections::HashSet<String>,
-    /// Cached children per directory path (lazy-loaded; dirs first, then files).
-    entries: std::collections::HashMap<String, Vec<DirEntry>>,
-    /// git status per path (relative to the worktree) → modified/added/… colour key.
-    git_status: std::collections::HashMap<String, String>,
-    /// The worktree path the cache currently reflects (cleared on worktree switch).
-    cached_for: String,
-    /// Selected row paths (multi-select via Ctrl/Cmd-click + Shift-range).
-    selected: std::collections::HashSet<String>,
-    /// Anchor path for Shift-range selection (the last non-Shift click).
-    anchor: Option<String>,
-}
-
-/// One file-explorer row.
-#[derive(Clone)]
-struct DirEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-}
-
-/// Build a worktree's terminal grid: an 80/20 horizontal split — Claude on top
-/// (80%), a shell on the bottom (20%) — both in the worktree's dir. Matches the
-/// web. Further-splittable like any pane.
-fn build_worktree_grid(path: &str) -> (pane_grid::State<PaneData>, pane_grid::Pane) {
-    use pane_grid::Configuration;
-    // The "Claude" pane auto-launches Claude (queued in the PTY; runs at the shell's
-    // first prompt once rc sets the shim PATH) so the worktree's status, model, and
-    // "ask Claude to merge" have a live Claude — like the web's Claude pane.
-    let claude_history = new_history_id();
-    let mut claude_session = spawn_session(None, Some(path), &claude_history);
-    claude_session.write(b"claude\r");
-    let claude = PaneData {
-        session: claude_session,
-        name: "Claude".to_string(),
-        shell: ShellKind::PowerShell,
-        history_id: claude_history,
-    };
-    let term_history = new_history_id();
-    let term = PaneData {
-        session: spawn_session(None, Some(path), &term_history),
-        name: "Terminal".to_string(),
-        shell: ShellKind::PowerShell,
-        history_id: term_history,
-    };
-    let config = Configuration::Split {
-        axis: pane_grid::Axis::Horizontal,
-        ratio: 0.8,
-        a: Box::new(Configuration::Pane(claude)),
-        b: Box::new(Configuration::Pane(term)),
-    };
-    let state = pane_grid::State::with_configuration(config);
-    let focus = *state.iter().next().map(|(p, _)| p).expect("grid has a pane");
-    (state, focus)
-}
-
-/// Build a project workspace from a repo root + its worktree list. The main
-/// worktree is active (its grid in `Workspace.panes`); the rest are stashed.
-fn new_project(root: String, infos: Vec<arbiter_native::git::WorktreeInfo>) -> Workspace {
-    // Order: main first, then existing linked worktrees that have a branch.
-    let mut ordered: Vec<&arbiter_native::git::WorktreeInfo> = Vec::new();
-    if let Some(m) = infos.iter().find(|w| w.is_main) {
-        ordered.push(m);
-    }
-    for w in &infos {
-        if !w.is_main && w.exists && w.branch.is_some() {
-            ordered.push(w);
-        }
-    }
-    if ordered.is_empty() {
-        ordered.extend(infos.first());
-    }
-
-    let mut worktrees = Vec::new();
-    let mut active: Option<(pane_grid::State<PaneData>, pane_grid::Pane)> = None;
-    for (i, info) in ordered.iter().enumerate() {
-        let (grid, focus) = build_worktree_grid(&info.path);
-        let branch = info.branch.clone().unwrap_or_else(|| "detached".to_string());
-        let stash = if i == 0 {
-            active = Some((grid, focus));
-            None
-        } else {
-            Some((grid, focus))
-        };
-        worktrees.push(Worktree { branch, path: info.path.clone(), stash, merged: false, avatar_salt: 0 });
-    }
-    let (panes, focus) = active.expect("project has a main worktree");
-    let name = std::path::Path::new(&root)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("project")
-        .to_string();
-    Workspace {
-        panes,
-        focus,
-        name,
-        project: Some(Project { root, active: 0, worktrees, explorer: Explorer::default() }),
     }
 }
 
@@ -270,17 +136,9 @@ struct State {
     /// re-rendered when the scale changes (see [`render_logo`]).
     logo_scale: f32,
     logo: iced::widget::image::Handle,
-    /// The "new worktree" modal, while open (branch name + base-branch dropdown).
-    worktree_dialog: Option<WorktreeDialog>,
-    /// The index of the worktree whose right-click context menu is open, if any.
-    worktree_menu: Option<usize>,
-    /// Whether the "+" new-workspace dropdown (Terminal / Project) is open.
-    new_ws_menu: bool,
-    /// Last known cursor position (window coords) — used to anchor the "+" dropdown
+    /// Last known cursor position (window coords), used to anchor context menus
     /// under the click, since iced can't report a widget's screen position.
     cursor: iced::Point,
-    /// The x at which the "+" dropdown was opened (snapshot of `cursor.x`).
-    new_ws_menu_x: f32,
     /// Latest Claude usage from the sidecar helper (drives the titlebar meters).
     usage: UsageData,
     /// When the usage subscription started (epoch ms) — if no data arrives within
@@ -312,11 +170,6 @@ struct State {
     /// operates on the focused pane's terminal (incl. its scrollback).
     find_open: bool,
     find_query: String,
-    /// Open file-explorer right-click menu (anchor position), and the rename/delete
-    /// dialogs it can launch. The menu acts on the explorer's current selection.
-    explorer_menu: Option<ExplorerMenu>,
-    explorer_rename: Option<ExplorerRename>,
-    explorer_delete: Option<ExplorerDelete>,
     /// Pending "close this workspace?" confirmation (the tab × / context-menu Close) — so a
     /// stray click can't silently drop a workspace and its terminals.
     close_confirm: Option<CloseConfirm>,
@@ -326,8 +179,8 @@ struct State {
     /// Whether the short Claude-usage sign-in explanation modal is showing (opened
     /// by the header "Sign in" pill; Cancel/Escape dismisses without signing in).
     usage_login_prompt: bool,
-    /// Live keyboard modifiers (Shift/Ctrl/Cmd) for multi-select clicks in the
-    /// file explorer. Tracked app-wide via ModifiersChanged.
+    /// Live keyboard modifiers (Shift/Ctrl/Cmd), tracked app-wide via
+    /// ModifiersChanged so a modified click can be told from a plain one.
     modifiers: iced::keyboard::Modifiers,
     /// Open terminal right-click context menu (target pane + anchor position).
     term_menu: Option<TermMenu>,
@@ -370,28 +223,6 @@ struct RenameTerminal {
     text: String,
 }
 
-/// A file-explorer right-click context menu, anchored at the cursor. Its actions
-/// operate on `Explorer.selected`.
-struct ExplorerMenu {
-    x: f32,
-    y: f32,
-}
-
-/// The file-explorer rename dialog: the path being renamed + the edit buffer.
-struct ExplorerRename {
-    path: String,
-    text: String,
-}
-
-/// The file-explorer delete confirmation: the selected paths to move to trash +
-/// a human label ("\"foo.rs\"" or "3 items") for the prompt.
-struct ExplorerDelete {
-    paths: Vec<String>,
-    label: String,
-}
-
-/// The workspace-close confirmation: which tab + its name (for the prompt). Closing a
-/// workspace drops its terminals, so confirm rather than nuke it on a stray × click.
 struct CloseConfirm {
     index: usize,
     name: String,
@@ -430,17 +261,6 @@ enum AttachSource {
     Docs,
 }
 
-/// State of the "new worktree" modal: the branch name being typed, the chosen
-/// base branch, and the repo's branches (for the dropdown).
-#[derive(Default)]
-struct WorktreeDialog {
-    name: String,
-    base: Option<String>,
-    branches: Vec<String>,
-}
-
-/// The main window id, for routing keyboard input (so typing in the overview
-/// window doesn't reach the terminal). Set once at startup.
 static MAIN_WINDOW: std::sync::OnceLock<iced::window::Id> = std::sync::OnceLock::new();
 
 /// The configurable surface colour for the terminals, sidebars and the overview's
@@ -495,11 +315,7 @@ enum Message {
     Close,
     Resized(pane_grid::ResizeEvent),
     NewWorkspace,
-    /// Toggle the "+" dropdown (choose Terminal vs Project workspace).
-    ToggleNewWsMenu,
-    /// Dismiss the "+" dropdown.
-    CloseNewWsMenu,
-    /// Cursor moved (window coords) — tracked to anchor the "+" dropdown.
+    /// Cursor moved (window coords), tracked to anchor context menus.
     CursorMoved(iced::Point),
     /// New Claude usage data from the sidecar helper.
     UsageUpdated(UsageData),
@@ -611,24 +427,8 @@ enum Message {
     EscapeKey,
     /// Cmd/Ctrl+click on a detected terminal link → open it in the browser.
     OpenUrl(String),
-    /// Live keyboard modifiers (for file-explorer multi-select clicks).
+    /// Live keyboard modifiers (for modified clicks and shortcuts).
     ModifiersChanged(iced::keyboard::Modifiers),
-    /// File-explorer: select a row (path, is_dir) — Shift/Ctrl/Cmd extend; plain
-    /// click single-selects and toggles a directory's expansion.
-    ExplorerSelect(String, bool),
-    /// File-explorer right-click menu: open (selecting the row first if needed),
-    /// close, and its actions (operate on the selection).
-    ExplorerMenuOpen(String, bool),
-    ExplorerMenuClose,
-    ExplorerOpenSelection,
-    ExplorerReveal(String),
-    ExplorerRenameStart,
-    ExplorerRenameInput(String),
-    ExplorerRenameCommit,
-    ExplorerRenameCancel,
-    ExplorerDeleteStart,
-    ExplorerDeleteConfirm,
-    ExplorerDeleteCancel,
     /// A mouse event encoded for a TUI that enabled mouse reporting: write the
     /// bytes to the pane's PTY, focusing it first when the bool is set (press).
     MouseReport(pane_grid::Pane, Vec<u8>, bool),
@@ -655,36 +455,6 @@ enum Message {
     ConfirmQuit,
     /// Dismiss the quit modal.
     CancelQuit,
-    /// New project workspace: pick a folder, then validate it's a git repo.
-    NewProjectWorkspace,
-    ProjectFolderPicked(Option<String>),
-    /// Switch the active project workspace to worktree `i` (swaps its pane grid in).
-    SwitchWorktree(usize),
-    /// Open the "new worktree" dialog (branch name + base-branch dropdown).
-    NewWorktree,
-    /// Live edits in the new-worktree dialog.
-    WtDialogName(String),
-    WtDialogPickBase(String),
-    /// Dismiss the new-worktree dialog without creating.
-    WtDialogCancel,
-    /// Create the worktree from the dialog's current name + base.
-    WtDialogCreate,
-    /// Open the right-click context menu for worktree `i`.
-    WorktreeMenu(usize),
-    /// Dismiss the worktree context menu.
-    WorktreeMenuClose,
-    /// Merge worktree `i`'s branch into the main worktree's branch (manual git merge).
-    WorktreeMerge(usize),
-    /// Merge worktree `i` into main, then remove the worktree (web "merge & delete").
-    WorktreeMergeDelete(usize),
-    /// Ask Claude (the main worktree's first idle session) to merge worktree `i`.
-    WorktreeAskClaudeMerge(usize),
-    /// Discard all uncommitted changes in worktree `i` (reset --hard + clean).
-    WorktreeDiscard(usize),
-    /// Reroll worktree `i`'s avatar (bump its salt → a new deterministic robot).
-    RegenerateAvatar(usize),
-    /// Remove worktree `i` from the active project (git worktree remove --force).
-    RemoveWorktree(usize),
     SwitchShell(pane_grid::Pane),
     ShiftEnter,
     /// Copy selection to clipboard; bool = fall back to interrupt (^C) if there's
@@ -811,18 +581,13 @@ fn history_file(id: &str) -> Option<std::path::PathBuf> {
 fn spawn_restored(
     shell: persist::SavedShell,
     cwd: Option<&str>,
-    fallback_cwd: Option<&str>,
     git_bash: Option<&str>,
     claude_running: bool,
     claude_session: Option<&str>,
     history_id: &str,
 ) -> (Session, ShellKind) {
-    // Prefer the saved cwd; if it's missing or gone, fall back (a project worktree
-    // passes its path, so its terminals reopen in the worktree even when the saved
-    // cwd was never captured — e.g. before the shell first emitted OSC-7).
-    let cwd = cwd
-        .filter(|d| std::path::Path::new(d).is_dir())
-        .or_else(|| fallback_cwd.filter(|d| std::path::Path::new(d).is_dir()));
+    // A saved cwd that no longer exists falls back to the shell's default dir.
+    let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
     let (mut session, kind) = match shell {
         persist::SavedShell::GitBash => match git_bash {
             Some(gb) => (spawn_session(Some(gb), cwd, history_id), ShellKind::GitBash),
@@ -850,14 +615,13 @@ fn spawn_restored(
 fn saved_to_config(
     node: persist::SavedNode,
     git_bash: Option<&str>,
-    fallback_cwd: Option<&str>,
 ) -> pane_grid::Configuration<PaneData> {
     match node {
         persist::SavedNode::Split { vertical, ratio, a, b } => pane_grid::Configuration::Split {
             axis: if vertical { pane_grid::Axis::Vertical } else { pane_grid::Axis::Horizontal },
             ratio,
-            a: Box::new(saved_to_config(*a, git_bash, fallback_cwd)),
-            b: Box::new(saved_to_config(*b, git_bash, fallback_cwd)),
+            a: Box::new(saved_to_config(*a, git_bash)),
+            b: Box::new(saved_to_config(*b, git_bash)),
         },
         persist::SavedNode::Leaf { name, shell, cwd, claude_running, claude_session, history_id } => {
             // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
@@ -865,7 +629,6 @@ fn saved_to_config(
             let (session, kind) = spawn_restored(
                 shell,
                 cwd.as_deref(),
-                fallback_cwd,
                 git_bash,
                 claude_running,
                 claude_session.as_deref(),
@@ -883,63 +646,9 @@ fn restore_workspaces(
 ) -> Option<(Vec<Workspace>, usize)> {
     let mut workspaces = Vec::new();
     for sw in saved.workspaces {
-        match sw.project {
-            // Project workspace: rebuild each worktree's grid; the active one lives
-            // in Workspace.panes, the rest are stashed (mirrors `new_project`).
-            Some(sp) => {
-                let active_idx = sp.active.min(sp.worktrees.len().saturating_sub(1));
-                let mut worktrees = Vec::new();
-                let mut active: Option<(pane_grid::State<PaneData>, pane_grid::Pane)> = None;
-                for (i, swt) in sp.worktrees.into_iter().enumerate() {
-                    // Worktree terminals fall back to the worktree path if their saved
-                    // cwd is gone/empty, so they reopen in the right folder.
-                    let grid = pane_grid::State::with_configuration(saved_to_config(
-                        swt.layout,
-                        git_bash,
-                        Some(swt.path.as_str()),
-                    ));
-                    let Some(focus) = grid.iter().next().map(|(p, _)| *p) else { continue };
-                    let stash = if i == active_idx {
-                        active = Some((grid, focus));
-                        None
-                    } else {
-                        Some((grid, focus))
-                    };
-                    worktrees.push(Worktree {
-                        branch: swt.branch,
-                        path: swt.path,
-                        stash,
-                        merged: false,
-                        avatar_salt: swt.avatar_salt,
-                    });
-                }
-                let Some((panes, focus)) = active else { continue };
-                let mut ws = Workspace {
-                    panes,
-                    focus,
-                    name: sw.name,
-                    project: Some(Project {
-                        root: sp.root,
-                        active: active_idx,
-                        worktrees,
-                        explorer: Explorer {
-                            expanded: sp.expanded.into_iter().collect(),
-                            ..Default::default()
-                        },
-                    }),
-                };
-                if let Some(p) = ws.project.as_mut() {
-                    load_explorer(p);
-                }
-                workspaces.push(ws);
-            }
-            None => {
-                let panes =
-                    pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash, None));
-                let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
-                workspaces.push(Workspace { panes, focus, name: sw.name, project: None });
-            }
-        }
+        let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
+        let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
+        workspaces.push(Workspace { panes, focus, name: sw.name });
     }
     if workspaces.is_empty() {
         return None;
@@ -1104,37 +813,9 @@ fn save_session(state: &State) {
         workspaces: state
             .workspaces
             .iter()
-            .map(|ws| {
-                // Project workspaces save each worktree's tree (active one from
-                // ws.panes, the rest from their stash) + which is active + explorer.
-                let project = ws.project.as_ref().map(|p| persist::SavedProject {
-                    root: p.root.clone(),
-                    active: p.active,
-                    expanded: p.explorer.expanded.iter().cloned().collect(),
-                    worktrees: p
-                        .worktrees
-                        .iter()
-                        .enumerate()
-                        .map(|(i, w)| {
-                            let grid = if i == p.active {
-                                &ws.panes
-                            } else {
-                                w.stash.as_ref().map(|(g, _)| g).unwrap_or(&ws.panes)
-                            };
-                            persist::SavedWorktree {
-                                branch: w.branch.clone(),
-                                path: w.path.clone(),
-                                layout: node_to_saved(grid, grid.layout()),
-                                avatar_salt: w.avatar_salt,
-                            }
-                        })
-                        .collect(),
-                });
-                persist::SavedWorkspace {
-                    name: ws.name.clone(),
-                    layout: node_to_saved(&ws.panes, ws.panes.layout()),
-                    project,
-                }
+            .map(|ws| persist::SavedWorkspace {
+                name: ws.name.clone(),
+                layout: node_to_saved(&ws.panes, ws.panes.layout()),
             })
             .collect(),
     });
@@ -1143,9 +824,9 @@ fn save_session(state: &State) {
 
 /// Delete orphaned per-pane history files: any file in `<data-dir>/history/` whose
 /// id is no longer live in any workspace. This is how "delete on close" happens —
-/// closing a pane / workspace / worktree drops its `PaneData`, so its id leaves the
-/// live set and its file is swept on the next save. Best-effort; never fatal. Runs
-/// only on save (layout change / exit), so no idle cost.
+/// closing a pane or workspace drops its `PaneData`, so its id leaves the live set
+/// and its file is swept on the next save. Best-effort; never fatal. Runs only on
+/// save (layout change / exit), so no idle cost.
 fn gc_history_files(state: &State) {
     let Some(dir) = arbiter_native::shell::app_data_dir().map(|d| d.join("history")) else {
         return;
@@ -1153,19 +834,8 @@ fn gc_history_files(state: &State) {
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
     let mut live = std::collections::HashSet::new();
     for ws in &state.workspaces {
-        // The active grid (active worktree, for a project) lives in ws.panes…
         for (_, d) in ws.panes.iter() {
             live.insert(d.history_id.clone());
-        }
-        // …the other worktrees stash theirs.
-        if let Some(p) = &ws.project {
-            for wt in &p.worktrees {
-                if let Some((grid, _)) = &wt.stash {
-                    for (_, d) in grid.iter() {
-                        live.insert(d.history_id.clone());
-                    }
-                }
-            }
         }
     }
     for entry in entries.flatten() {
@@ -1199,23 +869,17 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
             return true;
         }};
     }
-    if state.explorer_rename.is_some() { take!(state.explorer_rename) }
-    if state.explorer_delete.is_some() { take!(state.explorer_delete) }
     if state.close_confirm.is_some() { take!(state.close_confirm) }
     if state.quit_confirm { take!(state.quit_confirm) }
     if state.usage_login_prompt { take!(state.usage_login_prompt) }
-    if state.explorer_menu.is_some() { take!(state.explorer_menu) }
     if state.rename_terminal.is_some() { take!(state.rename_terminal) }
     if state.term_menu.is_some() { take!(state.term_menu) }
     if state.ws_tab_menu.is_some() { take!(state.ws_tab_menu) }
-    if state.new_ws_menu { take!(state.new_ws_menu) }
     if state.usage_org_menu { take!(state.usage_org_menu) }
     if state.rename_ws.is_some() { take!(state.rename_ws) }
     if state.rename_confirm.is_some() { take!(state.rename_confirm) }
     if state.shortcuts_open { take!(state.shortcuts_open) }
     if state.settings_open { take!(state.settings_open) }
-    if state.worktree_dialog.is_some() { take!(state.worktree_dialog) }
-    if state.worktree_menu.is_some() { take!(state.worktree_menu) }
     false
 }
 
@@ -1344,20 +1008,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.active_mut().panes.resize(split, ratio);
         }
         Message::NewWorkspace => {
-            state.new_ws_menu = false;
             let n = state.workspaces.len() + 1;
             state.workspaces.push(Workspace::new(format!("Workspace {n}")));
             state.active = state.workspaces.len() - 1;
             save_session(state);
-        }
-        Message::ToggleNewWsMenu => {
-            state.new_ws_menu = !state.new_ws_menu;
-            if state.new_ws_menu {
-                state.new_ws_menu_x = state.cursor.x; // anchor the dropdown under the +
-            }
-        }
-        Message::CloseNewWsMenu => {
-            state.new_ws_menu = false;
         }
         Message::CursorMoved(p) => {
             state.cursor = p;
@@ -1674,396 +1328,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CancelRename => state.rename_confirm = None,
-        Message::NewProjectWorkspace => {
-            state.new_ws_menu = false;
-            // Pick a folder off-thread (native dialog), then validate as a repo.
-            return iced::Task::perform(
-                async {
-                    rfd::AsyncFileDialog::new()
-                        .set_title("Open a Git repository as a project workspace")
-                        .pick_folder()
-                        .await
-                        .map(|h| h.path().to_string_lossy().into_owned())
-                },
-                Message::ProjectFolderPicked,
-            );
-        }
-        Message::ProjectFolderPicked(Some(path)) => {
-            match arbiter_native::git::repo_root(&path) {
-                Some(root) => {
-                    let infos = arbiter_native::git::worktree_list(&root);
-                    state.workspaces.push(new_project(root, infos));
-                    state.active = state.workspaces.len() - 1;
-                    if let Some(p) = state.active_mut().project.as_mut() {
-                        load_explorer(p);
-                    }
-                    save_session(state);
-                }
-                None => {
-                    // Not a git repo — explain (project workspaces manage worktrees).
-                    let _ = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Warning)
-                        .set_title("Not a Git repository")
-                        .set_description(format!(
-                            "\"{path}\" isn't inside a Git repository. Project workspaces \
-                             manage git worktrees, so they need a repo. Use a Terminal \
-                             workspace for a plain folder, or run \"git init\" first."
-                        ))
-                        .show();
-                }
-            }
-        }
-        Message::ProjectFolderPicked(None) => {} // dialog cancelled
-        Message::SwitchWorktree(i) => {
-            activate_worktree(state.active_mut(), i);
-        }
         Message::ModifiersChanged(m) => state.modifiers = m,
-        Message::ExplorerSelect(path, is_dir) => {
-            let mods = state.modifiers;
-            if let Some(p) = state.active_mut().project.as_mut() {
-                if mods.shift() && p.explorer.anchor.is_some() {
-                    // Range-select from the anchor to here, in visible (flattened)
-                    // order. The anchor stays put for further shift-clicks.
-                    let root =
-                        p.worktrees.get(p.active).map(|w| w.path.clone()).unwrap_or_default();
-                    let mut rows: Vec<(DirEntry, usize)> = Vec::new();
-                    flatten_tree(&p.explorer, &root, 0, &mut rows);
-                    let list: Vec<String> = rows.into_iter().map(|(e, _)| e.path).collect();
-                    let anchor = p.explorer.anchor.clone().unwrap_or_default();
-                    if let (Some(a), Some(b)) = (
-                        list.iter().position(|x| *x == path),
-                        list.iter().position(|x| *x == anchor),
-                    ) {
-                        let (s, e) = (a.min(b), a.max(b));
-                        p.explorer.selected = list[s..=e].iter().cloned().collect();
-                    }
-                } else if mods.control() || mods.logo() {
-                    // Toggle this row in/out of the selection; move the anchor here.
-                    if !p.explorer.selected.remove(&path) {
-                        p.explorer.selected.insert(path.clone());
-                    }
-                    p.explorer.anchor = Some(path);
-                } else {
-                    // Plain click: single-select, and a directory also toggles open.
-                    p.explorer.selected.clear();
-                    p.explorer.selected.insert(path.clone());
-                    p.explorer.anchor = Some(path.clone());
-                    if is_dir {
-                        explorer_toggle_expand(p, &path);
-                    }
-                }
-            }
-        }
-        Message::NewWorktree => {
-            // Open the dialog, pre-filled with a random name + the current branch as
-            // the base, and the repo's branch list for the dropdown.
-            if let Some(p) = state.active().project.as_ref() {
-                let base = p.worktrees.get(p.active).map(|w| w.branch.clone());
-                let branches = arbiter_native::git::list_branches(&p.root);
-                state.worktree_dialog =
-                    Some(WorktreeDialog { name: random_worktree_name(), base, branches });
-                return text_input::focus(text_input::Id::new(WT_NAME_INPUT));
-            }
-        }
-        Message::WtDialogName(s) => {
-            if let Some(d) = state.worktree_dialog.as_mut() {
-                d.name = s;
-            }
-        }
-        Message::WtDialogPickBase(b) => {
-            if let Some(d) = state.worktree_dialog.as_mut() {
-                d.base = Some(b);
-            }
-        }
-        Message::WtDialogCancel => {
-            state.worktree_dialog = None;
-        }
-        Message::WtDialogCreate => {
-            // The branch name must be non-empty; otherwise keep the dialog open.
-            let name = state
-                .worktree_dialog
-                .as_ref()
-                .map(|d| d.name.trim().to_string())
-                .unwrap_or_default();
-            if name.is_empty() {
-                return iced::Task::none();
-            }
-            let base = state.worktree_dialog.as_ref().and_then(|d| d.base.clone());
-            let ws = state.active_mut();
-            let Some(root) = ws.project.as_ref().map(|p| p.root.clone()) else {
-                return iced::Task::none();
-            };
-            match arbiter_native::git::worktree_add(&root, &name, base.as_deref()) {
-                Ok(info) => {
-                    // Build + activate the new worktree (stash the current active one).
-                    let (ng, nf) = build_worktree_grid(&info.path);
-                    let og = std::mem::replace(&mut ws.panes, ng);
-                    let of = std::mem::replace(&mut ws.focus, nf);
-                    if let Some(p) = ws.project.as_mut() {
-                        let old = p.active;
-                        p.worktrees[old].stash = Some((og, of));
-                        p.worktrees.push(Worktree {
-                            branch: info.branch.unwrap_or(name),
-                            path: info.path,
-                            stash: None,
-                            merged: false,
-                            avatar_salt: 0,
-                        });
-                        p.active = p.worktrees.len() - 1;
-                        p.explorer = Explorer::default();
-                        load_explorer(p);
-                    }
-                }
-                Err(e) => {
-                    // Keep the dialog open so the name/base can be corrected.
-                    let _ = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_title("Couldn't create worktree")
-                        .set_description(e)
-                        .show();
-                    return iced::Task::none();
-                }
-            }
-            // Success: close the dialog + persist (the `ws` borrow has ended).
-            state.worktree_dialog = None;
-            save_session(state);
-        }
-        Message::WorktreeMenu(i) => {
-            state.worktree_menu = Some(i);
-        }
-        Message::WorktreeMenuClose => {
-            state.worktree_menu = None;
-        }
-        Message::WorktreeMerge(i) => {
-            state.worktree_menu = None;
-            let Some(p) = state.active().project.as_ref() else { return iced::Task::none() };
-            let (Some(feature), Some(main)) = (p.worktrees.get(i), p.worktrees.first()) else {
-                return iced::Task::none();
-            };
-            let feature_branch = feature.branch.clone();
-            let main_path = main.path.clone();
-            let main_branch = main.branch.clone();
-            if !confirm(
-                "Merge worktree?",
-                &format!("Merge '{feature_branch}' into '{main_branch}'? The worktree is kept (marked merged)."),
-            ) {
-                return iced::Task::none();
-            }
-            match arbiter_native::git::merge_branch(&main_path, &feature_branch) {
-                Ok(_) => {
-                    // Web parity: a plain merge keeps the worktree but marks it
-                    // "merged" (greyed). Use "Merge & delete" to remove it.
-                    if let Some(p) = state.active_mut().project.as_mut() {
-                        if let Some(w) = p.worktrees.get_mut(i) {
-                            w.merged = true;
-                        }
-                        load_explorer(p);
-                    }
-                    save_session(state);
-                    let _ = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Info)
-                        .set_title("Merge complete")
-                        .set_description(format!(
-                            "Merged '{feature_branch}' into '{main_branch}'. The worktree is kept \
-                             and marked merged. Use \"Merge & delete\" to remove it."
-                        ))
-                        .show();
-                }
-                Err(e) => {
-                    let _ = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_title("Merge failed")
-                        .set_description(e)
-                        .show();
-                }
-            }
-        }
-        Message::WorktreeMergeDelete(i) => {
-            state.worktree_menu = None;
-            if i == 0 {
-                return iced::Task::none(); // never the main worktree
-            }
-            let Some(p) = state.active().project.as_ref() else { return iced::Task::none() };
-            let (Some(feature), Some(main)) = (p.worktrees.get(i), p.worktrees.first()) else {
-                return iced::Task::none();
-            };
-            let feature_branch = feature.branch.clone();
-            let main_path = main.path.clone();
-            let feature_path = feature.path.clone();
-            let root = p.root.clone();
-            if !confirm(
-                "Merge & delete worktree?",
-                &format!(
-                    "Merge '{feature_branch}' into '{main_branch}', then delete the worktree? Any \
-                     uncommitted changes in it will be lost.",
-                    main_branch = main.branch
-                ),
-            ) {
-                return iced::Task::none();
-            }
-            // 1. Merge the feature branch into the main worktree's branch.
-            if let Err(e) = arbiter_native::git::merge_branch(&main_path, &feature_branch) {
-                let _ = rfd::MessageDialog::new()
-                    .set_level(rfd::MessageLevel::Error)
-                    .set_title("Merge failed")
-                    .set_description(format!("{e}\n\nThe worktree was NOT deleted."))
-                    .show();
-                return iced::Task::none();
-            }
-            // 2. Switch off it if it's active (can't remove the live worktree), then
-            //    remove it (force: the branch is merged, the working copy is expendable).
-            if state.active().project.as_ref().map(|p| p.active) == Some(i) {
-                activate_worktree(state.active_mut(), 0);
-            }
-            match arbiter_native::git::worktree_remove(&root, &feature_path, true) {
-                Ok(()) => {
-                    if let Some(p) = state.active_mut().project.as_mut() {
-                        if i < p.worktrees.len() {
-                            p.worktrees.remove(i);
-                            if p.active > i {
-                                p.active -= 1;
-                            }
-                        }
-                        load_explorer(p);
-                    }
-                    save_session(state);
-                }
-                Err(e) => {
-                    let _ = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_title("Merged, but couldn't remove worktree")
-                        .set_description(e)
-                        .show();
-                }
-            }
-        }
-        Message::WorktreeAskClaudeMerge(i) => {
-            state.worktree_menu = None;
-            let ws = state.active_mut();
-            let (feature, main_branch, main_active) = {
-                let Some(p) = ws.project.as_ref() else { return iced::Task::none() };
-                (
-                    p.worktrees.get(i).map(|w| w.branch.clone()).unwrap_or_default(),
-                    p.worktrees.first().map(|w| w.branch.clone()).unwrap_or_default(),
-                    p.active == 0,
-                )
-            };
-            let cmd = format!(
-                "Please merge the '{feature}' branch into '{main_branch}', resolving any conflicts.\r"
-            );
-            // The main worktree's grid is `ws.panes` when it's active, else its stash.
-            let sent = if main_active {
-                send_to_idle_claude(&mut ws.panes, cmd.as_bytes())
-            } else if let Some((grid, _)) =
-                ws.project.as_mut().and_then(|p| p.worktrees.first_mut()).and_then(|w| w.stash.as_mut())
-            {
-                send_to_idle_claude(grid, cmd.as_bytes())
-            } else {
-                false
-            };
-            if !sent {
-                let _ = rfd::MessageDialog::new()
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_title("No idle Claude available")
-                    .set_description(
-                        "Couldn't send the merge request: the main worktree has no idle Claude \
-                         session. Open Claude in the main worktree (and wait for it to finish its \
-                         current task) before asking it to merge.",
-                    )
-                    .show();
-            }
-        }
-        Message::WorktreeDiscard(i) => {
-            state.worktree_menu = None;
-            let info = state
-                .active()
-                .project
-                .as_ref()
-                .and_then(|p| p.worktrees.get(i))
-                .map(|w| (w.path.clone(), w.branch.clone()));
-            if let Some((path, branch)) = info {
-                if !confirm(
-                    "Discard changes?",
-                    &format!("Discard ALL uncommitted changes in '{branch}'? This cannot be undone."),
-                ) {
-                    return iced::Task::none();
-                }
-                match arbiter_native::git::discard_changes(&path) {
-                    Ok(()) => {
-                        if let Some(p) = state.active_mut().project.as_mut() {
-                            load_explorer(p);
-                        }
-                    }
-                    Err(e) => {
-                        let _ = rfd::MessageDialog::new()
-                            .set_level(rfd::MessageLevel::Error)
-                            .set_title("Couldn't discard changes")
-                            .set_description(e)
-                            .show();
-                    }
-                }
-            }
-        }
-        Message::RegenerateAvatar(i) => {
-            state.worktree_menu = None;
-            if let Some(p) = state.active_mut().project.as_mut() {
-                if let Some(w) = p.worktrees.get_mut(i) {
-                    w.avatar_salt = w.avatar_salt.wrapping_add(1);
-                }
-            }
-            save_session(state);
-        }
-        Message::RemoveWorktree(i) => {
-            state.worktree_menu = None;
-            if i == 0 {
-                return iced::Task::none(); // never the main worktree
-            }
-            // Confirm (it discards any uncommitted changes; the branch is kept).
-            let branch = state
-                .active()
-                .project
-                .as_ref()
-                .and_then(|p| p.worktrees.get(i))
-                .map(|w| w.branch.clone());
-            let Some(branch) = branch else { return iced::Task::none() };
-            if !confirm(
-                "Delete worktree?",
-                &format!(
-                    "Delete the worktree for '{branch}'? Any uncommitted changes are lost; the \
-                     branch itself is kept (no merge)."
-                ),
-            ) {
-                return iced::Task::none();
-            }
-            // Can't remove the live worktree — switch to main first if it's active.
-            if state.active().project.as_ref().map(|p| p.active) == Some(i) {
-                activate_worktree(state.active_mut(), 0);
-            }
-            let ws = state.active_mut();
-            let Some(p) = ws.project.as_mut() else { return iced::Task::none() };
-            if i >= p.worktrees.len() {
-                return iced::Task::none();
-            }
-            let root = p.root.clone();
-            let path = p.worktrees[i].path.clone();
-            match arbiter_native::git::worktree_remove(&root, &path, true) {
-                Ok(()) => {
-                    p.worktrees.remove(i); // drops its stashed grid → sessions close
-                    if p.active > i {
-                        p.active -= 1;
-                    }
-                }
-                Err(e) => {
-                    let _ = rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_title("Couldn't remove worktree")
-                        .set_description(e)
-                        .show();
-                    return iced::Task::none();
-                }
-            }
-            save_session(state); // the `ws`/`p` borrow has ended
-        }
         Message::RequestCloseWorkspace(i) => {
             // Don't close on the click — a stray × already lost a workspace once. Open a
             // confirm dialog; its Close button sends CloseWorkspace(i) to actually close.
@@ -2101,7 +1366,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::WorkspaceTabMenuOpen(i) => {
             // The tab sits in the titlebar, where CursorMoved keeps state.cursor live.
-            state.explorer_menu = None;
             state.term_menu = None;
             state.ws_tab_menu = Some(WsTabMenu { index: i, x: state.cursor.x, y: state.cursor.y });
         }
@@ -2134,7 +1398,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Focus the right-clicked pane so the menu's actions (split/close/copy/
             // paste/clear) target it. Anchor at the click (state.cursor isn't tracked
             // over the terminal body, so the position rides in the message).
-            state.explorer_menu = None;
             state.ws_tab_menu = None;
             let ws = state.active_mut();
             if ws.panes.get(pane).is_some() {
@@ -2146,7 +1409,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Same menu as a body right-click, but the header isn't in the cursor-tracked
             // band, so anchor at the last recorded position. Focus the pane first so the
             // menu's actions (Select All, Copy, …) target this terminal.
-            state.explorer_menu = None;
             state.ws_tab_menu = None;
             let at = last_cursor();
             let ws = state.active_mut();
@@ -2240,106 +1502,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::OpenUrl(url) => open_url(&url),
-        Message::ExplorerMenuOpen(path, _is_dir) => {
-            // Right-click selects the row first if it isn't already in the
-            // selection, so the menu always acts on a meaningful target (web parity).
-            if let Some(p) = state.active_mut().project.as_mut() {
-                if !p.explorer.selected.contains(&path) {
-                    p.explorer.selected.clear();
-                    p.explorer.selected.insert(path.clone());
-                    p.explorer.anchor = Some(path);
-                }
-            }
-            state.explorer_menu = Some(ExplorerMenu { x: state.cursor.x, y: state.cursor.y });
-        }
-        Message::ExplorerMenuClose => state.explorer_menu = None,
-        Message::ExplorerOpenSelection => {
-            state.explorer_menu = None;
-            if let Some(p) = state.active().project.as_ref() {
-                for path in &p.explorer.selected {
-                    open_path(path);
-                }
-            }
-        }
-        Message::ExplorerReveal(path) => {
-            state.explorer_menu = None;
-            reveal_path(&path);
-        }
-        Message::ExplorerRenameStart => {
-            state.explorer_menu = None;
-            // Rename targets the single selected entry.
-            if let Some(p) = state.active().project.as_ref() {
-                if p.explorer.selected.len() == 1 {
-                    let path = p.explorer.selected.iter().next().cloned().unwrap_or_default();
-                    let name = std::path::Path::new(&path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.clone());
-                    state.explorer_rename = Some(ExplorerRename { path, text: name });
-                    return iced::widget::text_input::focus(text_input::Id::new(EXPLORER_RENAME_INPUT));
-                }
-            }
-        }
-        Message::ExplorerRenameInput(s) => {
-            if let Some(r) = state.explorer_rename.as_mut() {
-                r.text = s;
-            }
-        }
-        Message::ExplorerRenameCommit => {
-            if let Some(r) = state.explorer_rename.take() {
-                let new_name = r.text.trim();
-                let old = std::path::Path::new(&r.path);
-                // Reject empty / path-separator names (web `rename_path`).
-                if !new_name.is_empty() && !new_name.contains('/') && !new_name.contains('\\') {
-                    if let Some(parent) = old.parent() {
-                        let new_path = parent.join(new_name);
-                        if !new_path.exists() && std::fs::rename(old, &new_path).is_ok() {
-                            if let Some(p) = state.active_mut().project.as_mut() {
-                                p.explorer.expanded.remove(&r.path); // renamed dir loses expansion
-                                p.explorer.selected.remove(&r.path);
-                                load_explorer(p);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Message::ExplorerRenameCancel => state.explorer_rename = None,
-        Message::ExplorerDeleteStart => {
-            state.explorer_menu = None;
-            if let Some(p) = state.active().project.as_ref() {
-                let paths: Vec<String> = p.explorer.selected.iter().cloned().collect();
-                if !paths.is_empty() {
-                    let label = if paths.len() == 1 {
-                        let name = std::path::Path::new(&paths[0])
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| paths[0].clone());
-                        format!("\"{name}\"")
-                    } else {
-                        format!("{} items", paths.len())
-                    };
-                    state.explorer_delete = Some(ExplorerDelete { paths, label });
-                }
-            }
-        }
-        Message::ExplorerDeleteConfirm => {
-            if let Some(d) = state.explorer_delete.take() {
-                // Move to the OS trash (recoverable), like the web's `trash_path`.
-                let deleted: Vec<String> =
-                    d.paths.into_iter().filter(|p| trash::delete(p).is_ok()).collect();
-                if !deleted.is_empty() {
-                    if let Some(p) = state.active_mut().project.as_mut() {
-                        for path in &deleted {
-                            p.explorer.expanded.remove(path);
-                            p.explorer.selected.remove(path);
-                        }
-                        load_explorer(p);
-                    }
-                }
-            }
-        }
-        Message::ExplorerDeleteCancel => state.explorer_delete = None,
         Message::MouseReport(pane, bytes, focus) => {
             // Write to the reporting pane; focus it on press so keys follow the
             // click (but a wheel/motion report doesn't steal focus).
@@ -2708,37 +1870,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     Task::none()
 }
 
-/// Make worktree `target` the active one: swap its stashed grid into the live
-/// `panes`/`focus`, stashing the outgoing grid. No-op if already active / invalid.
-fn activate_worktree(ws: &mut Workspace, target: usize) {
-    let taken = ws.project.as_mut().and_then(|p| {
-        if target != p.active && target < p.worktrees.len() {
-            p.worktrees.get_mut(target).and_then(|w| w.stash.take()).map(|g| (p.active, g))
-        } else {
-            None
-        }
-    });
-    if let Some((old, (ng, nf))) = taken {
-        let og = std::mem::replace(&mut ws.panes, ng);
-        let of = std::mem::replace(&mut ws.focus, nf);
-        if let Some(p) = ws.project.as_mut() {
-            p.worktrees[old].stash = Some((og, of));
-            p.active = target;
-            p.explorer = Explorer::default(); // tree reflects the new worktree
-            load_explorer(p);
-        }
-    }
-}
-
 fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
     let name = ws.next_name();
-    // In a project workspace, new terminals open in the active worktree's folder
-    // (the web sets the split's cwd to the worktree path); plain workspaces default.
-    let cwd =
-        ws.project.as_ref().and_then(|p| p.worktrees.get(p.active)).map(|w| w.path.clone());
     let history_id = new_history_id();
     let pane = PaneData {
-        session: spawn_session(None, cwd.as_deref(), &history_id),
+        session: spawn_session(None, None, &history_id),
         name,
         shell: ShellKind::PowerShell,
         history_id,
@@ -2789,750 +1925,7 @@ fn app_glow_gradient() -> iced::Gradient {
         .into()
 }
 
-/// Text colour for a file/dir by its git status (web FileExplorerNode), or the
-/// default explorer text colour when clean/untracked-by-status.
-fn git_status_color(status: Option<&str>) -> iced::Color {
-    match status {
-        Some("modified") => iced::Color::from_rgb8(0xe2, 0xc0, 0x8d),
-        Some("added") | Some("untracked") | Some("renamed") => iced::Color::from_rgb8(0x73, 0xc9, 0x91),
-        Some("deleted") => iced::Color::from_rgb8(0xc7, 0x4e, 0x39),
-        Some("conflicted") => iced::Color::from_rgb8(0xe5, 0xc0, 0x7b),
-        _ => iced::Color::from_rgb8(0xc8, 0xcc, 0xd4),
-    }
-}
 
-/// Read a directory for the explorer: dirs first then files, alpha
-/// (case-insensitive), skipping `.git` and dotfiles. Matches the web `read_directory`.
-fn read_dir_entries(dir: &str) -> Vec<DirEntry> {
-    let mut out: Vec<DirEntry> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue; // .git + dotfiles
-        }
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        out.push(DirEntry { name, path: e.path().to_string_lossy().into_owned(), is_dir });
-    }
-    out.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
-    });
-    out
-}
-
-/// Expand or collapse a directory in the explorer, lazy-loading its children on
-/// expand (a plain click on a folder row toggles it).
-fn explorer_toggle_expand(project: &mut Project, path: &str) {
-    let ex = &mut project.explorer;
-    if ex.expanded.remove(path) {
-        // collapsed
-    } else {
-        ex.expanded.insert(path.to_string());
-        if std::path::Path::new(path).is_dir() {
-            let children = read_dir_entries(path);
-            project.explorer.entries.insert(path.to_string(), children);
-        }
-    }
-}
-
-/// (Re)load the active worktree's explorer cache: root + expanded dirs + git
-/// status (keyed by absolute path). Called when the cache is stale or files change.
-fn load_explorer(project: &mut Project) {
-    let Some(wt) = project.worktrees.get(project.active).map(|w| w.path.clone()) else {
-        return;
-    };
-    let ex = &mut project.explorer;
-    ex.cached_for = wt.clone();
-    ex.entries.clear();
-    ex.entries.insert(wt.clone(), read_dir_entries(&wt));
-    let expanded: Vec<String> = ex.expanded.iter().cloned().collect();
-    for d in expanded {
-        if std::path::Path::new(&d).is_dir() {
-            ex.entries.insert(d.clone(), read_dir_entries(&d));
-        }
-    }
-    ex.git_status.clear();
-    let wtp = std::path::Path::new(&wt);
-    for (rel, status) in arbiter_native::git::file_status(&wt) {
-        let abs = wtp.join(&rel).to_string_lossy().into_owned();
-        ex.git_status.insert(abs, status);
-    }
-}
-
-/// Flatten the visible tree (root children, recursing into expanded dirs) into
-/// (entry, depth) rows for rendering.
-fn flatten_tree(ex: &Explorer, dir: &str, depth: usize, out: &mut Vec<(DirEntry, usize)>) {
-    if depth > 40 {
-        return;
-    }
-    if let Some(children) = ex.entries.get(dir) {
-        for e in children {
-            out.push((e.clone(), depth));
-            if e.is_dir && ex.expanded.contains(&e.path) {
-                flatten_tree(ex, &e.path, depth + 1, out);
-            }
-        }
-    }
-}
-
-/// One file-explorer row: indent + chevron (dirs) + name, git-status coloured.
-/// Dir rows toggle expand; file rows are inert. Right-click opens the context
-/// menu (open / reveal / rename / delete).
-fn explorer_row(ex: &Explorer, entry: &DirEntry, depth: usize) -> Element<'static, Message> {
-    let color = git_status_color(ex.git_status.get(&entry.path).map(String::as_str));
-    let indent = depth as f32 * 16.0;
-    // The icon slot: a chevron for directories (the ▸/▾ glyphs aren't in the UI
-    // font → tofu), a file-type icon (coloured by type, like the web) for files.
-    let icon: Element<Message> = if entry.is_dir {
-        let path = if ex.expanded.contains(&entry.path) {
-            mdi_path::CHEVRON_DOWN
-        } else {
-            mdi_path::CHEVRON_RIGHT
-        };
-        mdi(path, 16.0, iced::Color::from_rgb8(0x9c, 0x9c, 0x9c))
-    } else {
-        let (path, (r, g, b)) = file_icons::file_icon(&entry.name);
-        mdi(path, 16.0, iced::Color::from_rgb8(r, g, b))
-    };
-    let content = row![
-        Space::with_width(Length::Fixed(indent)),
-        icon,
-        text(entry.name.clone()).size(13).color(color),
-    ]
-    .spacing(4)
-    .align_y(iced::Center);
-    // Every row is clickable to select (dirs also toggle on a plain click, handled
-    // in `ExplorerSelect`). Selected rows get the web's blue highlight.
-    let selected = ex.selected.contains(&entry.path);
-    let is_dir = entry.is_dir;
-    let btn = button(content)
-        .width(Length::Fill)
-        .padding([2, 8])
-        .on_press(Message::ExplorerSelect(entry.path.clone(), is_dir))
-        .style(move |_t: &iced::Theme, status| {
-            let bg = if selected {
-                Some(iced::Background::Color(iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.18)))
-            } else if matches!(status, button::Status::Hovered) {
-                Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25)))
-            } else {
-                None
-            };
-            button::Style {
-                background: bg,
-                border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                ..Default::default()
-            }
-        });
-    // Right-click → context menu. on_right_press doesn't carry the cursor, so the
-    // menu anchors at the last tracked cursor position (left-strip tracking).
-    mouse_area(btn)
-        .on_right_press(Message::ExplorerMenuOpen(entry.path.clone(), is_dir))
-        .into()
-}
-
-/// Project-workspace sidebar container chrome: same #121212 as the terminals,
-/// radius 8.
-fn sidebar_style(_t: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(app_bg())),
-        border: iced::Border { radius: 8.0.into(), ..Default::default() },
-        ..Default::default()
-    }
-}
-
-/// Uppercase sidebar section header (File explorer branch / "WORKTREES") with an
-/// optional trailing widget (e.g. the "+" button). Shared size/weight/colour AND a
-/// fixed height so both panels' titles line up identically.
-fn sidebar_header<'a>(label: String, trailing: Option<Element<'a, Message>>) -> Element<'a, Message> {
-    let mut r = row![
-        text(label).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8)),
-        horizontal_space(),
-    ]
-    .align_y(iced::Center)
-    .height(Length::Fixed(34.0))
-    .padding([0, 10]);
-    if let Some(t) = trailing {
-        r = r.push(t);
-    }
-    r.into()
-}
-
-/// Left sidebar: file explorer for the active worktree. Phase 3 = header only
-/// (branch name); phase 4 fills in the git-coloured file tree.
-fn explorer_sidebar(project: &Project) -> Element<'static, Message> {
-    let branch = project.worktrees.get(project.active).map(|w| w.branch.clone()).unwrap_or_default();
-    let header = sidebar_header(branch.to_uppercase(), None);
-    let mut rows: Vec<(DirEntry, usize)> = Vec::new();
-    if let Some(wt) = project.worktrees.get(project.active) {
-        flatten_tree(&project.explorer, &wt.path, 0, &mut rows);
-    }
-    let mut tree = column![].spacing(0);
-    for (entry, depth) in rows {
-        tree = tree.push(explorer_row(&project.explorer, &entry, depth));
-    }
-    container(
-        column![header, scrollable(tree).width(Length::Fill).height(Length::Fill)]
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .width(Length::Fixed(220.0))
-    .height(Length::Fill)
-    .style(sidebar_style)
-    .into()
-}
-
-/// Aggregate Claude state across ALL panes of a worktree grid (a worktree can
-/// run several Claude instances): counts per lifecycle + the stats of the first
-/// one with a capture (for the model + context display).
-struct WorktreeClaude {
-    working: usize,
-    attention: usize,
-    idle: usize,
-    model: Option<String>,
-    percent: Option<f64>,
-}
-
-fn worktree_claude(grid: &pane_grid::State<PaneData>) -> WorktreeClaude {
-    use arbiter_native::claude_status::Lifecycle;
-    let mut wc = WorktreeClaude { working: 0, attention: 0, idle: 0, model: None, percent: None };
-    for (_, d) in grid.iter() {
-        if !d.session.claude_running() {
-            continue;
-        }
-        let cs = d.session.claude_status();
-        match cs.lifecycle {
-            Lifecycle::Working => wc.working += 1,
-            Lifecycle::Attention => wc.attention += 1,
-            _ => wc.idle += 1,
-        }
-        if wc.model.is_none() && cs.has_stats {
-            wc.model = cs.model.clone();
-            wc.percent = cs.used_percent;
-        }
-    }
-    wc
-}
-
-/// A blocking native Yes/No confirmation. Returns true only on "Yes".
-fn confirm(title: &str, body: &str) -> bool {
-    rfd::MessageDialog::new()
-        .set_level(rfd::MessageLevel::Warning)
-        .set_title(title)
-        .set_description(body)
-        .set_buttons(rfd::MessageButtons::YesNo)
-        .show()
-        == rfd::MessageDialogResult::Yes
-}
-
-/// Write `bytes` to the first pane in `grid` running a Claude that's accepting
-/// input (Ready or Attention — i.e. not mid-task), matching the web's gate.
-/// Returns false if there's no such pane (caller warns the user).
-fn send_to_idle_claude(grid: &mut pane_grid::State<PaneData>, bytes: &[u8]) -> bool {
-    let target = grid
-        .iter()
-        .find(|(_, d)| {
-            d.session.claude_running()
-                && matches!(
-                    d.session.claude_status().lifecycle,
-                    Lifecycle::Ready | Lifecycle::Attention
-                )
-        })
-        .map(|(p, _)| *p);
-    match target.and_then(|p| grid.get_mut(p)) {
-        Some(d) => {
-            d.session.write(bytes);
-            true
-        }
-        None => false,
-    }
-}
-
-/// A small filled status dot (drawn, not a glyph) of the given colour.
-/// A filled status circle of diameter `d` — a styled box (exact size, clean
-/// vertical centering), not a glyph like "●" whose font metrics drift.
-fn dot_circle(color: iced::Color, d: f32) -> Element<'static, Message> {
-    container(Space::new(Length::Fixed(d), Length::Fixed(d)))
-        .style(move |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(color)),
-            border: iced::Border { radius: (d / 2.0).into(), ..Default::default() },
-            ..Default::default()
-        })
-        .into()
-}
-
-/// Place a status icon (a dot or the animated ✻ bloom) in a fixed, both-axis-
-/// centred square. The slot keeps the adjacent count from shifting, stops the ✻
-/// from jumping the layout as it blooms, and centres the icon on the number.
-fn status_slot(content: Element<'static, Message>) -> Element<'static, Message> {
-    const N: f32 = 16.0;
-    container(content).center_x(Length::Fixed(N)).center_y(Length::Fixed(N)).into()
-}
-
-/// A random `adjective-noun` worktree branch name (web WorktreeNewDialog), seeded
-/// off the clock (no rand dep).
-fn random_worktree_name() -> String {
-    const ADJ: &[&str] = &[
-        "swift", "brave", "clever", "witty", "lucky", "mighty", "silent", "bold", "eager", "jolly",
-        "nimble", "quirky", "sunny", "wild", "cosmic", "frosty", "golden", "lunar", "misty", "zesty",
-    ];
-    const NOUN: &[&str] = &[
-        "otter", "falcon", "panda", "tiger", "wolf", "fox", "lynx", "hawk", "badger", "cobra",
-        "dragon", "eagle", "gecko", "koala", "narwhal", "octopus", "penguin", "raven", "shark", "whale",
-    ];
-    let t = now_ms() as usize;
-    format!("{}-{}", ADJ[t % ADJ.len()], NOUN[(t / 7) % NOUN.len()])
-}
-
-/// HSL → RGB (h in degrees, s/l in 0..1).
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
-    let (r1, g1, b1) = match hp as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
-    (to(r1), to(g1), to(b1))
-}
-
-/// The avatar cache key for a worktree: its branch, plus the reroll salt when set.
-fn avatar_seed(branch: &str, salt: u32) -> String {
-    if salt == 0 {
-        branch.to_string()
-    } else {
-        format!("{branch}#{salt}")
-    }
-}
-
-/// A rounded-rect path (x,y,w,h with corner radius r).
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
-    let mut pb = tiny_skia::PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.quad_to(x + w, y, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.quad_to(x + w, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.quad_to(x, y + h, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
-    pb.close();
-    pb.finish().unwrap()
-}
-
-/// Number of pre-rendered frames in the working-Claude avatar animation.
-const ANIM_FRAMES: u32 = 8;
-
-/// Linear interpolate between two RGB colours (t in 0..1).
-fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
-    let t = t.clamp(0.0, 1.0);
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
-    (l(a.0, b.0), l(a.1, b.1), l(a.2, b.2))
-}
-
-/// A closed polygon path through `pts`.
-fn poly(pts: &[(f32, f32)]) -> tiny_skia::Path {
-    let mut pb = tiny_skia::PathBuilder::new();
-    pb.move_to(pts[0].0, pts[0].1);
-    for p in &pts[1..] {
-        pb.line_to(p.0, p.1);
-    }
-    pb.close();
-    pb.finish().unwrap()
-}
-
-/// A deterministic 64×64 robot avatar drawn from `seed`, at animation `frame`
-/// (0 = the neutral/static pose; higher frames bob + pulse the "thinking" LED).
-/// Every part — head shape, eye style/count, antenna, mouth, side bolts, and the
-/// background pattern — is selected from a distinct slice of the seed's hash, so
-/// branches differ in shape, not just colour. Rounded corners; the rest is
-/// transparent. tiny-skia outputs premultiplied RGBA, so it's un-premultiplied to
-/// match iced's straight-alpha expectation (same as `render_logo`).
-fn worktree_avatar(seed: &str, frame: u32) -> iced::widget::image::Handle {
-    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
-    // FNV-1a hash, then carve feature selectors from different bit ranges.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in seed.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let pick = |shift: u32, n: u64| ((h >> shift) % n) as usize;
-    let hue = (h % 360) as f32;
-    let head_shape = pick(8, 4); // 0 square · 1 rounded · 2 pill · 3 hexagon
-    let eye_style = pick(16, 3); // 0 round · 1 square · 2 visor bar
-    let eye_count = [2usize, 2, 1, 3, 2][pick(24, 5)]; // mostly 2, sometimes 1 or 3
-    let antenna = pick(33, 4); // 0 none · 1 single · 2 twin · 3 dish
-    let mouth = pick(41, 4); // 0 line · 1 teeth · 2 dots · 3 smile
-    let bolts = pick(49, 3); // 0 none · 1 bolts · 2 ears
-    let bg_pat = pick(53, 4); // 0 solid · 1 rings · 2 frame · 3 corner dots
-
-    let bg = hsl_to_rgb(hue, 0.50, 0.26);
-    let bg_accent = hsl_to_rgb(hue, 0.45, 0.36);
-    let head = hsl_to_rgb((hue + 25.0) % 360.0, 0.52, 0.62);
-    let head_dark = hsl_to_rgb((hue + 25.0) % 360.0, 0.45, 0.46);
-    let eye_dim = hsl_to_rgb((hue + 185.0) % 360.0, 0.45, 0.42);
-    let eye_glow = hsl_to_rgb((hue + 185.0) % 360.0, 0.80, 0.70);
-
-    // Animation: vertical bob + "thinking" LED/eye pulse (both neutral at frame 0).
-    let tau = std::f32::consts::TAU;
-    let t = frame as f32 / ANIM_FRAMES as f32;
-    let oy = (t * tau).sin() * 2.0;
-    let glow = 0.55 + 0.45 * (t * tau).cos();
-    let eye = lerp_rgb(eye_dim, eye_glow, glow);
-
-    const N: u32 = 64;
-    let mut pm = Pixmap::new(N, N).unwrap();
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    let id = Transform::identity();
-    let set = |paint: &mut Paint, c: (u8, u8, u8)| paint.set_color_rgba8(c.0, c.1, c.2, 255);
-    let fill = |pm: &mut Pixmap, paint: &Paint, path: &tiny_skia::Path| {
-        pm.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
-    };
-    let rect = |pm: &mut Pixmap, paint: &Paint, x, y, w, hh| {
-        if let Some(r) = Rect::from_xywh(x, y, w, hh) {
-            pm.fill_path(&PathBuilder::from_rect(r), paint, FillRule::Winding, Transform::identity(), None);
-        }
-    };
-    let circle = |pm: &mut Pixmap, paint: &Paint, cx, cy, rad| {
-        if let Some(p) = PathBuilder::from_circle(cx, cy, rad) {
-            pm.fill_path(&p, paint, FillRule::Winding, Transform::identity(), None);
-        }
-    };
-
-    // 1. Rounded-rect background (corners stay transparent).
-    set(&mut paint, bg);
-    fill(&mut pm, &paint, &rounded_rect(0.0, 0.0, 64.0, 64.0, 12.0));
-
-    // 2. Background pattern (accent colour, mostly visible as a frame around the head).
-    set(&mut paint, bg_accent);
-    match bg_pat {
-        1 => {
-            if let Some(p) = PathBuilder::from_circle(32.0, 32.0, 27.0) {
-                pm.stroke_path(&p, &paint, &Stroke { width: 2.0, ..Default::default() }, id, None);
-            }
-        }
-        2 => {
-            rect(&mut pm, &paint, 6.0, 6.0, 52.0, 1.5);
-            rect(&mut pm, &paint, 6.0, 56.5, 52.0, 1.5);
-            rect(&mut pm, &paint, 6.0, 6.0, 1.5, 52.0);
-            rect(&mut pm, &paint, 56.5, 6.0, 1.5, 52.0);
-        }
-        3 => {
-            for (cx, cy) in [(11.0, 11.0), (53.0, 11.0), (11.0, 53.0), (53.0, 53.0)] {
-                circle(&mut pm, &paint, cx, cy, 2.5);
-            }
-        }
-        _ => {}
-    }
-
-    // 3. Antenna (light; tip is the pulsing eye colour).
-    set(&mut paint, head);
-    match antenna {
-        1 => {
-            rect(&mut pm, &paint, 30.5, 6.0 + oy, 3.0, 10.0);
-            set(&mut paint, eye);
-            circle(&mut pm, &paint, 32.0, 6.0 + oy, 3.5);
-            set(&mut paint, head);
-        }
-        2 => {
-            rect(&mut pm, &paint, 22.0, 7.0 + oy, 2.5, 9.0);
-            rect(&mut pm, &paint, 39.5, 7.0 + oy, 2.5, 9.0);
-            set(&mut paint, eye);
-            circle(&mut pm, &paint, 23.0, 7.5 + oy, 2.5);
-            circle(&mut pm, &paint, 41.0, 7.5 + oy, 2.5);
-            set(&mut paint, head);
-        }
-        3 => {
-            rect(&mut pm, &paint, 30.5, 9.0 + oy, 3.0, 7.0);
-            rect(&mut pm, &paint, 25.0, 6.0 + oy, 14.0, 3.5);
-        }
-        _ => {}
-    }
-
-    // 4. Side bolts / ears.
-    match bolts {
-        1 => {
-            set(&mut paint, eye);
-            circle(&mut pm, &paint, 12.0, 33.0 + oy, 3.0);
-            circle(&mut pm, &paint, 52.0, 33.0 + oy, 3.0);
-        }
-        2 => {
-            set(&mut paint, head_dark);
-            rect(&mut pm, &paint, 9.0, 28.0 + oy, 4.0, 12.0);
-            rect(&mut pm, &paint, 51.0, 28.0 + oy, 4.0, 12.0);
-        }
-        _ => {}
-    }
-
-    // 5. Head.
-    set(&mut paint, head);
-    let (hx, hy, hw, hh) = (14.0, 16.0 + oy, 36.0, 34.0);
-    match head_shape {
-        0 => rect(&mut pm, &paint, hx, hy, hw, hh),
-        1 => fill(&mut pm, &paint, &rounded_rect(hx, hy, hw, hh, 8.0)),
-        2 => fill(&mut pm, &paint, &rounded_rect(hx, hy, hw, hh, 16.0)),
-        _ => {
-            let midy = hy + hh / 2.0;
-            fill(
-                &mut pm,
-                &paint,
-                &poly(&[
-                    (hx, midy),
-                    (hx + 9.0, hy),
-                    (hx + hw - 9.0, hy),
-                    (hx + hw, midy),
-                    (hx + hw - 9.0, hy + hh),
-                    (hx + 9.0, hy + hh),
-                ]),
-            );
-        }
-    }
-
-    // 6. Eyes.
-    set(&mut paint, eye);
-    let ey = 31.0 + oy;
-    if eye_style == 2 {
-        fill(&mut pm, &paint, &rounded_rect(20.0, ey - 4.0, 24.0, 8.0, 3.5));
-    } else {
-        let xs: &[f32] = match eye_count {
-            1 => &[32.0],
-            3 => &[22.0, 32.0, 42.0],
-            _ => &[25.0, 39.0],
-        };
-        let r = if eye_count == 3 { 3.4 } else { 4.6 };
-        for &ex in xs {
-            if eye_style == 1 {
-                rect(&mut pm, &paint, ex - r, ey - r, r * 2.0, r * 2.0);
-            } else {
-                circle(&mut pm, &paint, ex, ey, r);
-            }
-        }
-    }
-
-    // 7. Mouth.
-    let my = 41.0 + oy;
-    match mouth {
-        0 => rect(&mut pm, &paint, 24.0, my, 16.0, 3.0),
-        1 => {
-            rect(&mut pm, &paint, 24.0, my - 1.0, 16.0, 5.0);
-            set(&mut paint, bg);
-            rect(&mut pm, &paint, 28.0, my - 1.0, 1.5, 5.0);
-            rect(&mut pm, &paint, 31.5, my - 1.0, 1.5, 5.0);
-            rect(&mut pm, &paint, 35.0, my - 1.0, 1.5, 5.0);
-        }
-        2 => {
-            for ex in [27.0, 32.0, 37.0] {
-                circle(&mut pm, &paint, ex, my + 1.5, 1.6);
-            }
-        }
-        _ => {
-            let mut pb = PathBuilder::new();
-            pb.move_to(25.0, my);
-            pb.quad_to(32.0, my + 5.0, 39.0, my);
-            if let Some(p) = pb.finish() {
-                pm.stroke_path(&p, &paint, &Stroke { width: 2.5, ..Default::default() }, id, None);
-            }
-        }
-    }
-
-    // Un-premultiply (tiny-skia premultiplied → iced straight alpha).
-    let mut data = pm.data().to_vec();
-    for px in data.chunks_exact_mut(4) {
-        let a = px[3] as u32;
-        if a > 0 && a < 255 {
-            px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
-            px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
-            px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
-        }
-    }
-    iced::widget::image::Handle::from_rgba(N, N, data)
-}
-
-/// Cached [`worktree_avatar`], keyed by (seed, frame) — each frame is drawn once
-/// and the GPU texture is reused as the working animation cycles through frames.
-fn avatar_for(seed: &str, frame: u32) -> iced::widget::image::Handle {
-    static CACHE: std::sync::Mutex<
-        Option<std::collections::HashMap<(String, u32), iced::widget::image::Handle>>,
-    > = std::sync::Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    let key = (seed.to_string(), frame);
-    if let Some(h) = map.get(&key) {
-        return h.clone();
-    }
-    let handle = worktree_avatar(seed, frame);
-    map.insert(key, handle.clone());
-    handle
-}
-
-/// Right sidebar: worktree cards with Claude stats (status / model / context),
-/// a "+" to add a worktree, and "×" to remove a non-main one. Click → switch.
-fn worktree_sidebar(ws: &Workspace) -> Element<'static, Message> {
-    let project = ws.project.as_ref().expect("worktree_sidebar called on a project workspace");
-    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
-    let azure = iced::Color::from_rgb8(0x33, 0x99, 0xff);
-    let orange = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
-    let purple = iced::Color::from_rgb8(0xa3, 0x71, 0xf7);
-
-    let plus = button(text("+").size(14).color(muted))
-        .padding([0, 6])
-        .on_press(Message::NewWorktree)
-        .style(button::text);
-    let header = sidebar_header("WORKTREES".to_string(), Some(plus.into()));
-
-    let mut col = column![header].spacing(2).padding([0, 6]);
-    for (i, w) in project.worktrees.iter().enumerate() {
-        let active = i == project.active;
-        let empty = WorktreeClaude { working: 0, attention: 0, idle: 0, model: None, percent: None };
-        let wc = if active {
-            worktree_claude(&ws.panes)
-        } else {
-            w.stash.as_ref().map(|(g, _)| worktree_claude(g)).unwrap_or(empty)
-        };
-        let total = wc.working + wc.attention + wc.idle;
-
-        let branch_color = if active { azure } else { iced::Color::from_rgb8(0x9c, 0x9c, 0x9c) };
-        // Top row: branch (left) · model (top-right) · "⋯" menu. The model is only
-        // shown once a Claude here has captured stats.
-        let mut top = row![text(w.branch.clone())
-            .size(13)
-            .font(ui_semibold())
-            .color(branch_color)
-            .width(Length::Fill)]
-        .spacing(6)
-        .align_y(iced::Center);
-        if let Some(m) = &wc.model {
-            let c = clean_model(m);
-            top = top.push(text(c.clone()).size(11).color(model_color(&c)));
-        }
-        top = top.push(
-            button(mdi(mdi_path::DOTS_VERTICAL, 16.0, muted))
-                .padding([0, 2])
-                .on_press(Message::WorktreeMenu(i))
-                .style(button::text),
-        );
-        let mut info = column![top].spacing(3);
-
-        // Status line: one dot+count group per lifecycle (working glyph is the
-        // shared animated ✻; attention amber; idle muted). Merged/no-Claude special.
-        if w.merged {
-            info = info.push(text("Merged").size(11).color(purple));
-        } else if total == 0 {
-            info = info
-                .push(text("Terminal").size(11).color(iced::Color::from_rgba8(0x6b, 0x7a, 0x8d, 0.7)));
-        } else {
-            let mut status = row![].spacing(8).align_y(iced::Center);
-            if wc.working > 0 {
-                let (g, c) = working_frame();
-                status = status.push(
-                    row![
-                        status_slot(text(g).font(symbols_font()).size(15).color(c).into()),
-                        text(wc.working.to_string()).size(13).color(azure),
-                    ]
-                    .spacing(2)
-                    .align_y(iced::Center),
-                );
-            }
-            if wc.attention > 0 {
-                status = status.push(
-                    row![
-                        status_slot(dot_circle(orange, 10.0)),
-                        text(wc.attention.to_string()).size(13).color(orange)
-                    ]
-                    .spacing(2)
-                    .align_y(iced::Center),
-                );
-            }
-            if wc.idle > 0 {
-                status = status.push(
-                    row![
-                        status_slot(dot_circle(muted, 10.0)),
-                        text(wc.idle.to_string()).size(13).color(muted)
-                    ]
-                    .spacing(2)
-                    .align_y(iced::Center),
-                );
-            }
-            info = info.push(status);
-        }
-
-        // Context bar of the first Claude instance with captured stats.
-        if let Some(pct) = wc.percent {
-            let p = (pct.round() as u16).min(100);
-            let fill = if pct > 80.0 {
-                iced::Color::from_rgb8(0xef, 0x44, 0x44)
-            } else if pct > 60.0 {
-                iced::Color::from_rgb8(0xf5, 0x9e, 0x0b)
-            } else {
-                iced::Color::from_rgb8(0x22, 0xc5, 0x5e)
-            };
-            // Just the percentage — the context size ("1M"/"200k") is too wide.
-            info = info
-                .push(text(format!("{p}%")).size(10).color(iced::Color::from_rgb8(0x56, 0x9c, 0xd6)));
-            let bar = row![
-                container(Space::new(Length::Fill, Length::Fixed(3.0)))
-                    .width(Length::FillPortion(p.max(1)))
-                    .style(move |_t: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(fill)),
-                        ..Default::default()
-                    }),
-                container(Space::new(Length::Fill, Length::Fixed(3.0)))
-                    .width(Length::FillPortion((100 - p).max(1)))
-                    .style(|_t: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12))),
-                        ..Default::default()
-                    }),
-            ]
-            .height(Length::Fixed(3.0));
-            info = info.push(bar);
-        }
-
-        // Card body: a deterministic avatar (left, vertically centred) + the info
-        // column. It animates while a Claude here is working, and dims for merged
-        // worktrees to match their greyed treatment.
-        let frame = if wc.working > 0 {
-            ((now_ms() / 110) % ANIM_FRAMES as u64) as u32
-        } else {
-            0
-        };
-        let avatar = iced::widget::image(avatar_for(&avatar_seed(&w.branch, w.avatar_salt), frame))
-            .width(Length::Fixed(32.0))
-            .height(Length::Fixed(32.0))
-            .opacity(if w.merged { 0.45 } else { 1.0 })
-            .filter_method(iced::widget::image::FilterMethod::Linear);
-        let body = row![avatar, info.width(Length::Fill)].spacing(8).align_y(iced::Center);
-        let card = mouse_area(
-            container(body).width(Length::Fill).padding([8, 10]).style(move |_t: &iced::Theme| {
-                container::Style {
-                    background: active
-                        .then(|| iced::Background::Color(iced::Color::from_rgba8(0x56, 0x9c, 0xd6, 0.12))),
-                    border: iced::Border { radius: 6.0.into(), ..Default::default() },
-                    ..Default::default()
-                }
-            }),
-        )
-        .on_press(Message::SwitchWorktree(i))
-        .on_right_press(Message::WorktreeMenu(i));
-        col = col.push(card);
-    }
-    container(scrollable(col).width(Length::Fill).height(Length::Fill))
-        .width(Length::Fixed(260.0))
-        .height(Length::Fill)
-        .style(sidebar_style)
-        .into()
-}
-
-/// The text_input id of the new-worktree dialog's branch-name field (for autofocus).
-const WT_NAME_INPUT: &str = "wt-name-input";
 const WS_RENAME_INPUT: &str = "ws-rename-input";
 const TERM_RENAME_INPUT: &str = "term-rename-input";
 /// The text_input id of the find bar's query field (for autofocus on Ctrl+F).
@@ -3593,36 +1986,6 @@ fn open_path(path: &str) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
-/// Reveal a path in the OS file manager (web `reveal_path`): select it in
-/// Finder / File Explorer, or open the containing folder on Linux. Best-effort.
-fn reveal_path(path: &str) {
-    let p = std::path::Path::new(path);
-    if !p.exists() {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").args(["-R", path]).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(parent) = p.parent() {
-        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
-    }
-}
-
-/// Platform-specific label for the explorer's "reveal" action (web `revealLabel`).
-fn reveal_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Reveal in Finder"
-    } else if cfg!(target_os = "windows") {
-        "Reveal in File Explorer"
-    } else {
-        "Open containing folder"
-    }
-}
-
-/// Path to Claude's user `settings.json` — inside `$CLAUDE_CONFIG_DIR` or `~/.claude`
-/// (resolved by `claude_shim::claude_config_dir`).
 fn claude_settings_json_path() -> Option<std::path::PathBuf> {
     arbiter_native::claude_shim::claude_config_dir().map(|d| d.join("settings.json"))
 }
@@ -3652,19 +2015,7 @@ fn open_or_create_config(path: Option<std::path::PathBuf>, default: &str) {
     open_path(&path.to_string_lossy());
 }
 
-/// The text_input id of the explorer rename dialog's name field (for autofocus).
-const EXPLORER_RENAME_INPUT: &str = "explorer-rename-input";
-
-/// The modal layer over the whole window, if a worktree dialog or context menu is
-/// open: the new-worktree form, or the right-click actions for a worktree.
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
-    // File-explorer rename/delete dialogs + right-click menu (only one is ever set).
-    if let Some(r) = &state.explorer_rename {
-        return Some(explorer_rename_view(r));
-    }
-    if let Some(d) = &state.explorer_delete {
-        return Some(explorer_delete_view(d));
-    }
     if let Some(c) = &state.close_confirm {
         return Some(close_confirm_view(c));
     }
@@ -3674,11 +2025,6 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if state.usage_login_prompt {
         return Some(usage_login_prompt_view());
     }
-    if let Some(m) = &state.explorer_menu {
-        if let Some(p) = state.active().project.as_ref() {
-            return Some(explorer_menu_view(&p.explorer, m.x, m.y, state.main_size));
-        }
-    }
     if let Some(rt) = &state.rename_terminal {
         return Some(rename_terminal_view(rt));
     }
@@ -3687,9 +2033,6 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     }
     if let Some(m) = &state.ws_tab_menu {
         return Some(ws_tab_menu_view(state, m.index, m.x, m.y));
-    }
-    if state.new_ws_menu {
-        return Some(new_ws_menu_view(state.new_ws_menu_x));
     }
     // The org picker layers above Settings (it's reached from the Settings "Switch
     // organization" button), so check it first; dismissing it returns to Settings.
@@ -3708,10 +2051,7 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if state.settings_open {
         return Some(settings_dialog_view(state));
     }
-    if let Some(dlg) = &state.worktree_dialog {
-        return Some(worktree_dialog_view(dlg));
-    }
-    state.worktree_menu.map(|i| worktree_menu_view(state, i))
+    None
 }
 
 /// Centred modal listing the user's claude.ai orgs to pick usage for.
@@ -3771,103 +2111,6 @@ fn modal_panel<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
     .into()
 }
 
-fn worktree_dialog_view(dlg: &WorktreeDialog) -> Element<'_, Message> {
-    let label = |s: &str| {
-        text(s.to_string()).size(12).color(iced::Color::from_rgb8(0xa0, 0xaa, 0xb8))
-    };
-    let name_input = text_input("branch-name", &dlg.name)
-        .id(text_input::Id::new(WT_NAME_INPUT))
-        .on_input(Message::WtDialogName)
-        .on_submit(Message::WtDialogCreate)
-        .padding([7, 9])
-        .size(13);
-    let base = pick_list(dlg.branches.as_slice(), dlg.base.clone(), Message::WtDialogPickBase)
-        .placeholder("HEAD (current)")
-        .padding([7, 9])
-        .text_size(13)
-        .width(Length::Fill);
-    let actions = row![
-        horizontal_space(),
-        button(text("Cancel").size(13))
-            .on_press(Message::WtDialogCancel)
-            .style(button::secondary)
-            .padding([6, 14]),
-        button(text("Create").size(13))
-            .on_press(Message::WtDialogCreate)
-            .style(button::primary)
-            .padding([6, 14]),
-    ]
-    .spacing(8)
-    .align_y(iced::Center);
-    let panel = column![
-        text("New worktree").size(15).font(ui_semibold()),
-        column![label("Branch name"), name_input].spacing(5),
-        column![label("Base branch"), base].spacing(5),
-        actions,
-    ]
-    .spacing(14)
-    .padding(18)
-    .width(Length::Fixed(360.0));
-    modal_scrim(modal_panel(panel.into()), Message::WtDialogCancel)
-}
-
-fn worktree_menu_view(state: &State, i: usize) -> Element<'_, Message> {
-    let Some(p) = state.active().project.as_ref() else {
-        return modal_scrim(Space::new(0.0, 0.0).into(), Message::WorktreeMenuClose);
-    };
-    let Some(wt) = p.worktrees.get(i) else {
-        return modal_scrim(Space::new(0.0, 0.0).into(), Message::WorktreeMenuClose);
-    };
-    let branch = wt.branch.clone();
-    let main_branch = p.worktrees.first().map(|w| w.branch.clone()).unwrap_or_default();
-    let is_main = i == 0;
-
-    let item = |lbl: String, msg: Message, danger: bool| -> Element<'static, Message> {
-        let color = if danger {
-            iced::Color::from_rgb8(0xe5, 0x4a, 0x4a)
-        } else {
-            iced::Color::from_rgb8(0xcc, 0xcc, 0xcc)
-        };
-        button(text(lbl).size(13).color(color))
-            .width(Length::Fill)
-            .padding([7, 12])
-            .on_press(msg)
-            .style(button::text)
-            .into()
-    };
-
-    let mut items = column![
-        text(branch).size(12).font(ui_semibold()).color(iced::Color::from_rgb8(0x6b, 0x7a, 0x8d)),
-    ]
-    .spacing(2)
-    .padding(iced::Padding { top: 4.0, right: 4.0, bottom: 6.0, left: 12.0 });
-
-    if !is_main {
-        items = items.push(item(
-            format!("Ask Claude to merge into {main_branch}"),
-            Message::WorktreeAskClaudeMerge(i),
-            false,
-        ));
-        items = items.push(item(format!("Merge into {main_branch}"), Message::WorktreeMerge(i), false));
-        items = items.push(item(
-            format!("Merge into {main_branch} & delete"),
-            Message::WorktreeMergeDelete(i),
-            false,
-        ));
-    }
-    items = items.push(item("New robot".into(), Message::RegenerateAvatar(i), false));
-    items = items.push(item("Discard changes".into(), Message::WorktreeDiscard(i), false));
-    if !is_main {
-        items = items.push(item("Delete worktree".into(), Message::RemoveWorktree(i), true));
-    }
-
-    let panel = container(items).padding(8).width(Length::Fixed(280.0));
-    modal_scrim(modal_panel(panel.into()), Message::WorktreeMenuClose)
-}
-
-// ── Settings dialog (web SettingsDialog.vue: sidebar + tabbed content) ─────────
-
-/// Variants of the web `.btn` family used in Settings.
 #[derive(Clone, Copy)]
 enum BtnKind {
     Primary,
@@ -4566,7 +2809,7 @@ fn tab_pill(
     max_chars: usize,
     dragging_src: bool,
 ) -> Element<'static, Message> {
-    let icon = if ws.project.is_some() { mdi_path::FOLDER } else { mdi_path::CONSOLE };
+    let icon = mdi_path::CONSOLE;
     // Type icon + close go near-white on the active tab (visible), muted otherwise.
     let fg = if active { TXT_PRIMARY } else { TXT_MUTED };
     let mut content = row![cmdi(icon, 12.0, fg), text(truncate_name(&ws.name, max_chars)).size(12)]
@@ -4654,7 +2897,7 @@ fn tab_add_button() -> Element<'static, Message> {
     .width(Length::Fixed(26.0))
     .height(Length::Fixed(26.0))
     .padding(0)
-    .on_press(Message::ToggleNewWsMenu)
+    .on_press(Message::NewWorkspace)
     .style(|_t: &iced::Theme, s| {
         let hovered = matches!(s, button::Status::Hovered);
         let (bg, bc, tc) =
@@ -5361,62 +3604,10 @@ fn action_icon_btn(path: &'static str, msg: Message, active: bool) -> Element<'s
         .into()
 }
 
-/// One item in the "+" dropdown (web `.new-menu-item`): icon + label, azure hover.
-fn new_ws_menu_item(icon: &'static str, label: &str, msg: Message) -> Element<'static, Message> {
-    button(
-        row![cmdi(icon, 14.0, TXT_SECONDARY), text(label.to_string()).size(12)]
-            .spacing(8)
-            .align_y(iced::Center),
-    )
-    .width(Length::Fill)
-    .padding([6, 12])
-    .on_press(msg)
-    .style(|_t: &iced::Theme, s| {
-        let hovered = matches!(s, button::Status::Hovered);
-        button::Style {
-            background: hovered.then(|| iced::Background::Color(AZURE)),
-            text_color: if hovered { iced::Color::WHITE } else { TXT_SECONDARY },
-            ..Default::default()
-        }
-    })
-    .into()
-}
-
-/// The "+" dropdown overlay (web `.new-menu`): pick Terminal or Project workspace.
-/// Anchored below the titlebar near the tab area (iced can't read the +'s screen
-/// position, so the left inset is a fixed approximation).
-fn new_ws_menu_view(anchor_x: f32) -> Element<'static, Message> {
-    let menu = container(
-        column![
-            new_ws_menu_item(mdi_path::CONSOLE, "Terminal Workspace", Message::NewWorkspace),
-            new_ws_menu_item(mdi_path::FOLDER, "Project Workspace", Message::NewProjectWorkspace),
-        ]
-        .spacing(0),
-    )
-    .width(Length::Fixed(180.0))
-    .padding([4, 0])
-    .style(|_t: &iced::Theme| container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
-        border: iced::Border {
-            color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..Default::default()
-    });
-    // Anchor the menu's left edge just under the click on the "+" (web `.new-menu`
-    // opens at rect.left, bottom+2). 40px titlebar → top 42.
-    let left = (anchor_x - 4.0).max(4.0);
-    let anchored = container(mouse_area(menu).on_press(Message::Noop))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(iced::Padding { top: 42.0, right: 0.0, bottom: 0.0, left });
-    mouse_area(anchored).on_press(Message::CloseNewWsMenu).into()
-}
-
-/// One file-explorer context-menu item (icon + label; `danger` tints it red).
+/// One context-menu item (icon + label; `danger` tints it red). Shared by the
+/// terminal and workspace-tab menus.
 /// `msg: None` renders it disabled (greyed, no hover, no action).
-fn explorer_menu_item(
+fn menu_item(
     icon: &'static str,
     label: String,
     msg: Option<Message>,
@@ -5453,87 +3644,6 @@ fn explorer_menu_item(
     b.into()
 }
 
-/// The file-explorer right-click context menu (web `FileExplorerContextMenu`):
-/// Open (files only), Reveal/Rename (single), Delete — over the current
-/// selection, anchored at the cursor and clamped to the window. Scrim closes it.
-fn explorer_menu_view(ex: &Explorer, x0: f32, y0: f32, win: iced::Size) -> Element<'static, Message> {
-    const MENU_W: f32 = 210.0;
-    let is_dir = |path: &str| ex.entries.values().flatten().any(|e| e.path == path && e.is_dir);
-    let count = ex.selected.len();
-    let all_files = count > 0 && ex.selected.iter().all(|p| !is_dir(p));
-    let single = (count == 1).then(|| ex.selected.iter().next().cloned().unwrap_or_default());
-    let divider = || -> Element<'static, Message> {
-        container(
-            container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(
-                |_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
-                    ..Default::default()
-                },
-            ),
-        )
-        .padding(iced::Padding { top: 4.0, bottom: 4.0, left: 0.0, right: 0.0 })
-        .into()
-    };
-    let mut items = column![].spacing(0).padding([4, 0]);
-    let mut rows = 0;
-    // Open — only when every selected entry is a file (web hides it otherwise).
-    if all_files {
-        let label = if count > 1 { format!("Open {count} files") } else { "Open".into() };
-        items = items.push(explorer_menu_item(
-            mdi_path::OPEN_IN_APP,
-            label,
-            Some(Message::ExplorerOpenSelection),
-            false,
-        ));
-        rows += 1;
-    }
-    // Reveal — single selection only.
-    items = items.push(explorer_menu_item(
-        mdi_path::FOLDER_OPEN,
-        reveal_label().into(),
-        single.clone().map(Message::ExplorerReveal),
-        false,
-    ));
-    items = items.push(divider());
-    rows += 2;
-    // Rename — single selection only.
-    items = items.push(explorer_menu_item(
-        mdi_path::PENCIL,
-        "Rename".into(),
-        single.map(|_| Message::ExplorerRenameStart),
-        false,
-    ));
-    let del_label = if count > 1 { format!("Delete {count} items") } else { "Delete".into() };
-    items = items.push(explorer_menu_item(
-        mdi_path::DELETE,
-        del_label,
-        (count > 0).then_some(Message::ExplorerDeleteStart),
-        true,
-    ));
-    rows += 2;
-    let card = container(items).width(Length::Fixed(MENU_W)).style(|_t: &iced::Theme| {
-        container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
-            border: iced::Border {
-                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        }
-    });
-    // Clamp the anchor so the menu stays fully on-screen.
-    let menu_h = rows as f32 * 30.0 + 18.0;
-    let x = x0.min((win.width - MENU_W - 8.0).max(4.0)).max(4.0);
-    let y = y0.min((win.height - menu_h - 8.0).max(44.0)).max(44.0);
-    let anchored = container(mouse_area(card).on_press(Message::Noop))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(iced::Padding { top: y, right: 0.0, bottom: 0.0, left: x });
-    mouse_area(anchored).on_press(Message::ExplorerMenuClose).into()
-}
-
-/// A thin horizontal divider between context-menu groups.
 fn menu_divider() -> Element<'static, Message> {
     container(
         container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(
@@ -5589,26 +3699,26 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
         .and_then(|d| d.session.term().lock().ok().map(|t| t.has_selection()))
         .unwrap_or(false);
     let mut items = column![].spacing(0).padding([4, 0]);
-    items = items.push(explorer_menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::TermRenameStart), false));
+    items = items.push(menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::TermRenameStart), false));
     items = items.push(menu_divider());
-    items = items.push(explorer_menu_item(mdi_path::BROOM, "Clear Buffer".into(), Some(Message::ClearBuffer), false));
+    items = items.push(menu_item(mdi_path::BROOM, "Clear Buffer".into(), Some(Message::ClearBuffer), false));
     items = items.push(menu_divider());
-    items = items.push(explorer_menu_item(mdi_path::ARROW_RIGHT, "Split Pane Vertically".into(), Some(Message::SplitRight), false));
-    items = items.push(explorer_menu_item(mdi_path::ARROW_DOWN, "Split Pane Horizontally".into(), Some(Message::SplitDown), false));
+    items = items.push(menu_item(mdi_path::ARROW_RIGHT, "Split Pane Vertically".into(), Some(Message::SplitRight), false));
+    items = items.push(menu_item(mdi_path::ARROW_DOWN, "Split Pane Horizontally".into(), Some(Message::SplitDown), false));
     items = items.push(menu_divider());
-    items = items.push(explorer_menu_item(mdi_path::SELECT_ALL, "Select All".into(), Some(Message::SelectAll), false));
-    items = items.push(explorer_menu_item(mdi_path::CONTENT_COPY, "Copy".into(), has_sel.then_some(Message::Copy(false)), false));
-    items = items.push(explorer_menu_item(mdi_path::CONTENT_PASTE, "Paste".into(), Some(Message::Paste), false));
+    items = items.push(menu_item(mdi_path::SELECT_ALL, "Select All".into(), Some(Message::SelectAll), false));
+    items = items.push(menu_item(mdi_path::CONTENT_COPY, "Copy".into(), has_sel.then_some(Message::Copy(false)), false));
+    items = items.push(menu_item(mdi_path::CONTENT_PASTE, "Paste".into(), Some(Message::Paste), false));
     items = items.push(menu_divider());
-    items = items.push(explorer_menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::Close), true));
+    items = items.push(menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::Close), true));
     context_menu_card(items, 224.0, 300.0, x0, y0, state.main_size, Message::TermMenuClose)
 }
 
 /// The workspace-tab right-click context menu: rename or close the tab.
 fn ws_tab_menu_view(state: &State, index: usize, x0: f32, y0: f32) -> Element<'static, Message> {
     let mut items = column![].spacing(0).padding([4, 0]);
-    items = items.push(explorer_menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::RenameWorkspaceStart(index)), false));
-    items = items.push(explorer_menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::RequestCloseWorkspace(index)), true));
+    items = items.push(menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::RenameWorkspaceStart(index)), false));
+    items = items.push(menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::RequestCloseWorkspace(index)), true));
     context_menu_card(items, 176.0, 76.0, x0, y0, state.main_size, Message::WorkspaceTabMenuClose)
 }
 
@@ -5638,64 +3748,6 @@ fn rename_terminal_view(rt: &RenameTerminal) -> Element<'static, Message> {
         .padding(18)
         .width(Length::Fixed(340.0));
     modal_scrim(modal_panel(panel.into()), Message::TermRenameCancel)
-}
-
-/// The file-explorer rename dialog (web inline rename): a prefilled name input.
-fn explorer_rename_view(r: &ExplorerRename) -> Element<'static, Message> {
-    let input = text_input("Name", &r.text)
-        .id(text_input::Id::new(EXPLORER_RENAME_INPUT))
-        .on_input(Message::ExplorerRenameInput)
-        .on_submit(Message::ExplorerRenameCommit)
-        .padding([7, 9])
-        .size(13);
-    let actions = row![
-        horizontal_space(),
-        button(text("Cancel").size(13))
-            .on_press(Message::ExplorerRenameCancel)
-            .style(button::secondary)
-            .padding([6, 14]),
-        button(text("Rename").size(13))
-            .on_press(Message::ExplorerRenameCommit)
-            .style(button::primary)
-            .padding([6, 14]),
-    ]
-    .spacing(8)
-    .align_y(iced::Center);
-    let panel = column![text("Rename").size(15).font(ui_semibold()), input, actions]
-        .spacing(14)
-        .padding(18)
-        .width(Length::Fixed(340.0));
-    modal_scrim(modal_panel(panel.into()), Message::ExplorerRenameCancel)
-}
-
-/// The file-explorer delete confirmation (web "Move to trash?").
-fn explorer_delete_view(d: &ExplorerDelete) -> Element<'static, Message> {
-    let body = if d.paths.len() > 1 {
-        "The selected items will be moved to the OS trash.".to_string()
-    } else {
-        "The item will be moved to the OS trash.".to_string()
-    };
-    let panel = column![
-        text(format!("Move {} to trash?", d.label)).size(15).font(ui_semibold()),
-        text(body).size(13).color(TXT_SECONDARY),
-        row![
-            horizontal_space(),
-            button(text("Cancel").size(13))
-                .on_press(Message::ExplorerDeleteCancel)
-                .style(button::secondary)
-                .padding([6, 14]),
-            button(text("Delete").size(13))
-                .on_press(Message::ExplorerDeleteConfirm)
-                .style(button::danger)
-                .padding([6, 14]),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
-    ]
-    .spacing(14)
-    .padding(18)
-    .width(Length::Fixed(380.0));
-    modal_scrim(modal_panel(panel.into()), Message::ExplorerDeleteCancel)
 }
 
 fn close_confirm_view(c: &CloseConfirm) -> Element<'static, Message> {
@@ -6113,18 +4165,8 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
 
     // Workspace body, inset from the window edges (web padding `0 6px 6px` — flush
-    // under the titlebar, 6px on the other three sides). A terminal workspace is
-    // just the grid; a project workspace is explorer | grid | worktrees (6px gaps,
-    // matching the web `.project-workspace`).
-    let inner: Element<Message> = match state.active().project.as_ref() {
-        Some(project) => row![explorer_sidebar(project), grid, worktree_sidebar(state.active())]
-            .spacing(6)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        None => grid.into(),
-    };
-    let framed = container(inner)
+    // under the titlebar, 6px on the other three sides).
+    let framed = container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
@@ -6147,7 +4189,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     #[cfg(not(target_os = "windows"))]
     let base: Element<Message> = chrome.into();
 
-    // A worktree dialog / context menu, if open, layers over everything else.
+    // A modal or context menu, if open, layers over everything else.
     match modal_overlay(state) {
         Some(modal) => iced::widget::stack([base, modal]).into(),
         None => base,
@@ -6682,7 +4724,6 @@ fn clean_model(m: &str) -> String {
 
 mod mdi_path {
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
-    pub const DOTS_VERTICAL: &str = "M12,16A2,2 0 0,1 14,18A2,2 0 0,1 12,20A2,2 0 0,1 10,18A2,2 0 0,1 12,16M12,10A2,2 0 0,1 14,12A2,2 0 0,1 12,14A2,2 0 0,1 10,12A2,2 0 0,1 12,10M12,4A2,2 0 0,1 14,6A2,2 0 0,1 12,8A2,2 0 0,1 10,6A2,2 0 0,1 12,4Z";
     pub const BRANCH: &str = "M13,14C9.64,14 8.54,15.35 8.18,16.24C9.25,16.7 10,17.76 10,19A3,3 0 0,1 7,22A3,3 0 0,1 4,19C4,17.69 4.83,16.58 6,16.17V7.83C4.83,7.42 4,6.31 4,5A3,3 0 0,1 7,2A3,3 0 0,1 10,5C10,6.31 9.17,7.42 8,7.83V13.12C8.88,12.47 10.16,12 12,12C14.67,12 15.56,10.66 15.85,9.77C14.77,9.32 14,8.25 14,7A3,3 0 0,1 17,4A3,3 0 0,1 20,7C20,8.34 19.12,9.5 17.91,9.86C17.65,11.29 16.68,14 13,14M7,18A1,1 0 0,0 6,19A1,1 0 0,0 7,20A1,1 0 0,0 8,19A1,1 0 0,0 7,18M7,4A1,1 0 0,0 6,5A1,1 0 0,0 7,6A1,1 0 0,0 8,5A1,1 0 0,0 7,4M17,6A1,1 0 0,0 16,7A1,1 0 0,0 17,8A1,1 0 0,0 18,7A1,1 0 0,0 17,6Z";
     pub const ROBOT: &str = "M17.5 15.5C17.5 16.61 16.61 17.5 15.5 17.5S13.5 16.61 13.5 15.5 14.4 13.5 15.5 13.5 17.5 14.4 17.5 15.5M8.5 13.5C7.4 13.5 6.5 14.4 6.5 15.5S7.4 17.5 8.5 17.5 10.5 16.61 10.5 15.5 9.61 13.5 8.5 13.5M23 15V18C23 18.55 22.55 19 22 19H21V20C21 21.11 20.11 22 19 22H5C3.9 22 3 21.11 3 20V19H2C1.45 19 1 18.55 1 18V15C1 14.45 1.45 14 2 14H3C3 10.13 6.13 7 10 7H11V5.73C10.4 5.39 10 4.74 10 4C10 2.9 10.9 2 12 2S14 2.9 14 4C14 4.74 13.6 5.39 13 5.73V7H14C17.87 7 21 10.13 21 14H22C22.55 14 23 14.45 23 15M21 16H19V14C19 11.24 16.76 9 14 9H10C7.24 9 5 11.24 5 14V16H3V17H5V20H19V17H21V16Z";
     pub const DATABASE: &str = "M12,3C7.58,3 4,4.79 4,7C4,9.21 7.58,11 12,11C16.42,11 20,9.21 20,7C20,4.79 16.42,3 12,3M4,9V12C4,14.21 7.58,16 12,16C16.42,16 20,14.21 20,12V9C20,11.21 16.42,13 12,13C7.58,13 4,11.21 4,9M4,14V17C4,19.21 7.58,21 12,21C16.42,21 20,19.21 20,17V14C20,16.21 16.42,18 12,18C7.58,18 4,16.21 4,14Z";
@@ -6693,14 +4734,8 @@ mod mdi_path {
     pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
     pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
     pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
-    // File-explorer context menu (web mdiOpenInApp / FolderOpenOutline / PencilOutline / DeleteOutline).
-    pub const OPEN_IN_APP: &str = "M12,10L8,14H11V20H13V14H16M19,4H5C3.89,4 3,4.89 3,6V18A2,2 0 0,0 5,20H9V18H5V8H19V18H15V20H19A2,2 0 0,0 21,18V6A2,2 0 0,0 19,4Z";
-    pub const FOLDER_OPEN: &str = "M6.1,10L4,18V8H21A2,2 0 0,0 19,6H12L10,4H4A2,2 0 0,0 2,6V18A2,2 0 0,0 4,20H19C19.9,20 20.7,19.4 20.9,18.5L23.2,10H6.1M19,18H6L7.6,12H20.6L19,18Z";
+    // Context-menu actions (web PencilOutline).
     pub const PENCIL: &str = "M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z";
-    pub const DELETE: &str = "M9,3V4H4V6H5V19A2,2 0 0,0 7,21H17A2,2 0 0,0 19,19V6H20V4H15V3H9M7,6H17V19H7V6M9,8V17H11V8H9M13,8V17H15V8H13Z";
-    // File-explorer expand/collapse chevrons (the ▸/▾ glyphs tofu in the UI font).
-    pub const CHEVRON_RIGHT: &str = "M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z";
-    pub const CHEVRON_DOWN: &str = "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z";
     // Titlebar: tab type icon (terminal), tab close, new-workspace dropdown items,
     // usage-bar refresh, and the right-side action buttons.
     pub const CONSOLE: &str = "M20,19V7H4V19H20M20,3A2,2 0 0,1 22,5V19A2,2 0 0,1 20,21H4A2,2 0 0,1 2,19V5C2,3.89 2.9,3 4,3H20M13,17V15H18V17H13M9.58,13L5.57,9H8.4L11.7,12.3C12.09,12.69 12.09,13.33 11.7,13.72L8.42,17H5.59L9.58,13Z";
@@ -8213,7 +6248,7 @@ fn subscription(state: &State) -> Subscription<Message> {
     };
     // Only the main window's keys drive the terminal (not the overview window),
     // and not when a widget already consumed the key — e.g. a focused text input
-    // in the new-worktree modal (else the branch name leaks into the terminal).
+    // (Settings, rename) else the typed text leaks into the terminal.
     let keys = iced::event::listen_with(|event, status, id| {
         // macOS manual window drag: while a drag is active, forward cursor moves + the
         // left release from EITHER window — checked before the main-window gate so the
@@ -8234,14 +6269,13 @@ fn subscription(state: &State) -> Subscription<Message> {
         if MAIN_WINDOW.get().copied() != Some(id) {
             return None;
         }
-        // Track modifiers app-wide (Shift/Ctrl/Cmd) for file-explorer multi-select
-        // clicks — regardless of which widget has focus.
+        // Track modifiers app-wide (Shift/Ctrl/Cmd) so a modified click can be told
+        // from a plain one, regardless of which widget has focus.
         if let iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) = &event {
             return Some(Message::ModifiersChanged(*m));
         }
-        // Track the cursor over the titlebar (top ~44px, for the "+" dropdown) and
-        // the left strip (~240px, where the project file explorer sits, so its
-        // right-click menu anchors under the click). Cheap — off over the terminals.
+        // Track the cursor over the titlebar (top ~44px) so a workspace-tab
+        // right-click anchors its menu under the click. Cheap: off over the terminals.
         if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = &event {
             // While a window drag is in flight, forward every move (a fast drag can
             // briefly carry the cursor off the titlebar band before the window catches up).
@@ -8252,7 +6286,7 @@ fn subscription(state: &State) -> Subscription<Message> {
             // Record every move (no message → no redraw) so a header right-click can
             // anchor its menu anywhere; only the band emits a message for live tracking.
             stash_cursor(*position);
-            return (position.y < 44.0 || position.x < 240.0).then(|| Message::CursorMoved(*position));
+            return (position.y < 44.0).then(|| Message::CursorMoved(*position));
         }
         // Any left-button release ends an in-progress workspace-tab drag (the drop
         // commits wherever the cursor is). No-op when not dragging.
@@ -9211,11 +7245,7 @@ fn main() -> iced::Result {
                 // startup get_scale_factor query corrects it for the real display.
                 logo_scale: 2.0,
                 logo: render_logo((LOGO_LOGICAL * 2.0).round() as u32),
-                worktree_dialog: None,
-                worktree_menu: None,
-                new_ws_menu: false,
                 cursor: iced::Point::ORIGIN,
-                new_ws_menu_x: 0.0,
                 usage: UsageData::default(),
                 usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
@@ -9230,9 +7260,6 @@ fn main() -> iced::Result {
                 rename_ws: None,
                 find_open: false,
                 find_query: String::new(),
-                explorer_menu: None,
-                explorer_rename: None,
-                explorer_delete: None,
                 close_confirm: None,
                 quit_confirm: false,
                 usage_login_prompt: false,
@@ -9249,7 +7276,7 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_model, encode_mouse, hsl_to_rgb, trim_history_file, worktree_avatar, MouseModes};
+    use super::{clean_model, encode_mouse, trim_history_file, MouseModes};
 
     #[test]
     fn trim_history_keeps_the_last_n_lines() {
@@ -9309,20 +7336,6 @@ mod tests {
         assert!(encode_mouse(utf8, 0, false, false, 300, 0, false, false).is_some());
     }
 
-    #[test]
-    fn worktree_avatar_draws_without_panic() {
-        // Exercises every feature branch + each animation frame (the GUI smoke test
-        // starts with no project, so this path is otherwise unexercised). A handful
-        // of varied seeds covers the different head/eye/antenna/mouth selectors.
-        for seed in ["swift-otter", "brave-fox", "lucky-koala", "main", "", "a"] {
-            for frame in 0..super::ANIM_FRAMES {
-                let _ = worktree_avatar(seed, frame);
-            }
-        }
-        // HSL endpoints map into range.
-        assert_eq!(hsl_to_rgb(0.0, 0.0, 0.0), (0, 0, 0));
-        assert_eq!(hsl_to_rgb(0.0, 0.0, 1.0), (255, 255, 255));
-    }
 
     #[test]
     fn clean_model_strips_context_suffix() {

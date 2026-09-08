@@ -58,36 +58,10 @@ pub struct SavedWindow {
     pub y: Option<f32>,
 }
 
-/// One worktree of a saved project workspace: its branch, path, and split tree.
-#[derive(Serialize, Deserialize)]
-pub struct SavedWorktree {
-    pub branch: String,
-    pub path: String,
-    pub layout: SavedNode,
-    /// Avatar reroll counter (see `Worktree::avatar_salt`); defaulted for back-compat.
-    #[serde(default)]
-    pub avatar_salt: u32,
-}
-
-/// A saved project workspace (git repo + its worktrees + explorer state).
-#[derive(Serialize, Deserialize)]
-pub struct SavedProject {
-    pub root: String,
-    pub active: usize,
-    pub worktrees: Vec<SavedWorktree>,
-    #[serde(default)]
-    pub expanded: Vec<String>,
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct SavedWorkspace {
     pub name: String,
-    /// The active worktree's split tree (project) or the workspace's tree (terminal).
     pub layout: SavedNode,
-    /// Present → this is a project workspace; restore its sidebars + worktrees.
-    /// Defaulted so older save files (terminal-only) still load.
-    #[serde(default)]
-    pub project: Option<SavedProject>,
 }
 
 /// User-tweakable preferences (the Settings dialog). Kept small + serialised whole
@@ -343,7 +317,6 @@ mod tests {
                             history_id: None,
                         }),
                     },
-                    project: None,
                 },
                 SavedWorkspace {
                     name: "Workspace 2".into(),
@@ -355,7 +328,6 @@ mod tests {
                         claude_session: None,
                         history_id: None,
                     },
-                    project: None,
                 },
             ],
         };
@@ -397,6 +369,32 @@ mod tests {
                 assert!(!claude_running);
                 assert!(claude_session.is_none());
                 assert!(history_id.is_none()); // absent in old saves → fresh id on restore
+            }
+            _ => panic!("expected a leaf"),
+        }
+    }
+
+    // Saves written while project workspaces existed carry a `project` object that no
+    // longer has a field to land in. Serde ignores unknown keys, so such a workspace must
+    // still restore its terminal layout rather than failing the whole load (which `load()`
+    // turns into a fresh start, i.e. every terminal lost).
+    #[test]
+    fn save_with_retired_project_data_still_loads_its_terminals() {
+        let json = r#"{"active":0,"workspaces":[{"name":"W",
+            "layout":{"Leaf":{"name":"T","shell":"GitBash","cwd":"/tmp",
+                "claude_running":true,"claude_session":"sid-1","history_id":"h-1"}},
+            "project":{"root":"/repo","active":0,"expanded":["/repo/src"],
+                "worktrees":[{"branch":"main","path":"/repo","avatar_salt":3,
+                    "layout":{"Leaf":{"name":"T","shell":"PowerShell","cwd":null}}}]}}]}"#;
+        let s: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(s.workspaces.len(), 1);
+        assert_eq!(s.workspaces[0].name, "W");
+        match &s.workspaces[0].layout {
+            SavedNode::Leaf { name, cwd, claude_session, history_id, .. } => {
+                assert_eq!(name, "T");
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(claude_session.as_deref(), Some("sid-1"));
+                assert_eq!(history_id.as_deref(), Some("h-1"));
             }
             _ => panic!("expected a leaf"),
         }
