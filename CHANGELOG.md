@@ -8,6 +8,28 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Removed
+- **The per-terminal stats footer is retired,** along with the in-pane info card (the ⓘ
+  button in a terminal's header). Both restated what Claude's own status line already shows
+  inside the terminal: model, context percentage, and token counts appeared twice, one line
+  apart. Claude's version also has the advantage of being portable, rendering the same over
+  SSH, where Arbiter's footer could only ever show stale local values. Each terminal gains
+  back the footer's 26px.
+
+  The folder segment's "rename this terminal to its repo name" action was the footer's one
+  unique feature, so it moves to the terminal right-click menu as **Rename to Repo Name**,
+  enabled only inside a git repo.
+
+  Per-session cost, previously only in the info card, is no longer shown. Claude hands its
+  status line the same `total_cost_usd` Arbiter was reading, so adding it there brings it
+  back and works over SSH too.
+
+  Downstream, this makes the whole token/context/cost pipeline dead: nine fields of the
+  per-pane status and eight of the statusLine capture are gone, leaving the capture with
+  just the session id. The capture files themselves stay, since their existence is how a
+  pane knows Claude launched and how the attention/turn-end hooks are routed.
+
+  **The overview popout is unchanged** and still shows every terminal's live status dot and
+  git branch.
 - **Project workspaces are retired.** Every workspace is now a plain terminal workspace
   (tabs of terminals). This removes the git-worktree sidebar (with its robot avatars, merge
   / discard / remove actions and the new-worktree dialog), the file-explorer sidebar (with

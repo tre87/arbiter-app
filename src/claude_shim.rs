@@ -1,10 +1,9 @@
-//! Tier-2 Claude context capture (cross-platform). Ported from the webview's
-//! `src-tauri/src/claude_shim.rs` — it was already Tauri-free.
+//! Claude launch + lifecycle interception (cross-platform). Ported from the
+//! webview's `src-tauri/src/claude_shim.rs`, which was already Tauri-free.
 //!
-//! Claude's exact context-window usage (window size, used %, per-component
-//! tokens) is NOT in the transcript JSONL — it is only handed to a configured
-//! `statusLine` command on stdin. To surface it, we intercept `claude` launches
-//! inside Arbiter's own PTYs:
+//! Arbiter needs to know two things it cannot observe from outside: that Claude
+//! started in a given pane, and when it is waiting on the user. Both arrive by
+//! intercepting `claude` launches inside Arbiter's own PTYs:
 //!
 //!   1. `shell.rs` prepends an Arbiter `bin/` dir (written here) to PATH for the
 //!      spawned shell, so `claude` — and any alias that resolves it via PATH —
@@ -12,9 +11,15 @@
 //!   2. The launcher `exec`s the REAL claude with `--settings <file>` (generated
 //!      here) that points `statusLine` at `<arbiter-bin> claude-statusline` and
 //!      the Notification/PermissionRequest/Stop hooks at `<arbiter-bin> claude-hook`.
-//!   3. Claude pipes its session JSON to those commands; we write it to
-//!      `<capture-dir>/<session_id>.json` (and hook signals to `<hooks-dir>`),
-//!      then call through to the user's original status line so it still renders.
+//!   3. Claude pipes its session JSON to those commands. The statusLine capture is
+//!      written to `<capture-dir>/<pane-id>.json`, whose mere EXISTENCE is the
+//!      "Claude is running in this pane" signal, and whose `session_id` routes the
+//!      hook signals in `<hooks-dir>`. We then call through to the user's original
+//!      status line so it still renders.
+//!
+//! The capture's token/context/cost payload used to feed a per-pane footer. That
+//! footer is retired (Claude's own statusLine shows the same numbers, and does so
+//! over SSH too), so only `session_id` is parsed out now.
 //!
 //! All JSON is built/parsed here in Rust. The launcher scripts contain no logic,
 //! only a delegated `exec`.
@@ -256,56 +261,32 @@ fn forward_to_original(orig: &str, stdin_bytes: &[u8]) {
     debug_log(&format!("forward: child exited {status:?}"));
 }
 
-// ── Reading captures back (the footer's Tier-2 stats) ────────────────────────
+// ── Reading captures back (the per-pane Claude launch signal) ────────────────
 
-/// Parsed Claude statusLine capture: stats + the cwd/session_id used to bind it
-/// to a pane. `used_percent`/token usage are None/0 until the first turn.
+/// A parsed Claude statusLine capture. Its existence means Claude is running in
+/// the pane named by `key`; `session_id` routes that pane's hook signals.
 #[derive(Clone, Debug)]
 pub struct Capture {
     pub session_id: String,
-    pub cwd: String,
     /// The capture file's stem — the pane id (`PANE_ID_ENV`) when Claude ran in one
     /// of our shells, so a capture binds to the exact pane; else the session id
     /// (legacy / Claude launched outside our shell). The primary bind key.
     pub key: String,
-    /// The capture file's last-modified time — fallback to pick the LIVE session
-    /// when binding by cwd (the live one is written most recently).
-    pub mtime: std::time::SystemTime,
-    pub model: Option<String>,
-    pub context_size: Option<u64>,
-    pub used_percent: Option<f64>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub cost_usd: f64,
 }
 
 /// Parse one capture JSON (the shape Claude's statusLine emits).
 pub fn parse_capture(bytes: &[u8]) -> Option<Capture> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let session_id = v.get("session_id")?.as_str()?.to_string();
-    let cwd = v
-        .get("cwd")
+    // A `cwd` (or `workspace.current_dir`) must be present for the JSON to count as a
+    // real statusLine payload, even though the value is no longer read. Claude always
+    // sends one, so its absence means this isn't a capture we should bind to.
+    v.get("cwd")
         .and_then(|c| c.as_str())
-        .or_else(|| v.pointer("/workspace/current_dir").and_then(|c| c.as_str()))?
-        .to_string();
-    let cw = v.get("context_window");
-    let usage = cw.and_then(|c| c.get("current_usage"));
-    let tok = |k: &str| usage.and_then(|u| u.get(k)).and_then(|n| n.as_u64()).unwrap_or(0);
+        .or_else(|| v.pointer("/workspace/current_dir").and_then(|c| c.as_str()))?;
     Some(Capture {
         session_id,
-        cwd,
-        key: String::new(),                       // filled in by read_captures (file stem)
-        mtime: std::time::SystemTime::UNIX_EPOCH, // filled in by read_captures
-        model: v.pointer("/model/display_name").and_then(|m| m.as_str()).map(str::to_string),
-        context_size: cw.and_then(|c| c.get("context_window_size")).and_then(|n| n.as_u64()),
-        used_percent: cw.and_then(|c| c.get("used_percentage")).and_then(|n| n.as_f64()),
-        input_tokens: tok("input_tokens"),
-        output_tokens: tok("output_tokens"),
-        cache_write: tok("cache_creation_input_tokens"),
-        cache_read: tok("cache_read_input_tokens"),
-        cost_usd: v.pointer("/cost/total_cost_usd").and_then(|n| n.as_f64()).unwrap_or(0.0),
+        key: String::new(), // filled in by read_captures (file stem)
     })
 }
 
@@ -319,10 +300,6 @@ pub fn read_captures(dir: &Path) -> Vec<Capture> {
                 if let Ok(bytes) = std::fs::read(&p) {
                     if let Some(mut c) = parse_capture(&bytes) {
                         c.key = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                        c.mtime = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         out.push(c);
                     }
                 }

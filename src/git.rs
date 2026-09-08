@@ -1,4 +1,4 @@
-//! Minimal git info for the footer: branch + staged/unstaged/untracked counts
+//! Minimal git info for the per-pane status: branch + staged/unstaged/untracked counts
 //! from a single `git status --porcelain=v1 --branch`. Tauri-free; computed off
 //! the cwd the Session tracks (OSC-7), cached per session.
 //!

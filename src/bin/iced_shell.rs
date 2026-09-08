@@ -160,9 +160,7 @@ struct State {
     font_size_input: String,
     /// Whether the keyboard-shortcuts cheat-sheet modal is open.
     shortcuts_open: bool,
-    /// The pane whose Claude info popover is open (header info button), if any.
-    info_pane: Option<pane_grid::Pane>,
-    /// Pending "rename terminal to repo name" confirmation (footer folder click).
+    /// Pending "rename terminal to repo name" confirmation (context-menu action).
     rename_confirm: Option<RenameConfirm>,
     /// The workspace being renamed (right-click a tab), with its edit buffer.
     rename_ws: Option<RenameWorkspace>,
@@ -234,7 +232,7 @@ struct RenameWorkspace {
     text: String,
 }
 
-/// A pending confirm to rename a pane to its git repo's name (footer folder icon).
+/// A pending confirm to rename a pane to its git repo's name (context menu).
 struct RenameConfirm {
     pane: pane_grid::Pane,
     repo: String,
@@ -283,7 +281,7 @@ fn app_header_bg() -> iced::Color {
 }
 
 /// Foundational dark theme matching Arbiter's palette (#121212 bg, azure accent).
-/// The detailed chrome polish comes after the status/footer are functional.
+/// The detailed chrome polish comes after the status bars are functional.
 fn arbiter_theme() -> iced::Theme {
     iced::Theme::custom(
         "Arbiter".to_string(),
@@ -390,9 +388,7 @@ enum Message {
     FilesPicked(AttachSource, Option<Vec<String>>),
     /// A file was dropped onto the window → attach it to the focused terminal.
     FileDropped(std::path::PathBuf),
-    /// Toggle the Claude info popover for a pane (header info button).
-    ToggleInfoPanel(pane_grid::Pane),
-    /// Footer folder icon → confirm renaming the pane to its git repo's name.
+    /// Context menu → confirm renaming the pane to its git repo's name.
     RequestRenameToRepo(pane_grid::Pane),
     ConfirmRename,
     CancelRename,
@@ -1294,9 +1290,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::FileDropped(path) => {
             write_attach_paths(state, &[path.to_string_lossy().into_owned()]);
         }
-        Message::ToggleInfoPanel(pane) => {
-            state.info_pane = (state.info_pane != Some(pane)).then_some(pane);
-        }
         Message::RequestRenameToRepo(pane) => {
             // Resolve the repo name from the pane's cwd; only prompt inside a repo.
             if let Some(d) = state.active().panes.get(pane) {
@@ -2118,7 +2111,7 @@ enum BtnKind {
     Danger,
 }
 
-/// A 1px full-width hairline (web `border-bottom`/`border-top` on sections/footer).
+/// A 1px full-width hairline (web `border-bottom` on a section).
 fn settings_hdivider() -> Element<'static, Message> {
     container(Space::new(Length::Fill, Length::Fixed(1.0)))
         .style(|_t: &iced::Theme| container::Style {
@@ -3698,8 +3691,18 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
         .get(ws.focus)
         .and_then(|d| d.session.term().lock().ok().map(|t| t.has_selection()))
         .unwrap_or(false);
+    // Rename-to-repo lived on the footer's folder segment until the footer was
+    // retired; the menu is its home now. Enabled only inside a repo, matching the
+    // handler, which resolves the name from the pane's cwd and no-ops outside one.
+    let in_repo = ws.panes.get(ws.focus).map_or(false, |d| d.session.git().is_some());
     let mut items = column![].spacing(0).padding([4, 0]);
     items = items.push(menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::TermRenameStart), false));
+    items = items.push(menu_item(
+        mdi_path::FOLDER,
+        "Rename to Repo Name".into(),
+        in_repo.then_some(Message::RequestRenameToRepo(ws.focus)),
+        false,
+    ));
     items = items.push(menu_divider());
     items = items.push(menu_item(mdi_path::BROOM, "Clear Buffer".into(), Some(Message::ClearBuffer), false));
     items = items.push(menu_divider());
@@ -3985,7 +3988,6 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // The header's shell-switch button shows only when Git Bash is available AND
     // it isn't hidden in Settings (web `devStore.hideShellButton`).
     let has_git_bash = state.git_bash.is_some() && !state.settings.hide_shell_button;
-    let info_pane = state.info_pane; // which pane's Claude info popover is open
     // Approx per-pane pixel widths (from the split ratios × the window width), so
     // the working bar can keep a constant glow size + sweep speed across panes.
     let pane_widths: HashMap<pane_grid::Pane, f32> = state
@@ -4025,9 +4027,9 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 2.0 });
 
         let focused = pane == focus;
-        // Which of the grid's outer corners this pane owns → round those. The
-        // header covers the top corners, the footer the bottom, and the pane's own
-        // #121212 background must round to match so the glow shows through.
+        // Which of the grid's outer corners this pane owns → round those. The header
+        // covers the top corners; the bottom ones are the terminal area, which is
+        // transparent, so the pane's own background rounds them (see `pane_round`).
         let pick = |yes: bool| if yes { 8.0_f32 } else { 0.0 };
         let (rtl, rtr) = (pane == c_tl, pane == c_tr);
         let (rbl, rbr) = (pane == c_bl, pane == c_br);
@@ -4036,12 +4038,6 @@ fn main_view(state: &State) -> Element<'_, Message> {
             top_right: pick(rtr),
             bottom_right: 0.0,
             bottom_left: 0.0,
-        };
-        let footer_round = iced::border::Radius {
-            top_left: 0.0,
-            top_right: 0.0,
-            bottom_right: pick(rbr),
-            bottom_left: pick(rbl),
         };
         let pane_round = iced::border::Radius {
             top_left: pick(rtl),
@@ -4054,13 +4050,11 @@ fn main_view(state: &State) -> Element<'_, Message> {
         let cstatus = data.session.claude_status();
         let lc = cstatus.lifecycle;
         let status = claude_running.then(|| pane_dot(true, lc, false));
-        let info_open = info_pane == Some(pane) && claude_running;
         // Right-clicking the header opens the same context menu as the terminal body
         // (anchored at the cursor); left-clicks still fall through to focus / the
         // header's own buttons (mouse_area only captures the right-press).
         let header: Element<Message> = mouse_area(pane_header(
-            &data.name, focused, data.shell, has_git_bash, pane, status, claude_running, info_open,
-            header_round,
+            &data.name, focused, data.shell, has_git_bash, pane, status, header_round,
         ))
         .on_right_press(Message::HeaderMenuOpen(pane))
         .into();
@@ -4091,7 +4085,6 @@ fn main_view(state: &State) -> Element<'_, Message> {
         let term_area: Element<Message> = iced::widget::Stack::new()
             .push(term)
             .push_maybe(working.then(|| working_bar(pane_w)))
-            .push_maybe(info_open.then(|| info_panel(&cstatus)))
             .push_maybe(
                 (scroll_alpha > 0.0 && scroll_hist > 0)
                     .then(|| scroll_indicator(scroll_off, scroll_hist, scroll_screen, scroll_alpha)),
@@ -4101,8 +4094,8 @@ fn main_view(state: &State) -> Element<'_, Message> {
                 find_bar(find_query, status)
             }))
             .into();
-        // 1px #2c2c2c dividers under the header and above the footer (web card look).
-        let content = column![header, hline(), term_area, hline(), footer_bar(&data.session, pane, footer_round)]
+        // 1px #2c2c2c divider under the header (web card look).
+        let content = column![header, hline(), term_area]
             .width(Length::Fill)
             .height(Length::Fill);
         // No focus border on the pane body — focus is shown by the header title
@@ -4259,7 +4252,7 @@ fn overview_row_style(_t: &iced::Theme, status: button::Status) -> button::Style
     s
 }
 
-/// Git stat counts (●staged ✎unstaged +untracked), matching the footer's colours.
+/// Git stat counts (●staged ✎unstaged +untracked) for one overview row.
 fn overview_git(session: &Session) -> Element<'static, Message> {
     let mut r = row![].spacing(6).align_y(iced::Center);
     if let Some(g) = session.git() {
@@ -4280,7 +4273,7 @@ fn overview_git(session: &Session) -> Element<'static, Message> {
 /// terminal under it with a Claude icon (when active), git stats, and a live
 /// status indicator (idle/running/ready dot · animated ✻ working · amber
 /// attention). Clicking a row jumps to that pane. Reads the same shared status
-/// the footer does — redrawn each frame, no polling.
+/// redrawn each frame, no polling.
 /// The overview popout's titlebar — the same borderless chrome as the main window:
 /// logo + "Overview", a drag region, and (Windows) min/max/close caption buttons that
 /// target the overview window. On macOS the native traffic lights sit in the left pad.
@@ -4524,20 +4517,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     base
 }
 
-/// Per-pane footer: folder + git branch + status counts (from the Session's
-/// cwd-tracked git info). Claude model/context/tokens land here later.
-fn footer_style(_t: &iced::Theme) -> container::Style {
-    container::Style {
-        // Same colour as the terminal (the configurable app background); the 1px
-        // #2c2c2c top border is the `hline()` added above the footer in the pane column.
-        background: Some(iced::Background::Color(app_bg())),
-        text_color: Some(iced::Color::from_rgb8(0x9c, 0x9c, 0x9c)),
-        ..Default::default()
-    }
-}
 
 /// A 1px full-width divider line in the card-border colour (#2c2c2c) — the web's
-/// `.pane-toolbar` bottom border / `.terminal-footer` top border, which iced's
+/// `.pane-toolbar` bottom border, which iced's
 /// single-width `Border` can't do per-side.
 fn hline() -> Element<'static, Message> {
     container(Space::new(Length::Fill, Length::Fixed(1.0)))
@@ -4549,27 +4531,8 @@ fn hline() -> Element<'static, Message> {
         .into()
 }
 
-/// Compact token count: 4200 → "4.2K". TRUNCATES to one decimal (NOT round) to
-/// match Claude's status line, which formats via `bc scale=1` (e.g. 20450 →
-/// "20.4K", not "20.5K") — same as the web's `fmtK`.
-fn fmt_k(n: u64) -> String {
-    if n >= 1000 {
-        format!("{:.1}K", (n / 100) as f64 / 10.0)
-    } else {
-        n.to_string()
-    }
-}
 
-/// Context-window size: 1_000_000 → "1M", 200_000 → "200k".
-fn fmt_ctx_size(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{}M", n / 1_000_000)
-    } else {
-        format!("{}k", n / 1000)
-    }
-}
 
-// ── Footer (matches the web TerminalFooter.vue: same colours + MDI icons) ──────
 
 /// An MDI 24×24 path rendered at `size` px, filled with `color`.
 fn mdi(path: &str, size: f32, color: iced::Color) -> Element<'static, Message> {
@@ -4669,71 +4632,13 @@ fn cmdi(path: &'static str, size: f32, color: iced::Color) -> Element<'static, M
         .into()
 }
 
-/// Per-family model colour (web: `.model-opus`/`.model-sonnet`/…).
-fn model_color(model: &str) -> iced::Color {
-    let l = model.to_ascii_lowercase();
-    if l.contains("opus") {
-        iced::Color::from_rgb8(0x4e, 0xc9, 0xb0)
-    } else if l.contains("sonnet") {
-        iced::Color::from_rgb8(0x9c, 0xdc, 0xfe)
-    } else if l.contains("haiku") {
-        iced::Color::from_rgb8(0xb5, 0xce, 0xa8)
-    } else {
-        iced::Color::from_rgb8(0xe8, 0xea, 0xed)
-    }
-}
 
-/// The model display name without any context-window suffix Claude's statusLine
-/// may append — "Opus 4.8 (1M context)" / "Opus 4.8 · 1M context" → "Opus 4.8".
-/// Too wide for the titlebar otherwise. A model name with no such suffix is kept
-/// verbatim (the trailing size-token drop only runs once a "context" word is seen).
-fn clean_model(m: &str) -> String {
-    let mut s = m.trim();
-    let mut had_context = false;
-    // Parenthetical form: "Opus 4.8 (1M context)".
-    if let Some(i) = s.find('(') {
-        if s[i..].to_ascii_lowercase().contains("context") {
-            s = s[..i].trim_end();
-            had_context = true;
-        }
-    }
-    // Inline form: "Opus 4.8 · 1M context".
-    if !had_context {
-        let lower = s.to_ascii_lowercase();
-        if let Some(i) = lower.find("context") {
-            s = s[..i].trim_end();
-            had_context = true;
-        }
-    }
-    if !had_context {
-        return s.to_string();
-    }
-    // Drop a trailing size token left behind (e.g. "1M"/"200k").
-    let mut toks: Vec<&str> =
-        s.split(|c: char| matches!(c, ' ' | '·' | '•' | '|')).filter(|t| !t.is_empty()).collect();
-    if let Some(last) = toks.last() {
-        let l = last.to_ascii_lowercase();
-        let is_size =
-            last.chars().any(|c| c.is_ascii_digit()) && (l.ends_with('m') || l.ends_with('k') || l.ends_with('g'));
-        if is_size {
-            toks.pop();
-        }
-    }
-    toks.join(" ")
-}
 
 mod mdi_path {
+    // Context menu: "Rename to Repo Name" (was the retired footer's folder segment).
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
-    pub const BRANCH: &str = "M13,14C9.64,14 8.54,15.35 8.18,16.24C9.25,16.7 10,17.76 10,19A3,3 0 0,1 7,22A3,3 0 0,1 4,19C4,17.69 4.83,16.58 6,16.17V7.83C4.83,7.42 4,6.31 4,5A3,3 0 0,1 7,2A3,3 0 0,1 10,5C10,6.31 9.17,7.42 8,7.83V13.12C8.88,12.47 10.16,12 12,12C14.67,12 15.56,10.66 15.85,9.77C14.77,9.32 14,8.25 14,7A3,3 0 0,1 17,4A3,3 0 0,1 20,7C20,8.34 19.12,9.5 17.91,9.86C17.65,11.29 16.68,14 13,14M7,18A1,1 0 0,0 6,19A1,1 0 0,0 7,20A1,1 0 0,0 8,19A1,1 0 0,0 7,18M7,4A1,1 0 0,0 6,5A1,1 0 0,0 7,6A1,1 0 0,0 8,5A1,1 0 0,0 7,4M17,6A1,1 0 0,0 16,7A1,1 0 0,0 17,8A1,1 0 0,0 18,7A1,1 0 0,0 17,6Z";
-    pub const ROBOT: &str = "M17.5 15.5C17.5 16.61 16.61 17.5 15.5 17.5S13.5 16.61 13.5 15.5 14.4 13.5 15.5 13.5 17.5 14.4 17.5 15.5M8.5 13.5C7.4 13.5 6.5 14.4 6.5 15.5S7.4 17.5 8.5 17.5 10.5 16.61 10.5 15.5 9.61 13.5 8.5 13.5M23 15V18C23 18.55 22.55 19 22 19H21V20C21 21.11 20.11 22 19 22H5C3.9 22 3 21.11 3 20V19H2C1.45 19 1 18.55 1 18V15C1 14.45 1.45 14 2 14H3C3 10.13 6.13 7 10 7H11V5.73C10.4 5.39 10 4.74 10 4C10 2.9 10.9 2 12 2S14 2.9 14 4C14 4.74 13.6 5.39 13 5.73V7H14C17.87 7 21 10.13 21 14H22C22.55 14 23 14.45 23 15M21 16H19V14C19 11.24 16.76 9 14 9H10C7.24 9 5 11.24 5 14V16H3V17H5V20H19V17H21V16Z";
-    pub const DATABASE: &str = "M12,3C7.58,3 4,4.79 4,7C4,9.21 7.58,11 12,11C16.42,11 20,9.21 20,7C20,4.79 16.42,3 12,3M4,9V12C4,14.21 7.58,16 12,16C16.42,16 20,14.21 20,12V9C20,11.21 16.42,13 12,13C7.58,13 4,11.21 4,9M4,14V17C4,19.21 7.58,21 12,21C16.42,21 20,19.21 20,17V14C20,16.21 16.42,18 12,18C7.58,18 4,16.21 4,14Z";
     pub const ARROW_DOWN: &str = "M11,4H13V16L18.5,10.5L19.92,11.92L12,19.84L4.08,11.92L5.5,10.5L11,16V4Z";
     pub const ARROW_UP: &str = "M13,20H11V8L5.5,13.5L4.08,12.08L12,4.16L19.92,12.08L18.5,13.5L13,8V20Z";
-    pub const CACHED: &str = "M19,8L15,12H18A6,6 0 0,1 12,18C11,18 10.03,17.75 9.2,17.3L7.74,18.76C8.97,19.54 10.43,20 12,20A8,8 0 0,0 20,12H23M6,12A6,6 0 0,1 12,6C13,6 13.97,6.25 14.8,6.7L16.26,5.24C15.03,4.46 13.57,4 12,4A8,8 0 0,0 4,12H1L5,16L9,12";
-    pub const BOOK: &str = "M19 2L14 6.5V17.5L19 13V2M6.5 5C4.55 5 2.45 5.4 1 6.5V21.16C1 21.41 1.25 21.66 1.5 21.66C1.6 21.66 1.65 21.59 1.75 21.59C3.1 20.94 5.05 20.5 6.5 20.5C8.45 20.5 10.55 20.9 12 22C13.35 21.15 15.8 20.5 17.5 20.5C19.15 20.5 20.85 20.81 22.25 21.56C22.35 21.61 22.4 21.59 22.5 21.59C22.75 21.59 23 21.34 23 21.09V6.5C22.4 6.05 21.75 5.75 21 5.5V19C19.9 18.65 18.7 18.5 17.5 18.5C15.8 18.5 13.35 19.15 12 20V6.5C10.55 5.4 8.45 5 6.5 5Z";
-    pub const CHECK_CIRCLE: &str = "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M12 20C7.59 20 4 16.41 4 12S7.59 4 12 4 20 7.59 20 12 16.41 20 12 20M16.59 7.58L10 14.17L7.41 11.59L6 13L10 17L18 9L16.59 7.58Z";
-    pub const CIRCLE_EDIT: &str = "M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12H20A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4V2M18.78,3C18.61,3 18.43,3.07 18.3,3.2L17.08,4.41L19.58,6.91L20.8,5.7C21.06,5.44 21.06,5 20.8,4.75L19.25,3.2C19.12,3.07 18.95,3 18.78,3M16.37,5.12L9,12.5V15H11.5L18.87,7.62L16.37,5.12Z";
-    pub const PLUS_CIRCLE: &str = "M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M13,7H11V11H7V13H11V17H13V13H17V11H13V7Z";
     // Context-menu actions (web PencilOutline).
     pub const PENCIL: &str = "M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z";
     // Titlebar: tab type icon (terminal), tab close, new-workspace dropdown items,
@@ -4754,8 +4659,6 @@ mod mdi_path {
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
     // Usage error indicator: a "!" in a circle.
     pub const ALERT_CIRCLE: &str = "M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z";
-    // Header "i" info button (Claude session info popover).
-    pub const INFORMATION_OUTLINE: &str = "M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z";
 }
 
 /// Style for a Windows titlebar control button: no chrome until hover, then a
@@ -5266,175 +5169,6 @@ mod winresize {
     }
 }
 
-fn footer_bar(
-    session: &Session,
-    pane: pane_grid::Pane,
-    round: iced::border::Radius,
-) -> Element<'static, Message> {
-    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
-    let primary = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
-    let blue = iced::Color::from_rgb8(0x56, 0x9c, 0xd6);
-    let green = iced::Color::from_rgb8(0x6a, 0x99, 0x55);
-    let orange = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
-    let git_orange = iced::Color::from_rgb8(0xf0, 0x50, 0x32);
-    // Icons and text are each placed in an identical LINE-tall, vertically-centred
-    // box, so their contents land on the same line (iced's default 1.3× text line
-    // height otherwise rides the glyph lower than a centred icon of the same size).
-    const LINE: f32 = 16.0;
-    let lh = iced::widget::text::LineHeight::Absolute(iced::Pixels(LINE));
-    let fi = move |path: &'static str, size: f32, col: iced::Color| -> Element<'static, Message> {
-        container(mdi(path, size, col)).center_y(Length::Fixed(LINE)).into()
-    };
-    let lbl = move |s: String, col: iced::Color| text(s).size(11).color(col).line_height(lh);
-    // Inter Semibold sits at a slightly different height than regular in the same
-    // line box, per platform: macOS renders it ~1px high → nudge DOWN 1px (LINE-tall
-    // box, top padding); Windows renders it ~1px low → nudge UP 1px (bottom-aligned
-    // in a LINE-tall box with bottom padding — iced has no negative padding). Linux
-    // renders it level → leave bare like `lbl`. The box stays LINE tall either way,
-    // so the row height / icons don't move.
-    let sbl = move |s: String, col: iced::Color| -> Element<'static, Message> {
-        let mk = |line: iced::widget::text::LineHeight| {
-            text(s.clone()).size(11).color(col).font(ui_semibold()).line_height(line)
-        };
-        if cfg!(target_os = "macos") {
-            // macOS renders semibold ~1px high → nudge DOWN 1px (top padding).
-            container(mk(lh))
-                .height(Length::Fixed(LINE))
-                .padding(iced::Padding { top: 1.0, ..iced::Padding::ZERO })
-                .into()
-        } else if cfg!(target_os = "windows") {
-            // Windows renders it ~1px low. iced has no negative padding, so shrink
-            // the inner line box by 2px and top-anchor it in a LINE-tall box: the
-            // glyph (centred in its shorter line box) rides ~1px higher, lining up
-            // with the regular "/1M". Row height stays LINE.
-            container(mk(iced::widget::text::LineHeight::Absolute(iced::Pixels(LINE - 2.0))))
-                .height(Length::Fixed(LINE))
-                .into()
-        } else {
-            mk(lh).into()
-        }
-    };
-    let div = move || text("|").size(11).color(iced::Color::from_rgb8(0x3a, 0x3a, 0x3a)).line_height(lh);
-
-    let c = session.claude_status();
-    let mut r = row![].spacing(6).align_y(iced::Center);
-    // In a git repo, the folder segment is a button: click → confirm renaming the
-    // terminal to the repo name (web `folder-seg.clickable` → `rename-to-repo`).
-    let is_repo = session.git().is_some();
-    let folder_seg = move |el: Element<'static, Message>| -> Element<'static, Message> {
-        if !is_repo {
-            return el;
-        }
-        button(el)
-            .on_press(Message::RequestRenameToRepo(pane))
-            .padding(iced::Padding { top: 1.0, bottom: 1.0, left: 3.0, right: 3.0 })
-            .style(|_t: &iced::Theme, s| button::Style {
-                background: matches!(s, button::Status::Hovered)
-                    .then(|| iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c))),
-                border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                ..Default::default()
-            })
-            .into()
-    };
-
-    if session.claude_running() && c.has_stats {
-        if let Some(m) = &c.model {
-            let mc = model_color(m);
-            r = r.push(
-                row![fi(mdi_path::ROBOT, 13.0, mc), sbl(m.clone(), mc)].spacing(3).align_y(iced::Center),
-            );
-        }
-        if let Some(p) = c.used_percent {
-            let size = c.context_size.map(fmt_ctx_size).unwrap_or_default();
-            r = r.push(div());
-            r = r.push(
-                row![
-                    fi(mdi_path::DATABASE, 12.0, blue),
-                    sbl(format!("{p:.0}%"), blue),
-                    lbl(format!("/{size}"), muted),
-                ]
-                .spacing(2)
-                .align_y(iced::Center),
-            );
-        }
-        r = r.push(div());
-        let tin = iced::Color::from_rgb8(0x4e, 0xc9, 0xb0);
-        let tout = iced::Color::from_rgb8(0xc6, 0x78, 0xdd);
-        let tcr = iced::Color::from_rgb8(0xd7, 0xba, 0x7d);
-        r = r.push(
-            row![
-                fi(mdi_path::ARROW_DOWN, 11.0, tin), lbl(fmt_k(c.input_tokens), tin),
-                fi(mdi_path::ARROW_UP, 11.0, tout), lbl(fmt_k(c.output_tokens), tout),
-                fi(mdi_path::CACHED, 11.0, blue), lbl(fmt_k(c.cache_write), blue),
-                // The book glyph has a small left side-bearing → +1px left padding
-                // restores its gap from the preceding number to match the others.
-                container(mdi(mdi_path::BOOK, 11.0, tcr))
-                    .center_y(Length::Fixed(LINE))
-                    .padding(iced::Padding { left: 1.0, ..iced::Padding::ZERO }),
-                lbl(fmt_k(c.cache_read), tcr),
-            ]
-            .spacing(3)
-            .align_y(iced::Center),
-        );
-
-        r = r.push(horizontal_space());
-        if let Some(f) = session.folder() {
-            r = r.push(folder_seg(
-                row![fi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)]
-                    .spacing(4)
-                    .align_y(iced::Center)
-                    .into(),
-            ));
-        }
-        if let Some(b) = session.git().and_then(|g| g.branch) {
-            r = r.push(div());
-            r = r.push(
-                row![fi(mdi_path::BRANCH, 13.0, git_orange), sbl(b, green)]
-                    .spacing(3)
-                    .align_y(iced::Center),
-            );
-        }
-    } else {
-        // Not running: compact git status on the left; folder/branch on the right.
-        if let Some(g) = session.git() {
-            let count = |path, n: u32, col| {
-                row![fi(path, 14.0, col), lbl(n.to_string(), col)].spacing(2).align_y(iced::Center)
-            };
-            if g.staged > 0 {
-                r = r.push(count(mdi_path::CHECK_CIRCLE, g.staged, green));
-            }
-            if g.unstaged > 0 {
-                r = r.push(count(mdi_path::CIRCLE_EDIT, g.unstaged, orange));
-            }
-            if g.untracked > 0 {
-                r = r.push(count(mdi_path::PLUS_CIRCLE, g.untracked, blue));
-            }
-        }
-        r = r.push(horizontal_space());
-        if let Some(f) = session.folder() {
-            let mut fs =
-                row![fi(mdi_path::FOLDER, 12.0, muted), lbl(f, primary)].spacing(4).align_y(iced::Center);
-            if let Some(b) = session.git().and_then(|g| g.branch) {
-                fs = fs.push(lbl("[".into(), muted));
-                fs = fs.push(fi(mdi_path::BRANCH, 12.0, git_orange));
-                fs = fs.push(lbl(b, green));
-                fs = fs.push(lbl("]".into(), muted));
-            }
-            r = r.push(folder_seg(fs.into()));
-        }
-    }
-    // Web `.terminal-footer`: 26px tall, 0 8px padding. `center_y` fixes the height
-    // AND vertically centres the content (matching the header's treatment).
-    container(r)
-        .width(Length::Fill)
-        .center_y(Length::Fixed(26.0))
-        .padding([0, 8])
-        .style(move |t: &iced::Theme| container::Style {
-            border: iced::Border { radius: round, ..Default::default() },
-            ..footer_style(t)
-        })
-        .into()
-}
 
 // MDI icons (mdiPowershell / mdiBash) for the shell-switch button. The button
 // shows the icon of the shell you'd switch *to* (matching the web).
@@ -5684,8 +5418,6 @@ fn pane_header(
     has_git_bash: bool,
     pane: pane_grid::Pane,
     status: Option<Dot>,
-    claude_running: bool,
-    info_open: bool,
     round: iced::border::Radius,
 ) -> Element<'static, Message> {
     let color = if focused {
@@ -5731,9 +5463,6 @@ fn pane_header(
                 }),
         );
     }
-    if claude_running {
-        right = right.push(header_info_btn(pane, info_open));
-    }
     let sides = container(row![horizontal_space(), right].align_y(iced::Center))
         .center_y(Length::Fill)
         .padding(iced::Padding { top: 2.0, right: 6.0, bottom: 0.0, left: 6.0 });
@@ -5752,73 +5481,7 @@ fn pane_header(
         .into()
 }
 
-/// The header info button (web `.info-btn`, `mdiInformationOutline`): toggles the
-/// Claude session info popover for this pane. Azure when the popover is open.
-fn header_info_btn(pane: pane_grid::Pane, active: bool) -> Element<'static, Message> {
-    let color = if active { AZURE } else { iced::Color::from_rgb8(0x6b, 0x7a, 0x8d) };
-    button(cmdi(mdi_path::INFORMATION_OUTLINE, 14.0, color))
-        .padding(2)
-        .on_press(Message::ToggleInfoPanel(pane))
-        .style(move |_t: &iced::Theme, s| {
-            let on = active || matches!(s, button::Status::Hovered);
-            button::Style {
-                border: iced::Border {
-                    color: if on { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
-                    width: 1.0,
-                    radius: 3.0.into(),
-                },
-                ..Default::default()
-            }
-        })
-        .into()
-}
 
-/// The Claude session info popover (web `TerminalInfoPanel`): model + token counts,
-/// anchored top-right over the terminal. Built from the pane's live Claude stats.
-fn info_panel(c: &arbiter_native::claude_status::ClaudeStatus) -> Element<'static, Message> {
-    let muted = iced::Color::from_rgb8(0x6b, 0x7a, 0x8d);
-    let primary = iced::Color::from_rgb8(0xe8, 0xea, 0xed);
-    let info_row = |label: &str, value: String| -> Element<'static, Message> {
-        row![
-            text(label.to_string()).size(11).color(muted),
-            horizontal_space(),
-            text(value).size(11).color(primary),
-        ]
-        .spacing(16)
-        .into()
-    };
-    let mut col = column![].spacing(5);
-    if let Some(m) = &c.model {
-        col = col.push(info_row("Model", clean_model(m)));
-    }
-    col = col.push(info_row("Tokens in", fmt_commas(c.input_tokens)));
-    col = col.push(info_row("Tokens out", fmt_commas(c.output_tokens)));
-    col = col.push(info_row("Cache write", fmt_commas(c.cache_write)));
-    col = col.push(info_row("Cache read", fmt_commas(c.cache_read)));
-    if c.cost_usd > 0.0 {
-        col = col.push(info_row("Cost", format!("${:.2}", c.cost_usd)));
-    }
-    let card = container(col)
-        .padding([8, 12])
-        .width(Length::Fixed(220.0))
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
-            border: iced::Border {
-                color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..Default::default()
-        });
-    // Anchor top-right within the terminal area.
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(iced::alignment::Horizontal::Right)
-        .align_y(iced::alignment::Vertical::Top)
-        .padding(iced::Padding { top: 4.0, right: 6.0, bottom: 0.0, left: 0.0 })
-        .into()
-}
 
 /// How long the scroll indicator stays fully opaque after the last scroll, then
 /// how long it takes to fade out.
@@ -5993,21 +5656,8 @@ fn find_bar<'a>(query: &'a str, status: Option<(usize, usize)>) -> Element<'a, M
         .into()
 }
 
-/// Integer with thousands separators ("12,345"), for the info popover token counts.
-fn fmt_commas(n: u64) -> String {
-    let s = n.to_string();
-    let len = s.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
 
-/// "Rename terminal to <repo>?" confirmation (footer folder click).
+/// "Rename terminal to <repo>?" confirmation (context-menu action).
 fn rename_confirm_view(rc: &RenameConfirm) -> Element<'static, Message> {
     let panel = column![
         text(format!("Rename terminal to \"{}\"?", rc.repo)).size(15).font(ui_semibold()),
@@ -7255,7 +6905,6 @@ fn main() -> iced::Result {
                 settings_open: false,
                 settings_tab: SettingsTab::General,
                 shortcuts_open: false,
-                info_pane: None,
                 rename_confirm: None,
                 rename_ws: None,
                 find_open: false,
@@ -7276,7 +6925,7 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_model, encode_mouse, trim_history_file, MouseModes};
+    use super::{encode_mouse, trim_history_file, MouseModes};
 
     #[test]
     fn trim_history_keeps_the_last_n_lines() {
@@ -7334,21 +6983,5 @@ mod tests {
         // UTF-8 mode (?1005) two-byte-encodes a far column instead of dropping it.
         let utf8 = MouseModes { reporting: true, utf8: true, ..Default::default() };
         assert!(encode_mouse(utf8, 0, false, false, 300, 0, false, false).is_some());
-    }
-
-
-    #[test]
-    fn clean_model_strips_context_suffix() {
-        // Plain names pass through untouched.
-        assert_eq!(clean_model("Opus 4.8"), "Opus 4.8");
-        assert_eq!(clean_model("Claude Sonnet 4.6"), "Claude Sonnet 4.6");
-        // Parenthetical "(… context)" forms.
-        assert_eq!(clean_model("Opus 4.8 (1M context)"), "Opus 4.8");
-        assert_eq!(clean_model("Sonnet 4.6 (200k context)"), "Sonnet 4.6");
-        // Inline forms, with and without a separator.
-        assert_eq!(clean_model("Opus 4.8 · 1M context"), "Opus 4.8");
-        assert_eq!(clean_model("Opus 4.8 1M context"), "Opus 4.8");
-        // The trailing-size drop must not eat a real version token (no "context").
-        assert_eq!(clean_model("Haiku 4.5"), "Haiku 4.5");
     }
 }

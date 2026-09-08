@@ -1,11 +1,11 @@
 //! Per-pane Claude status, updated event-driven (no polling) by a single `notify`
-//! watcher over the capture + hook dirs — the same model the webview used and
-//! the native git footer uses.
+//! watcher over the capture + hook dirs, the same model the webview used and
+//! the native git status uses.
 //!
 //! Each `Session` owns an `Arc<ClaudeHandle>` (shared with the watcher via a
 //! global registry of `Weak` handles) holding its live `ClaudeStatus`; `view()`
-//! reads it each frame. Captures (`<data>/claude-sessions/<sid>.json`) bind to a
-//! pane by cwd and fill the stats; hook signals (`<data>/claude-hooks/<sid>.json`)
+//! reads it each frame. A capture (`<data>/claude-sessions/<pane-id>.json`) existing
+//! means Claude launched in that pane; hook signals (`<data>/claude-hooks/<sid>.json`)
 //! flip the lifecycle (Stop→ready, Permission/elicitation→attention).
 
 use std::path::Path;
@@ -27,20 +27,12 @@ pub enum Lifecycle {
     Attention,
 }
 
-/// Live Claude status for one pane (stats from the Tier-2 capture + lifecycle).
+/// Live Claude status for one pane. Only the lifecycle now: the per-pane token /
+/// context / cost readouts were retired because Claude's own statusLine already
+/// renders them, and unlike this it does so over SSH too.
 #[derive(Clone, Default)]
 pub struct ClaudeStatus {
     pub lifecycle: Lifecycle,
-    pub model: Option<String>,
-    pub context_size: Option<u64>,
-    pub used_percent: Option<f64>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub cost_usd: f64,
-    /// A capture has bound (stats are populated).
-    pub has_stats: bool,
 }
 
 /// The watcher's view of one session: how to match it (cwd + alive flag + bound
@@ -387,16 +379,6 @@ fn process_captures(dir: &Path) {
                 SAVE_DIRTY.store(true, Ordering::Relaxed);
             }
         }
-        let mut st = h.stats.lock().unwrap();
-        st.model = c.model.clone();
-        st.context_size = c.context_size;
-        st.used_percent = c.used_percent;
-        st.input_tokens = c.input_tokens;
-        st.output_tokens = c.output_tokens;
-        st.cache_read = c.cache_read;
-        st.cache_write = c.cache_write;
-        st.cost_usd = c.cost_usd;
-        st.has_stats = true;
     }
 }
 
