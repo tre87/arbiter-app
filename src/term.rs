@@ -369,6 +369,7 @@ impl VtTerm {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+
     /// Snapshot the active mouse-reporting + scroll modes (see [`MouseModes`]).
     pub fn mouse_modes(&self) -> MouseModes {
         let m = self.term.mode();
@@ -439,10 +440,14 @@ impl VtTerm {
     pub fn claude_chrome(&self) -> bool {
         const CHROME: &[&str] =
             &["? for shortcuts", "accept edits on", "plan mode on", "auto mode on"];
-        /// Rows below the cursor to include. Claude's hint sits 1-2 rows under the
-        /// input box; 4 leaves room for a status line between them without reaching
-        /// far enough to pick up unrelated output.
-        const BELOW: usize = 4;
+        /// Rows below the cursor to include. Measured against a real session: the
+        /// cursor sits in the input box, and below it come the box's bottom border, an
+        /// optional warning line, the user's statusLine, and finally the mode line, so
+        /// the marker was 4 rows down. This is set well past that because everything
+        /// between is optional and a future release could add another line; the window
+        /// only ever extends DOWNWARD, which is what keeps stale chrome above the
+        /// cursor from matching, so widening it costs no precision.
+        const BELOW: usize = 8;
 
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
@@ -846,6 +851,26 @@ mod tests {
         // A user statusLine renders between the box and the hint, pushing the hint
         // further from the cursor. It must still be found.
         assert!(chrome("> \r\nmdl:opus | ctx:13%/1000K\r\n? for shortcuts\x1b[A\x1b[A"));
+    }
+
+    // Transcribed from a real `claude` session captured through a PTY, cursor row
+    // included: the input box, its bottom border, a warning line, the user's
+    // statusLine, then the mode line. That is 4 rows between the cursor and the only
+    // marker, which is what sizes the scan window, so this pins the real geometry
+    // rather than an idealised version of it.
+    #[test]
+    fn detects_chrome_in_a_captured_real_session() {
+        let screen = concat!(
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n",
+            "\u{276f} Try \"refactor <filepath>\"\r\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n",
+            "  \u{26a0} Transcript saving is off\r\n",
+            "  mdl:opus | ctx: no data | tokens: no data | fld:arbiter-app[main]\r\n",
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)",
+            // Claude leaves the cursor in the input box, 4 rows back up.
+            "\x1b[4A\x1b[3C",
+        );
+        assert!(chrome(screen));
     }
 
     #[test]

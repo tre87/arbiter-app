@@ -234,6 +234,17 @@ impl Session {
     /// Latest OSC-133 idle state (Some(true)=at prompt, Some(false)=running).
     pub fn shell_idle(&self) -> Option<bool> { *self.shell_idle.lock().unwrap() }
 
+    /// Whether a command is running in this pane, for the green "running" dot.
+    ///
+    /// Always false for a remote pane. The shell integration that reports this is the
+    /// LOCAL shell's, and from its point of view the single command `ssh` runs from
+    /// connect to disconnect, so the dot would be stuck on for the whole session while
+    /// saying nothing about what the far host is doing. A remote pane's useful state
+    /// comes from Claude's lifecycle instead, which is read from the screen.
+    pub fn shell_busy(&self) -> bool {
+        self.shell_idle() == Some(false) && !self.is_remote()
+    }
+
     pub fn write(&mut self, bytes: &[u8]) {
         let _ = self.writer_tx.send(bytes.to_vec());
     }

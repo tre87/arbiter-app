@@ -33,6 +33,21 @@ history belongs to the prior Tauri/Vue web app it replaced.
   gives ground truth to compare against. That is how to check the markers still match if a
   future Claude release changes its interface.
 
+### Fixed
+- **An SSH terminal no longer shows a permanently green "running" dot.** That dot comes
+  from the local shell's integration, and from its point of view `ssh` is a single command
+  that runs from connect to disconnect, so the dot lit up the moment you connected and
+  stayed lit until you left, saying nothing about the remote host along the way. Remote
+  panes now leave it to Claude's own status, which is read from the screen.
+- **An SSH terminal no longer reports the wrong git status.** The overview's git counts come
+  from the pane's local working directory, which for an SSH pane is just wherever the shell
+  happened to be standing when `ssh` was typed, so it described an unrelated repo on your
+  own machine. Remote panes now show no counts rather than misleading ones, and the row's
+  title gets the freed space.
+- **Shift+Enter inserts a newline in a remote Claude** instead of submitting. The key
+  encoding is chosen by whether Claude is running in the pane, which now includes panes
+  where it is running over SSH.
+
 ### Removed
 - **The per-terminal stats footer is retired,** along with the in-pane info card (the ⓘ
   button in a terminal's header). Both restated what Claude's own status line already shows

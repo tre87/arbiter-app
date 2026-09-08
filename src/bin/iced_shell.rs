@@ -4255,6 +4255,13 @@ fn overview_row_style(_t: &iced::Theme, status: button::Status) -> button::Style
 /// Git stat counts (●staged ✎unstaged +untracked) for one overview row.
 fn overview_git(session: &Session) -> Element<'static, Message> {
     let mut r = row![].spacing(6).align_y(iced::Center);
+    // Nothing for a remote pane. Its git state comes from the LOCAL cwd, which is
+    // wherever the shell was standing when `ssh` was typed, so the counts would
+    // describe a repo on this machine that has nothing to do with what the pane is
+    // showing. Better blank than confidently wrong.
+    if session.is_remote() {
+        return r.into();
+    }
     if let Some(g) = session.git() {
         if g.staged > 0 {
             r = r.push(text(format!("●{}", g.staged)).size(11).color(iced::Color::from_rgb8(0x6a, 0x99, 0x55)));
@@ -4366,7 +4373,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         for (pane, data) in panes {
             let running = data.session.claude_running();
             let lc = data.session.claude_status().lifecycle;
-            let busy = data.session.shell_idle() == Some(false);
+            let busy = data.session.shell_busy();
             let dot = pane_dot(running, lc, busy);
 
             // Truncate the title so it can't push the right cluster (git stats + status
@@ -4374,7 +4381,9 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             // reserve the dot (~22), the git stats (so they take priority — title gets
             // shorter when present), the Claude icon, and chrome/padding/gaps. The Fill
             // container below pins the right cluster regardless; this just lands the "…".
-            let git = data.session.git();
+            // `overview_git` draws nothing for a remote pane, so reserve nothing for it
+            // either, or the title would be truncated to make room for a blank column.
+            let git = data.session.git().filter(|_| !data.session.is_remote());
             let git_px = git.as_ref().map_or(0.0, |g| {
                 let seg = |n: u32| if n > 0 { (1 + n.to_string().len()) as f32 * 6.5 + 6.0 } else { 0.0 };
                 seg(g.staged) + seg(g.unstaged) + seg(g.untracked)
@@ -5370,7 +5379,7 @@ fn workspace_dot(ws: &Workspace) -> Option<Dot> {
     let mut working = false;
     let mut running = false;
     for (_, d) in ws.panes.iter() {
-        let busy = d.session.shell_idle() == Some(false);
+        let busy = d.session.shell_busy();
         match pane_dot(d.session.claude_running(), d.session.claude_status().lifecycle, busy) {
             Dot::Attention => return Some(Dot::Attention), // top priority — return at once
             Dot::Working => working = true,
