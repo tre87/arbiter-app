@@ -139,6 +139,35 @@ pub fn running_under(shell_pid: u32) -> bool {
     })
 }
 
+/// True if an SSH (or mosh) client is a descendant of `shell_pid`, i.e. this pane
+/// is driving a shell on another machine. Scanned on the same OSC-133 busy edge as
+/// `running_under`, off the same 250ms-gated snapshot, so it costs nothing extra.
+///
+/// A remote pane needs different treatment in two places: Claude runs on the far
+/// host, so the process scan and statusLine capture can never see it (the pane is
+/// recognised from Claude's on-screen chrome instead), and the local shell stays
+/// "busy" for the whole session, so its busy dot would otherwise be stuck on.
+pub fn ssh_under(shell_pid: u32) -> bool {
+    shared_system().with(Duration::from_millis(250), |sys| {
+        for (pid, proc) in sys.processes() {
+            if is_ssh_name(&proc.name().to_string_lossy()) && is_descendant(sys, pid.as_u32(), shell_pid)
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Whether a process name is an SSH/mosh *client*. Matched on the whole basename so
+/// the daemon and helpers (`sshd`, `ssh-agent`, `ssh-add`) can't count, since those
+/// run under the user's session all the time and would mark every pane remote.
+fn is_ssh_name(name: &str) -> bool {
+    let base = name.to_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    matches!(base, "ssh" | "mosh" | "mosh-client" | "plink")
+}
+
 /// A readable `pid(name)→parent(name)→…` chain for diagnostics.
 fn ancestry_chain(sys: &System, mut pid: u32) -> String {
     let mut out = Vec::new();
@@ -227,5 +256,18 @@ mod tests {
     fn ignores_non_node_non_claude() {
         assert!(!is_claude_cmdline("bash", &cmd(&["bash", "-lc", "echo claude"])));
         assert!(!is_claude_cmdline("vite", &cmd(&["vite"])));
+    }
+
+    #[test]
+    fn detects_ssh_clients_but_not_the_daemon_or_helpers() {
+        use super::is_ssh_name;
+        for n in ["ssh", "ssh.exe", "SSH.EXE", "mosh", "mosh-client", "plink.exe"] {
+            assert!(is_ssh_name(n), "{n} should count as a remote client");
+        }
+        // These run in a normal desktop session all the time; matching any of them
+        // would mark every pane remote.
+        for n in ["sshd", "ssh-agent", "ssh-add.exe", "sshfs", "node", "pwsh.exe"] {
+            assert!(!is_ssh_name(n), "{n} must not count as a remote client");
+        }
     }
 }

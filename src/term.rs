@@ -80,14 +80,6 @@ pub enum SelectKind {
     Line,
 }
 
-/// What Claude's visible screen currently shows, for status classification.
-pub enum ClaudeScreen {
-    /// A menu / approval prompt is on screen (AskUserQuestion, plan, "proceed?").
-    Menu,
-    /// Claude's working spinner / "esc to interrupt" status line is on screen.
-    Working,
-}
-
 /// Snapshot of the terminal's mouse-reporting + scroll modes (a TUI toggles these
 /// via DECSET/DECRST). The renderer reads them to decide whether a click is sent
 /// to the app or handled locally (selection / scrollback).
@@ -422,6 +414,56 @@ impl VtTerm {
         }
         false
     }
+
+    /// True if Claude Code's own UI chrome is on the visible screen. This is how a
+    /// pane running Claude on a REMOTE host is recognised: the markers ride the PTY
+    /// like any other output, so it works identically over SSH, where the local
+    /// process scan sees only `ssh` and no statusLine capture is ever written.
+    ///
+    /// The markers are Claude's hint line, which reads `? for shortcuts` in the
+    /// default mode and shows the mode label in each of the other three (verified
+    /// against the shipped CLI's mode table: default / accept edits on / plan mode
+    /// on / auto mode on).
+    ///
+    /// Only rows from the cursor DOWN are scanned, which is the load-bearing detail.
+    /// Claude renders its input box at the cursor with the hint line just below, so
+    /// anchoring there finds it wherever the box currently sits: a fixed window at
+    /// the screen bottom would miss a freshly-started Claude, whose transcript is
+    /// still short and whose box is near the top. Anchoring also makes the signal
+    /// self-clearing. Once Claude exits, its last screen stays in the transcript
+    /// ABOVE the returning shell prompt, and text above the cursor is never scanned,
+    /// so a stale hint line cannot keep the pane marked as running Claude.
+    ///
+    /// During a turn Claude replaces the hint with the interrupt hint, so a single
+    /// absent scan does not mean it exited (see `ClaudeHandle::note_screen`).
+    pub fn claude_chrome(&self) -> bool {
+        const CHROME: &[&str] =
+            &["? for shortcuts", "accept edits on", "plan mode on", "auto mode on"];
+        /// Rows below the cursor to include. Claude's hint sits 1-2 rows under the
+        /// input box; 4 leaves room for a status line between them without reaching
+        /// far enough to pick up unrelated output.
+        const BELOW: usize = 4;
+
+        let rows = self.term.screen_lines();
+        let cols = self.term.columns();
+        let grid = self.term.grid();
+        // Absolute grid line, deliberately NOT display-offset adjusted: whether a pane
+        // is running Claude must not change just because the user scrolled up.
+        let cursor = grid.cursor.point.line.0.max(0) as usize;
+        let mut buf = String::with_capacity(cols);
+        for row in cursor..rows.min(cursor + BELOW + 1) {
+            buf.clear();
+            let line = &grid[Line(row as i32)];
+            for col in 0..cols {
+                buf.push(line[Column(col)].c);
+            }
+            if CHROME.iter().any(|m| buf.contains(m)) {
+                return true;
+            }
+        }
+        false
+    }
+
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
@@ -771,5 +813,59 @@ mod tests {
             after.lines().count() > before.lines().count(),
             "scrolling while selecting should extend the selection: before={before:?} after={after:?}"
         );
+    }
+
+    /// Feed `s` to a fresh 80x24 term and ask whether Claude's chrome is on screen.
+    /// The cursor ends up wherever `s` leaves it, which is what the scan anchors to.
+    fn chrome(s: &str) -> bool {
+        use super::VtTerm;
+        let mut t = VtTerm::new(80, 24);
+        t.feed(s.as_bytes());
+        t.claude_chrome()
+    }
+
+    /// Claude's rendered shape: an input box holding the cursor, then its hint line
+    /// one row below. `\x1b[A` walks the cursor back up into the box, which is where
+    /// Claude leaves it.
+    fn claude_screen(hint: &str) -> String {
+        format!("> \r\n{hint}\x1b[A\x1b[C\x1b[C")
+    }
+
+    #[test]
+    fn detects_claude_chrome_in_every_mode() {
+        // The hint line Claude draws in its default mode, and the label it shows
+        // instead in each of the other three (verified against the shipped CLI).
+        assert!(chrome(&claude_screen("? for shortcuts")));
+        assert!(chrome(&claude_screen("\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)")));
+        assert!(chrome(&claude_screen("\u{23f5}\u{23f5} accept edits on (shift+tab to cycle)")));
+        assert!(chrome(&claude_screen("\u{23f5} plan mode on (shift+tab to cycle)")));
+    }
+
+    #[test]
+    fn detects_claude_chrome_with_a_status_line_between() {
+        // A user statusLine renders between the box and the hint, pushing the hint
+        // further from the cursor. It must still be found.
+        assert!(chrome("> \r\nmdl:opus | ctx:13%/1000K\r\n? for shortcuts\x1b[A\x1b[A"));
+    }
+
+    #[test]
+    fn plain_shell_output_is_not_claude_chrome() {
+        assert!(!chrome("$ cargo build --bin arbiter\r\n   Compiling arbiter-native v1.0.12"));
+        assert!(!chrome("total 48\r\ndrwxr-xr-x  12 tre  staff   384 Sep  8 16:48 src"));
+        // The bare prompt arrow is not enough: Claude's input box draws one, but so
+        // do plenty of shell prompts.
+        assert!(!chrome("\u{276f} "));
+    }
+
+    #[test]
+    fn chrome_above_the_cursor_stops_counting() {
+        // The exit case, and the reason the scan is cursor-anchored. Claude's last
+        // screen stays in the transcript, but the shell prompt that follows puts the
+        // cursor BELOW it, so the stale hint must not keep the pane marked as Claude.
+        // Two rows of separation is the tight case: a bottom-anchored window would
+        // still match here.
+        assert!(!chrome("? for shortcuts\r\n\r\n$ "));
+        // Also true when it is only one row up.
+        assert!(!chrome("? for shortcuts\r\n$ "));
     }
 }

@@ -129,12 +129,16 @@ impl Session {
             });
         }
 
-        // Event-driven Claude monitor: on each busy edge, scan the shell's
-        // descendants for a `claude` process (it execs shortly after the edge).
+        // Event-driven Claude monitor: on each busy edge, scan the shell's descendants
+        // for a `claude` process (it execs shortly after the edge), or for an ssh/mosh
+        // client, which means the foreground program is on another machine.
         if let Some(pid) = shell_pid {
             let claude_running = claude_running.clone();
             let shell_idle = shell_idle.clone();
-            std::thread::spawn(move || claude_monitor(pid, cmd_epoch, claude_running, shell_idle));
+            let claude = claude.clone();
+            std::thread::spawn(move || {
+                claude_monitor(pid, cmd_epoch, claude_running, shell_idle, claude)
+            });
         }
 
         Ok(Self {
@@ -158,8 +162,27 @@ impl Session {
         self.claude.snapshot()
     }
 
-    /// True if a `claude` process is running in this pane right now.
+    /// True if Claude is running in this pane right now, whether that is a local
+    /// `claude` process or one on the far side of an ssh session (recognised from its
+    /// on-screen chrome). Every Claude-gated affordance reads this, so the remote case
+    /// lights the status dot, lists in the overview and picks the right Shift+Enter
+    /// encoding without any of them knowing the difference.
     pub fn claude_running(&self) -> bool {
+        self.claude_running.load(Ordering::Relaxed) || self.claude.on_screen()
+    }
+
+    /// True if this pane is driving a shell on another machine (an ssh/mosh client is
+    /// its foreground program).
+    pub fn is_remote(&self) -> bool {
+        self.claude.is_remote()
+    }
+
+    /// Whether a LOCAL `claude` process is running here. This is the flag the saved
+    /// layout must use: restore relaunches Claude by typing `claude` into a freshly
+    /// spawned LOCAL shell, and a remote pane's Claude lives on another machine, so
+    /// persisting the broader `claude_running()` would have a restored ssh pane start
+    /// a local Claude instead.
+    pub fn claude_running_local(&self) -> bool {
         self.claude_running.load(Ordering::Relaxed)
     }
 
@@ -180,7 +203,7 @@ impl Session {
     /// real conversation has happened (else `None`, so restore launches a clean
     /// `claude` rather than `--resume`ing a non-existent empty session).
     pub fn claude_session_id(&self) -> Option<String> {
-        self.claude_running().then(|| self.claude.resumable_session()).flatten()
+        self.claude_running_local().then(|| self.claude.resumable_session()).flatten()
     }
 
     /// Basename of the current working directory, if known.
@@ -325,7 +348,28 @@ fn reader_loop(
         // e.g. the user escapes/answers). A menu/approval prompt → attention (no
         // hook covers AskUserQuestion/plan); Claude's "(esc to interrupt)" status
         // line → working. Plain output (typing, redraws) is neither.
-        if claude_running.load(Ordering::Relaxed) {
+        // A REMOTE pane (an ssh/mosh client in the foreground) can't be detected the
+        // local way: the process scan sees only `ssh` and the far host writes no
+        // statusLine capture. So probe the rendered screen for Claude's own chrome
+        // instead. Deliberately gated on `remote`, so a local pane's detection path is
+        // byte-for-byte the one that already works and can't regress here.
+        if claude.is_remote() {
+            let chrome = term.lock().unwrap().claude_chrome();
+            claude.note_screen(chrome);
+        } else if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some() {
+            // Diagnostic (ARBITER_CLAUDE_DEBUG): run the probe on LOCAL panes too, where
+            // the process scan is ground truth, and log both. It changes nothing, but it
+            // is how the chrome markers get verified against a real Claude, and how a
+            // future Claude UI change that breaks them gets caught: a pane with
+            // local_claude=true and chrome=false at its prompt means the markers or the
+            // cursor geometry in `VtTerm::claude_chrome` have drifted.
+            let chrome = term.lock().unwrap().claude_chrome();
+            crate::claude_shim::debug_log(&format!(
+                "chrome probe: chrome={chrome} local_claude={}",
+                claude_running.load(Ordering::Relaxed)
+            ));
+        }
+        if claude_running.load(Ordering::Relaxed) || claude.on_screen() {
             // Attention: a menu/approval prompt on the rendered screen (level-based,
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
             // glyph in the *new* bytes (chunk-based like the web — instant, and a
@@ -367,7 +411,7 @@ fn reader_loop(
                                 prev_idle = Some(idle);
                                 if idle {
                                     // Prompt returned → the foreground command
-                                    // (incl. Claude) ended.
+                                    // (incl. Claude, or an ssh session) ended.
                                     let was = claude_running.swap(false, Ordering::Relaxed);
                                     if was {
                                         // Claude stopped → persist so a restore doesn't relaunch it,
@@ -375,6 +419,15 @@ fn reader_loop(
                                         // re-mark this pane as running on the next watcher pass.
                                         crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
                                         claude.clear_capture();
+                                    }
+                                    // The LOCAL prompt is back, so any ssh session is over and
+                                    // the remote Claude with it (this also drops the on-screen
+                                    // latch). The chrome probe would clear it on the next chunk
+                                    // anyway; doing it on the edge means the dot goes out the
+                                    // moment the session ends rather than on the next output.
+                                    if claude.is_remote() {
+                                        claude.set_remote(false);
+                                        crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
                                     }
                                     // A command just finished — it may have changed
                                     // files, so refresh the git status.
@@ -536,6 +589,7 @@ fn claude_monitor(
     cmd_epoch: CmdEpoch,
     claude_running: Arc<AtomicBool>,
     shell_idle: Arc<Mutex<Option<bool>>>,
+    claude: Arc<crate::claude_status::ClaudeHandle>,
 ) {
     // How long to keep looking for Claude after a command starts. Enough to catch a
     // slow cold launch (Windows especially: $PROFILE + shim + node + MCP servers,
@@ -576,6 +630,15 @@ fn claude_monitor(
                 // a restore relaunches it.
                 crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
                 crate::claude_shim::debug_log(&format!("claude_monitor: found on shell_pid={shell_pid}"));
+                break;
+            }
+            // Not Claude locally. An ssh/mosh client means the foreground program is on
+            // another machine, so hand the pane to the screen probe (see `reader_loop`)
+            // and stop scanning: nothing local will ever appear for it. Uses the same
+            // 250ms-gated snapshot the Claude scan just took, so it is effectively free.
+            if crate::claude::ssh_under(shell_pid) {
+                claude.set_remote(true);
+                crate::claude_shim::debug_log(&format!("claude_monitor: ssh on shell_pid={shell_pid}"));
                 break;
             }
             if *shell_idle.lock().unwrap() == Some(true) {

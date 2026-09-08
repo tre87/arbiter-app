@@ -7,6 +7,32 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Claude running over SSH is now detected.** Until now every Claude signal came from the
+  local machine: a scan of the pane shell's child processes, plus the status-line capture
+  file Claude writes through Arbiter's shim. Neither can see a `claude` running on another
+  host, so an SSH pane showed no status dot, was filtered out of the overview when "Claude
+  only" was on, and got the wrong Shift+Enter key encoding (submitting instead of inserting
+  a newline).
+
+  A pane whose foreground program is an `ssh`/`mosh` client is now recognised on the same
+  busy edge that already scans for Claude, and such panes get a second detector that looks
+  for Claude's own interface in the rendered screen. Those markers arrive as ordinary
+  terminal output, so they work over any connection with **nothing installed on the remote
+  host**. The scan is anchored to the cursor, where Claude draws its input box: that finds
+  it whether it has just started or has scrolled a long transcript, and once Claude exits
+  its last screen is left above the returning prompt, where the scan does not reach, so the
+  pane clears itself. A turn in flight holds the pane's state even though Claude swaps its
+  hint line for the interrupt hint while working.
+
+  **Local panes are untouched.** The screen probe runs only on panes with an SSH client, so
+  the local path is exactly the one that already worked. What Arbiter *persists* also stays
+  local-only, so a restored SSH pane no longer tries to start a local Claude.
+
+  Set `ARBITER_CLAUDE_DEBUG=1` to log the probe against local panes, where the process scan
+  gives ground truth to compare against. That is how to check the markers still match if a
+  future Claude release changes its interface.
+
 ### Removed
 - **The per-terminal stats footer is retired,** along with the in-pane info card (the ⓘ
   button in a terminal's header). Both restated what Claude's own status line already shows

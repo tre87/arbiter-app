@@ -75,6 +75,16 @@ pub struct ClaudeHandle {
     /// resumes (activity) or the turn ends (Stop). Covers tool-permission prompts
     /// that don't show a grid marker.
     hook_attention: AtomicBool,
+    /// An SSH/mosh client is running in this pane, so its foreground program lives on
+    /// another machine. Set from the same busy-edge scan as `claude_running`; gates
+    /// the on-screen probe below, which only remote panes need.
+    remote: AtomicBool,
+    /// Claude's own UI chrome is on this pane's screen (`VtTerm::claude_chrome`).
+    /// This is how a REMOTE Claude is recognised, where the local process scan sees
+    /// only `ssh` and no statusLine capture is ever written. Latched rather than
+    /// timed: an idle Claude produces no output, so nothing would refresh a TTL, but
+    /// the moment it exits the shell prints a prompt and that scan clears this.
+    on_screen: AtomicBool,
 }
 
 /// Working reverts to ready after this long without a detected spinner frame.
@@ -124,7 +134,49 @@ impl ClaudeHandle {
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
+            remote: AtomicBool::new(false),
+            on_screen: AtomicBool::new(false),
         })
+    }
+
+    /// Busy-edge scan: an SSH/mosh client is (or is no longer) running in this pane.
+    /// Turning remote off also drops the on-screen latch, so a pane that leaves a
+    /// remote session can't keep reporting the far host's Claude.
+    pub fn set_remote(&self, on: bool) {
+        self.remote.store(on, Ordering::Relaxed);
+        if !on {
+            self.on_screen.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.remote.load(Ordering::Relaxed)
+    }
+
+    /// Reader: the result of scanning this pane's screen for Claude's chrome.
+    ///
+    /// Present latches on. Absent only latches OFF when no spinner frame is fresh,
+    /// because during a turn Claude replaces its idle hint line with the interrupt
+    /// hint: clearing on that would drop the pane's Claude state mid-answer and take
+    /// the status dot with it. A real exit has no spinner either, so it still clears
+    /// on the very next chunk (the returning shell prompt).
+    pub fn note_screen(&self, chrome: bool) {
+        if chrome {
+            self.on_screen.store(true, Ordering::Relaxed);
+        } else if !self.activity_fresh() {
+            self.on_screen.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Claude is running in this pane as far as the SCREEN is concerned (remote panes).
+    pub fn on_screen(&self) -> bool {
+        self.on_screen.load(Ordering::Relaxed)
+    }
+
+    /// Whether a spinner frame landed recently enough to count as an in-flight turn.
+    fn activity_fresh(&self) -> bool {
+        let act = self.activity_ms.load(Ordering::Relaxed);
+        act != 0 && now_ms().saturating_sub(act) < WORKING_TTL_MS
     }
 
     /// Reader: a chunk carrying spinner glyphs arrived, `glyphs` being the fingerprint
@@ -477,6 +529,49 @@ mod tests {
         std::thread::sleep(FRAME);
         h.note_activity(0b0010);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+    }
+
+    // Chrome on screen latches the pane as running Claude; chrome gone clears it. This
+    // is what makes a remote pane light up and, when Claude exits on the far host, go
+    // dark again on the very next chunk (the returning remote prompt).
+    #[test]
+    fn chrome_latches_claude_on_and_off() {
+        let h = handle();
+        assert!(!h.on_screen());
+        h.note_screen(true);
+        assert!(h.on_screen());
+        h.note_screen(false);
+        assert!(!h.on_screen());
+    }
+
+    // The mid-turn case. While Claude works it swaps its hint line for the interrupt
+    // hint, so the chrome scan comes back empty even though Claude is very much there.
+    // Clearing on that would drop the pane's Claude state (and its dot) mid-answer.
+    #[test]
+    fn chrome_gone_during_a_live_turn_does_not_clear() {
+        let h = handle();
+        h.note_screen(true);
+        // Two differing spinner frames an animation gap apart = a turn is under way.
+        h.note_activity(0b1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0100);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+
+        h.note_screen(false);
+        assert!(h.on_screen(), "a working turn must keep the pane marked as Claude");
+    }
+
+    // Leaving the ssh session drops both, so the far host's Claude can't linger on a
+    // pane that is back at a local prompt.
+    #[test]
+    fn clearing_remote_also_drops_the_chrome_latch() {
+        let h = handle();
+        h.set_remote(true);
+        h.note_screen(true);
+        assert!(h.is_remote() && h.on_screen());
+        h.set_remote(false);
+        assert!(!h.is_remote());
+        assert!(!h.on_screen());
     }
 
     #[test]

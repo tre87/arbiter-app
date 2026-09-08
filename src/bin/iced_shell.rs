@@ -671,7 +671,7 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                     _ => persist::SavedShell::PowerShell,
                 },
                 cwd: data.and_then(|d| d.session.cwd()),
-                claude_running: data.map(|d| d.session.claude_running()).unwrap_or(false),
+                claude_running: data.map(|d| d.session.claude_running_local()).unwrap_or(false),
                 claude_session: data.and_then(|d| d.session.claude_session_id()),
                 history_id: data.map(|d| d.history_id.clone()),
             }
