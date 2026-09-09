@@ -601,13 +601,12 @@ fn spawn_restored(
     // it lands at the far host's prompt in the right place, and the user starts Claude.
     // Nothing here has to discover or guess a remote session id, so there is nothing to
     // go stale and no chance of attaching to the wrong conversation.
-    // Replay only what the whitelist accepts. `set_startup_cmd` reports that, and the
-    // replay is gated on it: a save from an earlier build can hold whatever was typed
-    // last (that bug persisted `claude`), and replaying it would run an unrelated
-    // command in a local shell on every launch.
-    if startup_cmd.is_some_and(|cmd| session.set_startup_cmd(cmd)) {
-        let cmd = session.startup_cmd().unwrap_or_default();
-        session.write(format!("{cmd}\r").as_bytes());
+    // Replay only what the whitelist accepts: a save from an earlier build can hold
+    // whatever was typed last (that bug persisted `claude`), and replaying it would run
+    // an unrelated command in a local shell on every launch.
+    if startup_cmd.is_some_and(|cmd| session.queue_startup_cmd(cmd)) {
+        // Queued, not written: it goes in once the pane is being read AND has its real
+        // size, which `queue_startup_cmd` waits for.
     } else if claude_running {
         // Relaunch Claude here — resuming the previous conversation if one was bound,
         // else a fresh session. The command queues in the PTY and runs at the shell's
@@ -1908,10 +1907,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     ShellKind::PowerShell => None,
                 };
                 data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
-                // Same whitelist gate as restore: only replay a recognised remote client.
-                if cmd.as_deref().is_some_and(|c| data.session.set_startup_cmd(c)) {
-                    let cmd = cmd.unwrap_or_default();
-                    data.session.write(format!("{cmd}\r").as_bytes());
+                // Same whitelist gate as restore, and likewise queued rather than written,
+                // so the fresh pane is being read and sized before anything runs in it.
+                if let Some(c) = cmd.as_deref() {
+                    data.session.queue_startup_cmd(c);
                 }
             }
             save_session(state);
@@ -4088,6 +4087,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
                 pane,
                 term: data.session.term(),
                 master: data.session.master(),
+                startup: data.session.startup_gate(),
                 font: font.clone(),
             })
             .width(Length::Fill)
@@ -6348,6 +6348,9 @@ fn push_mouse_pos(out: &mut Vec<u8>, pos: usize, utf8: bool) {
 struct Renderers(HashMap<u64, TermGpu>);
 
 struct TermProgram {
+    /// Notified when this pane's PTY is resized here, so a queued startup command can
+    /// wait for the real size (see `arbiter_native::session::StartupGate`).
+    startup: std::sync::Arc<arbiter_native::session::StartupGate>,
     id: u64,
     pane: pane_grid::Pane,
     term: SharedTerm,
@@ -6680,6 +6683,7 @@ impl shader::Program<Message> for TermProgram {
             id: self.id,
             term: self.term.clone(),
             master: self.master.clone(),
+            startup: self.startup.clone(),
             font: self.font.clone(),
         }
     }
@@ -6689,6 +6693,9 @@ struct TermPrimitive {
     id: u64,
     term: SharedTerm,
     master: SharedMaster,
+    /// Notified when this pane's PTY is resized here, so a queued startup command can
+    /// wait for the real size (see `arbiter_native::session::StartupGate`).
+    startup: Arc<arbiter_native::session::StartupGate>,
     font: Arc<arbiter_native::font::FontSpec>,
 }
 
@@ -6744,6 +6751,10 @@ impl shader::Primitive for TermPrimitive {
                         pixel_height: 0,
                     });
                 }
+                // A pane is spawned at 80x24 and gets its real size HERE, on its first
+                // rendered frame. A queued startup command must not go in before this,
+                // so the resize is announced (see `StartupGate`).
+                self.startup.note_resized();
             }
             gpu.prepare(device, queue, &t, pw, ph);
         }

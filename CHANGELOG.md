@@ -59,6 +59,23 @@ history belongs to the prior Tauri/Vue web app it replaced.
   shell has exited.
 
 ### Fixed
+- **A restored SSH terminal no longer falls back to password authentication.** On relaunch
+  the replayed `ssh` command would show its key passphrase prompt and then immediately
+  give up on the key, asking for the account password instead. Typing the same command by
+  hand a moment later worked fine, which is what made it so confusing.
+
+  Two things had to coincide. Terminals are created at 80x24 and resized to their real size
+  on their first rendered frame, which lands *after* the shell has printed its prompt, so
+  the replayed command ran during that resize. A resize arrives as a window-size change to
+  whatever is running, and Git's MSYS build of `ssh` does not survive one during its
+  passphrase read: the read is abandoned, it reports an incorrect passphrase, and `ssh`
+  moves on to the next authentication method. Native Windows OpenSSH is unaffected, which
+  is why this only appeared when Arbiter was started from Git Bash, whose `PATH` puts
+  Git's `ssh` ahead of the Windows one.
+
+  A replayed command now waits for the terminal to be both readable (its shell has
+  prompted) and at its real size before it is sent. Both arrive as events, so there is no
+  polling and no timing guess; whichever happens last releases the command.
 - **An SSH terminal no longer shows a permanently green "running" dot.** That dot comes
   from the local shell's integration, and from its point of view `ssh` is a single command
   that runs from connect to disconnect, so the dot lit up the moment you connected and

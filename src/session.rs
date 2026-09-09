@@ -24,6 +24,80 @@ type GitWatcher = Debouncer<RecommendedWatcher>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Last-resort delay before a queued startup command is sent even though the pane never
+/// reported itself ready. Only reachable when shell integration is broken (no OSC-133 at
+/// all), where the alternative is the command silently never running.
+const STARTUP_CMD_FALLBACK: Duration = Duration::from_secs(5);
+
+/// Holds a pane's startup command until the pane can safely be typed into, then sends it.
+///
+/// Two things have to be true, and they arrive as unrelated events on different threads:
+///
+///   * the shell has reached a prompt, so something is actually reading the PTY;
+///   * the PTY has its real size, because panes are created at 80x24 and are resized on
+///     their first rendered frame.
+///
+/// The second one is the subtle one. A resize lands as SIGWINCH on whatever is running,
+/// and Git's MSYS build of ssh does not survive one during its echo-off passphrase read:
+/// the read is abandoned, it reports "incorrect passphrase", and ssh falls back to
+/// password auth. So a command injected before the startup resize can have its program
+/// destroyed by a resize Arbiter itself caused a moment later. (Native Windows OpenSSH
+/// shrugs it off, which is why this only appeared when Arbiter was launched from Git
+/// Bash, whose PATH puts Git's ssh first.)
+///
+/// Both notifications simply record their fact and then try to release, so whichever
+/// arrives last performs the send. No polling and no settle window: `take` makes it
+/// once-only, and ordering does not matter.
+pub struct StartupGate {
+    cmd: Mutex<Option<String>>,
+    prompt_seen: AtomicBool,
+    resized: AtomicBool,
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl StartupGate {
+    fn new(tx: std::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            cmd: Mutex::new(None),
+            prompt_seen: AtomicBool::new(false),
+            resized: AtomicBool::new(false),
+            tx,
+        }
+    }
+
+    /// Hold `cmd` until the pane is ready. Replaces anything already queued.
+    fn queue(&self, cmd: &str) {
+        *self.cmd.lock().unwrap() = Some(cmd.to_string());
+        self.release_if_ready();
+    }
+
+    /// The shell reached a prompt (an OSC-133 idle edge).
+    pub fn note_prompt(&self) {
+        self.prompt_seen.store(true, Ordering::Relaxed);
+        self.release_if_ready();
+    }
+
+    /// The PTY was resized, so it now has a real size rather than the initial 80x24.
+    pub fn note_resized(&self) {
+        self.resized.store(true, Ordering::Relaxed);
+        self.release_if_ready();
+    }
+
+    fn release_if_ready(&self) {
+        if !(self.prompt_seen.load(Ordering::Relaxed) && self.resized.load(Ordering::Relaxed)) {
+            return;
+        }
+        self.send();
+    }
+
+    /// Send the queued command, if there still is one.
+    fn send(&self) {
+        if let Some(cmd) = self.cmd.lock().unwrap().take() {
+            let _ = self.tx.send(format!("{cmd}\r").into_bytes());
+        }
+    }
+}
+
 /// UI redraw hook: a PTY reader calls this after feeding new output so the UI can
 /// redraw *on output* instead of polling the grid every frame. The iced shell wires
 /// it to a redraw message at startup; it's a no-op until then (early output is covered
@@ -70,6 +144,8 @@ pub struct Session {
     /// session any more; the pane shows it as disconnected and offers Reconnect,
     /// which respawns rather than trying to revive it.
     exited: Arc<AtomicBool>,
+    /// Holds a queued startup command until this pane can safely be typed into.
+    startup: Arc<StartupGate>,
     /// The input line being typed. Fed only from real keystrokes (see `note_typed`),
     /// so PTY query replies and program output can never pollute it. The submitted
     /// commands it yields live on the `ClaudeHandle`, which the busy-edge monitor also
@@ -121,6 +197,7 @@ impl Session {
         let watcher: Arc<Mutex<Option<GitWatcher>>> = Arc::new(Mutex::new(None));
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
         let exited = Arc::new(AtomicBool::new(false));
+        let startup = Arc::new(StartupGate::new(writer_tx.clone()));
 
         // Shared Claude status, updated by the capture/hook watcher (registered
         // here so it routes by cwd / session id) + the reader (spinner/menu →
@@ -144,9 +221,11 @@ impl Session {
             let cmd_epoch = cmd_epoch.clone();
             let writer_tx = writer_tx.clone();
             let exited = exited.clone();
+            let startup = startup.clone();
             std::thread::spawn(move || {
                 reader_loop(
-                    reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch, exited,
+                    reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch,
+                    exited, startup,
                 )
             });
         }
@@ -174,6 +253,7 @@ impl Session {
             git,
             claude,
             exited,
+            startup,
             typed_line: Arc::new(Mutex::new(TypedLine::default())),
             _watcher: watcher,
             _child: child,
@@ -206,6 +286,37 @@ impl Session {
     /// this session (nobody typed it) and survives the next save.
     pub fn set_startup_cmd(&self, cmd: &str) -> bool {
         self.claude.set_startup_cmd(cmd)
+    }
+
+    /// Remember `cmd` as this pane's startup command AND schedule it to run once the
+    /// shell reaches its first prompt. Returns whether it was accepted (see
+    /// `ClaudeHandle::set_startup_cmd` for the whitelist).
+    ///
+    /// The command is queued rather than written immediately, because writing into a
+    /// PTY that nothing is reading yet leaves a stray newline behind on ConPTY, which
+    /// ssh then swallows as an empty key passphrase.
+    pub fn queue_startup_cmd(&self, cmd: &str) -> bool {
+        if !self.set_startup_cmd(cmd) {
+            return false;
+        }
+        self.startup.queue(cmd);
+
+        // Last resort for a pane that never reports itself ready, which in practice means
+        // shell integration is broken (no OSC-133 at all). One sleep, not a poll: the
+        // release is event-driven, and by this point either it has already happened and
+        // this is a no-op, or nothing was ever going to trigger it.
+        let gate = self.startup.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(STARTUP_CMD_FALLBACK);
+            gate.send();
+        });
+        true
+    }
+
+    /// This pane's startup gate, for the renderer to notify on resize (it owns the cell
+    /// metrics, so it is where the real size is applied).
+    pub fn startup_gate(&self) -> Arc<StartupGate> {
+        self.startup.clone()
     }
 
     /// The command to replay to rebuild this pane, if there is one.
@@ -324,6 +435,7 @@ impl Session {
         if let Ok(m) = self.master.lock() {
             let _ = m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         }
+        self.startup.note_resized();
         self.term.lock().unwrap().resize(cols as usize, rows as usize);
     }
 }
@@ -416,6 +528,7 @@ fn reader_loop(
     watcher: Arc<Mutex<Option<GitWatcher>>>,
     cmd_epoch: CmdEpoch,
     exited: Arc<AtomicBool>,
+    startup: Arc<StartupGate>,
 ) {
     let claude_running = claude.claude_running.clone();
     let mut buf = [0u8; 8192];
@@ -548,6 +661,17 @@ fn reader_loop(
                             if prev_idle != Some(idle) {
                                 prev_idle = Some(idle);
                                 if idle {
+                                    // The shell has reached a prompt, so release any queued
+                                    // startup command now. It is deliberately NOT written at
+                                    // spawn time: on ConPTY a CR written into a PTY that
+                                    // nothing is reading yet can arrive as CRLF, and the stray
+                                    // LF is then consumed by whatever runs next. ssh read it as
+                                    // an empty key passphrase and fell straight through to
+                                    // password auth before the user could type anything.
+                                    // `take` makes this once-only, so later prompts are unaffected.
+                                    // The PTY is being read. If the pane has also been
+                                    // resized, this releases any queued startup command.
+                                    startup.note_prompt();
                                     // Prompt returned → the foreground command
                                     // (incl. Claude, or an ssh session) ended.
                                     let was = claude_running.swap(false, Ordering::Relaxed);
@@ -862,6 +986,53 @@ mod tests {
             }
         }
         last
+    }
+
+    /// A gate plus the receiving end of its PTY channel.
+    fn gate() -> (super::StartupGate, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (super::StartupGate::new(tx), rx)
+    }
+
+    fn sent(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<String> {
+        rx.try_recv().ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    // Both facts are required, and they arrive from unrelated threads in either order,
+    // so whichever is last has to be the one that releases.
+    #[test]
+    fn startup_command_waits_for_the_prompt_and_the_real_size() {
+        // Resize last.
+        let (g, rx) = gate();
+        g.queue("ssh mini");
+        assert_eq!(sent(&rx), None, "nothing is ready yet");
+        g.note_prompt();
+        assert_eq!(sent(&rx), None, "being read, but still 80x24");
+        g.note_resized();
+        assert_eq!(sent(&rx).as_deref(), Some("ssh mini\r"));
+
+        // Prompt last.
+        let (g, rx) = gate();
+        g.queue("ssh mini");
+        g.note_resized();
+        assert_eq!(sent(&rx), None, "sized, but nothing is reading yet");
+        g.note_prompt();
+        assert_eq!(sent(&rx).as_deref(), Some("ssh mini\r"));
+    }
+
+    // A pane already prompted and sized before a command is queued (a Reconnect into a
+    // warm pane) must still send, and exactly once however many more events arrive.
+    #[test]
+    fn startup_command_is_sent_once_whenever_it_is_queued() {
+        let (g, rx) = gate();
+        g.note_prompt();
+        g.note_resized();
+        g.queue("ssh mini");
+        assert_eq!(sent(&rx).as_deref(), Some("ssh mini\r"));
+        g.note_prompt();
+        g.note_resized();
+        g.send();
+        assert_eq!(sent(&rx), None, "must not repeat");
     }
 
     #[test]
