@@ -239,12 +239,24 @@ impl Drop for SecretText {
     }
 }
 
-/// One row of the credential dialog: a connection command, and the secret the user typed
-/// for it. Deduplicated by `cmd`, so several panes sharing a connection are one row and
-/// are answered together.
+/// One row of the credential dialog: a connection command, what it is known to ask for,
+/// and the secret the user typed for it. Deduplicated by `cmd`, so several panes sharing
+/// a connection are one row and are answered together.
 struct ConnectRow {
     cmd: String,
+    /// Which secret, and for what (a key's name, or `user@host`), when a prompt has been
+    /// seen; `None` reads "passphrase or password".
+    prompt: Option<(persist::CredentialKind, String)>,
     secret: SecretText,
+    /// Leave this connection's terminals at their local prompt instead of connecting.
+    skip: bool,
+}
+
+/// What the UI needs to know about a pane's connection.
+struct Connection {
+    cmd: String,
+    prompts: Option<bool>,
+    prompt: Option<(persist::CredentialKind, String)>,
 }
 
 /// What the credential dialog is answering for.
@@ -504,6 +516,8 @@ enum Message {
     ConnectInput(usize, SecretText),
     ConnectSubmit,
     ConnectSkip,
+    /// One row's switch: `true` connects it, `false` leaves it at its local prompt.
+    ConnectRowOn(usize, bool),
     /// Put the remote shell snippet (`shell::REMOTE_OSC7_SNIPPET`) on the clipboard.
     CopyRemoteSnippet,
     /// Terminal context-menu actions on the focused pane: clear the buffer and
@@ -682,6 +696,8 @@ fn spawn_restored(
     history_id: &str,
     startup_cmd: Option<&str>,
     prompts_for_credential: Option<bool>,
+    credential_kind: Option<persist::CredentialKind>,
+    credential_detail: Option<&str>,
     remote_cwd: Option<&str>,
     remote_claude: bool,
     remote_session: Option<&str>,
@@ -710,6 +726,7 @@ fn spawn_restored(
     // typed last (that bug persisted `claude`).
     if startup_cmd.is_some_and(|cmd| session.set_startup_cmd(cmd)) {
         session.set_prompts_for_credential(prompts_for_credential);
+        session.seed_credential_prompt(credential_kind, credential_detail);
         session.seed_remote_cwd(remote_cwd);
         session.seed_remote_claude(remote_claude);
         session.seed_remote_session(remote_session);
@@ -748,6 +765,8 @@ fn saved_to_config(
             history_id,
             startup_cmd,
             prompts_for_credential,
+            credential_kind,
+            credential_detail,
             remote_cwd,
             remote_claude,
             remote_session,
@@ -763,6 +782,8 @@ fn saved_to_config(
                 &history_id,
                 startup_cmd.as_deref(),
                 prompts_for_credential,
+                credential_kind,
+                credential_detail.as_deref(),
                 remote_cwd.as_deref(),
                 remote_claude,
                 remote_session.as_deref(),
@@ -776,16 +797,20 @@ fn saved_to_config(
 /// unattended: not known to log in without one, and nothing in the vault for them. In
 /// first-seen order. Deduplicated, which is the whole point: several panes on one host
 /// become one row in the dialog and are answered by one secret.
-fn connections_needing_secret(workspaces: &[Workspace], vault: &Vault) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+fn connections_needing_secret(workspaces: &[Workspace], vault: &Vault) -> Vec<Connection> {
+    let mut out: Vec<Connection> = Vec::new();
     for ws in workspaces {
         for (_, d) in ws.panes.iter() {
             let Some(cmd) = d.session.startup_cmd() else { continue };
-            if d.session.prompts_for_credential() == Some(false) || vault.contains(&cmd) {
+            let prompts = d.session.prompts_for_credential();
+            if prompts == Some(false) || vault.contains(&cmd) {
                 continue;
             }
-            if !out.contains(&cmd) {
-                out.push(cmd);
+            let prompt = d.session.credential_prompt();
+            match out.iter_mut().find(|c| c.cmd == cmd) {
+                // Another pane on the same connection may know what it asks for.
+                Some(c) => c.prompt = c.prompt.take().or(prompt),
+                None => out.push(Connection { cmd, prompts, prompt }),
             }
         }
     }
@@ -826,15 +851,20 @@ fn connect_pane(d: &mut PaneData, vault: &Vault, claimed: &mut HashSet<(String, 
     d.session.queue_startup_cmd(&cmd);
 }
 
-/// Let every held connection run (see `spawn_restored`), each pane armed from the vault.
-fn release_connections(state: &mut State) {
+/// Let every held connection run (see `spawn_restored`), each pane armed from the vault,
+/// except the connections in `skipped`: their panes stay at the local prompt, dismissed
+/// (amber button kept, saved as local; see `ClaudeHandle::dismissed`).
+fn release_connections(state: &mut State, skipped: &HashSet<String>) {
     let State { workspaces, vault, .. } = state;
     let mut claimed = HashSet::new();
     for ws in workspaces.iter_mut() {
         let mut panes = Vec::new();
         leaf_panes(ws.panes.layout(), &mut panes);
         for pane in panes {
-            if let Some(d) = ws.panes.get_mut(pane) {
+            let Some(d) = ws.panes.get_mut(pane) else { continue };
+            if d.session.startup_cmd().is_some_and(|cmd| skipped.contains(&cmd)) {
+                d.session.dismiss_connection();
+            } else {
                 connect_pane(d, vault, &mut claimed);
             }
         }
@@ -855,6 +885,7 @@ fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
         let cmd = s.startup_cmd();
         let cwd = s.cwd().filter(|d| std::path::Path::new(d).is_dir());
         let prompts = s.prompts_for_credential();
+        let credential = s.credential_prompt();
         let remote_cwd = s.remote_cwd();
         let remote_claude = s.remote_claude();
         let remote_session = s.remote_session();
@@ -870,30 +901,41 @@ fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
             data.session.set_startup_cmd(c);
         }
         data.session.set_prompts_for_credential(prompts);
+        let (kind, detail) = credential.map(|(k, d)| (Some(k), Some(d))).unwrap_or((None, None));
+        data.session.seed_credential_prompt(kind, detail.as_deref());
         data.session.seed_remote_cwd(remote_cwd.as_deref());
         data.session.seed_remote_claude(remote_claude);
         data.session.seed_remote_session(remote_session.as_deref());
     }
+    // Asked for by hand, so a Skip from the dialog no longer applies.
+    data.session.undismiss();
     connect_pane(data, vault, &mut HashSet::new());
 }
 
 /// A pane's connection command and what is known about its prompting.
-fn connection_of(state: &State, ws: usize, pane: pane_grid::Pane) -> Option<(String, Option<bool>)> {
+fn connection_of(state: &State, ws: usize, pane: pane_grid::Pane) -> Option<Connection> {
     let d = state.workspaces.get(ws)?.panes.get(pane)?;
-    Some((d.session.startup_cmd()?, d.session.prompts_for_credential()))
+    Some(Connection {
+        cmd: d.session.startup_cmd()?,
+        prompts: d.session.prompts_for_credential(),
+        prompt: d.session.credential_prompt(),
+    })
 }
 
-/// Show the credential dialog for `cmds` and focus its first field: the key subscription
-/// only ignores keys a widget captured, so an unfocused masked field would send every
-/// keystroke to the focused TERMINAL instead.
+/// Show the credential dialog for `connections` and focus its first field: the key
+/// subscription only ignores keys a widget captured, so an unfocused masked field would
+/// send every keystroke to the focused TERMINAL instead.
 fn open_connect_prompt(
     state: &mut State,
-    cmds: Vec<String>,
+    connections: Vec<Connection>,
     kind: ConnectKind,
     rejected: bool,
 ) -> Task<Message> {
     state.connect_prompt = Some(ConnectPrompt {
-        rows: cmds.into_iter().map(|cmd| ConnectRow { cmd, secret: SecretText::default() }).collect(),
+        rows: connections
+            .into_iter()
+            .map(|c| ConnectRow { cmd: c.cmd, prompt: c.prompt, secret: SecretText::default(), skip: false })
+            .collect(),
         kind,
         rejected,
     });
@@ -905,15 +947,20 @@ fn open_connect_prompt(
 /// prompting in its own terminal; only a re-ask leaves its prompt to the user.
 fn connect_answer(state: &mut State, use_secrets: bool) -> Task<Message> {
     let Some(prompt) = state.connect_prompt.take() else { return Task::none() };
+    let skipped: HashSet<String> = prompt.rows.iter().filter(|r| r.skip).map(|r| r.cmd.clone()).collect();
     if use_secrets {
-        for row in &prompt.rows {
+        for row in prompt.rows.iter().filter(|r| !r.skip) {
             state.vault.remember(&row.cmd, &row.secret);
         }
     }
     match prompt.kind {
-        ConnectKind::Startup => release_connections(state),
+        ConnectKind::Startup => release_connections(state, &skipped),
         ConnectKind::Reconnect { ws, pane } => {
-            reconnect_pane(state, ws, pane);
+            if skipped.is_empty() {
+                reconnect_pane(state, ws, pane);
+            } else if let Some(d) = state.workspaces.get(ws).and_then(|w| w.panes.get(pane)) {
+                d.session.dismiss_connection();
+            }
             save_session(state);
         }
         ConnectKind::Reask { ws, pane } => {
@@ -955,19 +1002,19 @@ fn poll_connection_signals(state: &mut State) -> Task<Message> {
         }
     }
     for (wi, pane) in retry {
-        let Some((cmd, prompts)) = connection_of(state, wi, pane) else { continue };
+        let Some(c) = connection_of(state, wi, pane) else { continue };
         // A connection that will prompt, with nothing to answer it, would sit on that
         // prompt unattended; the amber button is the better outcome there.
-        if prompts != Some(false) && !state.vault.contains(&cmd) {
+        if c.prompts != Some(false) && !state.vault.contains(&c.cmd) {
             continue;
         }
         reconnect_pane(state, wi, pane);
     }
     if let Some((wi, pane)) = reask {
         if state.connect_prompt.is_none() {
-            if let Some((cmd, _)) = connection_of(state, wi, pane) {
-                state.vault.forget(&cmd);
-                return open_connect_prompt(state, vec![cmd], ConnectKind::Reask { ws: wi, pane }, true);
+            if let Some(c) = connection_of(state, wi, pane) {
+                state.vault.forget(&c.cmd);
+                return open_connect_prompt(state, vec![c], ConnectKind::Reask { ws: wi, pane }, true);
             }
         }
     }
@@ -1003,6 +1050,7 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
         },
         pane_grid::Node::Pane(pane) => {
             let data = grid.get(*pane);
+            let remote = data.filter(|d| !d.session.dismissed());
             persist::SavedNode::Leaf {
                 name: data.map(|d| d.name.clone()).unwrap_or_default(),
                 shell: match data.map(|d| d.shell) {
@@ -1013,11 +1061,15 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                 claude_running: data.map(|d| d.session.claude_running_local()).unwrap_or(false),
                 claude_session: data.and_then(|d| d.session.claude_session_id()),
                 history_id: data.map(|d| d.history_id.clone()),
-                startup_cmd: data.and_then(|d| d.session.startup_cmd()),
-                prompts_for_credential: data.and_then(|d| d.session.prompts_for_credential()),
-                remote_cwd: data.and_then(|d| d.session.remote_cwd()),
-                remote_claude: data.map_or(false, |d| d.session.remote_claude()),
-                remote_session: data.and_then(|d| d.session.remote_session()),
+                // A dismissed connection (Skip in the sign-in dialog, never brought back)
+                // is saved as the plain local pane it now is: nothing to replay next time.
+                startup_cmd: remote.and_then(|d| d.session.startup_cmd()),
+                prompts_for_credential: remote.and_then(|d| d.session.prompts_for_credential()),
+                credential_kind: remote.and_then(|d| d.session.credential_prompt()).map(|(k, _)| k),
+                credential_detail: remote.and_then(|d| d.session.credential_prompt()).map(|(_, who)| who),
+                remote_cwd: remote.and_then(|d| d.session.remote_cwd()),
+                remote_claude: remote.map_or(false, |d| d.session.remote_claude()),
+                remote_session: remote.and_then(|d| d.session.remote_session()),
             }
         }
     }
@@ -1835,6 +1887,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ConnectSubmit => return connect_answer(state, true),
         Message::ConnectSkip => return connect_answer(state, false),
+        Message::ConnectRowOn(i, on) => {
+            if let Some(row) = state.connect_prompt.as_mut().and_then(|p| p.rows.get_mut(i)) {
+                row.skip = !on;
+            }
+        }
         Message::CopyRemoteSnippet => {
             state.term_menu = None;
             return iced::clipboard::write(arbiter_native::shell::REMOTE_OSC7_SNIPPET.to_string());
@@ -2265,10 +2322,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let ws = state.active;
             // A connection that will prompt, with nothing in the vault for it, is asked
             // about first, exactly as at startup. Everything else reconnects at once.
-            if let Some((cmd, prompts)) = connection_of(state, ws, pane) {
-                if prompts != Some(false) && !state.vault.contains(&cmd) {
+            if let Some(c) = connection_of(state, ws, pane) {
+                if c.prompts != Some(false) && !state.vault.contains(&c.cmd) {
                     let kind = ConnectKind::Reconnect { ws, pane };
-                    return open_connect_prompt(state, vec![cmd], kind, false);
+                    return open_connect_prompt(state, vec![c], kind, false);
                 }
             }
             reconnect_pane(state, ws, pane);
@@ -2632,31 +2689,50 @@ fn settings_toggle(
     if let Some(s) = sub {
         labels = labels.push(text(s.to_string()).size(11).color(TXT_MUTED));
     }
-    let tog = toggler(value).size(20.0).on_toggle(on_toggle).style(
-        |_t: &iced::Theme, s| {
-            let on = matches!(
-                s,
-                toggler::Status::Active { is_toggled: true } | toggler::Status::Hovered { is_toggled: true }
-            );
-            toggler::Style {
-                background: if on { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
-                background_border_width: 0.0,
-                background_border_color: iced::Color::TRANSPARENT,
-                foreground: iced::Color::WHITE,
-                foreground_border_width: 0.0,
-                foreground_border_color: iced::Color::TRANSPARENT,
-            }
-        },
-    );
+    let tog = toggler(value).size(20.0).on_toggle(on_toggle).style(toggle_style);
     container(row![labels, horizontal_space(), tog].spacing(12).align_y(iced::Center))
         .padding([10, 4])
         .into()
+}
+
+/// The app's toggler look: azure when on, borderless, white knob. Shared by Settings and
+/// the sign-in dialog's per-connection switches.
+fn toggle_style(_t: &iced::Theme, s: toggler::Status) -> toggler::Style {
+    let on = matches!(
+        s,
+        toggler::Status::Active { is_toggled: true } | toggler::Status::Hovered { is_toggled: true }
+    );
+    toggler::Style {
+        background: if on { AZURE } else { iced::Color::from_rgb8(0x2c, 0x2c, 0x2c) },
+        background_border_width: 0.0,
+        background_border_color: iced::Color::TRANSPARENT,
+        foreground: iced::Color::WHITE,
+        foreground_border_width: 0.0,
+        foreground_border_color: iced::Color::TRANSPARENT,
+    }
 }
 
 /// Shared dark text-input style (web `.path-input`/`.num-input`): #121212 bg,
 /// #2c2c2c border that turns azure on focus.
 fn settings_input_style(_t: &iced::Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused);
+    // Disabled (no `on_input`): sunk into the panel with everything a step dimmer, so it
+    // reads as present but not for typing.
+    if matches!(status, text_input::Status::Disabled) {
+        let faint = iced::Color::from_rgb8(0x3a, 0x40, 0x4a);
+        return text_input::Style {
+            background: iced::Background::Color(iced::Color::from_rgb8(0x17, 0x17, 0x17)),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(0x22, 0x22, 0x22),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            icon: faint,
+            placeholder: faint,
+            value: faint,
+            selection: iced::Color::TRANSPARENT,
+        };
+    }
     text_input::Style {
         background: iced::Background::Color(iced::Color::from_rgb8(0x12, 0x12, 0x12)),
         border: iced::Border {
@@ -4225,7 +4301,9 @@ fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
             ConnectKind::Startup => (
                 format!("Sign in to {n} restored {}", if n == 1 { "connection" } else { "connections" }),
                 "Entered once and used for every terminal on that connection, reconnects \
-                 included. Kept in memory until Arbiter quits, never saved.",
+                 included. Kept in memory until Arbiter quits, never saved. Switch a \
+                 connection off to leave its terminals at their local prompt; their \
+                 Reconnect button brings one back later.",
                 "Connect without",
                 "Connect",
             ),
@@ -4239,31 +4317,65 @@ fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
     };
     let mut body = column![].spacing(2);
     for (i, row) in p.rows.iter().enumerate() {
+        // Which secret, told apart at a glance: a gold key for a key's passphrase, a blue
+        // lock for an account password, and the prompt's own detail (the key's name, the
+        // account) under the command. Unknown until the prompt has been seen once.
+        let (lead, what, placeholder): (Element<'static, Message>, String, &str) = match &row.prompt {
+            Some((persist::CredentialKind::Passphrase, key)) => (
+                cmdi(mdi_path::KEY_VARIANT, 15.0, iced::Color::from_rgb8(0xe5, 0xa0, 0x3c)),
+                if key.is_empty() { "Key passphrase".into() } else { format!("Key passphrase for {key}") },
+                "Passphrase",
+            ),
+            Some((persist::CredentialKind::Password, who)) => (
+                cmdi(mdi_path::LOCK, 15.0, iced::Color::from_rgb8(0x4d, 0xa6, 0xff)),
+                if who.is_empty() { "Account password".into() } else { format!("Password for {who}") },
+                "Password",
+            ),
+            None => (Space::with_width(Length::Fixed(15.0)).into(), "Passphrase or password".into(), ""),
+        };
+        let lead = container(lead).width(Length::Fixed(22.0)).center_y(Length::Fixed(32.0));
+        let what = if row.skip { "Not connecting".to_string() } else { what };
         let label = column![
-            text(row.cmd.clone()).size(13),
-            text("Passphrase or password").size(11).color(TXT_SECONDARY),
+            text(row.cmd.clone()).size(13).color(if row.skip { TXT_SECONDARY } else { iced::Color::WHITE }),
+            text(what).size(11).color(TXT_SECONDARY),
         ]
         .spacing(2);
         // `.secure(true)` is real masking in iced 0.13: it also disables copy/cut and
-        // word-selection on the field, so the secret cannot be lifted back out of it.
-        let input = text_input("", &row.secret.0)
+        // word-selection on the field, so the secret cannot be lifted back out of it. A
+        // row switched off keeps its field but disabled (no `on_input`), greyed by the
+        // style, so the row reads as "here, but not being connected".
+        let mut input = text_input(placeholder, &row.secret.0)
             .secure(true)
             .id(text_input::Id::new(if i == 0 {
                 CONNECT_INPUT_FIRST.to_string()
             } else {
                 format!("connect-secret-{i}")
             }))
-            .on_input(move |s| Message::ConnectInput(i, SecretText(s)))
-            .on_submit(Message::ConnectSubmit)
             .style(settings_input_style)
-            .width(Length::Fixed(190.0))
+            .width(Length::Fixed(170.0))
             .padding([6, 8])
             .size(13);
+        if !row.skip {
+            input = input
+                .on_input(move |s| Message::ConnectInput(i, SecretText(s)))
+                .on_submit(Message::ConnectSubmit);
+        }
+        // The switch, captioned so its meaning needs no guessing: on connects this row,
+        // off leaves its terminals at the local prompt.
+        let switch = row![
+            text("Connect").size(11).color(if row.skip { TXT_MUTED } else { TXT_SECONDARY }),
+            toggler(!row.skip)
+                .size(18.0)
+                .on_toggle(move |on| Message::ConnectRowOn(i, on))
+                .style(toggle_style),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
         if i > 0 {
             body = body.push(settings_hdivider());
         }
         body = body.push(
-            container(row![label, horizontal_space(), input].spacing(12).align_y(iced::Center))
+            container(row![lead, label, horizontal_space(), input, switch].spacing(12).align_y(iced::Center))
                 .padding([10, 4]),
         );
     }
@@ -4288,7 +4400,7 @@ fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
     ]
     .spacing(14)
     .padding(18)
-    .width(Length::Fixed(460.0));
+    .width(Length::Fixed(540.0));
     // Deliberately NOT dismissable by clicking the scrim: the panes behind it are all
     // waiting to connect, so a stray click must not decide that for them.
     modal_panel_only(panel.into())
@@ -5247,6 +5359,9 @@ mod mdi_path {
     // crisp at 16px — the full keyboard glyph is too dense to read small).
     pub const ARROW_ALL: &str = "M13,11H18L16.5,9.5L17.92,8.08L21.84,12L17.92,15.92L16.5,14.5L18,13H13V18L14.5,16.5L15.92,17.92L12,21.84L8.08,17.92L9.5,16.5L11,18V13H6L7.5,14.5L6.08,15.92L2.16,12L6.08,8.08L7.5,9.5L6,11H11V6L9.5,7.5L8.08,6.08L12,2.16L15.92,6.08L14.5,7.5L13,6V11Z";
     // Usage error indicator: a "!" in a circle.
+    /// mdi `key-variant` and `lock`: which secret a connection asks for, in the sign-in dialog.
+    pub const KEY_VARIANT: &str = "M22,18V22H18V19H15V16H12L9.74,13.74C9.19,13.91 8.61,14 8,14A6,6 0 0,1 2,8A6,6 0 0,1 8,2A6,6 0 0,1 14,8C14,8.61 13.91,9.19 13.74,9.74L22,18M7,5A2,2 0 0,0 5,7A2,2 0 0,0 7,9A2,2 0 0,0 9,7A2,2 0 0,0 7,5Z";
+    pub const LOCK: &str = "M12,17A2,2 0 0,0 14,15C14,13.89 13.1,13 12,13A2,2 0 0,0 10,15A2,2 0 0,0 12,17M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10C4,8.89 4.9,8 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z";
     pub const ALERT_CIRCLE: &str = "M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z";
 }
 
@@ -7356,6 +7471,15 @@ fn main() -> iced::Result {
             arbiter_native::claude_shim::run_hook_signal();
             return Ok(());
         }
+        // `arbiter` typed in a pane (via the shim launcher): the mark and the build facts.
+        Some("about") => {
+            arbiter_native::about::run();
+            return Ok(());
+        }
+        Some("--version") | Some("-V") => {
+            println!("{}", arbiter_native::about::Build::current().one_line());
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -7500,7 +7624,7 @@ fn main() -> iced::Result {
             // Those that will prompt are asked about once, up front, before anything
             // connects; the rest run the moment the state exists below.
             let vault = Vault::default();
-            let asking = connections_needing_secret(&workspaces, &vault);
+            let asking: Vec<Connection> = connections_needing_secret(&workspaces, &vault);
 
             let mut state = State {
                 workspaces,
@@ -7550,7 +7674,7 @@ fn main() -> iced::Result {
                 hovered_tab: None,
             };
             if asking.is_empty() {
-                release_connections(&mut state);
+                release_connections(&mut state, &HashSet::new());
             } else {
                 tasks.push(open_connect_prompt(&mut state, asking, ConnectKind::Startup, false));
             }

@@ -18,6 +18,16 @@ pub enum SavedShell {
     GitBash,
 }
 
+/// Which secret an SSH connection asked for, read from ssh's own prompt the first time it
+/// appeared, so the sign-in dialog can say which one it wants.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CredentialKind {
+    /// A key's passphrase (`Enter passphrase for key '...'`).
+    Passphrase,
+    /// An account password (`user@host's password:`, or keyboard-interactive `Password:`).
+    Password,
+}
+
 /// The split tree of one workspace: interior `Split`s (mirroring `pane_grid::Node`)
 /// and `Leaf` terminals.
 #[derive(Serialize, Deserialize)]
@@ -58,6 +68,12 @@ pub enum SavedNode {
         /// sign-in dialog has a row for it.
         #[serde(default)]
         prompts_for_credential: Option<bool>,
+        /// Which secret it asked for, and for what (a key's file name, or `user@host`),
+        /// read from ssh's prompt. Lets the sign-in dialog say what it wants.
+        #[serde(default)]
+        credential_kind: Option<CredentialKind>,
+        #[serde(default)]
+        credential_detail: Option<String>,
         /// The far host's working directory at save time, if its shell reported one (the
         /// opt-in snippet, `shell::REMOTE_OSC7_SNIPPET`). Only meaningful with `startup_cmd`.
         #[serde(default)]
@@ -339,6 +355,8 @@ mod tests {
                             history_id: Some("hist-abc-1".into()),
                             startup_cmd: None,
                             prompts_for_credential: None,
+                            credential_kind: None,
+                            credential_detail: None,
                             remote_cwd: None,
                             remote_claude: false,
                             remote_session: None,
@@ -352,6 +370,8 @@ mod tests {
                             history_id: None,
                             startup_cmd: Some("ssh mini".into()),
                             prompts_for_credential: Some(true),
+                            credential_kind: Some(CredentialKind::Passphrase),
+                            credential_detail: Some("id_ed25519".into()),
                             remote_cwd: Some("/home/tre/src".into()),
                             remote_claude: true,
                             remote_session: Some("abc-123".into()),
@@ -369,6 +389,8 @@ mod tests {
                         history_id: None,
                         startup_cmd: None,
                         prompts_for_credential: None,
+                        credential_kind: None,
+                        credential_detail: None,
                         remote_cwd: None,
                         remote_claude: false,
                         remote_session: None,
@@ -408,6 +430,8 @@ mod tests {
                         startup_cmd,
                         claude_running,
                         prompts_for_credential,
+                        credential_kind,
+                        credential_detail,
                         remote_cwd,
                         remote_claude,
                         remote_session,
@@ -416,6 +440,8 @@ mod tests {
                         assert_eq!(startup_cmd.as_deref(), Some("ssh mini"));
                         assert!(!claude_running, "a remote pane must not ask for a local claude");
                         assert_eq!(*prompts_for_credential, Some(true));
+                        assert_eq!(*credential_kind, Some(CredentialKind::Passphrase));
+                        assert_eq!(credential_detail.as_deref(), Some("id_ed25519"));
                         assert_eq!(remote_cwd.as_deref(), Some("/home/tre/src"));
                         assert!(*remote_claude, "the far Claude is what the remote pane resumes");
                         assert_eq!(remote_session.as_deref(), Some("abc-123"));
@@ -444,6 +470,7 @@ mod tests {
                 history_id,
                 startup_cmd,
                 prompts_for_credential,
+                credential_kind,
                 remote_cwd,
                 remote_claude,
                 remote_session,
@@ -454,6 +481,7 @@ mod tests {
                 assert!(history_id.is_none()); // absent in old saves → fresh id on restore
                 assert!(startup_cmd.is_none());
                 assert!(prompts_for_credential.is_none(), "unknown until observed");
+                assert!(credential_kind.is_none());
                 assert!(remote_cwd.is_none());
                 assert!(!remote_claude);
                 assert!(remote_session.is_none());

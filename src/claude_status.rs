@@ -98,6 +98,9 @@ pub struct ClaudeHandle {
     /// `Some(true)` once ssh has prompted, `Some(false)` once a login completed with no
     /// prompt. Persisted, so the startup dialog only asks for connections that will ask.
     prompts_for_credential: Mutex<Option<bool>>,
+    /// Which secret it asked for, and for what (a key's file name, or `user@host`), read
+    /// from ssh's prompt. Persisted, so the dialog can say what it wants.
+    credential_prompt: Mutex<Option<(crate::persist::CredentialKind, String)>>,
     /// A credential prompt appeared on the CURRENT connection. Reset per connection, so
     /// the login evidence below can tell "asked" from "never asked" this time.
     prompted_this_connection: AtomicBool,
@@ -144,6 +147,10 @@ pub struct ClaudeHandle {
     /// drop so the next connection resumes that very conversation; cleared once Claude is
     /// seen to have exited, or says the conversation is gone.
     remote_session: Mutex<Option<String>>,
+    /// The user declined to bring this pane's connection back (Skip in the sign-in
+    /// dialog). The command is kept so Reconnect still can, and the amber button stays,
+    /// until a command is run here; a save meanwhile writes the pane as a plain local one.
+    dismissed: AtomicBool,
 }
 
 /// Working reverts to ready after this long without a detected spinner frame.
@@ -201,6 +208,7 @@ impl ClaudeHandle {
             histfile,
             on_screen: AtomicBool::new(false),
             prompts_for_credential: Mutex::new(None),
+            credential_prompt: Mutex::new(None),
             prompted_this_connection: AtomicBool::new(false),
             login_seen: AtomicBool::new(false),
             credential_typed: AtomicBool::new(false),
@@ -215,6 +223,7 @@ impl ClaudeHandle {
             remote_claude_pending: AtomicBool::new(false),
             remote_claude_typed: AtomicBool::new(false),
             remote_session: Mutex::new(None),
+            dismissed: AtomicBool::new(false),
         })
     }
 
@@ -257,19 +266,37 @@ impl ClaudeHandle {
         *self.startup_cmd.lock().unwrap() = None;
         *self.last_command.lock().unwrap() = None;
         *self.prompts_for_credential.lock().unwrap() = None;
+        *self.credential_prompt.lock().unwrap() = None;
         *self.remote_cwd.lock().unwrap() = None;
         *self.remote_cwd_prev.lock().unwrap() = None;
         *self.remote_session.lock().unwrap() = None;
         self.was_remote.store(false, Ordering::Relaxed);
         self.remote_claude_pending.store(false, Ordering::Relaxed);
         self.remote_claude_typed.store(false, Ordering::Relaxed);
+        self.dismissed.store(false, Ordering::Relaxed);
         SAVE_DIRTY.store(true, Ordering::Relaxed);
     }
 
+    /// UI: the user declined to bring this connection back for now (see `dismissed`).
+    pub fn dismiss_connection(&self) {
+        self.dismissed.store(true, Ordering::Relaxed);
+        SAVE_DIRTY.store(true, Ordering::Relaxed);
+    }
+
+    /// UI: the connection is being brought back after all.
+    pub fn undismiss(&self) {
+        self.dismissed.store(false, Ordering::Relaxed);
+    }
+
+    pub fn dismissed(&self) -> bool {
+        self.dismissed.load(Ordering::Relaxed)
+    }
+
     /// Reader: ssh printed a credential prompt on this pane while its connection was
-    /// being made. Ignored once the login is known to have completed, so a prompt from
-    /// a nested `ssh` or `git push` on the far host does not describe this connection.
-    pub fn note_credential_prompt(&self) {
+    /// being made, asking for `prompt` (see `session::describe_credential_prompt`).
+    /// Ignored once the login is known to have completed, so a prompt from a nested
+    /// `ssh` or `git push` on the far host does not describe this connection.
+    pub fn note_credential_prompt(&self, prompt: Option<(crate::persist::CredentialKind, String)>) {
         if self.login_seen.load(Ordering::Relaxed) {
             return;
         }
@@ -279,6 +306,24 @@ impl ClaudeHandle {
             *prompts = Some(true);
             SAVE_DIRTY.store(true, Ordering::Relaxed);
         }
+        if prompt.is_some() {
+            let mut cur = self.credential_prompt.lock().unwrap();
+            if *cur != prompt {
+                *cur = prompt;
+                SAVE_DIRTY.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Which secret the connection asked for, and for what, if it has been seen.
+    pub fn credential_prompt(&self) -> Option<(crate::persist::CredentialKind, String)> {
+        self.credential_prompt.lock().unwrap().clone()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_credential_prompt(&self, kind: Option<crate::persist::CredentialKind>, detail: Option<&str>) {
+        *self.credential_prompt.lock().unwrap() =
+            kind.map(|k| (k, detail.unwrap_or_default().to_string()));
     }
 
     /// Evidence that the current connection's login has completed. The first call per
@@ -1041,7 +1086,7 @@ mod tests {
         let h = handle();
         h.note_command("ssh mini".into());
         h.set_remote(true);
-        h.note_credential_prompt();
+        h.note_credential_prompt(None);
         h.note_remote_cwd("/home/tre/src".into());
         h.note_screen(true);
         h.set_remote(false);
@@ -1101,7 +1146,7 @@ mod tests {
         assert!(h.request_retry(Duration::from_secs(3600)), "logged in: a drop, however quick");
         let h = handle();
         h.set_remote(true);
-        h.note_credential_prompt();
+        h.note_credential_prompt(None);
         assert!(h.request_retry(Duration::from_secs(3600)), "reached the prompt: the host was up");
     }
 
@@ -1192,7 +1237,7 @@ mod tests {
         let h = handle();
         assert_eq!(h.prompts_for_credential(), None);
         h.set_remote(true);
-        h.note_credential_prompt();
+        h.note_credential_prompt(None);
         assert_eq!(h.prompts_for_credential(), Some(true));
         assert!(h.note_login_evidence(), "first evidence on this connection");
         assert!(!h.note_login_evidence(), "only the first counts");
@@ -1202,7 +1247,7 @@ mod tests {
         h.set_remote(true);
         assert!(h.note_login_evidence());
         assert_eq!(h.prompts_for_credential(), Some(false));
-        h.note_credential_prompt(); // a nested ssh, after login
+        h.note_credential_prompt(None); // a nested ssh, after login
         assert_eq!(h.prompts_for_credential(), Some(false));
 
         let h = handle();

@@ -15,6 +15,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::persist::CredentialKind;
 use crate::term::VtTerm;
 
 /// Bumped on each OSC-133 idle→busy edge; the Claude monitor waits on it.
@@ -172,6 +173,33 @@ impl Drop for Secret {
 fn is_credential_prompt(text: &str) -> bool {
     const PROMPTS: &[&str] = &["Enter passphrase", "'s password:", ") Password:"];
     PROMPTS.iter().any(|p| text.contains(p))
+}
+
+/// What an ssh credential prompt in `text` asks for, and for what: a key's file name for
+/// a passphrase, `user@host` for a password (empty when the prompt does not say). The
+/// forms are those `is_credential_prompt` recognises.
+fn describe_credential_prompt(text: &str) -> Option<(CredentialKind, String)> {
+    if let Some(i) = text.find("Enter passphrase") {
+        // `Enter passphrase for key '/c/Users/TRE/.ssh/id_ed25519':` (MSYS ssh) or with
+        // double quotes (native Windows ssh naming the key); a bare `Enter passphrase:`
+        // names nothing.
+        let key = text[i..].strip_prefix("Enter passphrase for key ").and_then(|r| {
+            let quote = r.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+            let inner = &r[1..];
+            let path = &inner[..inner.find(quote)?];
+            path.rsplit(['/', '\\']).next().map(str::to_string)
+        });
+        return Some((CredentialKind::Passphrase, key.unwrap_or_default()));
+    }
+    if let Some(i) = text.find("'s password:") {
+        let who = text[..i].rsplit(char::is_whitespace).next().unwrap_or("");
+        return Some((CredentialKind::Password, who.to_string()));
+    }
+    if let Some(i) = text.find(") Password:") {
+        let who = text[..i].rsplit('(').next().unwrap_or("");
+        return Some((CredentialKind::Password, who.to_string()));
+    }
+    None
 }
 
 /// Whether `text` carries ssh's final refusal. After a credential Arbiter typed, this
@@ -863,6 +891,18 @@ impl Session {
     /// (see `remote_cd`) unless the far shell reports it itself. Ignored when Claude has
     /// the keyboard.
     pub fn on_remote_enter(&self, row: &str, name_sessions: bool) -> Option<Vec<u8>> {
+        // A dismissed connection's pane being used as a local terminal: the user has moved
+        // on, so the connection is forgotten and the amber button goes with it. An ssh
+        // typed here latches afresh as usual.
+        if self.claude.dismissed() && !self.is_remote() {
+            if let Some((_, cmd)) = command_on_row(row).filter(|(_, cmd)| !cmd.is_empty()) {
+                self.claude.forget_connection();
+                // Forgetting drops the typed-line record too, and this very line may be
+                // the new connection (typed before this ran), so it is recorded again.
+                self.claude.note_command(cmd.to_string());
+            }
+            return None;
+        }
         if !self.is_remote() || self.claude_running() {
             return None;
         }
@@ -910,6 +950,21 @@ impl Session {
         self.claude.remote_session()
     }
 
+    /// The user declined to bring this pane's connection back for now: it stays at its
+    /// local prompt with the amber button, and is saved as a local pane.
+    pub fn dismiss_connection(&self) {
+        self.claude.dismiss_connection();
+    }
+
+    /// The connection is being brought back after all.
+    pub fn undismiss(&self) {
+        self.claude.undismiss();
+    }
+
+    pub fn dismissed(&self) -> bool {
+        self.claude.dismissed()
+    }
+
     /// Seed from a saved layout.
     pub fn seed_remote_session(&self, id: Option<&str>) {
         self.claude.seed_remote_session(id);
@@ -933,6 +988,16 @@ impl Session {
     /// Seed from a saved layout.
     pub fn set_prompts_for_credential(&self, prompts: Option<bool>) {
         self.claude.set_prompts_for_credential(prompts);
+    }
+
+    /// Which secret this pane's connection asks for, and for what, if it has been seen.
+    pub fn credential_prompt(&self) -> Option<(CredentialKind, String)> {
+        self.claude.credential_prompt()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_credential_prompt(&self, kind: Option<CredentialKind>, detail: Option<&str>) {
+        self.claude.seed_credential_prompt(kind, detail);
     }
 
     /// The far host's working directory, if its shell has ever reported one.
@@ -1326,7 +1391,7 @@ fn reader_loop(
             // something else on the far host (a nested ssh, a `cd` into a forbidden
             // directory) and says nothing about this connection's credential.
             if is_credential_prompt(text) && claude.startup_cmd().is_some() {
-                claude.note_credential_prompt();
+                claude.note_credential_prompt(describe_credential_prompt(text));
                 match credential.lock().unwrap().take() {
                     Some((secret, _)) => {
                         let _ = writer_tx.send(secret.line());
@@ -1963,6 +2028,25 @@ mod tests {
         assert_eq!(osc133("D;abc"), (Some(true), None));
         assert_eq!(osc133("Z;1"), (None, Some(1)));
         assert_eq!(osc133(""), (None, None));
+    }
+
+    // The dialog can say which secret a connection wants, and for what, from the prompt.
+    #[test]
+    fn describes_what_a_credential_prompt_asks_for() {
+        use super::describe_credential_prompt as d;
+        use crate::persist::CredentialKind::*;
+        assert_eq!(
+            d("Enter passphrase for key '/c/Users/TRE/.ssh/id_ed25519': "),
+            Some((Passphrase, "id_ed25519".into()))
+        );
+        assert_eq!(
+            d("Enter passphrase for key \"C:\\Users\\TRE\\.ssh\\work_key\": "),
+            Some((Passphrase, "work_key".into()))
+        );
+        assert_eq!(d("Enter passphrase: "), Some((Passphrase, String::new())));
+        assert_eq!(d("Last login: Tue\r\ntre@10.0.0.16's password: "), Some((Password, "tre@10.0.0.16".into())));
+        assert_eq!(d("(tre@10.0.0.16) Password: "), Some((Password, "tre@10.0.0.16".into())));
+        assert_eq!(d("tre ~ $ "), None);
     }
 
     #[test]

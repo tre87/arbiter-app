@@ -8,6 +8,30 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **`arbiter` in any terminal shows the mark and the build.** Type `arbiter` in a pane and
+  the two strokes of the logo paint in, in its own blue gradients, followed by the version,
+  the commit and date it was built from (with a `+` when the tree was dirty), the profile,
+  target and compiler, the OS and host, whether the terminal is an Arbiter pane, the shell,
+  the saved layout (workspaces, terminals, how many over ssh), the data directory and the
+  Claude version. Plain text and no animation when piped or with `NO_COLOR`. Outside a pane
+  the same is `arbiter about`, and `arbiter --version` prints one line.
+
+- **The sign-in dialog says which secret each connection wants.** A row now carries a
+  gold key and "Key passphrase for id_ed25519", or a blue lock and "Password for
+  tre@10.0.0.16", read from ssh's own prompt the first time it appeared, and the field's
+  placeholder says "Passphrase" or "Password" to match. A connection that has never
+  prompted still reads "Passphrase or password" until it has.
+
+- **Switch a connection off in the sign-in dialog.** Each row ends in a "Connect" switch:
+  off, that connection's terminals are left at their local prompt instead of connecting
+  (its field greys out), while the others connect as usual. A skipped terminal keeps its amber
+  Reconnect button; pressing it
+  asks for that connection's secret once and connects that terminal only, and the secret is
+  then remembered for the other terminals on the same connection, which connect with a
+  press each. The button stays until you run a command in the terminal, which makes it an
+  ordinary local one. A skipped connection that is never brought back is saved as local, so
+  it is not offered again on the next launch.
+
 - **A restored SSH terminal can resume its own Claude conversation, not just the
   directory's most recent one.** Local terminals always did this, because Arbiter's shim
   learns each Claude's session id from its status line; nothing on a far host can tell
