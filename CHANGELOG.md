@@ -7,6 +7,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **A small black box no longer appears in the top-left corner of the primary monitor
+  on Windows.** Arbiter asks Windows 11 to round the corners of its windows and did so
+  for every window of its process, including the invisible 16x16 message window winit
+  keeps at the screen origin for its event loop. Rounding a transparent layered window
+  makes DWM paint a frame for it, which is what the box was. Utility windows are now left
+  alone.
+
 ## [1.2.0] — 2026-09-12
 
 ### Added

@@ -5463,10 +5463,15 @@ mod winround {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: u32 = 2;
 
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_TRANSPARENT: isize = 0x20;
+    const WS_EX_TOOLWINDOW: isize = 0x80;
+
     #[link(name = "user32")]
     extern "system" {
         fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, l: isize) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -5481,9 +5486,14 @@ mod winround {
         unsafe {
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            // Match by process only (rounding a hidden helper window is a harmless
-            // no-op); don't gate on visibility — the window may not be shown yet.
-            if pid == GetCurrentProcessId() {
+            // Match by process, not by visibility: a real window may not be shown yet.
+            // But skip winit's "Thread Event Target": a 16x16 layered, fully transparent
+            // tool window at the screen origin that exists only to receive broadcast
+            // messages. Asking DWM to round it makes DWM paint a rounded frame for it,
+            // and a black box appears in the corner of the primary monitor.
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let utility = ex & (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW) != 0;
+            if pid == GetCurrentProcessId() && !utility {
                 let pref: u32 = DWMWCP_ROUND;
                 DwmSetWindowAttribute(
                     hwnd,
