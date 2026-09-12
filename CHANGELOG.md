@@ -8,6 +8,95 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **One sign-in prompt for all restored SSH terminals.** Restoring several SSH terminals
+  used to mean typing the same passphrase separately in each one, blind, with no echo to
+  confirm you had typed it right. Arbiter now asks once, before anything connects, with a
+  masked field per connection, and each terminal answers its own prompt.
+
+  Terminals sharing a connection share a row: five terminals on one host is one field and
+  one answer. A row left blank connects and asks for itself in its own terminal, exactly as
+  before, and "Connect without" (or Escape) does that for everything at once.
+
+  Asking **before** connecting is deliberate rather than incidental. A connection left
+  sitting on an unanswered prompt is burning the server's login grace period (`sshd`'s
+  `LoginGraceTime`, two minutes by default) and counting against its limit on
+  unauthenticated connections, so a slow answer could have dropped the very connections it
+  was meant to establish. Nothing connects until the dialog is answered, so neither limit
+  is approached however long it stays open or however many terminals are restoring.
+
+  **Never written to disk.** A secret is kept in memory for as long as Arbiter runs, one
+  per connection, so a connection that drops (a timeout, a lost link, a laptop waking up)
+  comes back with at most a button press and no typing. It is never written to
+  `session.json` and never logged, and it is gone when Arbiter quits, which will ask again.
+  The field is a real masked input, so copy and cut are disabled on it too. A terminal
+  answers one prompt per connection attempt; if ssh asks again or refuses, the secret is
+  dropped and a one-row dialog asks for it afresh instead of retyping it. A held secret is
+  also let go the moment the login is seen to complete, or after 90 seconds, so a later
+  password prompt on the far host (a nested `ssh`, a `git push`) can never receive it.
+
+  The dialog only lists connections that have asked before. Once a connection has been seen
+  to log in without a prompt (a key in an agent, a key without a passphrase) it is left out,
+  and one that has never been seen is listed until it is. With nothing to ask, nothing
+  waits: the terminals connect at once.
+
+- **A dropped SSH session reconnects itself, once.** When ssh exits with its own failure
+  code (255: a timeout, a reset link, a host that went to sleep) after a session that was
+  up, Arbiter re-runs the connection in the same terminal, answering the prompt from
+  memory, so a brief outage costs nothing. If that attempt fails too, the amber Reconnect
+  button takes over, and clicking it now needs no typing either. A deliberate `exit` on the
+  far host exits cleanly and is never reconnected; it also makes the terminal an ordinary
+  local one again, with no Reconnect button and nothing to replay or sign in to on the
+  next launch, until the next `ssh` typed there. An attempt that never reaches the host
+  (refused, timed out, unresolvable) is a refusal, not a drop, however long ssh waited on
+  it, so a host that is down is not hammered while it stays down. Reconnect reuses the live
+  local shell when it is sitting at its prompt, so the scrollback survives; only a shell
+  that has exited, or is busy with something else, is respawned. The button also appears
+  when a restored connection fails before it is even up, which it used not to.
+
+  The local shell integration now reports each command's exit status (`OSC 133;D;<code>`),
+  which is what tells a drop from an `exit`.
+
+- **A restored SSH terminal comes back in its remote directory, with its Claude.** The
+  connection itself carries the directory: a saved `ssh host` is replayed as
+  `ssh -t host 'cd <dir> && exec $SHELL -l'`, so the terminal opens there with nothing typed
+  after connecting (ssh has no option for a starting directory; a remote command is the
+  only handle on it). A directory that no longer exists ends that connection with the
+  `cd`'s own status, which Arbiter reads as "gone" and forgets, so the next attempt lands at
+  home instead of failing the same way. For `mosh`, `plink`, or an ssh line with quoting or
+  a remote command of its own, the `cd` is typed at the far prompt instead.
+
+  If Claude was running there when the layout was saved or the connection dropped, it
+  rides in the same line: `claude -c` continues the most recent conversation in that
+  directory, or a plain `claude` starts if there is none, which is the rule local
+  terminals already follow, and the login shell takes over when Claude exits. It runs
+  inside an interactive login shell (`exec $SHELL -lic …`) because the shell sshd hands a
+  remote command to reads no rc file and so has no `claude` on its PATH; that inner
+  command travels as one backslash-escaped word, since no quote survives the trip through
+  every local shell, which is why the line looks the way it does. Claude is recognised on
+  the far side by its screen, and also by `claude` having been typed at the far prompt
+  with nothing else typed at a shell prompt since, so a Claude whose interface is not
+  recognised still comes back. Two terminals on the same connection and directory would
+  fight over one conversation, so only the first resumes; resuming the exact conversation
+  the way local terminals do would need the far Claude to say which it is, and is left for
+  later (the design is noted in CLAUDE.md).
+
+  Where the far shell is comes from one of two places. Without anything installed
+  remotely, Arbiter follows the `cd` commands you type there, read from the screen as the
+  shell showed them (so completed and recalled paths count), and takes back a `cd` the
+  shell rejected. A `cd` it cannot read (a variable, a glob, `cd -`) makes the directory
+  unknown rather than wrong, and the terminal then lands at the remote home with no Claude.
+  For an exact answer, add a small snippet to the far host's `.bashrc` or `.zshrc`
+  (right-click a remote terminal: Copy Remote Directory Snippet). It reports the working
+  directory with the standard OSC 7 sequence at every prompt and nothing else, the menu
+  item reads "(active here)" once reports arrive, and its reports override anything
+  inferred.
+
+  Where the line cannot be rewritten (`mosh`, `plink`, an ssh line with quoting or a
+  remote command of its own) the `cd` and Claude are typed at the far prompt instead, and
+  only once the far shell is known to be at it (its own report, or a prompt recognised on
+  screen after any credential prompt has been answered), so a credential prompt can never
+  receive them.
+
 - **Claude running over SSH is now detected.** Until now every Claude signal came from the
   local machine: a scan of the pane shell's child processes, plus the status-line capture
   file Claude writes through Arbiter's shim. Neither can see a `claude` running on another
@@ -39,9 +128,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   is stored as the literal line you typed, which is what makes it work for any host, jump
   chain or wrapper script without Arbiter needing to understand connections.
 
-  It stops there deliberately: the pane lands at the remote prompt and you start Claude.
-  Nothing has to discover or guess a session id on the far host, so there is nothing that
-  can go stale and no way to attach to the wrong conversation. Local terminals are
+  Without the remote directory snippet (see above) it stops there: the pane lands at the
+  remote prompt and you start Claude. Nothing has to discover or guess a session id on the
+  far host, so there is nothing that can go stale. Local terminals are
   unchanged, still restoring by respawning their shell in the saved directory, and never
   replay a command, since re-running an arbitrary last command on every launch could have
   side effects.
@@ -53,12 +142,30 @@ history belongs to the prior Tauri/Vue web app it replaced.
 - **A terminal whose shell exits now says so, and offers to come back.** Previously the
   pane sat on a frozen screen with no sign anything had happened, and typing into it did
   nothing at all, silently. A dropped SSH connection or a slept remote host now puts an
-  amber Reconnect button in the terminal's header, which respawns it and replays its
+  amber Reconnect button in the terminal's header, which brings it back and replays its
   startup command, keeping its name, position and command history. There is also a
   Reconnect entry in the right-click menu, enabled for remote terminals and any whose
   shell has exited.
 
 ### Fixed
+- **Claude's bullets and one spinner frame no longer render as coloured squares on
+  Windows.** Claude on a Mac or Linux host draws its tool bullets with `⏺` and one spinner
+  frame with `✳`, characters Claude on Windows never uses, so this only showed over SSH.
+  Both are emoji-capable, and DirectWrite's own font fallback reaches for Segoe UI Emoji
+  in their blocks, which returned the colour button glyph (a blue square, a teal square)
+  squashed into the cell. A character in a single-width cell has text presentation by
+  definition, so such a character the terminal font lacks is now laid out in Segoe UI
+  Symbol by name, giving the plain glyph in the text colour, the way every other terminal
+  shows them. Double-width emoji are untouched, and macOS rendering is not involved.
+
+- **A remote shell's directory reports no longer overwrite the local terminal's.** A far
+  host that already emitted OSC 7 at its prompt (fish, vte.sh, a custom prompt) was taken
+  for the local shell: the pane's folder, git status and saved directory followed the remote
+  path, on Windows mangled into `home\tre\src`, which Reconnect then handed to the new shell
+  as its start directory. Reports are now told apart by the host name they carry, remote
+  ones feed the remote-directory feature above, and Reconnect never starts a shell in a
+  directory that does not exist.
+
 - **A restored SSH terminal no longer falls back to password authentication.** On relaunch
   the replayed `ssh` command would show its key passphrase prompt and then immediately
   give up on the key, asking for the account password instead. Typing the same command by

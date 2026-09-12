@@ -12,7 +12,7 @@
 // REDIRECTED stdout pipes, which work fine without an attached console.
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,7 @@ use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::claude_status::Lifecycle;
 use arbiter_native::gpu::TermGpu;
-use arbiter_native::session::{Session, SharedMaster, SharedTerm};
+use arbiter_native::session::{Secret, Session, SharedMaster, SharedTerm};
 use arbiter_native::persist;
 use arbiter_native::term::{MouseModes, SelectKind};
 
@@ -186,6 +186,11 @@ struct State {
     ws_tab_menu: Option<WsTabMenu>,
     /// The pane (terminal) being renamed via the context menu, with its edit buffer.
     rename_terminal: Option<RenameTerminal>,
+    /// The credential dialog, while something waits on its answer. Holds the typed
+    /// secrets, so it is taken (not borrowed) the moment it is used.
+    connect_prompt: Option<ConnectPrompt>,
+    /// The secrets remembered for this run (see `Vault`).
+    vault: Vault,
     /// In-progress workspace-tab drag-reorder: the tab grabbed + the tab the cursor
     /// is currently over (the drop target). None when not dragging.
     tab_drag: Option<TabDrag>,
@@ -213,6 +218,86 @@ struct WsTabMenu {
     index: usize,
     x: f32,
     y: f32,
+}
+
+/// A secret as it is being typed. A newtype purely so it cannot print itself: it rides
+/// through `Message`, which derives `Debug` and is cloned by the iced runtime.
+#[derive(Clone, Default)]
+struct SecretText(String);
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretText(<redacted>)")
+    }
+}
+
+impl Drop for SecretText {
+    fn drop(&mut self) {
+        // Best effort, like `Secret`: the runtime clones this while it is being typed,
+        // and each copy takes its bytes with it. Zeroes keep the String valid UTF-8.
+        unsafe { self.0.as_bytes_mut() }.fill(0);
+    }
+}
+
+/// One row of the credential dialog: a connection command, and the secret the user typed
+/// for it. Deduplicated by `cmd`, so several panes sharing a connection are one row and
+/// are answered together.
+struct ConnectRow {
+    cmd: String,
+    secret: SecretText,
+}
+
+/// What the credential dialog is answering for.
+#[derive(Clone, Copy, Debug)]
+enum ConnectKind {
+    /// Every restored connection is held until this is answered.
+    Startup,
+    /// One pane's Reconnect, held until answered.
+    Reconnect { ws: usize, pane: pane_grid::Pane },
+    /// One pane's connection is waiting at a repeated prompt: the previous answer was
+    /// rejected. Submit answers that prompt in place; cancel leaves it to the user.
+    Reask { ws: usize, pane: pane_grid::Pane },
+}
+
+/// The credential dialog. Taking it drops every secret the user typed; what is to be
+/// kept has been copied into the `Vault` first.
+struct ConnectPrompt {
+    rows: Vec<ConnectRow>,
+    kind: ConnectKind,
+    /// The dialog is up because ssh rejected what was typed before.
+    rejected: bool,
+}
+
+/// The id of the dialog's first field, focused when it opens.
+const CONNECT_INPUT_FIRST: &str = "connect-secret-0";
+
+/// Secrets remembered for this run, one per connection command, so a connection that
+/// drops can be brought back without typing. Memory only: never written anywhere, and
+/// every entry zeroes itself when the vault goes, at exit.
+#[derive(Default)]
+struct Vault(HashMap<String, Secret>);
+
+impl Vault {
+    /// Keep a typed secret for `cmd`. A blank one means "I will type it myself".
+    fn remember(&mut self, cmd: &str, text: &SecretText) {
+        if !text.0.is_empty() {
+            self.0.insert(cmd.to_string(), Secret::new(&text.0));
+        }
+    }
+
+    fn contains(&self, cmd: &str) -> bool {
+        self.0.contains_key(cmd)
+    }
+
+    /// A copy to arm one pane with.
+    fn arm_copy(&self, cmd: &str) -> Option<Secret> {
+        self.0.get(cmd).map(Secret::duplicate)
+    }
+
+    /// Drop a secret ssh rejected.
+    fn forget(&mut self, cmd: &str) {
+        self.0.remove(cmd);
+    }
 }
 
 /// The terminal rename dialog: the pane being renamed + the edit buffer.
@@ -410,6 +495,16 @@ enum Message {
     TermRenameInput(String),
     TermRenameCommit,
     TermRenameCancel,
+    /// Startup credential dialog for restored SSH connections: edit one row's secret,
+    /// then either connect with what was typed or connect without answering anything.
+    /// `text_input`'s `on_input` has to hand the typed text back through a `Message`,
+    /// and `Message` derives `Debug` and is cloned freely by the runtime, so the text
+    /// travels in a newtype that refuses to print itself.
+    ConnectInput(usize, SecretText),
+    ConnectSubmit,
+    ConnectSkip,
+    /// Put the remote shell snippet (`shell::REMOTE_OSC7_SNIPPET`) on the clipboard.
+    CopyRemoteSnippet,
     /// Terminal context-menu actions on the focused pane: clear the buffer and
     /// select the whole buffer.
     ClearBuffer,
@@ -585,6 +680,9 @@ fn spawn_restored(
     claude_session: Option<&str>,
     history_id: &str,
     startup_cmd: Option<&str>,
+    prompts_for_credential: Option<bool>,
+    remote_cwd: Option<&str>,
+    remote_claude: bool,
 ) -> (Session, ShellKind) {
     // A saved cwd that no longer exists falls back to the shell's default dir.
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
@@ -597,16 +695,21 @@ fn spawn_restored(
             (spawn_session(None, cwd, history_id), ShellKind::PowerShell)
         }
     };
-    // A remote pane replays the command that built it (its ssh line) and stops there:
-    // it lands at the far host's prompt in the right place, and the user starts Claude.
-    // Nothing here has to discover or guess a remote session id, so there is nothing to
-    // go stale and no chance of attaching to the wrong conversation.
-    // Replay only what the whitelist accepts: a save from an earlier build can hold
-    // whatever was typed last (that bug persisted `claude`), and replaying it would run
-    // an unrelated command in a local shell on every launch.
-    if startup_cmd.is_some_and(|cmd| session.queue_startup_cmd(cmd)) {
-        // Queued, not written: it goes in once the pane is being read AND has its real
-        // size, which `queue_startup_cmd` waits for.
+    // A remote pane replays the command that built it (its ssh line). Where the far
+    // host reports its directory (the opt-in snippet), the pane then goes back there
+    // and, if Claude was running, resumes it with `claude -c`; otherwise it lands at the
+    // far prompt. Nothing here has to discover or guess a remote session id, so there is
+    // nothing to go stale.
+    //
+    // Only RECORDED here, not queued. Nothing connects until the credential dialog has
+    // been answered (see `connections_needing_secret`), because a connection parked on
+    // an unanswered prompt is burning the server's `LoginGraceTime`. Recording still
+    // runs the whitelist, so a save from an earlier build cannot smuggle in whatever was
+    // typed last (that bug persisted `claude`).
+    if startup_cmd.is_some_and(|cmd| session.set_startup_cmd(cmd)) {
+        session.set_prompts_for_credential(prompts_for_credential);
+        session.seed_remote_cwd(remote_cwd);
+        session.seed_remote_claude(remote_claude);
     } else if claude_running {
         // Relaunch Claude here — resuming the previous conversation if one was bound,
         // else a fresh session. The command queues in the PTY and runs at the shell's
@@ -641,6 +744,9 @@ fn saved_to_config(
             claude_session,
             history_id,
             startup_cmd,
+            prompts_for_credential,
+            remote_cwd,
+            remote_claude,
         } => {
             // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
             let history_id = history_id.unwrap_or_else(new_history_id);
@@ -652,10 +758,209 @@ fn saved_to_config(
                 claude_session.as_deref(),
                 &history_id,
                 startup_cmd.as_deref(),
+                prompts_for_credential,
+                remote_cwd.as_deref(),
+                remote_claude,
             );
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind, history_id })
         }
     }
+}
+
+/// The distinct connection commands that still need a secret before they can run
+/// unattended: not known to log in without one, and nothing in the vault for them. In
+/// first-seen order. Deduplicated, which is the whole point: several panes on one host
+/// become one row in the dialog and are answered by one secret.
+fn connections_needing_secret(workspaces: &[Workspace], vault: &Vault) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ws in workspaces {
+        for (_, d) in ws.panes.iter() {
+            let Some(cmd) = d.session.startup_cmd() else { continue };
+            if d.session.prompts_for_credential() == Some(false) || vault.contains(&cmd) {
+                continue;
+            }
+            if !out.contains(&cmd) {
+                out.push(cmd);
+            }
+        }
+    }
+    out
+}
+
+/// Leaf panes of a workspace in layout order (a before b), which is the order the saved
+/// file lists them in, so "the first pane" means the same thing on every launch.
+fn leaf_panes(node: &pane_grid::Node, out: &mut Vec<pane_grid::Pane>) {
+    match node {
+        pane_grid::Node::Split { a, b, .. } => {
+            leaf_panes(a, out);
+            leaf_panes(b, out);
+        }
+        pane_grid::Node::Pane(p) => out.push(*p),
+    }
+}
+
+/// Run one pane's connection: arm it from the vault, queue its follow-ups (back to the
+/// saved remote directory, and Claude there unless another pane already claimed that
+/// directory), then queue the command itself. `claimed` holds the (command, directory)
+/// pairs already resuming Claude, so two panes in one directory cannot both attach to
+/// the same most-recent conversation.
+fn connect_pane(d: &mut PaneData, vault: &Vault, claimed: &mut HashSet<(String, String)>) {
+    let Some(cmd) = d.session.startup_cmd() else { return };
+    if let Some(secret) = vault.arm_copy(&cmd) {
+        d.session.arm_credential(secret);
+    }
+    let resume = d.session.take_remote_claude_pending();
+    if let Some(dir) = d.session.remote_cwd() {
+        let resume = resume && claimed.insert((cmd.clone(), dir.clone()));
+        d.session.set_followup(&dir, resume);
+    }
+    d.session.queue_startup_cmd(&cmd);
+}
+
+/// Let every held connection run (see `spawn_restored`), each pane armed from the vault.
+fn release_connections(state: &mut State) {
+    let State { workspaces, vault, .. } = state;
+    let mut claimed = HashSet::new();
+    for ws in workspaces.iter_mut() {
+        let mut panes = Vec::new();
+        leaf_panes(ws.panes.layout(), &mut panes);
+        for pane in panes {
+            if let Some(d) = ws.panes.get_mut(pane) {
+                connect_pane(d, vault, &mut claimed);
+            }
+        }
+    }
+}
+
+/// Bring one pane's connection back. The live local shell is reused when it is sitting
+/// idle at its prompt, so the scrollback survives. A pane whose shell has exited, is
+/// still inside a session, or is running something else is respawned, its connection
+/// facts carried over; its name, position and history file stay, its scrollback resets.
+fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
+    let git_bash = state.git_bash.clone();
+    let State { workspaces, vault, .. } = state;
+    let Some(ws) = workspaces.get_mut(ws_idx) else { return };
+    let Some(data) = ws.panes.get_mut(pane) else { return };
+    let s = &data.session;
+    if s.exited() || s.is_remote() || s.shell_idle() != Some(true) {
+        let cmd = s.startup_cmd();
+        let cwd = s.cwd().filter(|d| std::path::Path::new(d).is_dir());
+        let prompts = s.prompts_for_credential();
+        let remote_cwd = s.remote_cwd();
+        let remote_claude = s.remote_claude();
+        let hid = data.history_id.clone();
+        let shell_arg = match data.shell {
+            ShellKind::GitBash => git_bash,
+            ShellKind::PowerShell => None,
+        };
+        // Assigning over `data.session` drops the old one, and with it its child, master
+        // PTY and reader thread.
+        data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
+        if let Some(c) = cmd.as_deref() {
+            data.session.set_startup_cmd(c);
+        }
+        data.session.set_prompts_for_credential(prompts);
+        data.session.seed_remote_cwd(remote_cwd.as_deref());
+        data.session.seed_remote_claude(remote_claude);
+    }
+    connect_pane(data, vault, &mut HashSet::new());
+}
+
+/// A pane's connection command and what is known about its prompting.
+fn connection_of(state: &State, ws: usize, pane: pane_grid::Pane) -> Option<(String, Option<bool>)> {
+    let d = state.workspaces.get(ws)?.panes.get(pane)?;
+    Some((d.session.startup_cmd()?, d.session.prompts_for_credential()))
+}
+
+/// Show the credential dialog for `cmds` and focus its first field: the key subscription
+/// only ignores keys a widget captured, so an unfocused masked field would send every
+/// keystroke to the focused TERMINAL instead.
+fn open_connect_prompt(
+    state: &mut State,
+    cmds: Vec<String>,
+    kind: ConnectKind,
+    rejected: bool,
+) -> Task<Message> {
+    state.connect_prompt = Some(ConnectPrompt {
+        rows: cmds.into_iter().map(|cmd| ConnectRow { cmd, secret: SecretText::default() }).collect(),
+        kind,
+        rejected,
+    });
+    text_input::focus(text_input::Id::new(CONNECT_INPUT_FIRST))
+}
+
+/// Answer the credential dialog: remember what was typed (when `use_secrets`) and let
+/// whatever was waiting on it proceed. Skipping still runs the connections, each
+/// prompting in its own terminal; only a re-ask leaves its prompt to the user.
+fn connect_answer(state: &mut State, use_secrets: bool) -> Task<Message> {
+    let Some(prompt) = state.connect_prompt.take() else { return Task::none() };
+    if use_secrets {
+        for row in &prompt.rows {
+            state.vault.remember(&row.cmd, &row.secret);
+        }
+    }
+    match prompt.kind {
+        ConnectKind::Startup => release_connections(state),
+        ConnectKind::Reconnect { ws, pane } => {
+            reconnect_pane(state, ws, pane);
+            save_session(state);
+        }
+        ConnectKind::Reask { ws, pane } => {
+            if !use_secrets {
+                return Task::none();
+            }
+            // ssh is normally still waiting at the prompt it repeated, so the answer goes
+            // straight in. If it has given up meanwhile, run the connection again; the
+            // vault now holds the new secret for that.
+            let Some(row) = prompt.rows.first() else { return Task::none() };
+            let sent = state
+                .workspaces
+                .get(ws)
+                .and_then(|w| w.panes.get(pane))
+                .zip(state.vault.arm_copy(&row.cmd))
+                .is_some_and(|(d, secret)| d.session.send_credential_now(secret));
+            if !sent {
+                reconnect_pane(state, ws, pane);
+            }
+        }
+    }
+    Task::none()
+}
+
+/// React to what the readers asked for since the last redraw: re-run a connection that
+/// dropped (once, and only when it can run unattended), and re-ask for a credential
+/// that was rejected. Rides the redraw the reader already triggers for that output.
+fn poll_connection_signals(state: &mut State) -> Task<Message> {
+    let mut retry = Vec::new();
+    let mut reask = None;
+    for (wi, ws) in state.workspaces.iter().enumerate() {
+        for (pane, d) in ws.panes.iter() {
+            if d.session.take_retry_wanted() {
+                retry.push((wi, *pane));
+            }
+            if d.session.take_reask_wanted() && reask.is_none() {
+                reask = Some((wi, *pane));
+            }
+        }
+    }
+    for (wi, pane) in retry {
+        let Some((cmd, prompts)) = connection_of(state, wi, pane) else { continue };
+        // A connection that will prompt, with nothing to answer it, would sit on that
+        // prompt unattended; the amber button is the better outcome there.
+        if prompts != Some(false) && !state.vault.contains(&cmd) {
+            continue;
+        }
+        reconnect_pane(state, wi, pane);
+    }
+    if let Some((wi, pane)) = reask {
+        if state.connect_prompt.is_none() {
+            if let Some((cmd, _)) = connection_of(state, wi, pane) {
+                state.vault.forget(&cmd);
+                return open_connect_prompt(state, vec![cmd], ConnectKind::Reask { ws: wi, pane }, true);
+            }
+        }
+    }
+    Task::none()
 }
 
 /// Rebuild workspaces from a saved session. `None` if nothing usable (→ fresh start).
@@ -698,6 +1003,9 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                 claude_session: data.and_then(|d| d.session.claude_session_id()),
                 history_id: data.map(|d| d.history_id.clone()),
                 startup_cmd: data.and_then(|d| d.session.startup_cmd()),
+                prompts_for_credential: data.and_then(|d| d.session.prompts_for_credential()),
+                remote_cwd: data.and_then(|d| d.session.remote_cwd()),
+                remote_claude: data.map_or(false, |d| d.session.remote_claude()),
             }
         }
     }
@@ -889,6 +1197,14 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
             return true;
         }};
     }
+    // Escape on the credential dialog means "connect without", NOT "cancel". Every
+    // restored pane is held waiting on it, so merely closing it would leave them all
+    // sitting at a local prompt with their connection never run. Hand-written rather
+    // than `take!` for exactly that reason.
+    if state.connect_prompt.is_some() {
+        let _ = connect_answer(state, false);
+        return true;
+    }
     if state.close_confirm.is_some() { take!(state.close_confirm) }
     if state.quit_confirm { take!(state.quit_confirm) }
     if state.usage_login_prompt { take!(state.usage_login_prompt) }
@@ -918,6 +1234,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 save_session(state);
             }
+            // The readers' requests (retry a dropped connection, re-ask a rejected
+            // secret) ride this same wake: each is raised while handling the output
+            // that triggered the redraw.
+            return poll_connection_signals(state);
         }
         Message::Tick => {
             // Persist when a Claude session newly bound in a pane (the watcher sets
@@ -957,6 +1277,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Input(bytes) => {
+            // While the sign-in dialog is up, a key no field captured must not reach the
+            // terminals behind it. A text input leaves Tab to the application, so Tab and
+            // Shift+Tab move between the fields here; Enter submits; the rest is dropped.
+            if state.connect_prompt.is_some() {
+                return match bytes.as_slice() {
+                    b"\t" => iced::widget::focus_next(),
+                    b"\x1b[Z" => iced::widget::focus_previous(),
+                    b"\r" => connect_answer(state, true),
+                    _ => Task::none(),
+                };
+            }
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
                 // Typing returns the view to the live bottom + clears selection.
@@ -978,10 +1309,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // that built it (see `Session::startup_cmd`). Only real keystrokes go
                 // through here, which is why it isn't done inside `write`.
                 p.session.note_typed(&bytes);
+                // Enter in a far shell: the command as the SCREEN shows it (completed,
+                // recalled) is what a `cd` there is read from (see `Session::note_remote_line`).
+                if bytes.as_slice() == b"\r" {
+                    let row = p.session.term().lock().map(|t| t.cursor_row_text()).unwrap_or_default();
+                    p.session.note_remote_line(&row);
+                }
                 p.session.write(&bytes);
             }
         }
         Message::ShiftEnter => {
+            if state.connect_prompt.is_some() {
+                return connect_answer(state, true);
+            }
             // Claude (Ink) wants the kitty Shift+Enter sequence to insert a
             // newline; a plain shell would echo those bytes as garbage, so send
             // a normal CR there instead.
@@ -1465,6 +1805,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::TermRenameCancel => state.rename_terminal = None,
+        Message::ConnectInput(i, s) => {
+            if let Some(p) = state.connect_prompt.as_mut() {
+                if let Some(row) = p.rows.get_mut(i) {
+                    row.secret = s;
+                }
+            }
+        }
+        Message::ConnectSubmit => return connect_answer(state, true),
+        Message::ConnectSkip => return connect_answer(state, false),
+        Message::CopyRemoteSnippet => {
+            state.term_menu = None;
+            return iced::clipboard::write(arbiter_native::shell::REMOTE_OSC7_SNIPPET.to_string());
+        }
         Message::ClearBuffer => {
             state.term_menu = None;
             let ws = state.active_mut();
@@ -1888,31 +2241,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state);
         }
         Message::Reconnect(pane) => {
-            // Respawn the pane and replay the command that built it. A dead PTY can't be
-            // revived and writes to it are silently dropped, so reconnecting has to mean
-            // a fresh session: assigning over `data.session` drops the old one, which
-            // drops its child and master PTY and releases the reader thread.
-            //
-            // The pane keeps its identity (name, position, history file), so this reads
-            // as the same terminal coming back rather than a new one appearing. Its
-            // scrollback does reset, exactly as it does for a shell switch.
-            let git_bash = state.git_bash.clone();
-            let ws = state.active_mut();
-            if let Some(data) = ws.panes.get_mut(pane) {
-                let cmd = data.session.startup_cmd();
-                let cwd = data.session.cwd();
-                let hid = data.history_id.clone();
-                let shell_arg = match data.shell {
-                    ShellKind::GitBash => git_bash,
-                    ShellKind::PowerShell => None,
-                };
-                data.session = spawn_session(shell_arg.as_deref(), cwd.as_deref(), &hid);
-                // Same whitelist gate as restore, and likewise queued rather than written,
-                // so the fresh pane is being read and sized before anything runs in it.
-                if let Some(c) = cmd.as_deref() {
-                    data.session.queue_startup_cmd(c);
+            let ws = state.active;
+            // A connection that will prompt, with nothing in the vault for it, is asked
+            // about first, exactly as at startup. Everything else reconnects at once.
+            if let Some((cmd, prompts)) = connection_of(state, ws, pane) {
+                if prompts != Some(false) && !state.vault.contains(&cmd) {
+                    let kind = ConnectKind::Reconnect { ws, pane };
+                    return open_connect_prompt(state, vec![cmd], kind, false);
                 }
             }
+            reconnect_pane(state, ws, pane);
             save_session(state);
         }
     }
@@ -2065,6 +2403,11 @@ fn open_or_create_config(path: Option<std::path::PathBuf>, default: &str) {
 }
 
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
+    // First: every restored connection is held until this is answered, so it outranks
+    // anything else that might be open.
+    if let Some(p) = &state.connect_prompt {
+        return Some(connect_prompt_view(p));
+    }
     if let Some(c) = &state.close_confirm {
         return Some(close_confirm_view(c));
     }
@@ -2144,6 +2487,24 @@ fn modal_scrim<'a>(panel: Element<'a, Message>, dismiss: Message) -> Element<'a,
         }),
     )
     .on_press(dismiss)
+    .into()
+}
+
+/// A dimmed, centred modal that CANNOT be dismissed by clicking outside it. For a dialog
+/// whose buttons are the only meaningful answers, where a stray click would otherwise
+/// choose one of them silently.
+fn modal_panel_only<'a>(panel: Element<'a, Message>) -> Element<'a, Message> {
+    mouse_area(
+        container(modal_panel(panel)).center(Length::Fill).style(|_t: &iced::Theme| {
+            container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba8(
+                    0x00, 0x00, 0x00, 0.5,
+                ))),
+                ..Default::default()
+            }
+        }),
+    )
+    .on_press(Message::Noop)
     .into()
 }
 
@@ -3774,6 +4135,22 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
         can_reconnect.then_some(Message::Reconnect(ws.focus)),
         false,
     ));
+    // The far host reports its directory only once this snippet is in its shell rc;
+    // "(active here)" is how the user sees that it took.
+    let focused = ws.panes.get(ws.focus);
+    let snippet_useful =
+        focused.map_or(false, |d| d.session.is_remote() || d.session.startup_cmd().is_some());
+    let snippet_active = focused.map_or(false, |d| d.session.remote_cwd_reported());
+    items = items.push(menu_item(
+        mdi_path::CONTENT_COPY,
+        if snippet_active {
+            "Copy Remote Directory Snippet (active here)".into()
+        } else {
+            "Copy Remote Directory Snippet".into()
+        },
+        snippet_useful.then_some(Message::CopyRemoteSnippet),
+        false,
+    ));
     items = items.push(menu_item(mdi_path::BROOM, "Clear Buffer".into(), Some(Message::ClearBuffer), false));
     items = items.push(menu_divider());
     items = items.push(menu_item(mdi_path::ARROW_RIGHT, "Split Pane Vertically".into(), Some(Message::SplitRight), false));
@@ -3784,7 +4161,7 @@ fn term_menu_view(state: &State, x0: f32, y0: f32) -> Element<'static, Message> 
     items = items.push(menu_item(mdi_path::CONTENT_PASTE, "Paste".into(), Some(Message::Paste), false));
     items = items.push(menu_divider());
     items = items.push(menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::Close), true));
-    context_menu_card(items, 224.0, 300.0, x0, y0, state.main_size, Message::TermMenuClose)
+    context_menu_card(items, 224.0, 324.0, x0, y0, state.main_size, Message::TermMenuClose)
 }
 
 /// The workspace-tab right-click context menu: rename or close the tab.
@@ -3793,6 +4170,101 @@ fn ws_tab_menu_view(state: &State, index: usize, x0: f32, y0: f32) -> Element<'s
     items = items.push(menu_item(mdi_path::PENCIL, "Rename".into(), Some(Message::RenameWorkspaceStart(index)), false));
     items = items.push(menu_item(mdi_path::CLOSE, "Close".into(), Some(Message::RequestCloseWorkspace(index)), true));
     context_menu_card(items, 176.0, 76.0, x0, y0, state.main_size, Message::WorkspaceTabMenuClose)
+}
+
+/// The startup credential dialog: one masked field per restored connection.
+///
+/// Shown before anything connects, so no connection sits on an unanswered prompt burning
+/// the server's login grace time. A row left blank simply connects and asks for itself in
+/// its own terminal, exactly as it did before this dialog existed.
+fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
+    let n = p.rows.len();
+    let (title, hint, skip_label, submit_label): (String, &str, &str, &str) = if p.rejected {
+        (
+            "That password was rejected".into(),
+            "Type it again to answer the prompt still waiting in the terminal, or cancel and \
+             type it there yourself.",
+            "Cancel",
+            "Sign in",
+        )
+    } else {
+        match p.kind {
+            ConnectKind::Startup => (
+                format!("Sign in to {n} restored {}", if n == 1 { "connection" } else { "connections" }),
+                "Entered once and used for every terminal on that connection, reconnects \
+                 included. Kept in memory until Arbiter quits, never saved.",
+                "Connect without",
+                "Connect",
+            ),
+            ConnectKind::Reconnect { .. } | ConnectKind::Reask { .. } => (
+                "Sign in to reconnect".into(),
+                "Kept in memory until Arbiter quits, never saved.",
+                "Connect without",
+                "Connect",
+            ),
+        }
+    };
+    let mut body = column![].spacing(2);
+    for (i, row) in p.rows.iter().enumerate() {
+        let label = column![
+            text(row.cmd.clone()).size(13),
+            text("Passphrase or password").size(11).color(TXT_SECONDARY),
+        ]
+        .spacing(2);
+        // `.secure(true)` is real masking in iced 0.13: it also disables copy/cut and
+        // word-selection on the field, so the secret cannot be lifted back out of it.
+        let input = text_input("", &row.secret.0)
+            .secure(true)
+            .id(text_input::Id::new(if i == 0 {
+                CONNECT_INPUT_FIRST.to_string()
+            } else {
+                format!("connect-secret-{i}")
+            }))
+            .on_input(move |s| Message::ConnectInput(i, SecretText(s)))
+            .on_submit(Message::ConnectSubmit)
+            .style(settings_input_style)
+            .width(Length::Fixed(190.0))
+            .padding([6, 8])
+            .size(13);
+        if i > 0 {
+            body = body.push(settings_hdivider());
+        }
+        body = body.push(
+            container(row![label, horizontal_space(), input].spacing(12).align_y(iced::Center))
+                .padding([10, 4]),
+        );
+    }
+    let actions = row![
+        horizontal_space(),
+        button(text(skip_label).size(13))
+            .on_press(Message::ConnectSkip)
+            .style(button::secondary)
+            .padding([6, 14]),
+        button(text(submit_label).size(13))
+            .on_press(Message::ConnectSubmit)
+            .style(primary_btn_style)
+            .padding([6, 14]),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    let panel = column![
+        text(title).size(15).font(ui_semibold()),
+        text(hint).size(12).color(TXT_SECONDARY),
+        scrollable(body).height(Length::Shrink),
+        actions,
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(460.0));
+    // Deliberately NOT dismissable by clicking the scrim: the panes behind it are all
+    // waiting to connect, so a stray click must not decide that for them.
+    modal_panel_only(panel.into())
+}
+
+/// `button::primary` with a white label: the theme's blue is dark enough that the
+/// palette's computed label colour comes out dark too.
+fn primary_btn_style(t: &iced::Theme, s: button::Status) -> button::Style {
+    button::Style { text_color: iced::Color::WHITE, ..button::primary(t, s) }
 }
 
 /// The terminal rename dialog (context menu → Rename): a prefilled name input.
@@ -3811,7 +4283,7 @@ fn rename_terminal_view(rt: &RenameTerminal) -> Element<'static, Message> {
             .padding([6, 14]),
         button(text("Rename").size(13))
             .on_press(Message::TermRenameCommit)
-            .style(button::primary)
+            .style(primary_btn_style)
             .padding([6, 14]),
     ]
     .spacing(8)
@@ -4125,7 +4597,10 @@ fn main_view(state: &State) -> Element<'_, Message> {
         // (anchored at the cursor); left-clicks still fall through to focus / the
         // header's own buttons (mouse_area only captures the right-press).
         let header: Element<Message> = mouse_area(pane_header(
-            &data.name, focused, data.shell, has_git_bash, pane, status, data.session.needs_reconnect(),
+            &data.name, focused, data.shell, has_git_bash, pane, status,
+            // Held connections (dialog up) are idle and not yet remote, which would read
+            // as "dropped" on every restored pane behind the scrim.
+            data.session.show_reconnect() && state.connect_prompt.is_none(),
             header_round,
         ))
         .on_right_press(Message::HeaderMenuOpen(pane))
@@ -6988,7 +7463,13 @@ fn main() -> iced::Result {
             // Learn the real display scale so the logo is rasterized 1:1 for it.
             tasks.push(iced::window::get_scale_factor(main_id).map(Message::ScaleChanged));
 
-            let state = State {
+            // Restored connections are held rather than run (see `spawn_restored`).
+            // Those that will prompt are asked about once, up front, before anything
+            // connects; the rest run the moment the state exists below.
+            let vault = Vault::default();
+            let asking = connections_needing_secret(&workspaces, &vault);
+
+            let mut state = State {
                 workspaces,
                 active,
                 font: font.clone(),
@@ -7030,9 +7511,16 @@ fn main() -> iced::Result {
                 term_menu: None,
                 ws_tab_menu: None,
                 rename_terminal: None,
+                connect_prompt: None,
+                vault,
                 tab_drag: None,
                 hovered_tab: None,
             };
+            if asking.is_empty() {
+                release_connections(&mut state);
+            } else {
+                tasks.push(open_connect_prompt(&mut state, asking, ConnectKind::Startup, false));
+            }
             (state, iced::Task::batch(tasks))
         })
 }

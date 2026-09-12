@@ -53,6 +53,18 @@ pub enum SavedNode {
         /// chain or wrapper without Arbiter needing to model connections.
         #[serde(default)]
         startup_cmd: Option<String>,
+        /// Whether that connection asks for a credential: `None` never observed, `Some(true)`
+        /// it prompted, `Some(false)` it logged in without one. Decides whether the startup
+        /// sign-in dialog has a row for it.
+        #[serde(default)]
+        prompts_for_credential: Option<bool>,
+        /// The far host's working directory at save time, if its shell reported one (the
+        /// opt-in snippet, `shell::REMOTE_OSC7_SNIPPET`). Only meaningful with `startup_cmd`.
+        #[serde(default)]
+        remote_cwd: Option<String>,
+        /// Claude was running on the far host, so the replayed connection resumes it there.
+        #[serde(default)]
+        remote_claude: bool,
     },
 }
 
@@ -315,6 +327,9 @@ mod tests {
                             claude_session: Some("sess-abc-123".into()),
                             history_id: Some("hist-abc-1".into()),
                             startup_cmd: None,
+                            prompts_for_credential: None,
+                            remote_cwd: None,
+                            remote_claude: false,
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
@@ -324,6 +339,9 @@ mod tests {
                             claude_session: None,
                             history_id: None,
                             startup_cmd: Some("ssh mini".into()),
+                            prompts_for_credential: Some(true),
+                            remote_cwd: Some("/home/tre/src".into()),
+                            remote_claude: true,
                         }),
                     },
                 },
@@ -337,6 +355,9 @@ mod tests {
                         claude_session: None,
                         history_id: None,
                         startup_cmd: None,
+                        prompts_for_credential: None,
+                        remote_cwd: None,
+                        remote_claude: false,
                     },
                 },
             ],
@@ -369,9 +390,19 @@ mod tests {
                 match b.as_ref() {
                     // The remote pane: its ssh line round-trips so a relaunch can
                     // replay it.
-                    SavedNode::Leaf { startup_cmd, claude_running, .. } => {
+                    SavedNode::Leaf {
+                        startup_cmd,
+                        claude_running,
+                        prompts_for_credential,
+                        remote_cwd,
+                        remote_claude,
+                        ..
+                    } => {
                         assert_eq!(startup_cmd.as_deref(), Some("ssh mini"));
                         assert!(!claude_running, "a remote pane must not ask for a local claude");
+                        assert_eq!(*prompts_for_credential, Some(true));
+                        assert_eq!(remote_cwd.as_deref(), Some("/home/tre/src"));
+                        assert!(*remote_claude, "the far Claude is what the remote pane resumes");
                     }
                     _ => panic!("expected a leaf"),
                 }
@@ -391,11 +422,23 @@ mod tests {
         assert!(s.settings.hide_sonnet_usage);
         assert!(!s.settings.hide_usage_bar);
         match &s.workspaces[0].layout {
-            SavedNode::Leaf { claude_running, claude_session, history_id, startup_cmd, .. } => {
+            SavedNode::Leaf {
+                claude_running,
+                claude_session,
+                history_id,
+                startup_cmd,
+                prompts_for_credential,
+                remote_cwd,
+                remote_claude,
+                ..
+            } => {
                 assert!(!claude_running);
                 assert!(claude_session.is_none());
                 assert!(history_id.is_none()); // absent in old saves → fresh id on restore
                 assert!(startup_cmd.is_none());
+                assert!(prompts_for_credential.is_none(), "unknown until observed");
+                assert!(remote_cwd.is_none());
+                assert!(!remote_claude);
             }
             _ => panic!("expected a leaf"),
         }

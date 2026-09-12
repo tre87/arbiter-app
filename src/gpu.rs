@@ -468,8 +468,9 @@ impl TermGpu {
         // path loads them into a real bold IDWriteFontFace so bold renders the bundled
         // bold (not a synthesised faux-bold). Other platforms ignore this.
         let bold_data = self.bold_face.as_ref().map(|(b, _)| b.as_slice());
-        let raster =
-            crate::raster::rasterize(&self.font_name, data, index, bold_data, self.em_px, ch, bold);
+        let raster = crate::raster::rasterize(
+            &self.font_name, data, index, bold_data, self.em_px, ch, bold, wide_hint,
+        );
         // Diagnostic: ARBITER_GLYPH_DEBUG logs how non-ASCII symbols (e.g. ✻ U+273B,
         // ⏵ U+23F5) rasterise — mono vs colour, size + bearing vs the cell, and the
         // width flag — so glyph-fit issues can be seen instead of guessed. Fires once
@@ -958,10 +959,14 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     // its natural size — Windows Terminal renders these at full size and lets them overflow.
     // Capped at +3px so a genuinely oversized glyph (or a colour emoji) still scales down
     // rather than losing big chunks to the clip; taller-than-cell glyphs scale down too.
+    // And only where the clip takes spoke tips: a filled shape (⏺ from Segoe UI Symbol is
+    // wider than the cell too) would come out with its sides cut off, a square.
     if !bmp.color && bmp.height <= box_h && bmp.width > box_w && bmp.width <= box_w + 3 {
         let left = ((box_w as f32 - bmp.width as f32) / 2.0).round() as i32; // negative → clipped
-        let top = base - ((box_h as f32 - bmp.height as f32) / 2.0).round() as i32;
-        return GlyphBitmap { left, top, ..bmp };
+        if !clip_cuts_solid_ink(&bmp, (-left) as u32, box_w) {
+            let top = base - ((box_h as f32 - bmp.height as f32) / 2.0).round() as i32;
+            return GlyphBitmap { left, top, ..bmp };
+        }
     }
 
     // Oversized: scale down to fit, centered. The blit draws the top at
@@ -977,6 +982,26 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
     let left = ((box_w as f32 - nw as f32) / 2.0).round() as i32;
     let top = base - ((box_h as f32 - nh as f32) / 2.0).round() as i32;
     GlyphBitmap { left, top, width: nw, height: nh, coverage, color: bmp.color }
+}
+
+/// Whether showing only `box_w` columns of a mono glyph, starting at column `skip`, would
+/// cut through solid ink: a surviving edge column that is mostly inked reads as a straight
+/// edge, which is how a filled circle turns into a square. Thin spoke tips (✻) pass. Only
+/// the sides actually clipped are examined.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn clip_cuts_solid_ink(bmp: &GlyphBitmap, skip: u32, box_w: u32) -> bool {
+    /// Inked share of a column at which its cut edge becomes a visible straight line.
+    const SOLID: f32 = 0.4;
+    if bmp.height == 0 || bmp.width == 0 {
+        return false;
+    }
+    let column_ink = |x: u32| -> f32 {
+        let sum: u32 = (0..bmp.height).map(|y| bmp.coverage[(y * bmp.width + x) as usize] as u32).sum();
+        sum as f32 / (255.0 * bmp.height as f32)
+    };
+    let last = skip + box_w;
+    (skip > 0 && column_ink(skip.min(bmp.width - 1)) > SOLID)
+        || (last < bmp.width && column_ink(last - 1) > SOLID)
 }
 
 /// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
@@ -1090,15 +1115,37 @@ mod tests {
         assert_eq!(out.top, 8); // fits vertically → untouched
     }
 
+    /// A ✻-like cross: one full row and one full column, so the outer columns carry only
+    /// a spoke tip.
+    fn spoked(w: u32, h: u32) -> GlyphBitmap {
+        let mut coverage = vec![0u8; (w * h) as usize];
+        for x in 0..w {
+            coverage[((h / 2) * w + x) as usize] = 220;
+        }
+        for y in 0..h {
+            coverage[(y * w + w / 2) as usize] = 220;
+        }
+        GlyphBitmap { left: 0, top: h as i32, width: w, height: h, coverage, color: false }
+    }
+
     #[test]
     fn wide_mono_symbol_centered_not_shrunk() {
         // ✻-like: 9px wide in a 7px cell, fits in height. Keep the full 9×10 (centered,
         // left<0 so the blit clips the ~1px overhang) instead of downscaling to ~7×8 —
         // matching Windows Terminal's full-size rendering. (A far-wider glyph, e.g. the
         // 14×14 in oversized_glyph_scaled_into_cell_keeping_aspect, still scales down.)
-        let out = fit_to_box(glyph(9, 10), 7, 14, 11.0);
+        let out = fit_to_box(spoked(9, 10), 7, 14, 11.0);
         assert_eq!((out.width, out.height), (9, 10)); // not shrunk
         assert_eq!(out.left, -1); // (7-9)/2 → 1px clipped each side
+    }
+
+    // ⏺-like: a filled shape 9px wide in a 7px cell. Clipping would cut straight through
+    // its sides and leave a square, so it scales down instead.
+    #[test]
+    fn wide_filled_symbol_is_scaled_not_clipped() {
+        let out = fit_to_box(glyph(9, 10), 7, 14, 11.0);
+        assert_eq!(out.width, 7, "fits the cell width");
+        assert!(out.left >= 0, "nothing clipped");
     }
 
     #[test]

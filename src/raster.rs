@@ -29,10 +29,11 @@ pub fn rasterize(
     em_px: f32,
     ch: char,
     bold: bool,
+    wide: bool,
 ) -> Option<GlyphBitmap> {
     #[cfg(target_os = "macos")]
     {
-        let _ = (font_data, font_index, bold_data);
+        let _ = (font_data, font_index, bold_data, wide);
         mac::rasterize(font_name, em_px, ch, bold)
     }
     #[cfg(target_os = "windows")]
@@ -41,12 +42,12 @@ pub fn rasterize(
         // bold_data (the bundled bold .ttf) is loaded into a real bold font face so
         // bold renders crisp instead of a synthesised faux-bold.
         let _ = (font_data, font_index);
-        dwrite::rasterize(font_name, bold_data, em_px, ch, bold)
+        dwrite::rasterize(font_name, bold_data, em_px, ch, bold, wide)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // Linux: swash with fontdb fallback (incl. Noto Color Emoji).
-        let _ = (font_name, bold, bold_data);
+        let _ = (font_name, bold, bold_data, wide);
         swash_raster::rasterize(font_data, font_index, em_px, ch)
     }
 }
@@ -429,6 +430,7 @@ mod dwrite {
         D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     };
     use windows::core::Interface;
+    use windows::Win32::Foundation::BOOL;
     use windows::Win32::Graphics::DirectWrite::{
         DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection,
         IDWriteFontFace, IDWriteFontFile, IDWriteFontSetBuilder1, IDWriteInMemoryFontFileLoader,
@@ -464,6 +466,12 @@ mod dwrite {
         /// regular — instead of DirectWrite synthesising a soft faux-bold by name. None
         /// if the bytes weren't supplied or failed to load.
         bold: Option<BoldFont>,
+        /// The primary family's regular face, for the glyph-presence check that decides
+        /// whether a symbol is laid out in `symbol` instead (see `render`).
+        regular: Option<IDWriteFontFace>,
+        /// "Segoe UI Symbol", null-terminated: the text-presentation home of the symbols
+        /// DirectWrite's own fallback would otherwise take from Segoe UI Emoji.
+        symbol: Vec<u16>,
     }
 
     /// The bundled bold face + the private collection wrapping it (for CreateTextFormat)
@@ -486,6 +494,7 @@ mod dwrite {
         em_px: f32,
         ch: char,
         bold: bool,
+        wide: bool,
     ) -> Option<GlyphBitmap> {
         CTX.with(|cell| {
             let mut cell = cell.borrow_mut();
@@ -496,8 +505,24 @@ mod dwrite {
                 *cell = build_ctx(font_name, bold_data, em_px).ok();
             }
             let ctx = cell.as_ref()?;
-            render(ctx, ch, bold).ok().flatten()
+            render(ctx, ch, bold, !wide && emoji_block(ch)).ok().flatten()
         })
+    }
+
+    /// Whether `ch` sits in a block that carries emoji, where DirectWrite's own fallback
+    /// reaches for Segoe UI Emoji. In a NARROW cell such a character (`⏺`, `✳`, `⏸`, `▶`)
+    /// has text presentation by definition, and the emoji font would give back its colour
+    /// button glyph instead: a blue square where Claude draws a bullet. Claude on Windows
+    /// avoids these characters for exactly that reason; Claude on a Mac, reached over
+    /// ssh, does not.
+    fn emoji_block(ch: char) -> bool {
+        let c = ch as u32;
+        (0x2190..=0x21FF).contains(&c) // Arrows
+            || (0x2300..=0x23FF).contains(&c) // Miscellaneous Technical
+            || (0x25A0..=0x25FF).contains(&c) // Geometric Shapes
+            || (0x2600..=0x27BF).contains(&c) // Miscellaneous Symbols, Dingbats
+            || (0x2B00..=0x2BFF).contains(&c) // Miscellaneous Symbols and Arrows
+            || (0x1F000..=0x1FAFF).contains(&c)
     }
 
     /// Load the bundled bold .ttf into a private DirectWrite font collection (in-memory
@@ -575,6 +600,9 @@ mod dwrite {
             // Load the bundled bold into a private collection (best-effort; falls back
             // to the by-name path if it fails).
             let bold = bold_data.and_then(|d| build_bold_face(&dwrite, d));
+            let regular = primary_face(&dwrite, &family);
+            let mut symbol: Vec<u16> = "Segoe UI Symbol".encode_utf16().collect();
+            symbol.push(0);
             Ok(Ctx {
                 dwrite,
                 d2d,
@@ -584,11 +612,40 @@ mod dwrite {
                 em: em_px,
                 params,
                 bold,
+                regular,
+                symbol,
             })
         }
     }
 
-    fn render(ctx: &Ctx, ch: char, bold: bool) -> Result<Option<GlyphBitmap>> {
+    /// The regular face of the installed family `family` (null-terminated), if any.
+    unsafe fn primary_face(dwrite: &IDWriteFactory, family: &[u16]) -> Option<IDWriteFontFace> {
+        let mut collection: Option<IDWriteFontCollection> = None;
+        dwrite.GetSystemFontCollection(&mut collection, false).ok()?;
+        let collection = collection?;
+        let mut index = 0u32;
+        let mut exists = BOOL(0);
+        collection.FindFamilyName(PCWSTR(family.as_ptr()), &mut index, &mut exists).ok()?;
+        if !exists.as_bool() {
+            return None;
+        }
+        collection
+            .GetFontFamily(index)
+            .ok()?
+            .GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL)
+            .ok()?
+            .CreateFontFace()
+            .ok()
+    }
+
+    /// Whether `face` has a glyph for `ch`.
+    unsafe fn face_has(face: &IDWriteFontFace, ch: char) -> bool {
+        let cps = [ch as u32];
+        let mut gids = [0u16; 1];
+        face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).is_ok() && gids[0] != 0
+    }
+
+    fn render(ctx: &Ctx, ch: char, bold: bool, text_presentation: bool) -> Result<Option<GlyphBitmap>> {
         unsafe {
             // Pick the font source. For bold, prefer our private collection holding the
             // REAL bundled bold face — DirectWrite would otherwise synthesise a soft
@@ -597,18 +654,19 @@ mod dwrite {
             // collection by name so font fallback still serves emoji/symbols it lacks.
             // Either way it's the SAME DrawTextLayout path below, so bold is as crisp as
             // regular — only the collection + family differ.
-            let bold_src = if bold {
-                ctx.bold.as_ref().filter(|b| {
-                    let cps = [ch as u32];
-                    let mut gids = [0u16; 1];
-                    b.face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).is_ok() && gids[0] != 0
-                })
-            } else {
-                None
-            };
+            let bold_src = if bold { ctx.bold.as_ref().filter(|b| face_has(&b.face, ch)) } else { None };
             let weight = if bold { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
+            // A symbol the primary font lacks, in a narrow cell, is laid out in Segoe UI
+            // Symbol by name rather than left to DirectWrite's fallback, which for these
+            // blocks reaches for Segoe UI Emoji and returns its colour button glyph (a
+            // blue square for ⏺, a teal one for ✳). If Segoe UI Symbol lacks it too, the
+            // layout falls back from there as it always did.
+            let in_symbol_font = text_presentation
+                && bold_src.is_none()
+                && !ctx.regular.as_ref().is_some_and(|f| face_has(f, ch));
             let (collection, family): (Option<&IDWriteFontCollection>, &[u16]) = match bold_src {
                 Some(b) => (Some(&b.collection), &b.family),
+                None if in_symbol_font => (None, &ctx.symbol),
                 None => (None, &ctx.family),
             };
             let locale: Vec<u16> = "en-us\0".encode_utf16().collect();

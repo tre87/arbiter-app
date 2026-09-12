@@ -9,6 +9,7 @@ pub mod git;
 pub mod gpu;
 pub mod persist;
 pub mod raster;
+pub mod remote;
 pub mod session;
 pub mod shell;
 pub mod term;

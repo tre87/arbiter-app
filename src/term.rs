@@ -444,6 +444,7 @@ impl VtTerm {
             "accept edits on",
             "plan mode on",
             "auto mode on",
+            "bypass permissions on",
         ];
         /// Rows below the cursor to include. Measured against a real session: the
         /// cursor sits in the input box, and below it come the box's bottom border, an
@@ -474,6 +475,24 @@ impl VtTerm {
         false
     }
 
+
+    /// The text of the row the cursor is on, trailing blanks trimmed. Read at Enter, it
+    /// is the command line exactly as the shell showed it: completed, recalled, edited.
+    /// Absolute grid line, like `claude_chrome`, so scrolling does not change it.
+    pub fn cursor_row_text(&self) -> String {
+        let cols = self.term.columns();
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point.line.0.max(0) as usize;
+        if cursor >= self.term.screen_lines() {
+            return String::new();
+        }
+        let line = &grid[Line(cursor as i32)];
+        let mut buf = String::with_capacity(cols);
+        for col in 0..cols {
+            buf.push(line[Column(col)].c);
+        }
+        buf.trim_end().to_string()
+    }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }

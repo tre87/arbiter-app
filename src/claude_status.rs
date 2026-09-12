@@ -94,6 +94,51 @@ pub struct ClaudeHandle {
     /// timed: an idle Claude produces no output, so nothing would refresh a TTL, but
     /// the moment it exits the shell prints a prompt and that scan clears this.
     on_screen: AtomicBool,
+    /// Whether this pane's connection asks for a credential. `None` until observed,
+    /// `Some(true)` once ssh has prompted, `Some(false)` once a login completed with no
+    /// prompt. Persisted, so the startup dialog only asks for connections that will ask.
+    prompts_for_credential: Mutex<Option<bool>>,
+    /// A credential prompt appeared on the CURRENT connection. Reset per connection, so
+    /// the login evidence below can tell "asked" from "never asked" this time.
+    prompted_this_connection: AtomicBool,
+    /// The current connection has shown signs of a completed login: the far shell
+    /// reported a directory, Claude's chrome appeared, or enough time passed. Ends the
+    /// window in which a credential may be typed and settles `prompts_for_credential`.
+    login_seen: AtomicBool,
+    /// Arbiter typed a credential on the current connection (auto or from the re-ask
+    /// dialog), so a further prompt or a denial means it was rejected. Reset per prompt
+    /// handled and per connection.
+    credential_typed: AtomicBool,
+    /// When the current connection was detected, ms since epoch; 0 when not remote.
+    remote_since_ms: AtomicU64,
+    /// The one automatic reconnect a connection gets has been used. Reset when the next
+    /// connection is detected, so every established session earns one more.
+    retry_spent: AtomicBool,
+    /// Requests from the reader to the UI, taken on the next redraw: rerun this pane's
+    /// connection (its ssh exited abnormally), or ask again for its credential (the one
+    /// typed was rejected).
+    retry_wanted: AtomicBool,
+    reask_wanted: AtomicBool,
+    /// ssh said it never reached the host on the current attempt (refused, timed out,
+    /// unresolvable), so however long the attempt took, nothing was up to drop.
+    connect_failed: AtomicBool,
+    /// The far host's working directory: from an OSC-7 the REMOTE shell emitted (the
+    /// opt-in snippet) where there is one, else followed from the `cd` commands typed
+    /// there. Kept when the connection ends so Reconnect and restore can go back to it.
+    remote_cwd: Mutex<Option<String>>,
+    /// The value before the last change, so a `cd` the far shell then rejected can be
+    /// undone.
+    remote_cwd_prev: Mutex<Option<String>>,
+    /// A remote OSC-7 arrived on the current connection: the snippet is active there.
+    remote_cwd_reported: AtomicBool,
+    /// Claude was on the far side when the connection ended (or, seeded on restore, at
+    /// save time), so the next connection should resume it. Taken by whoever queues
+    /// that connection.
+    remote_claude_pending: AtomicBool,
+    /// `claude` was typed at the far shell's prompt and no other command has been typed
+    /// at a shell prompt since. A second witness to a far Claude, for when its screen
+    /// chrome is not recognised.
+    remote_claude_typed: AtomicBool,
 }
 
 /// Working reverts to ready after this long without a detected spinner frame.
@@ -150,6 +195,20 @@ impl ClaudeHandle {
             startup_cmd: Mutex::new(None),
             histfile,
             on_screen: AtomicBool::new(false),
+            prompts_for_credential: Mutex::new(None),
+            prompted_this_connection: AtomicBool::new(false),
+            login_seen: AtomicBool::new(false),
+            credential_typed: AtomicBool::new(false),
+            remote_since_ms: AtomicU64::new(0),
+            retry_spent: AtomicBool::new(false),
+            retry_wanted: AtomicBool::new(false),
+            reask_wanted: AtomicBool::new(false),
+            connect_failed: AtomicBool::new(false),
+            remote_cwd: Mutex::new(None),
+            remote_cwd_prev: Mutex::new(None),
+            remote_cwd_reported: AtomicBool::new(false),
+            remote_claude_pending: AtomicBool::new(false),
+            remote_claude_typed: AtomicBool::new(false),
         })
     }
 
@@ -160,10 +219,208 @@ impl ClaudeHandle {
         self.remote.store(on, Ordering::Relaxed);
         if on {
             self.was_remote.store(true, Ordering::Relaxed);
+            self.remote_since_ms.store(now_ms(), Ordering::Relaxed);
+            self.retry_spent.store(false, Ordering::Relaxed);
+            self.login_seen.store(false, Ordering::Relaxed);
+            self.prompted_this_connection.store(false, Ordering::Relaxed);
+            self.credential_typed.store(false, Ordering::Relaxed);
+            self.connect_failed.store(false, Ordering::Relaxed);
+            self.remote_claude_typed.store(false, Ordering::Relaxed);
+            // A new connection is the new truth; whoever queued it took the flag first.
+            self.remote_claude_pending.store(false, Ordering::Relaxed);
             self.latch_startup_cmd();
         } else {
-            self.on_screen.store(false, Ordering::Relaxed);
+            // Claude was still on the far side when the session ended, so the next
+            // connection should bring it back. Both witnesses count.
+            let on_screen = self.on_screen.swap(false, Ordering::Relaxed);
+            let typed = self.remote_claude_typed.swap(false, Ordering::Relaxed);
+            if on_screen || typed {
+                self.remote_claude_pending.store(true, Ordering::Relaxed);
+                SAVE_DIRTY.store(true, Ordering::Relaxed);
+            }
+            self.remote_since_ms.store(0, Ordering::Relaxed);
+            self.remote_cwd_reported.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Reader: the user ended the remote session themselves (the far shell exited, so ssh
+    /// returned that shell's status rather than its own 255). The pane is a plain local
+    /// shell again: nothing to reconnect, nothing to replay or sign in to on the next
+    /// launch, and a new `ssh` typed here latches afresh.
+    pub fn forget_connection(&self) {
+        *self.startup_cmd.lock().unwrap() = None;
+        *self.last_command.lock().unwrap() = None;
+        *self.prompts_for_credential.lock().unwrap() = None;
+        *self.remote_cwd.lock().unwrap() = None;
+        *self.remote_cwd_prev.lock().unwrap() = None;
+        self.was_remote.store(false, Ordering::Relaxed);
+        self.remote_claude_pending.store(false, Ordering::Relaxed);
+        self.remote_claude_typed.store(false, Ordering::Relaxed);
+        SAVE_DIRTY.store(true, Ordering::Relaxed);
+    }
+
+    /// Reader: ssh printed a credential prompt on this pane while its connection was
+    /// being made. Ignored once the login is known to have completed, so a prompt from
+    /// a nested `ssh` or `git push` on the far host does not describe this connection.
+    pub fn note_credential_prompt(&self) {
+        if self.login_seen.load(Ordering::Relaxed) {
+            return;
+        }
+        self.prompted_this_connection.store(true, Ordering::Relaxed);
+        let mut prompts = self.prompts_for_credential.lock().unwrap();
+        if *prompts != Some(true) {
+            *prompts = Some(true);
+            SAVE_DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Evidence that the current connection's login has completed. The first call per
+    /// connection settles whether this connection prompts (it did not, if no prompt was
+    /// seen) and returns true, so the caller can stop holding a credential.
+    pub fn note_login_evidence(&self) -> bool {
+        if !self.is_remote() || self.login_seen.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        // Whatever was typed got the pane in, so nothing after this can reject it.
+        self.credential_typed.store(false, Ordering::Relaxed);
+        if !self.prompted_this_connection.load(Ordering::Relaxed) {
+            let mut prompts = self.prompts_for_credential.lock().unwrap();
+            if *prompts != Some(false) {
+                *prompts = Some(false);
+                SAVE_DIRTY.store(true, Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
+    /// Whether the current connection's login is known to have completed.
+    pub fn login_seen(&self) -> bool {
+        self.login_seen.load(Ordering::Relaxed)
+    }
+
+    /// Whether a credential prompt has appeared on the current connection.
+    pub fn prompted_this_connection(&self) -> bool {
+        self.prompted_this_connection.load(Ordering::Relaxed)
+    }
+
+    /// Reader: ssh reported that it could not reach the host on this attempt.
+    pub fn note_connect_failure(&self) {
+        self.connect_failed.store(true, Ordering::Relaxed);
+    }
+
+    /// What is known about whether this connection asks for a credential.
+    pub fn prompts_for_credential(&self) -> Option<bool> {
+        *self.prompts_for_credential.lock().unwrap()
+    }
+
+    /// Seed from a saved layout.
+    pub fn set_prompts_for_credential(&self, prompts: Option<bool>) {
+        *self.prompts_for_credential.lock().unwrap() = prompts;
+    }
+
+    /// A credential was just typed into this pane's connection (by Arbiter).
+    pub fn note_credential_typed(&self) {
+        self.credential_typed.store(true, Ordering::Relaxed);
+    }
+
+    /// Reader: ssh asked again, or denied access, after a credential was typed. True
+    /// once per typed credential, so the UI is asked to re-ask exactly once for it.
+    pub fn note_credential_rejected(&self) -> bool {
+        if !self.credential_typed.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        self.reask_wanted.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Reader: the connection ended abnormally and this pane should be reconnected.
+    /// Honoured once per ESTABLISHED connection (see `retry_spent`): one whose login
+    /// was seen, or that prompted, or that ran at least `min_connection` without ssh
+    /// saying the host was unreachable. That last clause matters: a connect that times
+    /// out runs for as long as ssh waits, and must not count as a session that dropped,
+    /// or an unreachable host would be retried for as long as it stays down.
+    pub fn request_retry(&self, min_connection: Duration) -> bool {
+        let since = self.remote_since_ms.load(Ordering::Relaxed);
+        let lasted = since != 0 && now_ms().saturating_sub(since) >= min_connection.as_millis() as u64;
+        let established = self.login_seen.load(Ordering::Relaxed)
+            || self.prompted_this_connection.load(Ordering::Relaxed)
+            || (lasted && !self.connect_failed.load(Ordering::Relaxed));
+        if !established || self.retry_spent.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        self.retry_wanted.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// When the current connection was detected (ms since epoch), 0 if not remote.
+    /// Identifies a connection, so a timer armed for one cannot act on the next.
+    pub fn remote_since_ms(&self) -> u64 {
+        self.remote_since_ms.load(Ordering::Relaxed)
+    }
+
+    /// UI: take a pending reconnect request.
+    pub fn take_retry_wanted(&self) -> bool {
+        self.retry_wanted.swap(false, Ordering::Relaxed)
+    }
+
+    /// UI: take a pending re-ask request.
+    pub fn take_reask_wanted(&self) -> bool {
+        self.reask_wanted.swap(false, Ordering::Relaxed)
+    }
+
+    /// Reader: the REMOTE shell reported its working directory.
+    pub fn note_remote_cwd(&self, path: String) {
+        self.set_remote_cwd(Some(path));
+        self.remote_cwd_reported.store(true, Ordering::Relaxed);
+    }
+
+    /// Where the far shell now is, as inferred (a `cd` typed there, a fresh login's home,
+    /// a follow-up's `cd`). `None` when a `cd` made it unknowable.
+    pub fn set_remote_cwd(&self, path: Option<String>) {
+        let mut cur = self.remote_cwd.lock().unwrap();
+        *self.remote_cwd_prev.lock().unwrap() = cur.clone();
+        *cur = path;
+    }
+
+    /// The far shell rejected the `cd` that produced the current value: go back.
+    pub fn revert_remote_cwd(&self) {
+        if let Some(prev) = self.remote_cwd_prev.lock().unwrap().take() {
+            *self.remote_cwd.lock().unwrap() = Some(prev);
+        }
+    }
+
+    /// The far host's last reported working directory, if its shell ever reported one.
+    pub fn remote_cwd(&self) -> Option<String> {
+        self.remote_cwd.lock().unwrap().clone()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_remote_cwd(&self, path: Option<&str>) {
+        *self.remote_cwd.lock().unwrap() = path.map(str::to_string);
+    }
+
+    /// Whether the far host has reported a directory on the current connection, which
+    /// is how the user can tell the snippet took.
+    pub fn remote_cwd_reported(&self) -> bool {
+        self.remote_cwd_reported.load(Ordering::Relaxed)
+    }
+
+    /// Whether Claude is (or, for an ended connection, was) running on the far side, by
+    /// either witness. This is what the saved layout carries for a remote pane.
+    pub fn remote_claude(&self) -> bool {
+        self.on_screen()
+            || self.remote_claude_typed.load(Ordering::Relaxed)
+            || self.remote_claude_pending.load(Ordering::Relaxed)
+    }
+
+    /// Take the "resume Claude on the next connection" flag.
+    pub fn take_remote_claude_pending(&self) -> bool {
+        self.remote_claude_pending.swap(false, Ordering::Relaxed)
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_remote_claude(&self, pending: bool) {
+        self.remote_claude_pending.store(pending, Ordering::Relaxed);
     }
 
     /// Record a command the user submitted in this pane, if it invokes a remote client.
@@ -234,6 +491,10 @@ impl ClaudeHandle {
             return false;
         }
         *self.startup_cmd.lock().unwrap() = Some(cmd.to_string());
+        // A pane with a remote startup command was remote, whether or not its ssh has
+        // been seen running yet. This is what lets a connection that fails before the
+        // process scan catches it still offer Reconnect.
+        self.was_remote.store(true, Ordering::Relaxed);
         true
     }
 
@@ -263,9 +524,25 @@ impl ClaudeHandle {
     /// on the very next chunk (the returning shell prompt).
     pub fn note_screen(&self, chrome: bool) {
         if chrome {
-            self.on_screen.store(true, Ordering::Relaxed);
-        } else if !self.activity_fresh() {
-            self.on_screen.store(false, Ordering::Relaxed);
+            if !self.on_screen.swap(true, Ordering::Relaxed) {
+                SAVE_DIRTY.store(true, Ordering::Relaxed);
+                crate::claude_shim::debug_log("remote claude: chrome on screen");
+            }
+            // Claude's own UI on screen means the login is long done.
+            self.note_login_evidence();
+        } else if !self.activity_fresh() && self.on_screen.swap(false, Ordering::Relaxed) {
+            // Its screen went away with no turn in flight: Claude exited, whatever was typed.
+            self.remote_claude_typed.store(false, Ordering::Relaxed);
+            SAVE_DIRTY.store(true, Ordering::Relaxed);
+            crate::claude_shim::debug_log("remote claude: chrome left the screen");
+        }
+    }
+
+    /// Keyboard: `claude` was typed at the far prompt (`true`), or another command was
+    /// typed at a shell prompt (`false`), which is only possible once Claude has exited.
+    pub fn set_remote_claude_typed(&self, typed: bool) {
+        if self.remote_claude_typed.swap(typed, Ordering::Relaxed) != typed {
+            SAVE_DIRTY.store(true, Ordering::Relaxed);
         }
     }
 
@@ -727,6 +1004,195 @@ mod tests {
         h.set_remote(false);
         assert!(!h.is_remote());
         assert!(!h.on_screen());
+    }
+
+    // Leaving a session with `exit` makes the pane local again: no Reconnect, nothing to
+    // replay on the next launch, and the next `ssh` typed defines a new connection.
+    #[test]
+    fn leaving_a_session_forgets_the_connection() {
+        let h = handle();
+        h.note_command("ssh mini".into());
+        h.set_remote(true);
+        h.note_credential_prompt();
+        h.note_remote_cwd("/home/tre/src".into());
+        h.note_screen(true);
+        h.set_remote(false);
+        h.forget_connection();
+        assert!(h.startup_cmd().is_none());
+        assert!(!h.was_remote());
+        assert_eq!(h.prompts_for_credential(), None);
+        assert!(h.remote_cwd().is_none());
+        assert!(!h.remote_claude());
+        // The next connection latches afresh.
+        h.note_command("ssh other".into());
+        h.set_remote(true);
+        assert_eq!(h.startup_cmd().as_deref(), Some("ssh other"));
+        assert!(h.was_remote());
+    }
+
+    // A restored pane whose ssh fails before the process scan sees it still has to
+    // offer Reconnect, so the saved command alone marks the pane as having been remote.
+    #[test]
+    fn a_seeded_startup_command_marks_the_pane_remote() {
+        let h = handle();
+        assert!(!h.was_remote());
+        assert!(h.set_startup_cmd("ssh mini"));
+        assert!(h.was_remote());
+        assert!(!h.is_remote(), "seeding does not pretend the connection is up");
+    }
+
+    // One automatic retry per established connection, none for a refusal that never got
+    // established, and a fresh one once the next connection is up.
+    #[test]
+    fn a_dropped_connection_earns_one_retry() {
+        let h = handle();
+        assert!(!h.request_retry(Duration::ZERO), "never connected: nothing to retry");
+        h.set_remote(true);
+        assert!(!h.request_retry(Duration::from_secs(3600)), "too short to count as established");
+        assert!(h.request_retry(Duration::ZERO));
+        assert!(h.take_retry_wanted());
+        assert!(!h.take_retry_wanted(), "taken once");
+        assert!(!h.request_retry(Duration::ZERO), "the one retry is spent");
+        h.set_remote(true);
+        assert!(h.request_retry(Duration::ZERO), "a new connection earns another");
+    }
+
+    // A connect that times out keeps ssh running for as long as it waits, which is not
+    // a session that dropped. Without this rule an unreachable host was retried for as
+    // long as it stayed down.
+    #[test]
+    fn an_attempt_that_never_reached_the_host_earns_no_retry() {
+        let h = handle();
+        h.set_remote(true);
+        h.note_connect_failure();
+        assert!(!h.request_retry(Duration::ZERO), "long, but never up");
+        // Evidence of a real session outranks the duration rule either way.
+        let h = handle();
+        h.set_remote(true);
+        h.note_login_evidence();
+        assert!(h.request_retry(Duration::from_secs(3600)), "logged in: a drop, however quick");
+        let h = handle();
+        h.set_remote(true);
+        h.note_credential_prompt();
+        assert!(h.request_retry(Duration::from_secs(3600)), "reached the prompt: the host was up");
+    }
+
+    // Inferred directories can be undone when the far shell rejects the cd, but a
+    // reported one (the snippet) is never second-guessed by the caller.
+    #[test]
+    fn a_rejected_cd_restores_the_previous_directory() {
+        let h = handle();
+        h.set_remote_cwd(Some("~".into()));
+        h.set_remote_cwd(Some("~/Do".into()));
+        h.revert_remote_cwd();
+        assert_eq!(h.remote_cwd().as_deref(), Some("~"));
+        h.revert_remote_cwd();
+        assert_eq!(h.remote_cwd().as_deref(), Some("~"), "nothing further to undo");
+    }
+
+    // The directory outlives the connection (Reconnect and restore need it); the
+    // "reported on this connection" fact does not.
+    #[test]
+    fn the_remote_directory_survives_the_connection_ending() {
+        let h = handle();
+        h.set_remote(true);
+        h.note_remote_cwd("/home/tre/src".into());
+        assert!(h.remote_cwd_reported());
+        h.set_remote(false);
+        assert_eq!(h.remote_cwd().as_deref(), Some("/home/tre/src"));
+        assert!(!h.remote_cwd_reported());
+    }
+
+    // Claude still on screen when the connection ends is what the next connection
+    // resumes; a Claude that had already exited is not.
+    #[test]
+    fn a_far_claude_alive_at_the_drop_is_resumed_next_time() {
+        let h = handle();
+        h.set_remote(true);
+        h.note_screen(true);
+        assert!(h.remote_claude());
+        h.set_remote(false);
+        assert!(h.remote_claude(), "pending for the next connection");
+        assert!(h.take_remote_claude_pending());
+        assert!(!h.take_remote_claude_pending(), "taken once");
+
+        let h = handle();
+        h.set_remote(true);
+        h.note_screen(true);
+        h.note_screen(false); // Claude exited at the remote prompt
+        h.set_remote(false);
+        assert!(!h.remote_claude());
+
+        // A stale pending flag does not survive a new connection being detected.
+        let h = handle();
+        h.seed_remote_claude(true);
+        h.set_remote(true);
+        assert!(!h.take_remote_claude_pending());
+    }
+
+    // The keyboard is a second witness: `claude` typed at the far prompt counts as
+    // running until another command is typed at a shell prompt, or its chrome leaves.
+    #[test]
+    fn claude_typed_at_the_far_prompt_counts_as_running() {
+        let h = handle();
+        h.set_remote(true);
+        h.set_remote_claude_typed(true);
+        assert!(h.remote_claude());
+        h.set_remote(false);
+        assert!(h.take_remote_claude_pending(), "resumed on the next connection");
+
+        let h = handle();
+        h.set_remote(true);
+        h.set_remote_claude_typed(true);
+        h.set_remote_claude_typed(false); // `ls` at the shell prompt: Claude has exited
+        h.set_remote(false);
+        assert!(!h.remote_claude());
+
+        let h = handle();
+        h.set_remote(true);
+        h.set_remote_claude_typed(true);
+        h.note_screen(true);
+        h.note_screen(false); // chrome gone with no turn in flight
+        assert!(!h.remote_claude(), "the screen outranks what was typed");
+    }
+
+    // What is known about a connection's prompting: unknown until seen; a prompt during
+    // login says yes; a login completing with no prompt says no; a prompt after the login
+    // (a nested ssh on the far host) says nothing about this connection.
+    #[test]
+    fn learns_whether_a_connection_prompts() {
+        let h = handle();
+        assert_eq!(h.prompts_for_credential(), None);
+        h.set_remote(true);
+        h.note_credential_prompt();
+        assert_eq!(h.prompts_for_credential(), Some(true));
+        assert!(h.note_login_evidence(), "first evidence on this connection");
+        assert!(!h.note_login_evidence(), "only the first counts");
+        assert_eq!(h.prompts_for_credential(), Some(true), "it did prompt");
+
+        let h = handle();
+        h.set_remote(true);
+        assert!(h.note_login_evidence());
+        assert_eq!(h.prompts_for_credential(), Some(false));
+        h.note_credential_prompt(); // a nested ssh, after login
+        assert_eq!(h.prompts_for_credential(), Some(false));
+
+        let h = handle();
+        assert!(!h.note_login_evidence(), "not remote: no connection to speak of");
+        assert_eq!(h.prompts_for_credential(), None);
+    }
+
+    // A typed credential followed by another prompt (or a denial) is a rejection, and
+    // is reported once per typed credential.
+    #[test]
+    fn a_repeated_prompt_after_typing_is_a_rejection() {
+        let h = handle();
+        assert!(!h.note_credential_rejected(), "nothing was typed");
+        h.note_credential_typed();
+        assert!(h.note_credential_rejected());
+        assert!(h.take_reask_wanted());
+        assert!(!h.note_credential_rejected(), "already reported for that credential");
+        assert!(!h.take_reask_wanted());
     }
 
     #[test]

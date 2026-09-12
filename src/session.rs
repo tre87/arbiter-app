@@ -98,6 +98,362 @@ impl StartupGate {
     }
 }
 
+/// A credential a restored pane will type at ssh's prompt, held in memory only.
+///
+/// Deliberately not a `String`: it carries a redacting `Debug` so it cannot be printed
+/// into a log or a panic message by accident, and it overwrites its bytes on drop. That
+/// last part is best-effort rather than a guarantee, since the plain `String` the dialog
+/// collected still exists in the UI's own state until that is cleared.
+pub struct Secret(Vec<u8>);
+
+impl Secret {
+    pub fn new(s: &str) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The secret plus the Return that submits it.
+    fn line(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.0.len() + 1);
+        out.extend_from_slice(&self.0);
+        out.push(b'\r');
+        out
+    }
+
+    /// A second copy, for arming another pane from the same vault entry. Deliberately
+    /// not `Clone`: every copy of a secret should be a visible decision.
+    pub fn duplicate(&self) -> Secret {
+        Secret(self.0.clone())
+    }
+}
+
+/// An armed credential and when it was armed, so an earlier arm's expiry cannot
+/// disarm a later one.
+type Armed = Arc<Mutex<Option<(Secret, Instant)>>>;
+
+/// How long an armed credential is held. ssh either prompts within seconds or never
+/// (the key is in an agent), and after this nothing on the pane can be assumed to be
+/// this connection's login any more.
+const ARM_WINDOW: Duration = Duration::from_secs(90);
+
+/// ssh's exit status for every connection-level failure (refused, reset, timed out,
+/// host key changed), as distinct from whatever the remote shell exited with.
+const SSH_CONNECTION_FAILED: i32 = 255;
+
+/// A connection that lasted at least this long was established; one that died sooner
+/// was refused, and re-running it at once would only fail again.
+const RETRY_MIN_CONNECTION: Duration = Duration::from_secs(4);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Secret(<redacted>, {} bytes)", self.0.len())
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Whether `text` contains one of ssh's credential prompts.
+///
+/// The markers are the literal prompt forms both installed OpenSSH builds emit, captured
+/// by running them: the MSYS build names the key (`Enter passphrase for key '...'`), the
+/// native Windows build does not (`Enter passphrase: `), password auth is
+/// `<user>@<host>'s password:`, and keyboard-interactive is `(<user>@<host>) Password:`.
+///
+/// The password forms deliberately require their punctuation. Matching a bare "password"
+/// would fire on `cat /etc/passwd` or any output mentioning the word, and the consequence
+/// of a false match is typing a secret somewhere it does not belong.
+fn is_credential_prompt(text: &str) -> bool {
+    const PROMPTS: &[&str] = &["Enter passphrase", "'s password:", ") Password:"];
+    PROMPTS.iter().any(|p| text.contains(p))
+}
+
+/// Whether `text` carries ssh's final refusal. After a credential Arbiter typed, this
+/// means it was wrong (or the key was not accepted), and only the user can fix that.
+fn permission_denied(text: &str) -> bool {
+    text.contains("Permission denied")
+}
+
+/// Decode the body of an OSC-133 report: the idle state its letter implies (`A`/`D` =
+/// at a prompt, `B`/`C` = running a command) and the exit code a `D;<code>` carries.
+fn osc133(rest: &str) -> (Option<bool>, Option<i32>) {
+    let mut parts = rest.splitn(2, ';');
+    let idle = match parts.next().and_then(|s| s.chars().next()) {
+        Some('A') | Some('D') => Some(true),
+        Some('B') | Some('C') => Some(false),
+        _ => None,
+    };
+    let code = parts.next().and_then(|c| c.trim().parse::<i32>().ok());
+    (idle, code)
+}
+
+/// One OSC-7 report: the `file://` authority (empty for Arbiter's own emitters) and the
+/// percent-decoded path, before any platform fixup.
+struct Osc7 {
+    host: String,
+    path: String,
+}
+
+fn parse_osc7(payload: &str) -> Option<Osc7> {
+    let uri = payload.strip_prefix("7;")?.strip_prefix("file://")?;
+    let slash = uri.find('/')?;
+    Some(Osc7 { host: uri[..slash].to_string(), path: url_decode(&uri[slash..]) })
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Osc7Origin {
+    Local,
+    Remote,
+}
+
+/// Which machine an OSC-7 describes. Arbiter's own emitters leave the authority empty,
+/// so an empty host is local by construction; a named host is remote unless it is this
+/// machine (a third-party local emitter filling in `$HOST`). Only when the local name is
+/// unknown does the ssh flag decide. Timing alone would get it wrong: when ssh exits,
+/// the local prompt's OSC-7 arrives while that flag is still on.
+fn osc7_origin(host: &str, local_host: Option<&str>, ssh_active: bool) -> Osc7Origin {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return Osc7Origin::Local;
+    }
+    match local_host {
+        Some(local) if same_host(host, local) => Osc7Origin::Local,
+        Some(_) => Osc7Origin::Remote,
+        None if ssh_active => Osc7Origin::Remote,
+        None => Osc7Origin::Local,
+    }
+}
+
+/// First DNS label, case-insensitive: `Mini.local` and `mini` are the same box.
+fn same_host(a: &str, b: &str) -> bool {
+    let label = |h: &str| h.split('.').next().unwrap_or(h).to_ascii_lowercase();
+    label(a) == label(b)
+}
+
+/// This machine's hostname, looked up once. `None` if the OS cannot say.
+fn local_host_name() -> Option<&'static str> {
+    static HOST: OnceLock<Option<String>> = OnceLock::new();
+    HOST.get_or_init(sysinfo::System::host_name).as_deref()
+}
+
+/// The local form of a path the LOCAL shell reported. Windows shells report
+/// `/C:/Users/x`, which becomes `C:\Users\x`. A remote POSIX path must never come
+/// through here: stripping its leading slash is exactly what mangled it before.
+fn local_path(decoded: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let trimmed = decoded.strip_prefix('/').unwrap_or(decoded);
+        if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+            return trimmed.replace('/', "\\");
+        }
+        trimmed.to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        decoded.to_string()
+    }
+}
+
+/// What a restored or reconnected remote pane still has to do once its far shell is at
+/// a prompt: go back to the saved directory, then optionally bring Claude back there.
+///
+/// Typed only once the far shell is known to be reading input: on its OSC-7 report (the
+/// opt-in snippet) or, failing that, when its prompt is recognised on screen. Nothing is
+/// typed before either, because until then ssh itself may be the one reading, at a
+/// credential prompt.
+struct Followup {
+    dir: String,
+    resume_claude: bool,
+    /// The connection command itself carries the `cd` (see `remote::remote_launch_line`),
+    /// so the far shell starts in `dir` and only Claude is left to type.
+    cd_in_command: bool,
+}
+
+/// What to type at the far prompt for a follow-up, and the directory it changes into,
+/// if it does. `reported` is the directory the far shell itself announced, if it did:
+/// already being there, by report, by the command line, or because the directory is
+/// home, saves the `cd`. Claude comes back as `remote::CLAUDE_COMMAND` says.
+fn followup_line(f: Followup, reported: Option<&str>) -> Option<(Vec<u8>, Option<String>)> {
+    let there = f.cd_in_command
+        || reported == Some(f.dir.as_str())
+        || (f.dir == "~" && reported.is_none());
+    let claude = format!("({})", crate::remote::CLAUDE_COMMAND);
+    let line = match (there, f.resume_claude) {
+        (true, false) => return None,
+        (true, true) => format!("{claude}\r"),
+        (false, false) => format!("{}\r", cd_cmd(&f.dir)),
+        (false, true) => format!("{} && {claude}\r", cd_cmd(&f.dir)),
+    };
+    Some((line.into_bytes(), (!there).then_some(f.dir)))
+}
+
+/// `cd` into `dir` for the remote shell. Single quotes make every character literal (a
+/// quote itself is spliced in as `'\''`); a leading `~` stays outside them so the far
+/// shell expands it.
+fn cd_cmd(dir: &str) -> String {
+    let (tilde, rest) = match dir {
+        "~" => ("~", ""),
+        d => d.strip_prefix("~/").map_or(("", d), |r| ("~/", r)),
+    };
+    if rest.is_empty() {
+        return format!("cd {tilde}");
+    }
+    format!("cd {tilde}'{}'", rest.replace('\'', "'\\''"))
+}
+
+/// Characters a shell prompt ends with: sh/bash, zsh, root, PowerShell and fish, and the
+/// arrows the popular prompt themes use.
+const PROMPT_ENDINGS: &[char] = &['$', '%', '#', '>', '\u{276f}', '\u{bb}', '\u{203a}'];
+
+/// Whether a screen row reads as a shell prompt waiting for input: its last visible
+/// character is one a prompt ends with. Used only for a REMOTE shell without
+/// integration, once ssh is known to be running and its credential prompt is behind it,
+/// so a wrong guess costs a line typed a moment early, which the far tty buffers until
+/// its shell reads it.
+fn looks_like_prompt(row: &str) -> bool {
+    row.trim_end().chars().next_back().is_some_and(|c| PROMPT_ENDINGS.contains(&c))
+}
+
+/// The prompt ending and the command on a screen row: what follows the last prompt
+/// ending that has a space after it. `None` when the row shows no prompt at all. The
+/// ending tells a shell (`$`, `%`, `#`) from Claude's own input box (`>`, `❯`).
+fn command_on_row(row: &str) -> Option<(char, &str)> {
+    let mut best = None;
+    let mut chars = row.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if PROMPT_ENDINGS.contains(&c) && matches!(chars.peek(), Some((_, ' '))) {
+            best = Some((c, row[i + c.len_utf8() + 1..].trim()));
+        }
+    }
+    best
+}
+
+/// The `cd` a REMOTE command line performs, read from the screen row as the shell showed
+/// it when Enter was pressed (so completed and recalled text counts), against the
+/// directory the shell was in. `None`: not a `cd`. `Some(None)`: a `cd` whose target
+/// the text cannot tell (a variable, a glob, `cd -`). `Some(Some(dir))`: the new
+/// directory, `~`-relative or absolute.
+fn remote_cd(row: &str, base: &str) -> Option<Option<String>> {
+    let (_, cmd) = command_on_row(row)?;
+    let rest = cmd.strip_prefix("cd")?;
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    // Only the cd itself: `cd x && make` changes into x all the same.
+    let arg = rest.split([';', '&', '|']).next().unwrap_or("").trim();
+    if arg.is_empty() {
+        return Some(Some("~".to_string()));
+    }
+    let unquoted = arg
+        .strip_prefix('\'')
+        .and_then(|a| a.strip_suffix('\''))
+        .or_else(|| arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')));
+    let arg = unquoted.unwrap_or(arg);
+    let opaque = arg.is_empty()
+        || arg == "-"
+        || arg.chars().any(|c| matches!(c, '$' | '`' | '*' | '?' | '[' | '{' | '\\' | '"' | '\'' | '(' | ')' | '<' | '>'))
+        || (arg.starts_with('~') && arg != "~" && !arg.starts_with("~/"));
+    if opaque {
+        return Some(None);
+    }
+    let joined = if arg.starts_with('/') || arg.starts_with('~') {
+        arg.to_string()
+    } else {
+        format!("{base}/{arg}")
+    };
+    Some(normalize_remote_path(&joined))
+}
+
+/// Resolve `.` and `..` in a `~`-relative or absolute POSIX path. `None` if `..` would
+/// climb above `~`, whose parent cannot be known from here.
+fn normalize_remote_path(path: &str) -> Option<String> {
+    let (root, rest) = match path.strip_prefix('~') {
+        Some(r) => ("~", r),
+        None => ("", path),
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if out.pop().is_none() && root == "~" {
+                    return None;
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return Some(if root.is_empty() { "/".to_string() } else { root.to_string() });
+    }
+    let mut s = String::from(root);
+    for seg in out {
+        s.push('/');
+        s.push_str(seg);
+    }
+    Some(s)
+}
+
+/// The far shell reported a failed `cd`, in bash's or zsh's words, so the directory
+/// inferred from that `cd` is wrong.
+fn cd_failed(text: &str) -> bool {
+    text.contains("cd: ")
+        && ["o such file or directory", "ot a directory", "ermission denied"]
+            .iter()
+            .any(|m| text.contains(m))
+}
+
+/// ssh never reached the host, in its own words. An exit after one of these is a
+/// refusal, not a drop, however long the attempt took to time out.
+fn connect_failed(text: &str) -> bool {
+    [
+        "ssh: connect to host",
+        "ssh: Could not resolve hostname",
+        "kex_exchange_identification:",
+        "Connection closed by ",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
+/// The far shell is at a prompt, so the login is complete. Settles what the connection
+/// taught (see `ClaudeHandle::note_login_evidence`), releases a credential still held
+/// for it, records where the shell is (its home, unless it said otherwise), and types
+/// the pane's follow-up, if one is pending.
+fn remote_ready(
+    claude: &crate::claude_status::ClaudeHandle,
+    credential: &Armed,
+    followup: &Mutex<Option<Followup>>,
+    writer_tx: &std::sync::mpsc::Sender<Vec<u8>>,
+    reported: Option<&str>,
+) {
+    let pending = followup.lock().unwrap().take();
+    if claude.note_login_evidence() {
+        *credential.lock().unwrap() = None;
+        if reported.is_none() && !claude.remote_cwd_reported() {
+            // Where the far shell is: where its command line put it, else home.
+            let now = pending.as_ref().filter(|f| f.cd_in_command).map_or("~", |f| f.dir.as_str());
+            claude.set_remote_cwd(Some(now.to_string()));
+        }
+    }
+    // Claude already has the keyboard (its own screen is up), so nothing may be typed:
+    // it would land in the conversation. Whatever was pending is simply dropped.
+    if claude.on_screen() {
+        return;
+    }
+    if let Some((line, dir)) = pending.and_then(|f| followup_line(f, reported)) {
+        let _ = writer_tx.send(line);
+        if dir.is_some() {
+            claude.set_remote_cwd(dir);
+        }
+    }
+}
+
 /// UI redraw hook: a PTY reader calls this after feeding new output so the UI can
 /// redraw *on output* instead of polling the grid every frame. The iced shell wires
 /// it to a redraw message at startup; it's a no-op until then (early output is covered
@@ -146,6 +502,11 @@ pub struct Session {
     exited: Arc<AtomicBool>,
     /// Holds a queued startup command until this pane can safely be typed into.
     startup: Arc<StartupGate>,
+    /// A credential to type once at this pane's next ssh prompt, if the user supplied
+    /// one for its restored connection. Memory only, taken on first use.
+    credential: Armed,
+    /// What to type once the far shell is at a prompt (see `Followup`).
+    followup: Arc<Mutex<Option<Followup>>>,
     /// The input line being typed. Fed only from real keystrokes (see `note_typed`),
     /// so PTY query replies and program output can never pollute it. The submitted
     /// commands it yields live on the `ClaudeHandle`, which the busy-edge monitor also
@@ -198,6 +559,11 @@ impl Session {
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
         let exited = Arc::new(AtomicBool::new(false));
         let startup = Arc::new(StartupGate::new(writer_tx.clone()));
+        let credential: Armed = Arc::new(Mutex::new(None));
+        // The exit code of the last command the LOCAL shell ran (`OSC 133;D;<code>`),
+        // read only by the reader, which is what decides whether a drop earns a retry.
+        let last_exit: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let followup: Arc<Mutex<Option<Followup>>> = Arc::new(Mutex::new(None));
 
         // Shared Claude status, updated by the capture/hook watcher (registered
         // here so it routes by cwd / session id) + the reader (spinner/menu →
@@ -222,10 +588,12 @@ impl Session {
             let writer_tx = writer_tx.clone();
             let exited = exited.clone();
             let startup = startup.clone();
+            let credential = credential.clone();
+            let followup = followup.clone();
             std::thread::spawn(move || {
                 reader_loop(
                     reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch,
-                    exited, startup,
+                    exited, startup, credential, last_exit, followup,
                 )
             });
         }
@@ -254,6 +622,8 @@ impl Session {
             claude,
             exited,
             startup,
+            credential,
+            followup,
             typed_line: Arc::new(Mutex::new(TypedLine::default())),
             _watcher: watcher,
             _child: child,
@@ -299,7 +669,19 @@ impl Session {
         if !self.set_startup_cmd(cmd) {
             return false;
         }
-        self.startup.queue(cmd);
+        // What is remembered is the line as saved. What is typed may carry the saved
+        // remote directory, and Claude, in the connection itself, which then has nothing
+        // to type after connecting; where that is not possible the follow-up types them.
+        let mut line = cmd.to_string();
+        if let Some(f) = self.followup.lock().unwrap().as_mut() {
+            let chained = crate::remote::remote_launch_line(cmd, Some(&f.dir), f.resume_claude);
+            if let Some(chained) = chained {
+                line = chained;
+                f.cd_in_command = true;
+                f.resume_claude = false;
+            }
+        }
+        self.startup.queue(&line);
 
         // Last resort for a pane that never reports itself ready, which in practice means
         // shell integration is broken (no OSC-133 at all). One sleep, not a poll: the
@@ -317,6 +699,140 @@ impl Session {
     /// metrics, so it is where the real size is applied).
     pub fn startup_gate(&self) -> Arc<StartupGate> {
         self.startup.clone()
+    }
+
+    /// Arm this pane to answer ONE ssh credential prompt with `secret`.
+    ///
+    /// Only meaningful alongside a queued startup command: the pane is armed just before
+    /// its connection is replayed, and disarms the moment it answers a prompt or the
+    /// command ends, so the window in which anything could be typed is the connection
+    /// itself and nothing more. An empty secret arms nothing, which is how "I will type
+    /// this one myself" is expressed.
+    pub fn arm_credential(&self, secret: Secret) {
+        if secret.is_empty() {
+            return;
+        }
+        let armed_at = Instant::now();
+        *self.credential.lock().unwrap() = Some((secret, armed_at));
+        // Expiry. One sleep, not a poll: by the time it fires the credential has almost
+        // always been consumed or dropped already, and this is a no-op. A later arm is
+        // left alone, which is what the timestamp is for.
+        let credential = self.credential.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(ARM_WINDOW);
+            let mut slot = credential.lock().unwrap();
+            if slot.as_ref().is_some_and(|(_, at)| *at == armed_at) {
+                *slot = None;
+            }
+        });
+    }
+
+    /// Type `secret` into this pane's connection right now, for a re-asked credential
+    /// whose prompt is already on screen. Refused unless the local shell is running a
+    /// remote client: had ssh given up in the meantime, the bytes would land on the
+    /// local prompt, echoed and written to history.
+    pub fn send_credential_now(&self, secret: Secret) -> bool {
+        if secret.is_empty() || self.shell_idle() != Some(false) || !self.is_remote() {
+            return false;
+        }
+        let _ = self.writer_tx.send(secret.line());
+        self.claude.note_credential_typed();
+        true
+    }
+
+    /// Queue what to type once the far shell is at its prompt after the next connection:
+    /// `cd` into `dir`, then `claude -c` if `resume_claude`. Set right before
+    /// `queue_startup_cmd`. Nothing happens unless the far shell reports its directory.
+    pub fn set_followup(&self, dir: &str, resume_claude: bool) {
+        *self.followup.lock().unwrap() =
+            Some(Followup { dir: dir.to_string(), resume_claude, cd_in_command: false });
+    }
+
+    /// Enter was pressed with `row` on screen. In a far shell without integration, a
+    /// `cd` typed there is the only way to know where the shell went, so it is followed
+    /// here (see `remote_cd`). Ignored when Claude has the keyboard, or when the far
+    /// shell reports its directory itself and will say so more reliably.
+    pub fn note_remote_line(&self, row: &str) {
+        if !self.is_remote() || self.claude_running() {
+            return;
+        }
+        let Some((ending, cmd)) = command_on_row(row) else { return };
+        // `claude` typed at the far prompt is Claude running there, even if its screen is
+        // never recognised; any other command typed at a shell prompt (`$`, `%`, `#`,
+        // which Claude's own `>` box never shows) means it is not.
+        let word = cmd.split_whitespace().next().unwrap_or("");
+        if word == "claude" || word.ends_with("/claude") {
+            self.claude.set_remote_claude_typed(true);
+        } else if matches!(ending, '$' | '%' | '#') {
+            self.claude.set_remote_claude_typed(false);
+        }
+        if self.claude.remote_cwd_reported() {
+            return;
+        }
+        let base = self.remote_cwd().unwrap_or_else(|| "~".to_string());
+        if let Some(target) = remote_cd(row, &base) {
+            self.claude.set_remote_cwd(target);
+        }
+    }
+
+    /// Whether the header should offer Reconnect: the shell has exited, or this was a
+    /// remote pane whose connection is not up AND whose shell is not busy making one.
+    /// The busy half keeps the button from flashing while a restored pane connects.
+    pub fn show_reconnect(&self) -> bool {
+        self.exited()
+            || (self.claude.was_remote() && !self.is_remote() && self.shell_idle() != Some(false))
+    }
+
+    /// What is known about whether this pane's connection asks for a credential:
+    /// `None` never observed, `Some(true)` it prompted, `Some(false)` it logged in
+    /// without prompting.
+    pub fn prompts_for_credential(&self) -> Option<bool> {
+        self.claude.prompts_for_credential()
+    }
+
+    /// Seed from a saved layout.
+    pub fn set_prompts_for_credential(&self, prompts: Option<bool>) {
+        self.claude.set_prompts_for_credential(prompts);
+    }
+
+    /// The far host's working directory, if its shell has ever reported one.
+    pub fn remote_cwd(&self) -> Option<String> {
+        self.claude.remote_cwd()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_remote_cwd(&self, path: Option<&str>) {
+        self.claude.seed_remote_cwd(path);
+    }
+
+    /// Whether the far shell has reported its directory on the current connection.
+    pub fn remote_cwd_reported(&self) -> bool {
+        self.claude.remote_cwd_reported()
+    }
+
+    /// Claude is, or when the connection ended was, running on the far side.
+    pub fn remote_claude(&self) -> bool {
+        self.claude.remote_claude()
+    }
+
+    /// Take the "resume Claude on the next connection" flag.
+    pub fn take_remote_claude_pending(&self) -> bool {
+        self.claude.take_remote_claude_pending()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_remote_claude(&self, pending: bool) {
+        self.claude.seed_remote_claude(pending);
+    }
+
+    /// UI: this pane's connection dropped and should be re-run once (taken).
+    pub fn take_retry_wanted(&self) -> bool {
+        self.claude.take_retry_wanted()
+    }
+
+    /// UI: the credential typed into this pane was rejected; ask again (taken).
+    pub fn take_reask_wanted(&self) -> bool {
+        self.claude.take_reask_wanted()
     }
 
     /// The command to replay to rebuild this pane, if there is one.
@@ -529,6 +1045,9 @@ fn reader_loop(
     cmd_epoch: CmdEpoch,
     exited: Arc<AtomicBool>,
     startup: Arc<StartupGate>,
+    credential: Armed,
+    last_exit: Arc<Mutex<Option<i32>>>,
+    followup: Arc<Mutex<Option<Followup>>>,
 ) {
     let claude_running = claude.claude_running.clone();
     let mut buf = [0u8; 8192];
@@ -620,6 +1139,11 @@ fn reader_loop(
                 claude_running.load(Ordering::Relaxed)
             ));
         }
+        // The login is known to be over (see `ClaudeHandle::note_login_evidence`), so a
+        // credential still held for it cannot be meant for anything on this pane.
+        if claude.login_seen() {
+            *credential.lock().unwrap() = None;
+        }
         if claude_running.load(Ordering::Relaxed) || claude.on_screen() {
             // Attention: a menu/approval prompt on the rendered screen (level-based,
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
@@ -646,16 +1170,52 @@ fn reader_loop(
         // Separately scan for OSC-7 (cwd) + OSC-133 (busy/idle), which the grid
         // doesn't surface.
         let text = unsafe { std::str::from_utf8_unchecked(valid) };
+
+        // ssh's credential prompt. An ARMED pane (a connection whose credential the user
+        // supplied) answers it once, then disarms; a prompt after that answer, or a
+        // denial, means the answer was wrong and the UI is asked to re-ask.
+        //
+        // The `shell_idle == Some(false)` guard is the load-bearing safety rule, not a
+        // nicety: it means a command is running, so the shell is not reading a command
+        // line. Were a prompt pattern ever to match while the shell sat at its prompt,
+        // the secret would be echoed on screen AND written into this pane's private
+        // command-history file. `shell_idle` is read from BEFORE this chunk's own OSC
+        // scan below, which is the state the output was produced under.
+        if *shell_idle.lock().unwrap() == Some(false) {
+            // Once the login is known complete, a further prompt or denial belongs to
+            // something else on the far host (a nested ssh, a `cd` into a forbidden
+            // directory) and says nothing about this connection's credential.
+            if is_credential_prompt(text) && claude.startup_cmd().is_some() {
+                claude.note_credential_prompt();
+                match credential.lock().unwrap().take() {
+                    Some((secret, _)) => {
+                        let _ = writer_tx.send(secret.line());
+                        claude.note_credential_typed();
+                    }
+                    None if !claude.login_seen() => {
+                        claude.note_credential_rejected();
+                    }
+                    None => {}
+                }
+            } else if !claude.login_seen() && permission_denied(text) {
+                claude.note_credential_rejected();
+            }
+            if connect_failed(text) {
+                claude.note_connect_failure();
+            }
+            if claude.is_remote() && !claude.remote_cwd_reported() && cd_failed(text) {
+                claude.revert_remote_cwd();
+            }
+        }
         for ch in text.chars() {
             if in_osc {
                 if ch == '\x07' || (osc.ends_with('\x1b') && ch == '\\') {
                     let payload = if osc.ends_with('\x1b') { &osc[..osc.len() - 1] } else { &osc };
                     if let Some(rest) = payload.strip_prefix("133;") {
-                        let idle = match rest.chars().next() {
-                            Some('A') | Some('D') => Some(true),
-                            Some('B') | Some('C') => Some(false),
-                            _ => None,
-                        };
+                        let (idle, code) = osc133(rest);
+                        if code.is_some() {
+                            *last_exit.lock().unwrap() = code;
+                        }
                         if let Some(idle) = idle {
                             *shell_idle.lock().unwrap() = Some(idle);
                             if prev_idle != Some(idle) {
@@ -672,6 +1232,10 @@ fn reader_loop(
                                     // The PTY is being read. If the pane has also been
                                     // resized, this releases any queued startup command.
                                     startup.note_prompt();
+                                    // The command that needed a credential has ended, so
+                                    // stop holding one. Bounds the armed window to the
+                                    // connection itself.
+                                    *credential.lock().unwrap() = None;
                                     // Prompt returned → the foreground command
                                     // (incl. Claude, or an ssh session) ended.
                                     let was = claude_running.swap(false, Ordering::Relaxed);
@@ -688,9 +1252,43 @@ fn reader_loop(
                                     // anyway; doing it on the edge means the dot goes out the
                                     // moment the session ends rather than on the next output.
                                     if claude.is_remote() {
+                                        let code = *last_exit.lock().unwrap();
+                                        // ssh's own failure code after a session that was
+                                        // up is a drop: not a refusal, not an `exit`. Worth
+                                        // one automatic re-run, which the UI performs.
+                                        if code == Some(SSH_CONNECTION_FAILED) {
+                                            claude.request_retry(RETRY_MIN_CONNECTION);
+                                        }
+                                        // Ended before the far shell ever showed a prompt,
+                                        // with the command's own status rather than ssh's:
+                                        // the `cd` the connection carried failed, so that
+                                        // directory is gone. Forget it, or every reconnect
+                                        // would fail the same way.
+                                        let chained = followup
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .is_some_and(|f| f.cd_in_command);
+                                        if chained
+                                            && !claude.login_seen()
+                                            && code.is_some_and(|c| c != 0 && c != SSH_CONNECTION_FAILED)
+                                        {
+                                            claude.set_remote_cwd(None);
+                                        }
+                                        // A session that was up and ended with the far
+                                        // shell's own status was ended by the user (`exit`),
+                                        // not lost. The pane is a local shell again.
+                                        let left = claude.login_seen()
+                                            && code.is_some_and(|c| c != SSH_CONNECTION_FAILED);
                                         claude.set_remote(false);
+                                        if left {
+                                            claude.forget_connection();
+                                        }
                                         crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
                                     }
+                                    // Whatever was to be typed at the far prompt has no far
+                                    // prompt to go to any more.
+                                    *followup.lock().unwrap() = None;
                                     // A command just finished — it may have changed
                                     // files, so refresh the git status.
                                     recompute_git(cwd.clone(), git.clone());
@@ -703,15 +1301,30 @@ fn reader_loop(
                             }
                         }
                     }
-                    if let Some(path) = parse_osc7_uri(payload) {
-                        let changed = prev_cwd.as_ref() != Some(&path);
-                        *cwd.lock().unwrap() = Some(path.clone());
-                        if changed {
-                            prev_cwd = Some(path.clone());
-                            recompute_git(cwd.clone(), git.clone());
-                            // Re-point the FS watcher at the new repo so external
-                            // edits (made outside the terminal) refresh git too.
-                            repoint_watcher(&watcher, &cwd, &git, path);
+                    if let Some(report) = parse_osc7(payload) {
+                        match osc7_origin(&report.host, local_host_name(), claude.is_remote()) {
+                            Osc7Origin::Remote => {
+                                claude.note_remote_cwd(report.path.clone());
+                                remote_ready(
+                                    &claude,
+                                    &credential,
+                                    &followup,
+                                    &writer_tx,
+                                    Some(&report.path),
+                                );
+                            }
+                            Osc7Origin::Local => {
+                                let path = local_path(&report.path);
+                                let changed = prev_cwd.as_ref() != Some(&path);
+                                *cwd.lock().unwrap() = Some(path.clone());
+                                if changed {
+                                    prev_cwd = Some(path.clone());
+                                    recompute_git(cwd.clone(), git.clone());
+                                    // Re-point the FS watcher at the new repo so external
+                                    // edits (made outside the terminal) refresh git too.
+                                    repoint_watcher(&watcher, &cwd, &git, path);
+                                }
+                            }
                         }
                     }
                     osc.clear();
@@ -731,6 +1344,22 @@ fn reader_loop(
                 in_osc = true;
             } else {
                 osc.clear();
+            }
+        }
+
+        // A far shell without integration announces nothing, so its first prompt is
+        // recognised on screen instead (see `looks_like_prompt`). Only while the login
+        // is unconfirmed, never while a credential is still to be typed, and for a
+        // connection known to prompt not before that prompt has been seen: a pre-login
+        // banner line must not pass for the prompt.
+        if claude.is_remote()
+            && !claude.login_seen()
+            && credential.lock().unwrap().is_none()
+            && (claude.prompts_for_credential() != Some(true) || claude.prompted_this_connection())
+        {
+            let row = term.lock().unwrap().cursor_row_text();
+            if looks_like_prompt(&row) {
+                remote_ready(&claude, &credential, &followup, &writer_tx, None);
             }
         }
     }
@@ -901,6 +1530,18 @@ fn claude_monitor(
             if crate::claude::ssh_under(shell_pid) {
                 claude.set_remote(true);
                 crate::claude_shim::debug_log(&format!("claude_monitor: ssh on shell_pid={shell_pid}"));
+                // A connection still up when the arm window closes, having never
+                // prompted, logged in without a credential. Learned here because a far
+                // host without the snippet and without Claude offers no other evidence.
+                // One sleep, not a poll; checks it is still the same connection.
+                let since = claude.remote_since_ms();
+                let claude = claude.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(ARM_WINDOW);
+                    if claude.remote_since_ms() == since {
+                        claude.note_login_evidence();
+                    }
+                });
                 break;
             }
             if *shell_idle.lock().unwrap() == Some(true) {
@@ -912,30 +1553,6 @@ fn claude_monitor(
             std::thread::sleep(delay);
             delay = (delay * 2).min(Duration::from_secs(2)); // 250ms → 500ms → 1s → 2s cap
         }
-    }
-}
-
-fn parse_osc7_uri(payload: &str) -> Option<String> {
-    let uri = payload.strip_prefix("7;")?;
-    let path_part = uri.strip_prefix("file://")?;
-    let path = if path_part.starts_with('/') {
-        path_part.to_string()
-    } else {
-        let idx = path_part.find('/')?;
-        path_part[idx..].to_string()
-    };
-    let decoded = url_decode(&path);
-    #[cfg(target_os = "windows")]
-    {
-        let trimmed = decoded.strip_prefix('/').unwrap_or(&decoded);
-        if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
-            return Some(trimmed.replace('/', "\\"));
-        }
-        Some(trimmed.to_string())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Some(decoded)
     }
 }
 
@@ -1033,6 +1650,47 @@ mod tests {
         g.note_resized();
         g.send();
         assert_eq!(sent(&rx), None, "must not repeat");
+    }
+
+    // The five prompt forms, transcribed from running both installed OpenSSH builds.
+    #[test]
+    fn recognises_every_ssh_credential_prompt() {
+        use super::is_credential_prompt;
+        assert!(is_credential_prompt("Enter passphrase for key '/c/Users/TRE/.ssh/id_ed25519': "));
+        assert!(is_credential_prompt("Enter passphrase for \"C:\\Users\\TRE\\.ssh\\id_ed25519\": "));
+        assert!(is_credential_prompt("Enter passphrase: "));
+        assert!(is_credential_prompt("tre@10.0.0.16's password: "));
+        assert!(is_credential_prompt("(tre@10.0.0.16) Password: "));
+        // Prompts arrive mid-chunk, after other output.
+        assert!(is_credential_prompt("Last login: Tue\r\ntre@10.0.0.16's password: "));
+    }
+
+    // A false match means typing a secret somewhere it does not belong, so the near
+    // misses matter more than the hits.
+    #[test]
+    fn ordinary_output_is_not_a_credential_prompt() {
+        use super::is_credential_prompt;
+        assert!(!is_credential_prompt("PS C:\\Users\\TRE> "));
+        assert!(!is_credential_prompt("tre ~ $ "));
+        // The bare word, which is why the markers carry their punctuation.
+        assert!(!is_credential_prompt("cat /etc/passwd"));
+        assert!(!is_credential_prompt("export DB_PASSWORD=hunter2"));
+        assert!(!is_credential_prompt("Password rotation is due"));
+        assert!(!is_credential_prompt("error: bad password"));
+        // Talking about a passphrase is not being asked for one.
+        assert!(!is_credential_prompt("ssh-add: no passphrase supplied"));
+        assert!(!is_credential_prompt(""));
+    }
+
+    #[test]
+    fn a_secret_never_prints_itself() {
+        let s = super::Secret::new("hunter2");
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("hunter2"), "Debug must not leak the secret: {shown}");
+        assert!(shown.contains("redacted"));
+        // What gets typed is the secret plus Return.
+        assert_eq!(s.line(), b"hunter2\r".to_vec());
+        assert!(super::Secret::new("").is_empty(), "an empty secret arms nothing");
     }
 
     #[test]
@@ -1135,5 +1793,220 @@ mod tests {
         assert!(!rel("target/debug/build/x"));
         assert!(!rel("node_modules/vite/dist/x.js"));
         assert!(!rel("frontend/.next/cache/x"));
+    }
+
+    #[test]
+    fn a_duplicated_secret_types_the_same_line() {
+        let s = super::Secret::new("hunter2");
+        let d = s.duplicate();
+        drop(s);
+        assert_eq!(d.line(), b"hunter2\r".to_vec());
+    }
+
+    // `D;<code>` carries the exit status of the command that just ended; the older
+    // bare letters still mean what they meant.
+    #[test]
+    fn osc133_reports_carry_the_exit_code() {
+        use super::osc133;
+        assert_eq!(osc133("D;255"), (Some(true), Some(255)));
+        assert_eq!(osc133("D;0"), (Some(true), Some(0)));
+        assert_eq!(osc133("D"), (Some(true), None));
+        assert_eq!(osc133("A"), (Some(true), None));
+        assert_eq!(osc133("C"), (Some(false), None));
+        assert_eq!(osc133("B"), (Some(false), None));
+        assert_eq!(osc133("D;"), (Some(true), None));
+        assert_eq!(osc133("D;abc"), (Some(true), None));
+        assert_eq!(osc133("Z;1"), (None, Some(1)));
+        assert_eq!(osc133(""), (None, None));
+    }
+
+    #[test]
+    fn a_denial_is_recognised_but_talk_of_permissions_is_not() {
+        use super::permission_denied;
+        assert!(permission_denied("tre@10.0.0.16: Permission denied (publickey,password)."));
+        assert!(!permission_denied("chmod: changing permissions of 'x': Operation not permitted"));
+        assert!(!permission_denied(""));
+    }
+
+    // Arbiter's own emitters leave the host empty, so that alone says local; a named
+    // host is remote unless it is this machine. The flag is only a last resort because
+    // at ssh exit the local prompt reports while the flag is still on.
+    #[test]
+    fn osc7_reports_are_told_apart_by_their_host() {
+        use super::{osc7_origin, Osc7Origin::*};
+        assert_eq!(osc7_origin("", Some("mac"), true), Local);
+        assert_eq!(osc7_origin("", Some("mac"), false), Local);
+        assert_eq!(osc7_origin("localhost", Some("mac"), true), Local);
+        assert_eq!(osc7_origin("mini", Some("mac"), false), Remote);
+        assert_eq!(osc7_origin("mini", Some("mac"), true), Remote);
+        assert_eq!(osc7_origin("Mac.local", Some("mac"), true), Local);
+        assert_eq!(osc7_origin("mac", Some("Mac.fritz.box"), true), Local);
+        assert_eq!(osc7_origin("mini", None, true), Remote);
+        assert_eq!(osc7_origin("mini", None, false), Local);
+    }
+
+    #[test]
+    fn osc7_parsing_keeps_the_host_and_decodes_the_path() {
+        use super::parse_osc7;
+        let r = parse_osc7("7;file://mini/home/tre/my%20dir").unwrap();
+        assert_eq!(r.host, "mini");
+        assert_eq!(r.path, "/home/tre/my dir");
+        let r = parse_osc7("7;file:///Users/tor").unwrap();
+        assert_eq!(r.host, "");
+        assert_eq!(r.path, "/Users/tor");
+        let r = parse_osc7("7;file:///C:/Users/TRE").unwrap();
+        assert_eq!(r.host, "");
+        assert_eq!(r.path, "/C:/Users/TRE");
+        assert!(parse_osc7("7;http://x/y").is_none());
+        assert!(parse_osc7("133;A").is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_local_windows_path_gets_its_drive_form() {
+        assert_eq!(super::local_path("/C:/Users/TRE"), "C:\\Users\\TRE");
+    }
+
+    // Quotes make the path literal; a leading `~` stays outside them so the far shell
+    // expands it, which is what a `~`-relative inferred path needs.
+    #[test]
+    fn cd_cmd_quotes_for_the_remote_shell() {
+        use super::cd_cmd;
+        assert_eq!(cd_cmd("/home/tre/src"), "cd '/home/tre/src'");
+        assert_eq!(cd_cmd("/home/tre/my dir"), "cd '/home/tre/my dir'");
+        assert_eq!(cd_cmd("/it's"), "cd '/it'\\''s'");
+        assert_eq!(cd_cmd("/h\u{e9}"), "cd '/h\u{e9}'");
+        assert_eq!(cd_cmd("~"), "cd ~");
+        assert_eq!(cd_cmd("~/Source/dev-webapp"), "cd ~/'Source/dev-webapp'");
+    }
+
+    fn followup(dir: &str, claude: bool) -> super::Followup {
+        super::Followup { dir: dir.into(), resume_claude: claude, cd_in_command: false }
+    }
+
+    fn line(out: Option<(Vec<u8>, Option<String>)>) -> (String, Option<String>) {
+        let (bytes, dir) = out.expect("something to type");
+        (String::from_utf8(bytes).unwrap(), dir)
+    }
+
+    // The typed fallback (mosh, plink, an ssh line that cannot be rewritten): one line
+    // does it all, the cd guards Claude, and Claude continues or starts afresh.
+    #[test]
+    fn followup_changes_directory_and_relaunches_claude_in_one_line() {
+        assert_eq!(
+            line(super::followup_line(followup("/home/tre/src", true), None)),
+            ("cd '/home/tre/src' && (claude -c || claude)\r".into(), Some("/home/tre/src".into()))
+        );
+        assert_eq!(
+            line(super::followup_line(followup("~/Source/dev-webapp", false), None)),
+            ("cd ~/'Source/dev-webapp'\r".into(), Some("~/Source/dev-webapp".into()))
+        );
+    }
+
+    // Already there, by the far shell's report, by the connection's own `cd`, or because
+    // the directory is home: only Claude is left to type, or nothing at all.
+    #[test]
+    fn followup_skips_the_cd_when_already_there() {
+        assert_eq!(
+            line(super::followup_line(followup("/home/tre", true), Some("/home/tre"))),
+            ("(claude -c || claude)\r".into(), None)
+        );
+        assert!(super::followup_line(followup("/home/tre", false), Some("/home/tre")).is_none());
+        let mut chained = followup("~/Source/x", true);
+        chained.cd_in_command = true;
+        assert_eq!(
+            line(super::followup_line(chained, None)),
+            ("(claude -c || claude)\r".into(), None)
+        );
+        assert!(super::followup_line(followup("~", false), None).is_none());
+        assert_eq!(
+            line(super::followup_line(followup("~", true), None)),
+            ("(claude -c || claude)\r".into(), None)
+        );
+    }
+
+    #[test]
+    fn recognises_a_prompt_row() {
+        use super::looks_like_prompt;
+        assert!(looks_like_prompt("tre ~ $ "));
+        assert!(looks_like_prompt("tre@ubuntu:~$"));
+        assert!(looks_like_prompt("root@box:~# "));
+        assert!(looks_like_prompt("tre@mini ~ %"));
+        assert!(looks_like_prompt("PS C:\\Users\\tre> "));
+        assert!(looks_like_prompt("~/src on main \u{276f} "));
+        assert!(!looks_like_prompt("Enter passphrase for key '/c/Users/TRE/.ssh/id_ed25519': "));
+        assert!(!looks_like_prompt("tre@10.0.0.16's password: "));
+        assert!(!looks_like_prompt("Are you sure you want to continue connecting (yes/no/[fingerprint])? "));
+        assert!(!looks_like_prompt("Last login: Sat Sep 12 17:40:39 2026 from 10.0.0.8"));
+        assert!(!looks_like_prompt(""));
+    }
+
+    // The command is whatever follows the last prompt ending on the row, whatever the
+    // prompt looks like.
+    #[test]
+    fn finds_the_command_after_the_prompt() {
+        use super::command_on_row;
+        assert_eq!(command_on_row("tre ~ $ cd Source"), Some(('$', "cd Source")));
+        assert_eq!(command_on_row("tre ~/Source/dev-webapp [main] $ ls -la"), Some(('$', "ls -la")));
+        assert_eq!(command_on_row("tre@ubuntu:~$ cd x"), Some(('$', "cd x")));
+        assert_eq!(command_on_row("PS C:\\Users\\tre> cd x"), Some(('>', "cd x")));
+        assert_eq!(command_on_row("> hello claude"), Some(('>', "hello claude")), "Claude's own box");
+        assert_eq!(command_on_row("cd Source"), None, "no prompt on the row");
+        assert_eq!(command_on_row("tre ~ $ echo $ x"), Some(('$', "x")), "the last ending wins");
+    }
+
+    // Typed cds move the inferred directory; anything the text cannot resolve makes it
+    // unknown rather than wrong.
+    #[test]
+    fn follows_typed_cd_commands() {
+        use super::remote_cd;
+        let cd = |row: &str, base: &str| remote_cd(row, base);
+        assert_eq!(cd("tre ~ $ cd Source", "~"), Some(Some("~/Source".into())));
+        assert_eq!(cd("tre ~/Source $ cd dev-webapp", "~/Source"), Some(Some("~/Source/dev-webapp".into())));
+        assert_eq!(cd("tre ~/Source/dev-webapp $ cd ..", "~/Source/dev-webapp"), Some(Some("~/Source".into())));
+        assert_eq!(cd("tre ~/Source $ cd", "~/Source"), Some(Some("~".into())));
+        assert_eq!(cd("tre ~/Source $ cd ~", "~/Source"), Some(Some("~".into())));
+        assert_eq!(cd("tre ~ $ cd ~/src/x", "~"), Some(Some("~/src/x".into())));
+        assert_eq!(cd("tre ~ $ cd /var/log", "~"), Some(Some("/var/log".into())));
+        assert_eq!(cd("tre ~ $ cd 'My Docs'", "~"), Some(Some("~/My Docs".into())));
+        assert_eq!(cd("tre ~ $ cd \"a b\"", "~"), Some(Some("~/a b".into())));
+        assert_eq!(cd("tre ~ $ cd ./x/./y", "~"), Some(Some("~/x/y".into())));
+        assert_eq!(cd("tre ~ $ cd src && claude", "~"), Some(Some("~/src".into())));
+        assert_eq!(cd("tre ~ $ cd src; ls", "~"), Some(Some("~/src".into())));
+        // Unknowable targets.
+        assert_eq!(cd("tre ~ $ cd -", "~/src"), Some(None));
+        assert_eq!(cd("tre ~ $ cd $HOME/x", "~"), Some(None));
+        assert_eq!(cd("tre ~ $ cd ~tre/x", "~"), Some(None));
+        assert_eq!(cd("tre ~ $ cd ..", "~"), Some(None), "above home is unknowable");
+        assert_eq!(cd("tre ~ $ cd a\\ b", "~"), Some(None));
+        // Not a cd at all.
+        assert_eq!(cd("tre ~ $ cdx", "~"), None);
+        assert_eq!(cd("tre ~ $ ls", "~"), None);
+        assert_eq!(cd("tre ~ $ echo cd foo", "~"), None);
+        assert_eq!(cd("> cd foo", "~"), Some(Some("~/foo".into())), "gated by the caller, not here");
+        // Absolute bases climb normally.
+        assert_eq!(cd("root@box:/var/log# cd ../..", "/var/log"), Some(Some("/".into())));
+        assert_eq!(cd("root@box:/# cd ..", "/"), Some(Some("/".into())));
+    }
+
+    #[test]
+    fn recognises_failed_cds_and_unreachable_hosts() {
+        use super::{cd_failed, connect_failed};
+        assert!(cd_failed("cd: no such file or directory: Do"));
+        assert!(cd_failed("bash: cd: Do: No such file or directory"));
+        assert!(cd_failed("bash: cd: /root: Permission denied"));
+        assert!(cd_failed("cd: not a directory: file.txt"));
+        assert!(!cd_failed("ls: cannot access 'x': No such file or directory"));
+        assert!(!cd_failed("tre ~/Downloads $ "));
+
+        assert!(connect_failed("ssh: connect to host 10.0.0.16 port 22: Connection refused"));
+        assert!(connect_failed("ssh: connect to host 10.0.0.16 port 22: Connection timed out"));
+        assert!(connect_failed("ssh: Could not resolve hostname mini: Name or service not known"));
+        assert!(connect_failed("kex_exchange_identification: read: Connection reset by peer"));
+        assert!(connect_failed("Connection closed by 10.0.0.16 port 22"));
+        // A session that WAS up and then went: these must still earn a retry.
+        assert!(!connect_failed("Connection to 10.0.0.16 closed by remote host."));
+        assert!(!connect_failed("client_loop: send disconnect: Connection reset by peer"));
+        assert!(!connect_failed("Connection to 10.0.0.16 closed."));
     }
 }

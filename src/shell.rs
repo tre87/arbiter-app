@@ -87,8 +87,9 @@ ZDOTDIR="$_arbiter_user_zdotdir"
 unset _arbiter_user_zdotdir ARBITER_USER_ZDOTDIR
 
 _arbiter_precmd() {
+  local ec=$?
   local pwd_encoded="${PWD// /%20}"
-  printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$HOST" "$pwd_encoded"
+  printf '\e]133;D;%d\a\e]7;file://%s\a\e]133;A\a' "$ec" "$pwd_encoded"
 }
 _arbiter_preexec() {
   printf '\e]133;C\a'
@@ -189,10 +190,11 @@ if ($env:ARBITER_HISTFILE -and (Get-Module PSReadLine -ErrorAction SilentlyConti
   } catch {}
 }
 function global:prompt {
+  $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }
   $loc = (Get-Location).Path
   $uri = 'file:///' + ($loc -replace '\\','/')
   $e = [char]27; $bel = [char]7
-  [Console]::Write("${e}]133;C${bel}${e}]7;${uri}${bel}${e}]133;A${bel}")
+  [Console]::Write("${e}]133;C${bel}${e}]133;D;${ec}${bel}${e}]7;${uri}${bel}${e}]133;A${bel}")
   & $global:__arbiter_orig_prompt
 }
 if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
@@ -215,6 +217,29 @@ fn ensure_powershell_init() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// What a REMOTE host's bash or zsh needs so a pane connected to it can be restored to
+/// its directory: an OSC-7 report at every prompt, carrying the host's name, and nothing
+/// else. Offered to the user on the clipboard; Arbiter never installs it itself.
+///
+/// The host is never empty (bash sets `HOSTNAME`, zsh `HOST`), which is what keeps these
+/// reports out of the "empty host is local" rule in `session::osc7_origin`. Only spaces
+/// are percent-encoded, exactly as Arbiter's own zsh emitter does. No OSC-133: a remote
+/// prompt marker would be read as the LOCAL shell returning.
+pub const REMOTE_OSC7_SNIPPET: &str = r#"# Arbiter: report the working directory to the terminal (OSC 7) so a restored
+# pane can come back to it. Emits nothing else. Safe to source more than once.
+if [ -z "$ARBITER_OSC7" ]; then
+  ARBITER_OSC7=1
+  _arbiter_osc7() {
+    printf '\033]7;file://%s%s\a' "${HOSTNAME:-${HOST:-$(hostname)}}" "${PWD// /%20}"
+  }
+  if [ -n "$ZSH_VERSION" ]; then
+    precmd_functions+=(_arbiter_osc7)
+  else
+    PROMPT_COMMAND="_arbiter_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+  fi
+fi
+"#;
+
 /// Build the interactive shell command with OSC-7/OSC-133 emitters injected.
 /// On Windows: `shell = Some(bash_path)` → Git Bash, else PowerShell.
 #[cfg_attr(target_os = "windows", allow(unused_variables))]
@@ -234,8 +259,10 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // on every prompt so commands persist immediately — Arbiter kills the
                     // shell on quit, so a save-on-exit would lose everything (the bug you saw:
                     // up-arrow empty after restart). No-op until ARBITER_HISTFILE is set.
-                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
-                    r#"printf '\e]133;D\a\e]7;file:///%s\a\e]133;A\a' "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
+                    // `$?` first: it is the exit status of the command that just ended,
+                    // and the history housekeeping below would overwrite it.
+                    r#"__arb_ec=$?; if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
+                    r#"printf '\e]133;D;%d\a\e]7;file:///%s\a\e]133;A\a' "$__arb_ec" "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
                     // Re-prepend Arbiter's claude-shim dir LAST (after Git Bash's
                     // profile/rc, which may reorder PATH so the real claude wins), so
                     // `claude` resolves to our launcher and our --settings →
@@ -305,8 +332,10 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // EVERY prompt appends new commands to the file immediately, so they
                     // persist even though Arbiter kills the shell on quit (bash otherwise
                     // only saves on a clean exit). No-op until ARBITER_HISTFILE is set.
-                    r#"if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
-                    r#"printf '\e]133;D\a\e]7;file://%s%s\a\e]133;A\a' "$(hostname)" "$(pwd)""#,
+                    // `$?` first: it is the exit status of the command that just ended,
+                    // and the history housekeeping below would overwrite it.
+                    r#"__arb_ec=$?; if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$ARBITER_HISTFILE"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
+                    r#"printf '\e]133;D;%d\a\e]7;file://%s\a\e]133;A\a' "$__arb_ec" "$(pwd)""#,
                 ),
             );
             cmd.env("PS0", "\x1b]133;C\x07");
