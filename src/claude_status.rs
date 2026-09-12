@@ -139,6 +139,11 @@ pub struct ClaudeHandle {
     /// at a shell prompt since. A second witness to a far Claude, for when its screen
     /// chrome is not recognised.
     remote_claude_typed: AtomicBool,
+    /// The far Claude's conversation, when Arbiter knows it: the id it completed onto a
+    /// typed `claude` (`--session-id`), or the one typed with `--resume`. Kept across a
+    /// drop so the next connection resumes that very conversation; cleared once Claude is
+    /// seen to have exited, or says the conversation is gone.
+    remote_session: Mutex<Option<String>>,
 }
 
 /// Working reverts to ready after this long without a detected spinner frame.
@@ -209,6 +214,7 @@ impl ClaudeHandle {
             remote_cwd_reported: AtomicBool::new(false),
             remote_claude_pending: AtomicBool::new(false),
             remote_claude_typed: AtomicBool::new(false),
+            remote_session: Mutex::new(None),
         })
     }
 
@@ -253,6 +259,7 @@ impl ClaudeHandle {
         *self.prompts_for_credential.lock().unwrap() = None;
         *self.remote_cwd.lock().unwrap() = None;
         *self.remote_cwd_prev.lock().unwrap() = None;
+        *self.remote_session.lock().unwrap() = None;
         self.was_remote.store(false, Ordering::Relaxed);
         self.remote_claude_pending.store(false, Ordering::Relaxed);
         self.remote_claude_typed.store(false, Ordering::Relaxed);
@@ -533,6 +540,7 @@ impl ClaudeHandle {
         } else if !self.activity_fresh() && self.on_screen.swap(false, Ordering::Relaxed) {
             // Its screen went away with no turn in flight: Claude exited, whatever was typed.
             self.remote_claude_typed.store(false, Ordering::Relaxed);
+            *self.remote_session.lock().unwrap() = None;
             SAVE_DIRTY.store(true, Ordering::Relaxed);
             crate::claude_shim::debug_log("remote claude: chrome left the screen");
         }
@@ -544,6 +552,26 @@ impl ClaudeHandle {
         if self.remote_claude_typed.swap(typed, Ordering::Relaxed) != typed {
             SAVE_DIRTY.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// The far Claude's conversation as far as Arbiter can know it (see the field). `None`
+    /// when it cannot: a `claude -c` typed by hand, Claude gone, or its id refused.
+    pub fn set_remote_session(&self, id: Option<String>) {
+        let mut cur = self.remote_session.lock().unwrap();
+        if *cur != id {
+            *cur = id;
+            SAVE_DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The far Claude's session id, if known.
+    pub fn remote_session(&self) -> Option<String> {
+        self.remote_session.lock().unwrap().clone()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_remote_session(&self, id: Option<&str>) {
+        *self.remote_session.lock().unwrap() = id.map(str::to_string);
     }
 
     /// Claude is running in this pane as far as the SCREEN is concerned (remote panes).

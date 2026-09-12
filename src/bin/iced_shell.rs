@@ -434,6 +434,7 @@ enum Message {
     ToggleHideShellButton(bool),
     ToggleShowTerminalButtons(bool),
     ToggleConfirmOnQuit(bool),
+    ToggleNameRemoteSessions(bool),
     /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
     SetIntenseStyle(persist::IntenseStyle),
     /// Settings → background colour (hex `#rrggbb`); from a preset button or the input.
@@ -683,6 +684,7 @@ fn spawn_restored(
     prompts_for_credential: Option<bool>,
     remote_cwd: Option<&str>,
     remote_claude: bool,
+    remote_session: Option<&str>,
 ) -> (Session, ShellKind) {
     // A saved cwd that no longer exists falls back to the shell's default dir.
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
@@ -710,6 +712,7 @@ fn spawn_restored(
         session.set_prompts_for_credential(prompts_for_credential);
         session.seed_remote_cwd(remote_cwd);
         session.seed_remote_claude(remote_claude);
+        session.seed_remote_session(remote_session);
     } else if claude_running {
         // Relaunch Claude here — resuming the previous conversation if one was bound,
         // else a fresh session. The command queues in the PTY and runs at the shell's
@@ -747,6 +750,7 @@ fn saved_to_config(
             prompts_for_credential,
             remote_cwd,
             remote_claude,
+            remote_session,
         } => {
             // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
             let history_id = history_id.unwrap_or_else(new_history_id);
@@ -761,6 +765,7 @@ fn saved_to_config(
                 prompts_for_credential,
                 remote_cwd.as_deref(),
                 remote_claude,
+                remote_session.as_deref(),
             );
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind, history_id })
         }
@@ -811,8 +816,12 @@ fn connect_pane(d: &mut PaneData, vault: &Vault, claimed: &mut HashSet<(String, 
     }
     let resume = d.session.take_remote_claude_pending();
     if let Some(dir) = d.session.remote_cwd() {
-        let resume = resume && claimed.insert((cmd.clone(), dir.clone()));
-        d.session.set_followup(&dir, resume);
+        // With its conversation known the pane resumes exactly that and contends with
+        // nobody; without one, `claude -c` takes the directory's most recent, which two
+        // panes must not both claim.
+        let session = d.session.remote_session();
+        let resume = resume && (session.is_some() || claimed.insert((cmd.clone(), dir.clone())));
+        d.session.set_followup(&dir, resume, session.as_deref());
     }
     d.session.queue_startup_cmd(&cmd);
 }
@@ -848,6 +857,7 @@ fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
         let prompts = s.prompts_for_credential();
         let remote_cwd = s.remote_cwd();
         let remote_claude = s.remote_claude();
+        let remote_session = s.remote_session();
         let hid = data.history_id.clone();
         let shell_arg = match data.shell {
             ShellKind::GitBash => git_bash,
@@ -862,6 +872,7 @@ fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
         data.session.set_prompts_for_credential(prompts);
         data.session.seed_remote_cwd(remote_cwd.as_deref());
         data.session.seed_remote_claude(remote_claude);
+        data.session.seed_remote_session(remote_session.as_deref());
     }
     connect_pane(data, vault, &mut HashSet::new());
 }
@@ -1006,6 +1017,7 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                 prompts_for_credential: data.and_then(|d| d.session.prompts_for_credential()),
                 remote_cwd: data.and_then(|d| d.session.remote_cwd()),
                 remote_claude: data.map_or(false, |d| d.session.remote_claude()),
+                remote_session: data.and_then(|d| d.session.remote_session()),
             }
         }
     }
@@ -1288,6 +1300,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     _ => Task::none(),
                 };
             }
+            let name_sessions = state.settings.name_remote_claude_sessions;
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
                 // Typing returns the view to the live bottom + clears selection.
@@ -1310,10 +1323,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // through here, which is why it isn't done inside `write`.
                 p.session.note_typed(&bytes);
                 // Enter in a far shell: the command as the SCREEN shows it (completed,
-                // recalled) is what a `cd` there is read from (see `Session::note_remote_line`).
+                // recalled) is what Arbiter reads a `cd` or a `claude` from, and a bare
+                // `claude` gets its conversation named before the Enter goes through (see
+                // `Session::on_remote_enter`).
                 if bytes.as_slice() == b"\r" {
                     let row = p.session.term().lock().map(|t| t.cursor_row_text()).unwrap_or_default();
-                    p.session.note_remote_line(&row);
+                    if let Some(completion) = p.session.on_remote_enter(&row, name_sessions) {
+                        p.session.write(&completion);
+                    }
                 }
                 p.session.write(&bytes);
             }
@@ -1494,6 +1511,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleConfirmOnQuit(v) => {
             state.settings.confirm_on_quit = v;
+            save_session(state);
+        }
+        Message::ToggleNameRemoteSessions(v) => {
+            state.settings.name_remote_claude_sessions = v;
             save_session(state);
         }
         Message::SetIntenseStyle(s) => {
@@ -2902,6 +2923,18 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 Some("Ask for confirmation before closing Arbiter, so a stray close doesn't drop your terminals."),
                 state.settings.confirm_on_quit,
                 Message::ToggleConfirmOnQuit,
+            ),
+            Space::with_height(Length::Fixed(8.0)),
+            settings_section("Remote Terminals"),
+            settings_toggle(
+                "Name remote Claude sessions",
+                Some(
+                    "When you type `claude` in an SSH terminal, add `--session-id <id>` to the line as \
+                     you press Enter, so a restored terminal resumes exactly that conversation instead \
+                     of the directory's most recent one. You will see the argument appear.",
+                ),
+                state.settings.name_remote_claude_sessions,
+                Message::ToggleNameRemoteSessions,
             ),
             Space::with_height(Length::Fixed(8.0)),
             settings_section("Saved Data"),

@@ -269,6 +269,8 @@ fn local_path(decoded: &str) -> String {
 struct Followup {
     dir: String,
     resume_claude: bool,
+    /// The conversation to resume, when Arbiter knows the far Claude's id.
+    session: Option<String>,
     /// The connection command itself carries the `cd` (see `remote::remote_launch_line`),
     /// so the far shell starts in `dir` and only Claude is left to type.
     cd_in_command: bool,
@@ -277,12 +279,12 @@ struct Followup {
 /// What to type at the far prompt for a follow-up, and the directory it changes into,
 /// if it does. `reported` is the directory the far shell itself announced, if it did:
 /// already being there, by report, by the command line, or because the directory is
-/// home, saves the `cd`. Claude comes back as `remote::CLAUDE_COMMAND` says.
+/// home, saves the `cd`. Claude comes back as `remote::claude_command` says.
 fn followup_line(f: Followup, reported: Option<&str>) -> Option<(Vec<u8>, Option<String>)> {
     let there = f.cd_in_command
         || reported == Some(f.dir.as_str())
         || (f.dir == "~" && reported.is_none());
-    let claude = format!("({})", crate::remote::CLAUDE_COMMAND);
+    let claude = format!("({})", crate::remote::claude_command(f.session.as_deref()));
     let line = match (there, f.resume_claude) {
         (true, false) => return None,
         (true, true) => format!("{claude}\r"),
@@ -304,6 +306,96 @@ fn cd_cmd(dir: &str) -> String {
         return format!("cd {tilde}");
     }
     format!("cd {tilde}'{}'", rest.replace('\'', "'\\''"))
+}
+
+/// What a command typed at the far prompt means for the pane's Claude conversation.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeLaunch {
+    NotClaude,
+    /// A plain interactive launch naming no conversation: Arbiter may name one.
+    Bare,
+    /// Launched into a named conversation (`--resume <id>` or `--session-id <id>`).
+    Named(String),
+    /// Something Arbiter cannot follow: `-c`, a subcommand, a prompt, `--print`, the
+    /// resume picker.
+    Other,
+}
+
+/// Claude's subcommands, which take no `--session-id`. A first bare word that is one of
+/// these is a subcommand; any other bare word is an initial prompt, which an interactive
+/// launch happily takes alongside a session id.
+const CLAUDE_SUBCOMMANDS: &[&str] = &[
+    "mcp", "update", "doctor", "install", "auth", "config", "plugin", "agents", "setup-token",
+    "migrate-installer",
+];
+
+fn classify_claude_launch(cmd: &str) -> ClaudeLaunch {
+    let mut words = cmd.split_whitespace();
+    let Some(first) = words.next() else { return ClaudeLaunch::NotClaude };
+    if first.rsplit('/').next().unwrap_or(first) != "claude" {
+        return ClaudeLaunch::NotClaude;
+    }
+    let mut named = None;
+    let mut after_flag = false;
+    while let Some(word) = words.next() {
+        let (flag, inline) = match word.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (word, None),
+        };
+        match flag {
+            "--resume" | "-r" | "--session-id" => {
+                let value = inline.or_else(|| words.next());
+                match value.filter(|v| crate::remote::plausible_session_id(v)) {
+                    Some(id) => named = Some(id.to_string()),
+                    None => return ClaudeLaunch::Other,
+                }
+                after_flag = false;
+            }
+            "-c" | "--continue" | "-p" | "--print" | "-h" | "--help" | "-v" | "--version" => {
+                return ClaudeLaunch::Other;
+            }
+            f if f.starts_with('-') => after_flag = inline.is_none(),
+            // A bare word: the preceding flag's value, a subcommand, or an initial prompt.
+            w if !after_flag && CLAUDE_SUBCOMMANDS.contains(&w) => return ClaudeLaunch::Other,
+            _ => after_flag = false,
+        }
+    }
+    match named {
+        Some(id) => ClaudeLaunch::Named(id),
+        None => ClaudeLaunch::Bare,
+    }
+}
+
+/// A fresh conversation id for a far Claude, in the UUID form `claude --session-id`
+/// accepts. Randomness comes from the standard library's per-process hash seeds mixed
+/// with the clock, plenty for uniqueness: this is an identifier, not a secret.
+fn new_session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in bytes.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(nanos);
+        h.write_usize(i);
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Claude's own words for a `--resume` that named a conversation it no longer has.
+fn conversation_gone(text: &str) -> bool {
+    text.contains("No conversation found with session ID")
 }
 
 /// Characters a shell prompt ends with: sh/bash, zsh, root, PowerShell and fish, and the
@@ -674,7 +766,12 @@ impl Session {
         // to type after connecting; where that is not possible the follow-up types them.
         let mut line = cmd.to_string();
         if let Some(f) = self.followup.lock().unwrap().as_mut() {
-            let chained = crate::remote::remote_launch_line(cmd, Some(&f.dir), f.resume_claude);
+            let chained = crate::remote::remote_launch_line(
+                cmd,
+                Some(&f.dir),
+                f.resume_claude,
+                f.session.as_deref(),
+            );
             if let Some(chained) = chained {
                 line = chained;
                 f.cd_in_command = true;
@@ -743,36 +840,79 @@ impl Session {
     /// Queue what to type once the far shell is at its prompt after the next connection:
     /// `cd` into `dir`, then `claude -c` if `resume_claude`. Set right before
     /// `queue_startup_cmd`. Nothing happens unless the far shell reports its directory.
-    pub fn set_followup(&self, dir: &str, resume_claude: bool) {
-        *self.followup.lock().unwrap() =
-            Some(Followup { dir: dir.to_string(), resume_claude, cd_in_command: false });
+    pub fn set_followup(&self, dir: &str, resume_claude: bool, session: Option<&str>) {
+        *self.followup.lock().unwrap() = Some(Followup {
+            dir: dir.to_string(),
+            resume_claude,
+            session: session.map(str::to_string),
+            cd_in_command: false,
+        });
     }
 
-    /// Enter was pressed with `row` on screen. In a far shell without integration, a
-    /// `cd` typed there is the only way to know where the shell went, so it is followed
-    /// here (see `remote_cd`). Ignored when Claude has the keyboard, or when the far
-    /// shell reports its directory itself and will say so more reliably.
-    pub fn note_remote_line(&self, row: &str) {
+    /// Enter was pressed with `row` on screen in this pane. Returns what to type BEFORE
+    /// the Enter, if anything: with `name_sessions` (a setting, off by default), a bare
+    /// `claude` at the far shell's prompt gets ` --session-id <uuid>`, so the conversation
+    /// is known from its first moment and a restore can resume exactly it (the local shim
+    /// learns the id from Claude's status line; nothing on the far host can tell Arbiter,
+    /// so Arbiter names it). Only at a prompt ending a shell uses (`$`, `%`, `#`), which
+    /// Claude's own `>` box never shows.
+    ///
+    /// The row also keeps the pane's remote facts current: `claude` typed there is Claude
+    /// running (with the id it was launched into, when the line names one), any other
+    /// command at a shell prompt means it is not, and a `cd` moves the inferred directory
+    /// (see `remote_cd`) unless the far shell reports it itself. Ignored when Claude has
+    /// the keyboard.
+    pub fn on_remote_enter(&self, row: &str, name_sessions: bool) -> Option<Vec<u8>> {
         if !self.is_remote() || self.claude_running() {
-            return;
+            return None;
         }
-        let Some((ending, cmd)) = command_on_row(row) else { return };
-        // `claude` typed at the far prompt is Claude running there, even if its screen is
-        // never recognised; any other command typed at a shell prompt (`$`, `%`, `#`,
-        // which Claude's own `>` box never shows) means it is not.
-        let word = cmd.split_whitespace().next().unwrap_or("");
-        if word == "claude" || word.ends_with("/claude") {
-            self.claude.set_remote_claude_typed(true);
-        } else if matches!(ending, '$' | '%' | '#') {
-            self.claude.set_remote_claude_typed(false);
+        let (ending, cmd) = command_on_row(row)?;
+        let shell_prompt = matches!(ending, '$' | '%' | '#');
+        match classify_claude_launch(cmd) {
+            ClaudeLaunch::Bare => {
+                self.claude.set_remote_claude_typed(true);
+                if !name_sessions || !shell_prompt {
+                    self.claude.set_remote_session(None);
+                    return None;
+                }
+                let id = new_session_id();
+                self.claude.set_remote_session(Some(id.clone()));
+                Some(format!(" --session-id {id}").into_bytes())
+            }
+            ClaudeLaunch::Named(id) => {
+                self.claude.set_remote_claude_typed(true);
+                self.claude.set_remote_session(Some(id));
+                None
+            }
+            ClaudeLaunch::Other => {
+                self.claude.set_remote_claude_typed(true);
+                self.claude.set_remote_session(None);
+                None
+            }
+            ClaudeLaunch::NotClaude => {
+                if shell_prompt {
+                    self.claude.set_remote_claude_typed(false);
+                    self.claude.set_remote_session(None);
+                }
+                if !self.claude.remote_cwd_reported() {
+                    let base = self.remote_cwd().unwrap_or_else(|| "~".to_string());
+                    if let Some(target) = remote_cd(row, &base) {
+                        self.claude.set_remote_cwd(target);
+                    }
+                }
+                None
+            }
         }
-        if self.claude.remote_cwd_reported() {
-            return;
-        }
-        let base = self.remote_cwd().unwrap_or_else(|| "~".to_string());
-        if let Some(target) = remote_cd(row, &base) {
-            self.claude.set_remote_cwd(target);
-        }
+    }
+
+    /// The far Claude's session id, if Arbiter knows it.
+    pub fn remote_session(&self) -> Option<String> {
+        self.claude.remote_session()
+    }
+
+    /// Seed from a saved layout.
+    pub fn seed_remote_session(&self, id: Option<&str>) {
+        self.claude.seed_remote_session(id);
     }
 
     /// Whether the header should offer Reconnect: the shell has exited, or this was a
@@ -1205,6 +1345,11 @@ fn reader_loop(
             }
             if claude.is_remote() && !claude.remote_cwd_reported() && cd_failed(text) {
                 claude.revert_remote_cwd();
+            }
+            // The conversation Arbiter would resume no longer exists on the far host, so
+            // stop naming it: the fallbacks (`-c`, then a fresh `claude`) take over.
+            if claude.is_remote() && conversation_gone(text) {
+                claude.set_remote_session(None);
             }
         }
         for ch in text.chars() {
@@ -1881,7 +2026,62 @@ mod tests {
     }
 
     fn followup(dir: &str, claude: bool) -> super::Followup {
-        super::Followup { dir: dir.into(), resume_claude: claude, cd_in_command: false }
+        super::Followup { dir: dir.into(), resume_claude: claude, session: None, cd_in_command: false }
+    }
+
+    #[test]
+    fn followup_resumes_the_known_conversation() {
+        let mut f = followup("~/src", true);
+        f.session = Some("abc-123".into());
+        f.cd_in_command = true;
+        assert_eq!(
+            line(super::followup_line(f, None)),
+            ("(claude --resume abc-123 || claude -c || claude)\r".into(), None)
+        );
+    }
+
+    // What a typed `claude` line tells Arbiter about the conversation it starts.
+    #[test]
+    fn classifies_typed_claude_launches() {
+        use super::{classify_claude_launch as c, ClaudeLaunch::*};
+        assert_eq!(c("claude"), Bare);
+        assert_eq!(c("claude --dangerously-skip-permissions"), Bare);
+        assert_eq!(c("claude --model opus"), Bare, "a value after a flag is still a flag's");
+        assert_eq!(c("claude --model=opus mcp"), Other, "an inline value does not swallow the next word");
+        assert_eq!(c("claude fix the tests"), Bare, "an initial prompt is still interactive");
+        assert_eq!(c("/opt/homebrew/bin/claude"), Bare);
+        assert_eq!(c("claude --resume abc-123"), Named("abc-123".into()));
+        assert_eq!(c("claude -r abc-123"), Named("abc-123".into()));
+        assert_eq!(c("claude --resume=abc-123"), Named("abc-123".into()));
+        assert_eq!(c("claude --session-id abc-123"), Named("abc-123".into()));
+        assert_eq!(c("claude -r"), Other, "the picker: whatever is chosen is unknown");
+        assert_eq!(c("claude -c"), Other);
+        assert_eq!(c("claude --continue"), Other);
+        assert_eq!(c("claude -p hello"), Other, "non-interactive");
+        assert_eq!(c("claude mcp list"), Other, "a subcommand");
+        assert_eq!(c("claude update"), Other);
+        assert_eq!(c("claude --version"), Other);
+        assert_eq!(c("claudette"), NotClaude);
+        assert_eq!(c("ls"), NotClaude);
+        assert_eq!(c(""), NotClaude);
+    }
+
+    #[test]
+    fn fresh_session_ids_are_uuids_claude_accepts() {
+        let id = super::new_session_id();
+        assert_eq!(id.len(), 36);
+        assert!(crate::remote::plausible_session_id(&id));
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert!(parts[2].starts_with('4'), "version 4: {id}");
+        assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'), "variant: {id}");
+        assert_ne!(id, super::new_session_id());
+    }
+
+    #[test]
+    fn recognises_claude_saying_a_conversation_is_gone() {
+        assert!(super::conversation_gone("No conversation found with session ID: abc-123"));
+        assert!(!super::conversation_gone("tre ~/src $ "));
     }
 
     fn line(out: Option<(Vec<u8>, Option<String>)>) -> (String, Option<String>) {

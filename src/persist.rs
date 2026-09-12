@@ -65,6 +65,10 @@ pub enum SavedNode {
         /// Claude was running on the far host, so the replayed connection resumes it there.
         #[serde(default)]
         remote_claude: bool,
+        /// That Claude's session id when Arbiter named or read it (see
+        /// `ClaudeHandle::remote_session`), so the very conversation is resumed.
+        #[serde(default)]
+        remote_session: Option<String>,
     },
 }
 
@@ -140,6 +144,12 @@ pub struct Settings {
     /// Alt+F4). On by default so a stray close can't silently drop every terminal.
     #[serde(default = "default_true")]
     pub confirm_on_quit: bool,
+    /// Complete a `claude` typed at a far shell's prompt with `--session-id <uuid>`, so a
+    /// restored SSH terminal resumes exactly that conversation (see
+    /// `Session::on_remote_enter`). Off by default: it visibly edits what was typed, which
+    /// is a surprise to anyone who did not ask for it.
+    #[serde(default)]
+    pub name_remote_claude_sessions: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -246,6 +256,7 @@ impl Default for Settings {
             intense_text_style: IntenseStyle::Bold,
             background: default_bg_hex(),
             confirm_on_quit: true,
+            name_remote_claude_sessions: false,
         }
     }
 }
@@ -330,6 +341,7 @@ mod tests {
                             prompts_for_credential: None,
                             remote_cwd: None,
                             remote_claude: false,
+                            remote_session: None,
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
@@ -342,6 +354,7 @@ mod tests {
                             prompts_for_credential: Some(true),
                             remote_cwd: Some("/home/tre/src".into()),
                             remote_claude: true,
+                            remote_session: Some("abc-123".into()),
                         }),
                     },
                 },
@@ -358,6 +371,7 @@ mod tests {
                         prompts_for_credential: None,
                         remote_cwd: None,
                         remote_claude: false,
+                        remote_session: None,
                     },
                 },
             ],
@@ -396,6 +410,7 @@ mod tests {
                         prompts_for_credential,
                         remote_cwd,
                         remote_claude,
+                        remote_session,
                         ..
                     } => {
                         assert_eq!(startup_cmd.as_deref(), Some("ssh mini"));
@@ -403,6 +418,7 @@ mod tests {
                         assert_eq!(*prompts_for_credential, Some(true));
                         assert_eq!(remote_cwd.as_deref(), Some("/home/tre/src"));
                         assert!(*remote_claude, "the far Claude is what the remote pane resumes");
+                        assert_eq!(remote_session.as_deref(), Some("abc-123"));
                     }
                     _ => panic!("expected a leaf"),
                 }
@@ -430,6 +446,7 @@ mod tests {
                 prompts_for_credential,
                 remote_cwd,
                 remote_claude,
+                remote_session,
                 ..
             } => {
                 assert!(!claude_running);
@@ -439,6 +456,7 @@ mod tests {
                 assert!(prompts_for_credential.is_none(), "unknown until observed");
                 assert!(remote_cwd.is_none());
                 assert!(!remote_claude);
+                assert!(remote_session.is_none());
             }
             _ => panic!("expected a leaf"),
         }

@@ -7,6 +7,24 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **A restored SSH terminal can resume its own Claude conversation, not just the
+  directory's most recent one.** Local terminals always did this, because Arbiter's shim
+  learns each Claude's session id from its status line; nothing on a far host can tell
+  Arbiter that, so Arbiter can name the conversation itself. With **Name remote Claude
+  sessions** on (Settings, General; off by default), typing `claude` at the far prompt and
+  pressing Enter completes the line with `--session-id <uuid>` before it goes through, and
+  you see the argument appear. A restore or reconnect then runs `claude --resume <id>`,
+  falling back to `-c` and then a fresh `claude`, so several terminals in one remote
+  directory each get their own conversation back. Nothing is installed on the host.
+
+  It is off by default because it visibly edits what you typed, which is a surprise to
+  anyone who did not ask for it. The completion only happens for a plain `claude` (flags
+  allowed, no subcommand, `-c`, `-p` or picker) at a prompt ending a shell uses (`$`, `%`,
+  `#`), which Claude's own input box never shows. A `claude --resume <id>` you type is read
+  as it is whether the setting is on or not. Should Claude report the conversation gone,
+  the id is forgotten and the fallbacks take over.
+
 ## [1.1.0] — 2026-09-12
 
 ### Added

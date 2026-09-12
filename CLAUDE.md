@@ -23,30 +23,25 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
 - **No polling.** Every live signal must be event-driven (file watchers / PTY reader
   callbacks); web parity depends on it.
 
-## Remote Claude resume — deferred design
+## Remote Claude resume — how the session id is known
 
-A restored SSH pane brings Claude back with `claude -c || claude` (`src/remote.rs`
-`CLAUDE_COMMAND`): the directory's most recent conversation, else a fresh one. Local panes
-are exact (`claude --resume <id>`) because Arbiter's shim runs as Claude's status line and
-writes each pane's session id to a file; over SSH nothing on the far host says which
-conversation belonged to which pane, so two panes in one remote directory cannot both be
-resumed (only the first gets `-c`).
+Local panes resume exactly (`claude --resume <id>`) because Arbiter's shim runs as
+Claude's status line and writes each pane's session id to a file. Over SSH nothing on the
+far host can tell Arbiter that, so **Arbiter names the conversation** when the setting
+`name_remote_claude_sessions` is on (Settings, General; off by default because it visibly
+edits typed input): on Enter in a remote pane, a bare `claude` at a shell prompt is
+completed with ` --session-id <uuid>` before the CR goes through (`Session::on_remote_enter`,
+`classify_claude_launch` in `src/session.rs`). A typed `--resume <id>` is read as is
+regardless of the setting. The id lives in `ClaudeHandle::remote_session`,
+is persisted as `remote_session` on `SavedNode::Leaf`, and the relaunch is
+`claude --resume <id> || claude -c || claude` (`remote::claude_command`). A pane with an id
+never contends for its directory in `connect_pane`'s `claimed` set. It relies on Claude
+keeping the id across `--resume`, which current versions do; if that changed, panes would
+degrade to the `-c` fallback. A hand-typed `claude -c` is unknowable and stays `-c`.
 
-The exact version was built and then shelved (2026-09-12) because it needs a script copied
-to every remote host, which the user did not want yet. If it comes back, the design was:
-
-- A remote status-line command (`~/.claude/statusLine` in the far `~/.claude/settings.json`)
-  that reads Claude's status JSON and prints an invisible control sequence,
-  `ESC ] 7777 ; arbiter ; session=<id> ; cwd=<percent-encoded path> BEL`, chaining any
-  status line the user already had. Claude's renderer strips recognised escape sequences
-  when measuring, so it passes through unchanged; stick to the character set
-  `ansi-regex` accepts.
-- The reader (`session::reader_loop`, OSC scan) parses it on remote panes only: session id
-  → a `remote_session` on `ClaudeHandle` (kept across a drop, cleared when Claude's chrome
-  leaves or another command is typed at the shell prompt), cwd → `set_remote_cwd`, and
-  both count as login evidence. Persist it as `remote_session` on `SavedNode::Leaf`.
-- The relaunch becomes `claude --resume <id> || claude -c || claude`, and a pane with an
-  id never contends for its directory in `connect_pane`'s `claimed` set.
+A rejected alternative, for the record: a status-line script on the far host printing
+`ESC ] 7777 ; arbiter ; session=<id> ; cwd=<path> BEL` for the reader to parse. It works
+but needs a file copied to every host, which the user did not want (2026-09-12).
 
 ## Terminal renderer — known limitation (intentional)
 
