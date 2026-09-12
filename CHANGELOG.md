@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-12
+
 ### Added
 - **One sign-in prompt for all restored SSH terminals.** Restoring several SSH terminals
   used to mean typing the same passphrase separately in each one, blind, with no echo to
