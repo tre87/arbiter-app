@@ -4,9 +4,9 @@
 
 # Arbiter
 
-**A lightweight, cross-platform terminal for running many Claude Code sessions side by side.**
+**A cross-platform terminal that remembers where you were.**
 
-One window. Many agents. You decide who works on what.
+Tabs, panes, folders, Claude conversations, SSH sessions: close it, open it, carry on.
 
 </div>
 
@@ -18,16 +18,18 @@ One window. Many agents. You decide who works on what.
 
 ## What it is
 
-Arbiter is a desktop terminal built for running a bunch of [Claude Code](https://claude.com/claude-code) sessions at once, in the same window. Split your space into as many terminal panes as you want, group them into tabs, and let the agents work in parallel while Arbiter keeps an eye on who is busy, who is done, and who is waiting on you.
+Arbiter is a terminal for Windows and macOS that picks up exactly where you left off. Quit it, reboot, come back tomorrow: every tab and pane is there, each terminal is in the folder it was in, the [Claude Code](https://claude.com/claude-code) conversation that was running in it is running again, and an SSH terminal is connected again, in its remote folder, with its remote Claude back too. Nothing to reopen, nothing to `cd` to, nothing to `--resume` by hand.
 
-The name is the idea behind it. One authority keeping an eye on the agents below. You are the arbiter.
+It is a lightweight native app, one codebase that looks and behaves the same on both platforms, with a GPU renderer and each OS's own text engine, so it feels like the terminal that belongs on that machine.
+
+Because most of what runs in it is Claude Code, Arbiter also knows what each Claude is doing and shows it at a glance, in the pane, in the tab, and in an overview you can keep on top of everything else. The name comes from that: one authority keeping an eye on the agents below. You are the arbiter.
 
 ## Why it exists
 
-- **Lightweight.** A native Rust app with a custom GPU terminal renderer. No browser engine, no Electron. Everything is event driven, so it uses nothing while nothing is happening, and it lets your display sleep.
-- **Cross-platform, and the same everywhere.** One codebase, one look, one set of shortcuts on Windows and macOS. Text is rasterised with each OS's own engine (DirectWrite, CoreText) so it reads like a native terminal on both.
+- **Resume, for real.** Layout, folders, Claude sessions and SSH connections all come back on their own. Resume of a running program is Claude Code specific today; anything else comes back to a shell in the right place.
+- **Cross-platform, and the same everywhere.** One look, one set of shortcuts, one behaviour on Windows and macOS. Text is rasterised with each OS's own engine (DirectWrite, CoreText) so it reads like a native terminal on both.
+- **Lightweight.** Native Rust, no browser engine, no Electron. Everything is event driven, so it uses nothing while nothing is happening, and it lets your display sleep.
 - **Fast.** Terminal output is parsed by the same engine Alacritty uses and drawn straight to the GPU. Redraws happen on output, not on a clock.
-- **It picks up where you left off.** Close Arbiter, open it again, and your tabs, panes, directories and running Claude sessions come back, including the ones on other machines over SSH. Resume is Claude Code specific today; other programs come back to a shell in the right place.
 
 ## Tabs and terminals
 
