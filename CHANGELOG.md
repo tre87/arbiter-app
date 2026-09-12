@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-12
+
 ### Added
 - **`arbiter` in any terminal shows the mark and the build.** Type `arbiter` in a pane and
   the two strokes of the logo paint in, in its own blue gradients, followed by the version,
