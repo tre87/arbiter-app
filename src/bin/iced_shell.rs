@@ -5025,7 +5025,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()));
     // Wake-on-LAN, right of the overview button, only when switched on in Settings.
     if state.settings.show_wol_button {
-        actions = actions.push(action_icon_btn(mdi_path::POWER_SYMBOL, Message::ToggleWolMenu, state.wol_menu.is_some()));
+        actions = actions.push(action_icon_btn(mdi_path::ACCESS_POINT, Message::ToggleWolMenu, state.wol_menu.is_some()));
     }
     actions = actions
         .push(action_icon_btn(mdi_path::ARROW_ALL, Message::OpenShortcuts, state.shortcuts_open))
@@ -5723,8 +5723,9 @@ mod mdi_path {
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
     pub const ARROW_DOWN: &str = "M11,4H13V16L18.5,10.5L19.92,11.92L12,19.84L4.08,11.92L5.5,10.5L11,16V4Z";
     pub const ARROW_UP: &str = "M13,20H11V8L5.5,13.5L4.08,12.08L12,4.16L19.92,12.08L18.5,13.5L13,8V20Z";
-    /// mdi `power`: the titlebar's Wake-on-LAN button.
-    pub const POWER_SYMBOL: &str = "M16.56,5.44L15.11,6.89C16.84,7.94 18,9.83 18,12A6,6 0 0,1 12,18A6,6 0 0,1 6,12C6,9.83 7.16,7.94 8.88,6.88L7.44,5.44C5.36,6.88 4,9.28 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12C20,9.28 18.64,6.88 16.56,5.44M13,3H11V13H13";
+    /// mdi `access-point`: the titlebar's Wake-on-LAN button. Radio waves, not a power
+    /// symbol, which next to the window's close button would read as "turn off".
+    pub const ACCESS_POINT: &str = "M4.93,4.93C3.12,6.74 2,9.24 2,12C2,14.76 3.12,17.26 4.93,19.07L6.34,17.66C4.89,16.22 4,14.22 4,12C4,9.79 4.89,7.78 6.34,6.34L4.93,4.93M19.07,4.93L17.66,6.34C19.11,7.78 20,9.79 20,12C20,14.22 19.11,16.22 17.66,17.66L19.07,19.07C20.88,17.26 22,14.76 22,12C22,9.24 20.88,6.74 19.07,4.93M7.76,7.76C6.67,8.85 6,10.35 6,12C6,13.65 6.67,15.15 7.76,16.24L9.17,14.83C8.45,14.11 8,13.11 8,12C8,10.89 8.45,9.89 9.17,9.17L7.76,7.76M16.24,7.76L14.83,9.17C15.55,9.89 16,10.89 16,12C16,13.11 15.55,14.11 14.83,14.83L16.24,16.24C17.33,15.15 18,13.65 18,12C18,10.35 17.33,8.85 16.24,7.76M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10Z";
     /// mdi `check`: a magic packet went out.
     pub const CHECK_BOLD: &str = "M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,6.59L21,7Z";
     /// mdi `upload`: an arrow rising from a tray, for a copy to a far host under way.
