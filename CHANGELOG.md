@@ -17,7 +17,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   the sign-in dialog this run; a connection not signed in through Arbiter asks once, in
   that same dialog. Copies older than a day are removed by Arbiter itself, once a day per
   host, after the day's first copy. Works from Windows or macOS to a Mac, a Linux box or a
-  Windows OpenSSH server alike, since sftp needs nothing of the far host's shell.
+  Windows OpenSSH server alike, since sftp needs nothing of the far host's shell. While a
+  copy is under way the terminal's header says "Copying to mini…" with a pulsing upload
+  arrow, since the path lands only when it is done and typing meanwhile still goes through.
 
 ### Fixed
 - **The cursor no longer flickers while Claude works over ssh.** Two causes, both fixed.

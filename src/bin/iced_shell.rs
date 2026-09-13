@@ -196,6 +196,8 @@ struct State {
     /// Connection commands whose attach directory on the far host has been swept of old
     /// copies, by the UTC day it happened (see `attach::sweep`): once a day is enough.
     attach_swept: HashMap<String, i64>,
+    /// Copies under way, by the session id of the pane they are for (see `AttachInflight`).
+    attach_inflight: HashMap<u64, AttachInflight>,
     /// In-progress workspace-tab drag-reorder: the tab grabbed + the tab the cursor
     /// is currently over (the drop target). None when not dragging.
     tab_drag: Option<TabDrag>,
@@ -285,6 +287,13 @@ enum ConnectKind {
 struct Notice {
     title: String,
     body: String,
+}
+
+/// A copy of attached files to a remote pane's host that is under way, shown in that
+/// pane's header: typing meanwhile still goes through, and the paths land when it is
+/// done, so the user should see that it is not done yet.
+struct AttachInflight {
+    host: String,
 }
 
 /// The credential dialog. Taking it drops every secret the user typed; what is to be
@@ -4834,6 +4843,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
             // Held connections (dialog up) are idle and not yet remote, which would read
             // as "dropped" on every restored pane behind the scrim.
             data.session.show_reconnect() && state.connect_prompt.is_none(),
+            state.attach_inflight.get(&data.session.id()).map(|a| a.host.as_str()),
             header_round,
         ))
         .on_right_press(Message::HeaderMenuOpen(pane))
@@ -5428,6 +5438,8 @@ mod mdi_path {
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
     pub const ARROW_DOWN: &str = "M11,4H13V16L18.5,10.5L19.92,11.92L12,19.84L4.08,11.92L5.5,10.5L11,16V4Z";
     pub const ARROW_UP: &str = "M13,20H11V8L5.5,13.5L4.08,12.08L12,4.16L19.92,12.08L18.5,13.5L13,8V20Z";
+    /// mdi `upload`: an arrow rising from a tray, for a copy to a far host under way.
+    pub const UPLOAD: &str = "M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z";
     // Context-menu actions (web PencilOutline).
     pub const PENCIL: &str = "M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z";
     // Titlebar: tab type icon (terminal), tab close, new-workspace dropdown items,
@@ -6221,6 +6233,7 @@ fn pane_header(
     pane: pane_grid::Pane,
     status: Option<Dot>,
     needs_reconnect: bool,
+    copying_to: Option<&str>,
     round: iced::border::Radius,
 ) -> Element<'static, Message> {
     let color = if focused {
@@ -6272,7 +6285,16 @@ fn pane_header(
     if needs_reconnect {
         right = right.push(header_reconnect_btn(pane));
     }
-    let sides = container(row![horizontal_space(), right].align_y(iced::Center))
+    // Left layer: a copy of attached files to the far host, while it runs. Pulsing in
+    // the working colour, like the tab dot, so it reads as "busy" without a spinner
+    // glyph (the fast tick runs while any copy is in flight; see `needs_fast_tick`).
+    let mut left = row![].spacing(5).align_y(iced::Center);
+    if let Some(host) = copying_to {
+        let c = iced::Color { a: pulse_alpha(1200), ..AZURE };
+        left = left.push(cmdi(mdi_path::UPLOAD, 13.0, c));
+        left = left.push(text(format!("Copying to {host}\u{2026}")).size(11).color(c));
+    }
+    let sides = container(row![left, horizontal_space(), right].align_y(iced::Center))
         .center_y(Length::Fill)
         .padding(iced::Padding { top: 2.0, right: 6.0, bottom: 0.0, left: 6.0 });
 
@@ -6670,6 +6692,7 @@ fn start_remote_attach(state: &mut State, session: u64, paths: Vec<String>) -> T
     let cmd = cmd.unwrap_or_default();
     let secret = state.vault.arm_copy(&cmd);
     let sweep = state.attach_swept.get(&cmd) != Some(&attach::day_number(SystemTime::now()));
+    state.attach_inflight.insert(session, AttachInflight { host: inv.host().to_string() });
     let (tx, rx) = iced::futures::channel::oneshot::channel();
     let local = paths.clone();
     std::thread::spawn(move || {
@@ -6699,6 +6722,7 @@ fn remote_attach_done(
     result: Result<arbiter_native::attach::Attached, arbiter_native::attach::Failure>,
 ) -> Task<Message> {
     use arbiter_native::attach::{day_number, Failure};
+    state.attach_inflight.remove(&session);
     let Some((cmd, remote)) =
         pane_by_session(state, session).and_then(|d| Some((d.session.startup_cmd()?, d.session.is_remote())))
     else {
@@ -6817,6 +6841,10 @@ fn default_screenshot_dir_label() -> String {
 /// dot, so a session parked at a prompt no longer pins the UI at 60fps — it's idle.
 fn needs_fast_tick(state: &State) -> bool {
     if !state.chrome_init || state.usage.state == UsageState::Pending {
+        return true;
+    }
+    // A copy to a far host pulses in its pane's header for the second or so it takes.
+    if !state.attach_inflight.is_empty() {
         return true;
     }
     state.workspaces.iter().any(|ws| {
@@ -7914,6 +7942,7 @@ fn main() -> iced::Result {
                 connect_prompt: None,
                 notice: None,
                 attach_swept: HashMap::new(),
+                attach_inflight: HashMap::new(),
                 vault,
                 tab_drag: None,
                 hovered_tab: None,
