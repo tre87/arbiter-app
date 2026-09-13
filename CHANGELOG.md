@@ -17,6 +17,15 @@ history belongs to the prior Tauri/Vue web app it replaced.
   stays what it is; Claude's own symbols (⏺, ✳) render as before. Licence in
   `assets/SymbolsNerdFont-LICENSE.txt` (MIT).
 
+- **Wake a machine over the network.** Settings has a Wake on LAN tab: add a machine by
+  name and MAC address (any of the usual spellings), remove it again, and switch on a Wake
+  button in the titlebar, right of the overview button (off by default). The button, or
+  Ctrl+Shift+M from anywhere, drops down the list; click a machine, or move with the arrow
+  keys and press Enter or Space, and its magic packet goes out as a broadcast on the local
+  network. A checkmark grows in on the row and the menu closes a moment later; a send the
+  network stack refuses says so on the row instead. Reaches machines on the same LAN or
+  Wi-Fi with Wake-on-LAN enabled in their firmware and adapter.
+
 ## [1.3.0] — 2026-09-13
 
 ### Added

@@ -61,6 +61,19 @@ exits; the run watches the exit on its own thread, lets output settle, then drop
 master to close the console. Live harness: `cargo test --lib attach::tests::live -- --ignored`
 (Windows, Git for Windows' sftp-server via `-D`).
 
+## Wake on LAN
+
+`src/wol.rs` builds and broadcasts the magic packet (255.255.255.255, ports 9 and 7, default
+route only; no directed broadcast). Machines live in `Settings::wol_hosts` (MAC stored
+canonical, `wol::format_mac`), the titlebar button behind `Settings::show_wol_button` (off by
+default, right of the overview button). The menu is `State::wol_menu`, opened by the button or
+Ctrl+Shift+M (`handle_key`; the chord is free in the app and indistinguishable from Enter to
+programs in a terminal). While it is open, `Message::Input` is routed to it (arrows, Enter,
+Space) and nothing reaches the PTY; Escape closes via `dismiss_top_overlay`. A sent packet
+starts the checkmark (fast tick while `sent` is set) and `Tick` closes the menu after
+`WOL_SENT_SHOW_MS`. The dropdown's x is estimated from the titlebar button widths in
+`wol_menu_view`, not measured.
+
 ## Terminal renderer — known limitation (intentional)
 
 The GPU renderer draws **one opaque quad per cell**, so a glyph cannot overflow its cell

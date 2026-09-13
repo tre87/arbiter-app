@@ -28,6 +28,14 @@ pub enum CredentialKind {
     Password,
 }
 
+/// A machine to wake over the network (Settings, Wake on LAN): what to call it, and its
+/// MAC address as typed (any spelling `wol::parse_mac` accepts; validated on entry).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct WolHost {
+    pub name: String,
+    pub mac: String,
+}
+
 /// The split tree of one workspace: interior `Split`s (mirroring `pane_grid::Node`)
 /// and `Leaf` terminals.
 #[derive(Serialize, Deserialize)]
@@ -166,6 +174,13 @@ pub struct Settings {
     /// is a surprise to anyone who did not ask for it.
     #[serde(default)]
     pub name_remote_claude_sessions: bool,
+    /// Machines the Wake-on-LAN menu can wake (Settings, Wake on LAN), in list order.
+    #[serde(default)]
+    pub wol_hosts: Vec<WolHost>,
+    /// Show the Wake-on-LAN button in the titlebar, right of the overview button. Off by
+    /// default: the menu is also on Ctrl+Shift+M, and most people have nothing to wake.
+    #[serde(default)]
+    pub show_wol_button: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -273,6 +288,8 @@ impl Default for Settings {
             background: default_bg_hex(),
             confirm_on_quit: true,
             name_remote_claude_sessions: false,
+            wol_hosts: Vec::new(),
+            show_wol_button: false,
         }
     }
 }

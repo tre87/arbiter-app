@@ -15,3 +15,4 @@ pub mod remote;
 pub mod session;
 pub mod shell;
 pub mod term;
+pub mod wol;

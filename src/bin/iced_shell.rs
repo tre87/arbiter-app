@@ -149,6 +149,13 @@ struct State {
     usage_org: Option<String>,
     /// Whether the org-selection modal is open.
     usage_org_menu: bool,
+    /// The Wake-on-LAN menu, while open (see `WolMenu`).
+    wol_menu: Option<WolMenu>,
+    /// The Settings "Add a machine" form's fields, and why the last Add was refused
+    /// (cleared on the next edit).
+    wol_new_name: String,
+    wol_new_mac: String,
+    wol_add_error: Option<String>,
     /// User preferences (the Settings dialog) — persisted with the session.
     settings: persist::Settings,
     /// Whether the Settings modal is open, and which tab it's showing.
@@ -296,6 +303,23 @@ struct AttachInflight {
     host: String,
 }
 
+/// The Wake-on-LAN menu while it is open (titlebar button or Ctrl+Shift+M).
+struct WolMenu {
+    /// The highlighted row, moved with the arrow keys; Enter or Space wakes it.
+    selected: usize,
+    /// The row a magic packet just went out for, and when (ms): its checkmark grows in,
+    /// then the menu closes (see `WOL_SENT_SHOW_MS`).
+    sent: Option<(usize, u64)>,
+    /// The row whose last send the network stack refused, with the OS's words.
+    error: Option<(usize, String)>,
+}
+
+/// How long the checkmark shows after a magic packet went out before the menu closes.
+const WOL_SENT_SHOW_MS: u64 = 900;
+
+/// Width of the Wake-on-LAN menu card.
+const WOL_MENU_W: f32 = 260.0;
+
 /// The credential dialog. Taking it drops every secret the user typed; what is to be
 /// kept has been copied into the `Vault` first.
 struct ConnectPrompt {
@@ -370,6 +394,7 @@ enum SettingsTab {
     Display,
     Files,
     ClaudeUsage,
+    WakeOnLan,
 }
 
 /// Which default folder the file-attach picker opens in (web Ctrl+Shift+S vs +A).
@@ -607,6 +632,17 @@ enum Message {
     Pasted(Option<String>),
     /// Toggle the popout overview window.
     ToggleOverview,
+    /// Titlebar Wake button / Ctrl+Shift+M: open the Wake-on-LAN menu (or close it).
+    ToggleWolMenu,
+    CloseWolMenu,
+    /// Send the magic packet for machine `i` (a click, or Enter/Space on the highlighted row).
+    WolSend(usize),
+    /// Settings, Wake on LAN: the add form, the list, and the titlebar button switch.
+    WolNewName(String),
+    WolNewMac(String),
+    WolAdd,
+    WolRemove(usize),
+    ToggleWolButton(bool),
     /// Jump to a pane from the overview (select its workspace + focus it).
     JumpTo(usize, pane_grid::Pane),
     /// A window was closed (main → exit; overview → forget it).
@@ -1316,6 +1352,7 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
     if state.rename_terminal.is_some() { take!(state.rename_terminal) }
     if state.term_menu.is_some() { take!(state.term_menu) }
     if state.ws_tab_menu.is_some() { take!(state.ws_tab_menu) }
+    if state.wol_menu.is_some() { take!(state.wol_menu) }
     if state.usage_org_menu { take!(state.usage_org_menu) }
     if state.rename_ws.is_some() { take!(state.rename_ws) }
     if state.rename_confirm.is_some() { take!(state.rename_confirm) }
@@ -1380,8 +1417,34 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.usage.state = UsageState::NeedsLogin;
                 set_usage_poll(state.usage.state); // quiet the poll (incl. any retry)
             }
+            // The Wake-on-LAN checkmark has shown long enough: the menu closes itself.
+            if state
+                .wol_menu
+                .as_ref()
+                .and_then(|m| m.sent)
+                .is_some_and(|(_, at)| now_ms().saturating_sub(at) >= WOL_SENT_SHOW_MS)
+            {
+                state.wol_menu = None;
+            }
         }
         Message::Input(bytes) => {
+            // While the Wake-on-LAN menu is open the keyboard drives it: arrows move the
+            // highlight, Enter or Space wakes the highlighted machine, everything else is
+            // dropped so no keystroke reaches the terminal behind it (Escape closes it via
+            // `dismiss_top_overlay`).
+            if let Some(menu) = state.wol_menu.as_mut() {
+                let n = state.settings.wol_hosts.len();
+                match bytes.as_slice() {
+                    b"\x1b[A" | b"\x1bOA" if n > 0 => menu.selected = (menu.selected + n - 1) % n,
+                    b"\x1b[B" | b"\x1bOB" if n > 0 => menu.selected = (menu.selected + 1) % n,
+                    b"\r" | b" " => {
+                        let i = menu.selected;
+                        return update(state, Message::WolSend(i));
+                    }
+                    _ => {}
+                }
+                return Task::none();
+            }
             // While the sign-in dialog is up, a key no field captured must not reach the
             // terminals behind it. A text input leaves Tab to the application, so Tab and
             // Shift+Tab move between the fields here; Enter submits; the rest is dropped.
@@ -2059,6 +2122,77 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             trafficlights::end_drag();
         }
         Message::Noop => {}
+        Message::ToggleWolMenu => {
+            if state.wol_menu.is_some() {
+                state.wol_menu = None;
+            } else if state.settings.wol_hosts.is_empty() {
+                // Nothing to wake yet: the menu would be empty, so go where a machine is added.
+                state.settings_tab = SettingsTab::WakeOnLan;
+                state.settings_open = true;
+            } else {
+                state.wol_menu = Some(WolMenu { selected: 0, sent: None, error: None });
+            }
+        }
+        Message::CloseWolMenu => state.wol_menu = None,
+        Message::WolSend(i) => {
+            let Some(menu) = state.wol_menu.as_mut() else { return Task::none() };
+            let Some(host) = state.settings.wol_hosts.get(i) else { return Task::none() };
+            // One at a time: a send that went out is about to close the menu anyway.
+            if menu.sent.is_some() {
+                return Task::none();
+            }
+            menu.selected = i;
+            let result = arbiter_native::wol::parse_mac(&host.mac)
+                .ok_or_else(|| "not a MAC address".to_string())
+                .and_then(|mac| arbiter_native::wol::send(&mac).map_err(|e| e.to_string()));
+            match result {
+                Ok(()) => {
+                    menu.sent = Some((i, now_ms()));
+                    menu.error = None;
+                }
+                Err(why) => menu.error = Some((i, why)),
+            }
+        }
+        Message::WolNewName(s) => {
+            state.wol_new_name = s;
+            state.wol_add_error = None;
+        }
+        Message::WolNewMac(s) => {
+            state.wol_new_mac = s;
+            state.wol_add_error = None;
+        }
+        Message::WolAdd => {
+            let name = state.wol_new_name.trim().to_string();
+            match arbiter_native::wol::parse_mac(state.wol_new_mac.trim()) {
+                None => {
+                    state.wol_add_error =
+                        Some("That is not a MAC address: six pairs of hex digits, like 00:1a:2b:3c:4d:5e.".into());
+                }
+                Some(mac) => {
+                    let mac = arbiter_native::wol::format_mac(&mac);
+                    if state.settings.wol_hosts.iter().any(|h| h.mac == mac) {
+                        state.wol_add_error = Some("That machine is already in the list.".into());
+                    } else {
+                        let name = if name.is_empty() { mac.clone() } else { name };
+                        state.settings.wol_hosts.push(persist::WolHost { name, mac });
+                        state.wol_new_name.clear();
+                        state.wol_new_mac.clear();
+                        state.wol_add_error = None;
+                        save_session(state);
+                    }
+                }
+            }
+        }
+        Message::WolRemove(i) => {
+            if i < state.settings.wol_hosts.len() {
+                state.settings.wol_hosts.remove(i);
+                save_session(state);
+            }
+        }
+        Message::ToggleWolButton(v) => {
+            state.settings.show_wol_button = v;
+            save_session(state);
+        }
         Message::ToggleOverview => {
             if let Some(id) = state.overview_window.take() {
                 save_session(state); // persist "overview closed"
@@ -2552,6 +2686,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if let Some(m) = &state.ws_tab_menu {
         return Some(ws_tab_menu_view(state, m.index, m.x, m.y));
     }
+    if let Some(m) = &state.wol_menu {
+        return Some(wol_menu_view(state, m));
+    }
     // The org picker layers above Settings (it's reached from the Settings "Switch
     // organization" button), so check it first; dismissing it returns to Settings.
     if state.usage_org_menu {
@@ -2844,6 +2981,22 @@ fn settings_str_row(
         .into()
 }
 
+/// One saved Wake-on-LAN machine in Settings: name and MAC, with a Remove button.
+fn wol_host_row(i: usize, h: &persist::WolHost) -> Element<'static, Message> {
+    let labels = column![
+        text(h.name.clone()).size(13).color(TXT_SECONDARY),
+        text(h.mac.clone()).size(11).color(TXT_MUTED),
+    ]
+    .spacing(2);
+    container(
+        row![labels, horizontal_space(), settings_btn("Remove", Message::WolRemove(i), BtnKind::Secondary)]
+            .spacing(12)
+            .align_y(iced::Center),
+    )
+    .padding([6, 4])
+    .into()
+}
+
 /// A `label  [picker]` row for the intense-text style (label + hint on the left, a
 /// pick_list on the right) — mirrors `settings_number_row`'s layout.
 fn settings_intense_row(
@@ -3026,6 +3179,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 settings_tab_item("Display", SettingsTab::Display, state.settings_tab),
                 settings_tab_item("Files", SettingsTab::Files, state.settings_tab),
                 settings_tab_item("Claude Usage", SettingsTab::ClaudeUsage, state.settings_tab),
+                settings_tab_item("Wake on LAN", SettingsTab::WakeOnLan, state.settings_tab),
             ]
             .spacing(2),
             Space::with_height(Length::Fill),
@@ -3161,6 +3315,54 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             ]
             .spacing(12)
         }
+        SettingsTab::WakeOnLan => {
+            let mut col = column![
+                settings_section("Machines"),
+                settings_hint(
+                    "Machines to wake with a magic packet, from the titlebar button or Ctrl+Shift+M. The \
+                     packet is a broadcast on this network, so the machine must be on the same LAN or Wi-Fi, \
+                     with Wake-on-LAN enabled in its firmware and network adapter."
+                ),
+            ]
+            .spacing(12);
+            if state.settings.wol_hosts.is_empty() {
+                col = col.push(settings_hint("No machines yet."));
+            }
+            for (i, h) in state.settings.wol_hosts.iter().enumerate() {
+                col = col.push(wol_host_row(i, h));
+            }
+            col = col.push(settings_hdivider());
+            col = col.push(settings_section("Add a machine"));
+            let name = text_input("Name (optional)", &state.wol_new_name)
+                .on_input(Message::WolNewName)
+                .on_submit(Message::WolAdd)
+                .width(Length::Fill)
+                .padding([7, 9])
+                .size(13)
+                .style(settings_input_style);
+            let mac = text_input("MAC address, like 00:1a:2b:3c:4d:5e", &state.wol_new_mac)
+                .on_input(Message::WolNewMac)
+                .on_submit(Message::WolAdd)
+                .width(Length::Fixed(250.0))
+                .padding([7, 9])
+                .size(13)
+                .style(settings_input_style);
+            col = col.push(
+                row![name, mac, settings_btn("Add", Message::WolAdd, BtnKind::Primary)].spacing(8).align_y(iced::Center),
+            );
+            if let Some(e) = &state.wol_add_error {
+                col = col.push(text(e.clone()).size(11).color(iced::Color::from_rgb8(0xe5, 0x6b, 0x6f)));
+            }
+            col = col.push(Space::with_height(Length::Fixed(8.0)));
+            col = col.push(settings_section("Titlebar"));
+            col = col.push(settings_toggle(
+                "Show the Wake button in the titlebar",
+                Some("Right of the overview button. The menu is on Ctrl+Shift+M either way."),
+                state.settings.show_wol_button,
+                Message::ToggleWolButton,
+            ));
+            col
+        }
         SettingsTab::ClaudeUsage => column![
             settings_section("Account"),
             settings_account(&state.usage),
@@ -3261,7 +3463,7 @@ fn kbd_combo(keys: &str) -> Element<'static, Message> {
 /// The keyboard-shortcuts cheat sheet — a centred card listing every binding
 /// (Ctrl on all platforms, like the web).
 fn shortcuts_dialog_view() -> Element<'static, Message> {
-    const ROWS: [(&str, &str); 14] = [
+    const ROWS: [(&str, &str); 15] = [
         ("New workspace", "Ctrl + Shift + T"),
         ("Next workspace", "Ctrl + Tab"),
         ("Previous workspace", "Ctrl + Shift + Tab"),
@@ -3276,6 +3478,7 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
         ("Workspace overview", "Ctrl + Shift + O"),
         ("Attach screenshot", "Ctrl + Shift + S"),
         ("Attach files", "Ctrl + Shift + A"),
+        ("Wake a machine (Wake on LAN)", "Ctrl + Shift + M"),
     ];
     let mut list = column![].spacing(0);
     for (i, (action, keys)) in ROWS.iter().enumerate() {
@@ -4329,6 +4532,82 @@ fn ws_tab_menu_view(state: &State, index: usize, x0: f32, y0: f32) -> Element<'s
     context_menu_card(items, 176.0, 76.0, x0, y0, state.main_size, Message::WorkspaceTabMenuClose)
 }
 
+/// The Wake-on-LAN menu: one row per saved machine, dropped down under the titlebar's Wake
+/// button (right of the overview button; the same spot whether or not that button is shown).
+/// Arrow keys move the highlight, Enter or Space wakes, Escape or a click outside closes.
+fn wol_menu_view(state: &State, menu: &WolMenu) -> Element<'static, Message> {
+    let mut items = column![].spacing(0).padding([4, 0]);
+    items = items.push(
+        container(text("Wake a machine").size(11).color(TXT_MUTED))
+            .padding(iced::Padding { top: 4.0, right: 12.0, bottom: 4.0, left: 12.0 }),
+    );
+    for (i, h) in state.settings.wol_hosts.iter().enumerate() {
+        let sent_at = menu.sent.filter(|(row, _)| *row == i).map(|(_, at)| at);
+        let error = menu.error.as_ref().filter(|(row, _)| *row == i).map(|(_, e)| e.clone());
+        items = items.push(wol_menu_row(i, h, menu.selected == i, sent_at, error));
+    }
+    items = items.push(
+        container(text("\u{2191}\u{2193} choose \u{00b7} Enter or Space wakes \u{00b7} Esc closes").size(10).color(TXT_MUTED))
+            .padding(iced::Padding { top: 6.0, right: 12.0, bottom: 4.0, left: 12.0 }),
+    );
+    let est_h = 64.0 + 44.0 * state.settings.wol_hosts.len() as f32;
+    #[cfg(target_os = "windows")]
+    let caption_w = 140.0;
+    #[cfg(not(target_os = "windows"))]
+    let caption_w = 0.0;
+    // Under the Wake button: to its right sit the shortcuts and settings buttons (two
+    // 30px buttons and their gaps) and, on Windows, the caption strip.
+    let x0 = state.main_size.width - TITLEBAR_RIGHT_PAD - caption_w - 68.0 - WOL_MENU_W;
+    context_menu_card(items, WOL_MENU_W, est_h, x0, 44.0, state.main_size, Message::CloseWolMenu)
+}
+
+/// One machine in the Wake-on-LAN menu. `highlighted` is the keyboard selection; `sent_at`
+/// (ms) starts the checkmark that grows in over a quarter second while the row tints green;
+/// `error` is the last refused send, in the OS's words.
+fn wol_menu_row(
+    i: usize,
+    h: &persist::WolHost,
+    highlighted: bool,
+    sent_at: Option<u64>,
+    error: Option<String>,
+) -> Element<'static, Message> {
+    let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
+    let (name_c, mac_c) = if highlighted {
+        (iced::Color::WHITE, iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.7))
+    } else {
+        (TXT_SECONDARY, TXT_MUTED)
+    };
+    let mut labels = column![
+        text(h.name.clone()).size(13).color(name_c),
+        text(h.mac.clone()).size(11).color(mac_c),
+    ]
+    .spacing(1);
+    if let Some(e) = error {
+        labels = labels.push(text(format!("Could not send: {e}")).size(11).color(iced::Color::from_rgb8(0xe5, 0x6b, 0x6f)));
+    }
+    let mut content = row![labels, horizontal_space()].spacing(8).align_y(iced::Center);
+    let flash = sent_at.map(|at| (now_ms().saturating_sub(at) as f32 / 250.0).clamp(0.0, 1.0));
+    if let Some(t) = flash {
+        let ease = 1.0 - (1.0 - t) * (1.0 - t);
+        content = content.push(cmdi(mdi_path::CHECK_BOLD, 8.0 + 10.0 * ease, iced::Color { a: 0.2 + 0.8 * ease, ..green }));
+    }
+    let bg = match flash {
+        Some(t) => Some(iced::Color { a: 0.18 * t, ..green }),
+        None if highlighted => Some(AZURE),
+        None => None,
+    };
+    button(content)
+        .width(Length::Fill)
+        .padding([8, 12])
+        .on_press(Message::WolSend(i))
+        .style(move |_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered);
+            let background = bg.or_else(|| hovered.then_some(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)));
+            button::Style { background: background.map(iced::Background::Color), ..Default::default() }
+        })
+        .into()
+}
+
 /// The startup credential dialog: one masked field per restored connection.
 ///
 /// Shown before anything connects, so no connection sits on an unanswered prompt burning
@@ -4656,8 +4935,9 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let caption_w = 0.0;
     // 3 menu btn-icons always; the split/down/close trio + separator only when
     // the terminal buttons are enabled (+ Windows caption strip).
-    let actions_w =
-        (if state.settings.show_terminal_buttons { 216.0 } else { 104.0 }) + caption_w;
+    let actions_w = (if state.settings.show_terminal_buttons { 216.0 } else { 104.0 })
+        + (if state.settings.show_wol_button { 34.0 } else { 0.0 })
+        + caption_w;
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
     // Usage section (bars / loading / sign-in / warning), built once with its own
@@ -4742,7 +5022,12 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
             .push(group_sep());
     }
     actions = actions
-        .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()))
+        .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()));
+    // Wake-on-LAN, right of the overview button, only when switched on in Settings.
+    if state.settings.show_wol_button {
+        actions = actions.push(action_icon_btn(mdi_path::POWER_SYMBOL, Message::ToggleWolMenu, state.wol_menu.is_some()));
+    }
+    actions = actions
         .push(action_icon_btn(mdi_path::ARROW_ALL, Message::OpenShortcuts, state.shortcuts_open))
         .push(action_icon_btn(mdi_path::COG, Message::OpenSettings, state.settings_open));
     bar = bar.push(actions);
@@ -5438,6 +5723,10 @@ mod mdi_path {
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
     pub const ARROW_DOWN: &str = "M11,4H13V16L18.5,10.5L19.92,11.92L12,19.84L4.08,11.92L5.5,10.5L11,16V4Z";
     pub const ARROW_UP: &str = "M13,20H11V8L5.5,13.5L4.08,12.08L12,4.16L19.92,12.08L18.5,13.5L13,8V20Z";
+    /// mdi `power`: the titlebar's Wake-on-LAN button.
+    pub const POWER_SYMBOL: &str = "M16.56,5.44L15.11,6.89C16.84,7.94 18,9.83 18,12A6,6 0 0,1 12,18A6,6 0 0,1 6,12C6,9.83 7.16,7.94 8.88,6.88L7.44,5.44C5.36,6.88 4,9.28 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12C20,9.28 18.64,6.88 16.56,5.44M13,3H11V13H13";
+    /// mdi `check`: a magic packet went out.
+    pub const CHECK_BOLD: &str = "M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,6.59L21,7Z";
     /// mdi `upload`: an arrow rising from a tray, for a copy to a far host under way.
     pub const UPLOAD: &str = "M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z";
     // Context-menu actions (web PencilOutline).
@@ -6847,6 +7136,10 @@ fn needs_fast_tick(state: &State) -> bool {
     if !state.attach_inflight.is_empty() {
         return true;
     }
+    // The Wake-on-LAN checkmark grows in, then the menu closes: under a second.
+    if state.wol_menu.as_ref().is_some_and(|m| m.sent.is_some()) {
+        return true;
+    }
     state.workspaces.iter().any(|ws| {
         ws.panes.iter().any(|(_, d)| {
             // Only *Working* animates (the ✻ bloom / avatar bob). Attention is a
@@ -7111,6 +7404,9 @@ fn handle_key(event: iced::Event) -> Option<Message> {
                     Some('w') => return Some(Message::Close),
                     Some('a') => return Some(Message::AttachFiles(AttachSource::Docs)),
                     Some('s') => return Some(Message::AttachFiles(AttachSource::Screenshot)),
+                    // Free in the app and meaningless to programs in a terminal, which
+                    // cannot tell Ctrl+Shift+M from plain Enter in the legacy encoding.
+                    Some('m') => return Some(Message::ToggleWolMenu),
                     _ => {} // c/v fall through to copy/paste below
                 }
             }
@@ -7923,6 +8219,10 @@ fn main() -> iced::Result {
                 usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
+                wol_menu: None,
+                wol_new_name: String::new(),
+                wol_new_mac: String::new(),
+                wol_add_error: None,
                 font_size_input: saved_settings.font_size.to_string(),
                 settings: saved_settings,
                 settings_open: false,
