@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-13
+
 ### Added
 - **Attaching a file to a terminal on another machine now works.** Drop a file on a
   remote terminal, or attach a screenshot with Ctrl+Shift+S, and Arbiter copies it to the
