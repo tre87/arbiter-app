@@ -177,6 +177,78 @@ pub fn remote_launch_line(
     Some(out)
 }
 
+/// How to reach the far host of a plain `ssh` line with `sftp`, the client's own transfer
+/// program: the program (beside a path-qualified `ssh`), the options to place before the
+/// batch file, and the destination as `[user@]host`. Only a handful of ssh options mean
+/// anything to a transfer; the tty, forwarding and session options are dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpInvocation {
+    pub program: String,
+    pub options: Vec<String>,
+    pub destination: String,
+}
+
+impl SftpInvocation {
+    /// The host without its user part, for messages.
+    pub fn host(&self) -> &str {
+        self.destination.rsplit('@').next().unwrap_or(&self.destination)
+    }
+}
+
+/// sftp's letters collide with ssh's but mean other things (`-p` preserves times, `-l`
+/// limits bandwidth), so nothing is passed through by position: `-p` becomes `-P`, `-l`
+/// becomes the destination's user part, and only `-i -F -J -o -c` and the flags
+/// `-4 -6 -A -C -q` keep their spelling. `None` for anything `parse_simple_ssh` refuses.
+pub fn sftp_invocation(startup_cmd: &str) -> Option<SftpInvocation> {
+    let ssh = parse_simple_ssh(startup_cmd.trim())?;
+    let (client, args) = ssh.words.split_first()?;
+    let (dir, base) = match client.rfind(['/', '\\']) {
+        Some(i) => (&client[..=i], &client[i + 1..]),
+        None => ("", *client),
+    };
+    let exe = if base.to_ascii_lowercase().ends_with(".exe") { "sftp.exe" } else { "sftp" };
+    let program = format!("{dir}{exe}");
+    let mut options = Vec::new();
+    let mut login = None;
+    let mut host = None;
+    let mut i = 0;
+    while i < args.len() {
+        let word = args[i];
+        i += 1;
+        let Some(flags) = word.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            host = Some(word);
+            break;
+        };
+        let mut letters = flags.chars();
+        while let Some(c) = letters.next() {
+            if OPTS_WITH_VALUE.contains(c) {
+                let value = if letters.as_str().is_empty() {
+                    i += 1;
+                    *args.get(i - 1)?
+                } else {
+                    letters.as_str()
+                };
+                match c {
+                    'p' => options.extend(["-P".to_string(), value.to_string()]),
+                    'l' => login = Some(value),
+                    'i' | 'F' | 'J' | 'o' | 'c' => options.extend([format!("-{c}"), value.to_string()]),
+                    _ => {}
+                }
+                break;
+            }
+            if matches!(c, '4' | '6' | 'A' | 'C' | 'q') {
+                options.push(format!("-{c}"));
+            }
+        }
+    }
+    let host = host?;
+    let destination = match login {
+        Some(user) if !host.contains('@') => format!("{user}@{host}"),
+        _ => host.to_string(),
+    };
+    Some(SftpInvocation { program, options, destination })
+}
+
 #[cfg(test)]
 mod tests {
     fn line(cmd: &str, dir: &str) -> Option<String> {
@@ -291,5 +363,31 @@ mod tests {
         assert!(line("ssh mini", "relative/x").is_none());
         assert!(line("ssh mini", "~tre/x").is_none(), "another user's home is not expanded reliably");
         assert!(line("ssh mini", "~").is_none(), "home is where a login lands anyway");
+    }
+
+    // The transfer program is found beside the client and given only what a transfer
+    // can use, spelled the way sftp spells it.
+    #[test]
+    fn sftp_invocation_is_translated_from_the_ssh_line() {
+        use super::sftp_invocation as inv;
+        let s = inv("ssh mini").unwrap();
+        assert_eq!((s.program.as_str(), s.destination.as_str()), ("sftp", "mini"));
+        assert!(s.options.is_empty());
+        let s = inv("ssh -p 2222 -i ~/.ssh/key -l tre -t -A -4 -o StrictHostKeyChecking=no 10.0.0.16").unwrap();
+        assert_eq!(s.options, ["-P", "2222", "-i", "~/.ssh/key", "-A", "-4", "-o", "StrictHostKeyChecking=no"]);
+        assert_eq!(s.destination, "tre@10.0.0.16");
+        assert_eq!(s.host(), "10.0.0.16");
+        assert_eq!(inv("ssh -p2222 mini").unwrap().options, ["-P", "2222"]);
+        assert_eq!(inv("ssh -l tre tre2@mini").unwrap().destination, "tre2@mini", "an explicit user wins");
+        assert_eq!(inv("ssh -L 8080:localhost:80 -N -tt mini").unwrap().options, Vec::<String>::new());
+        assert_eq!(inv("/usr/bin/ssh mini").unwrap().program, "/usr/bin/sftp");
+        assert_eq!(
+            inv("C:\\Windows\\System32\\OpenSSH\\ssh.exe mini").unwrap().program,
+            "C:\\Windows\\System32\\OpenSSH\\sftp.exe"
+        );
+        assert!(inv("mosh mini").is_none());
+        assert!(inv("plink mini").is_none());
+        assert!(inv("ssh mini uptime").is_none());
+        assert!(inv("ssh").is_none());
     }
 }

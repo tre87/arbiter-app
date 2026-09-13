@@ -7,6 +7,18 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Attaching a file to a terminal on another machine now works.** Drop a file on a
+  remote terminal, or attach a screenshot with Ctrl+Shift+S, and Arbiter copies it to the
+  far host first, then pastes the copy's path, so Claude there reads it as if it had been
+  dropped locally. The copy goes over a second connection made with `sftp` from the
+  terminal's own ssh line, into `~/.arbiter/attach` on the far host, and takes well under
+  a second on a LAN. A password or key passphrase is answered from what was typed into
+  the sign-in dialog this run; a connection not signed in through Arbiter asks once, in
+  that same dialog. Copies older than a day are removed by Arbiter itself, once a day per
+  host, after the day's first copy. Works from Windows or macOS to a Mac, a Linux box or a
+  Windows OpenSSH server alike, since sftp needs nothing of the far host's shell.
+
 ### Fixed
 - **A small black box no longer appears in the top-left corner of the primary monitor
   on Windows.** Arbiter asks Windows 11 to round the corners of its windows and did so

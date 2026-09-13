@@ -43,6 +43,24 @@ A rejected alternative, for the record: a status-line script on the far host pri
 `ESC ] 7777 ; arbiter ; session=<id> ; cwd=<path> BEL` for the reader to parse. It works
 but needs a file copied to every host, which the user did not want (2026-09-12).
 
+## Remote attach — how a local file reaches the far host
+
+Ctrl+Shift+S, Ctrl+Shift+A and a file drop all end in `attach_paths` (`iced_shell.rs`). A
+remote pane cannot read this machine's disk, so `src/attach.rs` copies the file first over a
+second connection: `sftp`, chosen because its batch commands are protocol operations and
+the far host's shell (cmd.exe included) never enters into it. The invocation comes from
+the pane's saved ssh line (`remote::sftp_invocation`; `-p`→`-P`, `-l`→`user@`, the rest
+dropped or kept by name). It runs inside a PTY so a password/passphrase prompt can be
+answered from the `Vault`, with `-o BatchMode=no` placed BEFORE `-b` because ssh keeps the
+first value it sees for an option. Copies land in `~/.arbiter/attach/<UTC stamp>-<name>`;
+the pasted path is absolute, learnt from `pwd` in the batch. Cleanup is Arbiter's own daily
+sweep (`attach::sweep`, `State::attach_swept`), globbing away stamps older than yesterday.
+No secret was known → the same credential dialog opens (`ConnectKind::Attach`) and Submit
+re-runs the copy. **ConPTY gotcha learnt here:** a PTY reader gets no EOF when the child
+exits; the run watches the exit on its own thread, lets output settle, then drops the
+master to close the console. Live harness: `cargo test --lib attach::tests::live -- --ignored`
+(Windows, Git for Windows' sftp-server via `-D`).
+
 ## Terminal renderer — known limitation (intentional)
 
 The GPU renderer draws **one opaque quad per cell**, so a glyph cannot overflow its cell

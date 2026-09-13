@@ -117,7 +117,7 @@ impl Secret {
     }
 
     /// The secret plus the Return that submits it.
-    fn line(&self) -> Vec<u8> {
+    pub(crate) fn line(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.0.len() + 1);
         out.extend_from_slice(&self.0);
         out.push(b'\r');
@@ -170,7 +170,7 @@ impl Drop for Secret {
 /// The password forms deliberately require their punctuation. Matching a bare "password"
 /// would fire on `cat /etc/passwd` or any output mentioning the word, and the consequence
 /// of a false match is typing a secret somewhere it does not belong.
-fn is_credential_prompt(text: &str) -> bool {
+pub(crate) fn is_credential_prompt(text: &str) -> bool {
     const PROMPTS: &[&str] = &["Enter passphrase", "'s password:", ") Password:"];
     PROMPTS.iter().any(|p| text.contains(p))
 }
@@ -178,7 +178,7 @@ fn is_credential_prompt(text: &str) -> bool {
 /// What an ssh credential prompt in `text` asks for, and for what: a key's file name for
 /// a passphrase, `user@host` for a password (empty when the prompt does not say). The
 /// forms are those `is_credential_prompt` recognises.
-fn describe_credential_prompt(text: &str) -> Option<(CredentialKind, String)> {
+pub(crate) fn describe_credential_prompt(text: &str) -> Option<(CredentialKind, String)> {
     if let Some(i) = text.find("Enter passphrase") {
         // `Enter passphrase for key '/c/Users/TRE/.ssh/id_ed25519':` (MSYS ssh) or with
         // double quotes (native Windows ssh naming the key); a bare `Enter passphrase:`
@@ -204,7 +204,7 @@ fn describe_credential_prompt(text: &str) -> Option<(CredentialKind, String)> {
 
 /// Whether `text` carries ssh's final refusal. After a credential Arbiter typed, this
 /// means it was wrong (or the key was not accepted), and only the user can fix that.
-fn permission_denied(text: &str) -> bool {
+pub(crate) fn permission_denied(text: &str) -> bool {
     text.contains("Permission denied")
 }
 

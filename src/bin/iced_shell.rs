@@ -191,6 +191,11 @@ struct State {
     connect_prompt: Option<ConnectPrompt>,
     /// The secrets remembered for this run (see `Vault`).
     vault: Vault,
+    /// Something the user has to be told, until dismissed (see `Notice`).
+    notice: Option<Notice>,
+    /// Connection commands whose attach directory on the far host has been swept of old
+    /// copies, by the UTC day it happened (see `attach::sweep`): once a day is enough.
+    attach_swept: HashMap<String, i64>,
     /// In-progress workspace-tab drag-reorder: the tab grabbed + the tab the cursor
     /// is currently over (the drop target). None when not dragging.
     tab_drag: Option<TabDrag>,
@@ -260,7 +265,7 @@ struct Connection {
 }
 
 /// What the credential dialog is answering for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ConnectKind {
     /// Every restored connection is held until this is answered.
     Startup,
@@ -269,6 +274,17 @@ enum ConnectKind {
     /// One pane's connection is waiting at a repeated prompt: the previous answer was
     /// rejected. Submit answers that prompt in place; cancel leaves it to the user.
     Reask { ws: usize, pane: pane_grid::Pane },
+    /// Files attached to a remote pane (the one running `session`) are waiting to be
+    /// copied to its host, whose connection asked for a secret nobody has typed this run.
+    /// Submit copies them; cancel drops them.
+    Attach { session: u64, paths: Vec<String> },
+}
+
+/// Something the user has to be told, with one button to close it: what could not be
+/// done, and why.
+struct Notice {
+    title: String,
+    body: String,
 }
 
 /// The credential dialog. Taking it drops every secret the user typed; what is to be
@@ -486,6 +502,15 @@ enum Message {
     FilesPicked(AttachSource, Option<Vec<String>>),
     /// A file was dropped onto the window → attach it to the focused terminal.
     FileDropped(std::path::PathBuf),
+    /// Files attached to a remote pane have been copied to its host, or not: the pane's
+    /// session id, the local paths (to try again after signing in), and the far host's
+    /// paths or the reason.
+    RemoteAttachDone(
+        u64,
+        Vec<String>,
+        Result<arbiter_native::attach::Attached, arbiter_native::attach::Failure>,
+    ),
+    DismissNotice,
     /// Context menu → confirm renaming the pane to its git repo's name.
     RequestRenameToRepo(pane_grid::Pane),
     ConfirmRename,
@@ -981,6 +1006,12 @@ fn connect_answer(state: &mut State, use_secrets: bool) -> Task<Message> {
                 reconnect_pane(state, ws, pane);
             }
         }
+        ConnectKind::Attach { session, paths } => {
+            if !use_secrets {
+                return Task::none();
+            }
+            return start_remote_attach(state, session, paths);
+        }
     }
     Task::none()
 }
@@ -1269,6 +1300,7 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
         let _ = connect_answer(state, false);
         return true;
     }
+    if state.notice.is_some() { take!(state.notice) }
     if state.close_confirm.is_some() { take!(state.close_confirm) }
     if state.quit_confirm { take!(state.quit_confirm) }
     if state.usage_login_prompt { take!(state.usage_login_prompt) }
@@ -1725,12 +1757,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     save_session(state);
                 }
             }
-            write_attach_paths(state, &paths);
+            return attach_paths(state, paths);
         }
         Message::FilesPicked(_, _) => {}
         Message::FileDropped(path) => {
-            write_attach_paths(state, &[path.to_string_lossy().into_owned()]);
+            return attach_paths(state, vec![path.to_string_lossy().into_owned()]);
         }
+        Message::RemoteAttachDone(session, local_paths, result) => {
+            return remote_attach_done(state, session, local_paths, result);
+        }
+        Message::DismissNotice => state.notice = None,
         Message::RequestRenameToRepo(pane) => {
             // Resolve the repo name from the pane's cwd; only prompt inside a repo.
             if let Some(d) = state.active().panes.get(pane) {
@@ -2485,6 +2521,9 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     // anything else that might be open.
     if let Some(p) = &state.connect_prompt {
         return Some(connect_prompt_view(p));
+    }
+    if let Some(n) = &state.notice {
+        return Some(notice_view(n));
     }
     if let Some(c) = &state.close_confirm {
         return Some(close_confirm_view(c));
@@ -4288,32 +4327,57 @@ fn ws_tab_menu_view(state: &State, index: usize, x0: f32, y0: f32) -> Element<'s
 /// its own terminal, exactly as it did before this dialog existed.
 fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
     let n = p.rows.len();
-    let (title, hint, skip_label, submit_label): (String, &str, &str, &str) = if p.rejected {
-        (
+    let attaching = matches!(p.kind, ConnectKind::Attach { .. });
+    let (title, hint, skip_label, submit_label): (String, String, &str, &str) = match (&p.kind, p.rejected) {
+        (ConnectKind::Attach { paths, .. }, rejected) => {
+            // Named after what is happening, not after signing in, so it cannot be taken
+            // for the startup dialog: the file and the host it is going to.
+            let host = p
+                .rows
+                .first()
+                .and_then(|r| arbiter_native::remote::sftp_invocation(&r.cmd))
+                .map(|i| i.host().to_string())
+                .unwrap_or_else(|| "the far host".into());
+            let what = match paths.as_slice() {
+                [one] => format!("{} goes", one.rsplit(['/', '\\']).next().unwrap_or(one)),
+                many => format!("{} files go", many.len()),
+            };
+            (
+                if rejected { "That password was rejected".into() } else { format!("Copy to {host}") },
+                format!(
+                    "{what} to {host} over a second ssh connection, which asks for the same secret the \
+                     terminal's connection did. {}Kept in memory until Arbiter quits, never saved, \
+                     and used for reconnects too.",
+                    if rejected { "Type it again to copy, or cancel. " } else { "" },
+                ),
+                "Cancel",
+                "Copy",
+            )
+        }
+        (_, true) => (
             "That password was rejected".into(),
             "Type it again to answer the prompt still waiting in the terminal, or cancel and \
-             type it there yourself.",
+             type it there yourself."
+                .into(),
             "Cancel",
             "Sign in",
-        )
-    } else {
-        match p.kind {
-            ConnectKind::Startup => (
-                format!("Sign in to {n} restored {}", if n == 1 { "connection" } else { "connections" }),
-                "Entered once and used for every terminal on that connection, reconnects \
-                 included. Kept in memory until Arbiter quits, never saved. Switch a \
-                 connection off to leave its terminals at their local prompt; their \
-                 Reconnect button brings one back later.",
-                "Connect without",
-                "Connect",
-            ),
-            ConnectKind::Reconnect { .. } | ConnectKind::Reask { .. } => (
-                "Sign in to reconnect".into(),
-                "Kept in memory until Arbiter quits, never saved.",
-                "Connect without",
-                "Connect",
-            ),
-        }
+        ),
+        (ConnectKind::Startup, false) => (
+            format!("Sign in to {n} restored {}", if n == 1 { "connection" } else { "connections" }),
+            "Entered once and used for every terminal on that connection, reconnects \
+             included. Kept in memory until Arbiter quits, never saved. Switch a \
+             connection off to leave its terminals at their local prompt; their \
+             Reconnect button brings one back later."
+                .into(),
+            "Connect without",
+            "Connect",
+        ),
+        (ConnectKind::Reconnect { .. } | ConnectKind::Reask { .. }, false) => (
+            "Sign in to reconnect".into(),
+            "Kept in memory until Arbiter quits, never saved.".into(),
+            "Connect without",
+            "Connect",
+        ),
     };
     let mut body = column![].spacing(2);
     for (i, row) in p.rows.iter().enumerate() {
@@ -4374,10 +4438,12 @@ fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
         if i > 0 {
             body = body.push(settings_hdivider());
         }
-        body = body.push(
-            container(row![lead, label, horizontal_space(), input, switch].spacing(12).align_y(iced::Center))
-                .padding([10, 4]),
-        );
+        // A copy either happens or is cancelled; there is no "connect without" for it.
+        let mut fields = row![lead, label, horizontal_space(), input].spacing(12).align_y(iced::Center);
+        if !attaching {
+            fields = fields.push(switch);
+        }
+        body = body.push(container(fields).padding([10, 4]));
     }
     let actions = row![
         horizontal_space(),
@@ -4470,6 +4536,27 @@ fn close_confirm_view(c: &CloseConfirm) -> Element<'static, Message> {
     .padding(18)
     .width(Length::Fixed(380.0));
     modal_scrim(modal_panel(panel.into()), Message::CancelCloseWorkspace)
+}
+
+/// One thing the user has to be told (`Notice`): closed by its button, Escape or the scrim.
+fn notice_view(n: &Notice) -> Element<'static, Message> {
+    let panel = column![
+        text(n.title.clone()).size(15).font(ui_semibold()),
+        text(n.body.clone()).size(13).color(TXT_SECONDARY),
+        row![
+            horizontal_space(),
+            button(text("OK").size(13))
+                .on_press(Message::DismissNotice)
+                .style(primary_btn_style)
+                .padding([6, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ]
+    .spacing(14)
+    .padding(18)
+    .width(Length::Fixed(440.0));
+    modal_scrim(modal_panel(panel.into()), Message::DismissNotice)
 }
 
 /// "Quit Arbiter?" confirmation (the app-close gesture), gated by `confirm_on_quit`.
@@ -6521,24 +6608,157 @@ fn resize_target(
 
 // ── File attach (drag-drop + Ctrl+Shift+S / Ctrl+Shift+A pickers) ──────────────
 
-/// Write file `paths` to the focused terminal as bracketed-paste runs (one per
-/// path, unquoted — matches the web's `writePathsToPane`), so Claude/the shell
-/// receives each verbatim even with spaces.
-fn write_attach_paths(state: &mut State, paths: &[String]) {
+/// Attach `paths` to the focused terminal. A local pane gets them as they are. A remote
+/// pane cannot read this machine's disk, so its files are copied to the far host first,
+/// and the copies' paths arrive with `Message::RemoteAttachDone`.
+fn attach_paths(state: &mut State, paths: Vec<String>) -> Task<Message> {
     if paths.is_empty() {
-        return;
+        return Task::none();
     }
-    let payload: String = paths.iter().map(|p| format!("\x1b[200~{p}\x1b[201~")).collect();
     let ws = state.active_mut();
-    if let Some(p) = ws.panes.get_mut(ws.focus) {
-        // Like typing/paste, return the view to the live bottom (the paths land at the
-        // prompt) and clear the selection.
-        if let Ok(mut t) = p.session.term().lock() {
-            t.scroll_to_bottom();
-            t.clear_selection();
-        }
-        p.session.write(payload.as_bytes());
+    let Some(p) = ws.panes.get_mut(ws.focus) else { return Task::none() };
+    if !p.session.is_remote() {
+        write_attach_paths(p, &paths);
+        return Task::none();
     }
+    let session = p.session.id();
+    start_remote_attach(state, session, paths)
+}
+
+/// Write file `paths` to pane `p` as bracketed-paste runs (one per path, unquoted,
+/// matching the web's `writePathsToPane`), so Claude/the shell receives each verbatim
+/// even with spaces.
+fn write_attach_paths(p: &mut PaneData, paths: &[String]) {
+    let payload: String = paths.iter().map(|p| format!("\x1b[200~{p}\x1b[201~")).collect();
+    // Like typing/paste, return the view to the live bottom (the paths land at the
+    // prompt) and clear the selection.
+    if let Ok(mut t) = p.session.term().lock() {
+        t.scroll_to_bottom();
+        t.clear_selection();
+    }
+    p.session.write(payload.as_bytes());
+}
+
+/// The pane running session `id`, in whichever workspace: a copy takes a moment, and
+/// focus may have moved meanwhile.
+fn pane_by_session(state: &mut State, id: u64) -> Option<&mut PaneData> {
+    state
+        .workspaces
+        .iter_mut()
+        .find_map(|w| w.panes.iter_mut().map(|(_, d)| d).find(|d| d.session.id() == id))
+}
+
+/// Copy `paths` to the host of the pane running `session`, off the UI thread, with the
+/// vault's secret for its connection if there is one; the outcome comes back as
+/// `RemoteAttachDone`. The first successful copy of the day per connection is followed
+/// by the sweep of old copies (`attach::sweep`), after the paths have been delivered.
+fn start_remote_attach(state: &mut State, session: u64, paths: Vec<String>) -> Task<Message> {
+    use arbiter_native::attach::{self, Failure};
+    let Some(d) = pane_by_session(state, session) else { return Task::none() };
+    let cmd = d.session.startup_cmd();
+    let Some(inv) = cmd.as_deref().and_then(arbiter_native::remote::sftp_invocation) else {
+        state.notice = Some(Notice {
+            title: "Cannot copy files to this host".into(),
+            body: "Attached files reach a remote terminal's host over a second connection made \
+                   from the terminal's own ssh line. This terminal was not opened with a plain \
+                   `ssh [options] host`, so there is nothing to make it from."
+                .into(),
+        });
+        return Task::none();
+    };
+    let cmd = cmd.unwrap_or_default();
+    let secret = state.vault.arm_copy(&cmd);
+    let sweep = state.attach_swept.get(&cmd) != Some(&attach::day_number(SystemTime::now()));
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    let local = paths.clone();
+    std::thread::spawn(move || {
+        let result = attach::upload(&inv, &paths, secret.as_ref()).map(|mut a| {
+            a.swept = sweep;
+            a
+        });
+        let sweep_now = sweep && result.is_ok();
+        let _ = tx.send(result);
+        if sweep_now {
+            attach::sweep(&inv, secret.as_ref());
+        }
+    });
+    Task::perform(
+        async move { rx.await.unwrap_or_else(|_| Err(Failure::Failed("the copy was abandoned".into()))) },
+        move |result| Message::RemoteAttachDone(session, local.clone(), result),
+    )
+}
+
+/// A copy finished: paste the far paths into the pane if it is still remote, or say what
+/// went wrong. A missing or rejected secret opens the credential dialog, whose Submit
+/// runs the copy again with what was typed.
+fn remote_attach_done(
+    state: &mut State,
+    session: u64,
+    local_paths: Vec<String>,
+    result: Result<arbiter_native::attach::Attached, arbiter_native::attach::Failure>,
+) -> Task<Message> {
+    use arbiter_native::attach::{day_number, Failure};
+    let Some((cmd, remote)) =
+        pane_by_session(state, session).and_then(|d| Some((d.session.startup_cmd()?, d.session.is_remote())))
+    else {
+        return Task::none();
+    };
+    let host = arbiter_native::remote::sftp_invocation(&cmd)
+        .map(|i| i.host().to_string())
+        .unwrap_or_else(|| cmd.clone());
+    let files = if local_paths.len() == 1 { "the file".to_string() } else { format!("{} files", local_paths.len()) };
+    match result {
+        Ok(attached) => {
+            if remote {
+                if let Some(d) = pane_by_session(state, session) {
+                    write_attach_paths(d, &attached.paths);
+                }
+            }
+            if attached.swept {
+                state.attach_swept.insert(cmd, day_number(SystemTime::now()));
+            }
+        }
+        Err(Failure::NeedsCredential(prompt)) => {
+            return ask_attach_credential(state, cmd, prompt, session, local_paths, false);
+        }
+        Err(Failure::Rejected(prompt)) => {
+            state.vault.forget(&cmd);
+            return ask_attach_credential(state, cmd, prompt, session, local_paths, true);
+        }
+        Err(Failure::UnknownHostKey) => {
+            state.notice = Some(Notice {
+                title: format!("Could not copy {files} to {host}"),
+                body: "ssh wanted the host's key confirmed first. Connect to it once in a terminal \
+                       and answer yes, then attach again."
+                    .into(),
+            });
+        }
+        Err(Failure::Failed(why)) => {
+            state.notice = Some(Notice { title: format!("Could not copy {files} to {host}"), body: why });
+        }
+    }
+    Task::none()
+}
+
+/// Ask for the secret a copy needs. With a credential dialog already up for something
+/// else, the copy is dropped with a word instead; two dialogs cannot share the screen.
+fn ask_attach_credential(
+    state: &mut State,
+    cmd: String,
+    prompt: Option<(persist::CredentialKind, String)>,
+    session: u64,
+    paths: Vec<String>,
+    rejected: bool,
+) -> Task<Message> {
+    if state.connect_prompt.is_some() {
+        state.notice = Some(Notice {
+            title: "Sign in first".into(),
+            body: "A sign-in dialog is already waiting. Answer it, then attach the files again.".into(),
+        });
+        return Task::none();
+    }
+    let connection = Connection { cmd, prompts: Some(true), prompt };
+    open_connect_prompt(state, vec![connection], ConnectKind::Attach { session, paths }, rejected)
 }
 
 /// The parent directory of a path (handles `/` and `\`), for docs-folder stickiness.
@@ -7679,6 +7899,8 @@ fn main() -> iced::Result {
                 ws_tab_menu: None,
                 rename_terminal: None,
                 connect_prompt: None,
+                notice: None,
+                attach_swept: HashMap::new(),
                 vault,
                 tab_drag: None,
                 hovered_tab: None,
