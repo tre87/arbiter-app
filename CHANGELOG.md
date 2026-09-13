@@ -20,6 +20,17 @@ history belongs to the prior Tauri/Vue web app it replaced.
   Windows OpenSSH server alike, since sftp needs nothing of the far host's shell.
 
 ### Fixed
+- **The cursor no longer flickers while Claude works over ssh.** Two causes, both fixed.
+  Claude's UI hides the cursor while it redraws and shows it again afterwards, and over
+  ssh, at the pace of its working animation, the hide and the show landed in separate
+  frames; the cursor now stays drawn for a quarter second after a program hides it, long
+  enough to bridge that, while a program that means to hide its cursor still loses it.
+  And a screen update that leaves the far host as one write arrives over ssh in several
+  pieces, which the frames drawn in between showed half-done (the input line erased and
+  not yet redrawn), all the more while the working animation's repaint clock runs; a
+  frame is now built from the grid only once output has paused for 10 ms (never more
+  than 40 ms in a row, so a scrolling log still moves), and the previous frame stays up
+  in between. Locally an update arrives whole, so nothing changes there.
 - **A small black box no longer appears in the top-left corner of the primary monitor
   on Windows.** Arbiter asks Windows 11 to round the corners of its windows and did so
   for every window of its process, including the invisible 16x16 message window winit

@@ -4793,6 +4793,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
                 master: data.session.master(),
                 startup: data.session.startup_gate(),
                 font: font.clone(),
+                hold: data.session.wake_hold(),
             })
             .width(Length::Fill)
             .height(Length::Fill),
@@ -7209,6 +7210,9 @@ struct TermProgram {
     term: SharedTerm,
     master: SharedMaster,
     font: Arc<arbiter_native::font::FontSpec>,
+    /// Whether the grid is whole or mid-burst, so a frame is not built from half an
+    /// update (see `arbiter_native::session::WakeHold`).
+    hold: arbiter_native::session::WakeHold,
 }
 
 /// Per-widget interaction state for selection + scrolling.
@@ -7538,6 +7542,7 @@ impl shader::Program<Message> for TermProgram {
             master: self.master.clone(),
             startup: self.startup.clone(),
             font: self.font.clone(),
+            hold: self.hold.clone(),
         }
     }
 }
@@ -7550,6 +7555,7 @@ struct TermPrimitive {
     /// wait for the real size (see `arbiter_native::session::StartupGate`).
     startup: Arc<arbiter_native::session::StartupGate>,
     font: Arc<arbiter_native::font::FontSpec>,
+    hold: arbiter_native::session::WakeHold,
 }
 
 impl std::fmt::Debug for TermPrimitive {
@@ -7594,7 +7600,8 @@ impl shader::Primitive for TermPrimitive {
         let rows = (ph / gpu.cell_h).max(1) as usize;
         {
             let mut t = self.term.lock().unwrap();
-            if t.size() != (cols, rows) {
+            let resized = t.size() != (cols, rows);
+            if resized {
                 t.resize(cols, rows);
                 if let Ok(m) = self.master.lock() {
                     let _ = m.resize(PtySize {
@@ -7609,7 +7616,13 @@ impl shader::Primitive for TermPrimitive {
                 // so the resize is announced (see `StartupGate`).
                 self.startup.note_resized();
             }
-            gpu.prepare(device, queue, &t, pw, ph);
+            // Between two chunks of one screen update the grid is half-drawn, and the
+            // repaint clock that runs while Claude works would draw it that way. Keep
+            // the previous frame instead; the held wake redraws once the burst has
+            // landed (see `WakeHold`). A resize or a first frame is drawn regardless.
+            if resized || !gpu.has_frame() || self.hold.settled() {
+                gpu.prepare(device, queue, &t, pw, ph);
+            }
         }
     }
 

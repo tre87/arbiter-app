@@ -592,6 +592,69 @@ fn wake_ui() {
     }
 }
 
+/// How long a redraw waits for more output after a chunk. A screen update from a program
+/// like Claude's UI leaves the far host as one write, but over ssh it arrives here in
+/// several chunks, and a frame drawn between them is half an update: the input line
+/// erased and not yet redrawn, which reads as the cursor flickering while Claude works.
+/// Chunks of one update land within a millisecond or two of each other, separate updates
+/// tens of milliseconds apart, so a short quiet period tells them apart. Locally an
+/// update arrives whole, so there this only costs the settle time, well under one frame.
+const OUTPUT_SETTLE: Duration = Duration::from_millis(10);
+
+/// The most a redraw is held in a row, so continuous output (a long build log) still gets
+/// frames at a steady rate instead of waiting for a pause that never comes.
+const OUTPUT_HOLD_MAX: Duration = Duration::from_millis(40);
+
+/// A redraw held while output is still arriving (see `OUTPUT_SETTLE`). One waiter thread
+/// runs while a hold is armed and wakes the UI when the hold lapses. Armed per chunk, so
+/// nothing runs while the pane is quiet. The renderer asks `settled` before it rebuilds a
+/// frame from the grid: a frame that is drawn anyway mid-burst (the working animation
+/// runs a repaint clock) keeps showing the previous one instead of half an update.
+#[derive(Default, Clone)]
+pub struct WakeHold(Arc<Mutex<Option<Hold>>>);
+
+struct Hold {
+    started: Instant,
+    until: Instant,
+}
+
+impl WakeHold {
+    /// Push the redraw back by `OUTPUT_SETTLE`, never past `OUTPUT_HOLD_MAX` from the
+    /// first chunk of the burst; starts the waiter if none is running.
+    fn extend(&self) {
+        let now = Instant::now();
+        let mut slot = self.0.lock().unwrap();
+        if let Some(h) = slot.as_mut() {
+            h.until = (now + OUTPUT_SETTLE).min(h.started + OUTPUT_HOLD_MAX);
+            return;
+        }
+        *slot = Some(Hold { started: now, until: now + OUTPUT_SETTLE });
+        let slot = self.0.clone();
+        std::thread::spawn(move || loop {
+            let until = match *slot.lock().unwrap() {
+                Some(ref h) => h.until,
+                None => return,
+            };
+            let now = Instant::now();
+            if now < until {
+                std::thread::sleep(until - now);
+                continue;
+            }
+            *slot.lock().unwrap() = None;
+            wake_ui();
+            return;
+        });
+    }
+
+    /// Whether the grid is between bursts, so a frame built from it is a whole update.
+    pub fn settled(&self) -> bool {
+        match *self.0.lock().unwrap() {
+            None => true,
+            Some(ref h) => Instant::now() >= h.until,
+        }
+    }
+}
+
 pub type SharedTerm = Arc<Mutex<VtTerm>>;
 pub type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
@@ -611,6 +674,8 @@ pub struct Session {
     writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
     master: SharedMaster,
     term: SharedTerm,
+    /// Whether the grid is mid-burst or whole, shared with the renderer (see `WakeHold`).
+    wake_hold: WakeHold,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude_running: Arc<AtomicBool>,
@@ -697,6 +762,7 @@ impl Session {
         );
         crate::claude_status::register(&claude);
 
+        let wake_hold = WakeHold::default();
         {
             let term = term.clone();
             let cwd = cwd.clone();
@@ -710,10 +776,11 @@ impl Session {
             let startup = startup.clone();
             let credential = credential.clone();
             let followup = followup.clone();
+            let wake_hold = wake_hold.clone();
             std::thread::spawn(move || {
                 reader_loop(
                     reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch,
-                    exited, startup, credential, last_exit, followup,
+                    exited, startup, credential, last_exit, followup, wake_hold,
                 )
             });
         }
@@ -734,6 +801,7 @@ impl Session {
             id,
             writer_tx,
             master: Arc::new(Mutex::new(pair.master)),
+            wake_hold,
             term,
             cwd,
             shell_idle,
@@ -1130,6 +1198,8 @@ impl Session {
 
     /// Shared grid handle for the renderer.
     pub fn term(&self) -> SharedTerm { self.term.clone() }
+    /// For the renderer: whether the grid is whole or mid-burst (see `WakeHold`).
+    pub fn wake_hold(&self) -> WakeHold { self.wake_hold.clone() }
     /// Shared master handle (for resizing the PTY from the render path).
     pub fn master(&self) -> SharedMaster { self.master.clone() }
     /// Latest cwd from OSC-7, if the shell reported one.
@@ -1253,6 +1323,7 @@ fn reader_loop(
     credential: Armed,
     last_exit: Arc<Mutex<Option<i32>>>,
     followup: Arc<Mutex<Option<Followup>>>,
+    wake_hold: WakeHold,
 ) {
     let claude_running = claude.claude_running.clone();
     let mut buf = [0u8; 8192];
@@ -1262,6 +1333,7 @@ fn reader_loop(
     let mut prev_cwd: Option<String> = None;
     let mut prev_idle: Option<bool> = None;
     let mut prev_menu = false;
+    let hide_wake_pending = Arc::new(AtomicBool::new(false));
 
     loop {
         let n = match reader.read(&mut buf) {
@@ -1303,10 +1375,10 @@ fn reader_loop(
         // running program sent (cursor position, device attributes, status). Apps
         // like vim or .NET/Spectre console UIs wait on these; dropping them made
         // their input handling misbehave.
-        let responses = {
+        let (responses, cursor_grace) = {
             let mut t = term.lock().unwrap();
             t.feed(valid);
-            t.take_responses()
+            (t.take_responses(), t.cursor_grace_remaining())
         };
         if !responses.is_empty() {
             // Hand off to the writer thread — never write from here, or a blocking
@@ -1314,9 +1386,22 @@ fn reader_loop(
             let _ = writer_tx.send(responses);
         }
         // The grid changed — wake the UI to redraw (event-driven; the UI no longer
-        // polls the grid every frame). Coalesced on the UI side, so a burst of output
-        // is one redraw.
-        wake_ui();
+        // polls the grid every frame), once this burst of output has landed (see
+        // `WakeHold`); the UI coalesces wakes further, so a burst is one redraw.
+        wake_hold.extend();
+        // A cursor the program hid is still drawn for a grace period (see
+        // `term::CURSOR_HIDE_GRACE`). If it stays hidden, only a frame after the grace
+        // takes it off screen, and nothing else may be due by then: one wake, once.
+        if let Some(remaining) = cursor_grace {
+            if !hide_wake_pending.swap(true, Ordering::Relaxed) {
+                let pending = hide_wake_pending.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(remaining + Duration::from_millis(5));
+                    pending.store(false, Ordering::Relaxed);
+                    wake_ui();
+                });
+            }
+        }
 
         // Tier-3b: while Claude runs here, reflect the live turn from the *rendered
         // screen* (level-triggered, so attention clears the instant a menu leaves —
@@ -2292,5 +2377,20 @@ mod tests {
         assert!(!connect_failed("Connection to 10.0.0.16 closed by remote host."));
         assert!(!connect_failed("client_loop: send disconnect: Connection reset by peer"));
         assert!(!connect_failed("Connection to 10.0.0.16 closed."));
+    }
+
+    // A chunk arms a held redraw, and a burst of chunks cannot push its deadline past
+    // the cap.
+    #[test]
+    fn a_held_redraw_is_capped_across_a_burst() {
+        let hold = super::WakeHold::default();
+        hold.extend();
+        let started = hold.0.lock().unwrap().as_ref().unwrap().started;
+        for _ in 0..50 {
+            hold.extend();
+        }
+        let until = hold.0.lock().unwrap().as_ref().unwrap().until;
+        assert!(until <= started + super::OUTPUT_HOLD_MAX);
+        assert!(until >= started + super::OUTPUT_SETTLE);
     }
 }

@@ -141,12 +141,23 @@ impl Dimensions for Size {
     fn columns(&self) -> usize { self.cols }
 }
 
+/// How long the cursor stays drawn after a program hides it. Claude's UI hides the cursor
+/// while it redraws and shows it again after; over ssh, at the pace of its working
+/// animation, the hide and the show land in separate frames, and drawing exactly what the
+/// grid said made the cursor flicker at that pace. A program that means to hide its
+/// cursor still loses it after this; the reader schedules the frame that does.
+pub const CURSOR_HIDE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub struct VtTerm {
     term: Term<Responder>,
     parser: Processor,
     palette: [Rgb; 256],
     default_fg: Rgb,
     search: Option<Search>,
+    /// Where the cursor was when the program last had it shown, and when the program hid
+    /// it, for `CURSOR_HIDE_GRACE`. `hidden_since` is `None` while it is shown.
+    cursor_shown_at: (usize, usize),
+    hidden_since: Option<std::time::Instant>,
     /// When the view was last scrolled BY THE USER (wheel / drag-autoscroll), to
     /// fade the scroll indicator out. Not set by output or jump-to-bottom, so the
     /// indicator never flashes while text merely streams in.
@@ -171,6 +182,8 @@ impl VtTerm {
             // live via term_bg() so changing it updates every terminal. The Iced shell's
             // surfaces read the same value so skipped (empty, default-bg) cells blend.
             search: None,
+            cursor_shown_at: (0, 0),
+            hidden_since: None,
             last_scroll: None,
             responses,
         }
@@ -178,6 +191,13 @@ impl VtTerm {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            let p = self.term.grid().cursor.point;
+            self.cursor_shown_at = (p.line.0.max(0) as usize, p.column.0);
+            self.hidden_since = None;
+        } else if self.hidden_since.is_none() {
+            self.hidden_since = Some(std::time::Instant::now());
+        }
     }
 
     /// Drain the terminal's pending PTY replies (responses to queries the running
@@ -497,12 +517,21 @@ impl VtTerm {
     pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
     pub fn size(&self) -> (usize, usize) { (self.term.columns(), self.term.screen_lines()) }
 
-    /// (row, col, visible) for the block cursor.
+    /// (row, col, visible) for the block cursor. A cursor the program has hidden stays
+    /// visible, where it last was, for `CURSOR_HIDE_GRACE`.
     pub fn cursor(&self) -> (usize, usize, bool) {
         let p = self.term.grid().cursor.point;
-        let vis = self.term.grid().display_offset() == 0
-            && self.term.mode().contains(TermMode::SHOW_CURSOR);
-        (p.line.0.max(0) as usize, p.column.0, vis)
+        let at_bottom = self.term.grid().display_offset() == 0;
+        if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            return (p.line.0.max(0) as usize, p.column.0, at_bottom);
+        }
+        let (row, col) = self.cursor_shown_at;
+        (row, col, at_bottom && self.cursor_grace_remaining().is_some())
+    }
+
+    /// How much longer a hidden cursor is still drawn, if it is (see `CURSOR_HIDE_GRACE`).
+    pub fn cursor_grace_remaining(&self) -> Option<std::time::Duration> {
+        CURSOR_HIDE_GRACE.checked_sub(self.hidden_since?.elapsed())
     }
 
     /// The http(s) URL at a visible (row, col), or `None`. Single-row detection
@@ -923,5 +952,22 @@ mod tests {
         assert!(!chrome("? for shortcuts\r\n\r\n$ "));
         // Also true when it is only one row up.
         assert!(!chrome("? for shortcuts\r\n$ "));
+    }
+
+    // A hidden cursor stays drawn where it was for the grace period, then goes; showing
+    // it again puts it back where the program has it.
+    #[test]
+    fn a_hidden_cursor_lingers_for_the_grace_period() {
+        let mut t = super::VtTerm::new(20, 5);
+        t.feed(b"ab");
+        assert_eq!(t.cursor(), (0, 2, true));
+        t.feed(b"\x1b[?25l\x1b[H");
+        assert_eq!(t.cursor(), (0, 2, true), "still drawn where it was, not where the program moved it");
+        assert!(t.cursor_grace_remaining().is_some());
+        t.hidden_since = Some(std::time::Instant::now() - super::CURSOR_HIDE_GRACE - std::time::Duration::from_millis(1));
+        assert_eq!(t.cursor(), (0, 2, false));
+        assert!(t.cursor_grace_remaining().is_none());
+        t.feed(b"\x1b[?25h");
+        assert_eq!(t.cursor(), (0, 0, true));
     }
 }

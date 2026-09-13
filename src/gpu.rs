@@ -417,6 +417,12 @@ impl TermGpu {
         self.built_pts
     }
 
+    /// Whether a frame has been prepared and can be drawn again as it is. The host
+    /// keeps the previous frame while a burst of output is still landing in the grid.
+    pub fn has_frame(&self) -> bool {
+        self.count > 0
+    }
+
     /// Reserve `cells` horizontally-contiguous slots in the colour atlas (a wide
     /// emoji needs 2), never straddling a row wrap.
     fn alloc_color(&mut self, cells: u32) -> u32 {
