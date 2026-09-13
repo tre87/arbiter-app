@@ -18,9 +18,27 @@ pub struct GlyphBitmap {
     pub color: bool,
 }
 
+/// The em size an icon (see `is_icon`) is drawn at when the renderer gives it two cells,
+/// relative to the text size. Measured at 16px text against an 8x11 capital H: at the
+/// font's natural size (1.0) a tag is 14x14 and a database 14x17, a capital and a half,
+/// which is what other terminals show and read as too big here; squeezed into one cell
+/// they had been scaled down to 9 wide, which read as small. 0.8 gives 11x11 and 11x14,
+/// about a capital, a quarter larger than the one-cell size, with a cell's worth of gap
+/// left before the text. `gpu::fit_to_box` catches an icon that still overflows.
+pub const ICON_EM_SCALE: f32 = 0.8;
+
+/// A Private Use Area code point other than Powerline's (U+E0A0..=U+E0D7): an icon that
+/// may spill into a following blank cell, as Windows Terminal and WezTerm let it (see
+/// `TermGpu::prepare`). Powerline's separators are drawn to exactly one cell against
+/// their segment colours and must stay put.
+pub fn is_icon(ch: char) -> bool {
+    let c = ch as u32;
+    ((0xE000..=0xF8FF).contains(&c) && !(0xE0A0..=0xE0D7).contains(&c)) || (0xF0000..=0xFFFFD).contains(&c)
+}
+
 /// Rasterise `ch` at `em_px` (the CSS-style em size in device px), in bold if
-/// requested. Returns None for a missing glyph (`.notdef`) — callers leave the
-/// cell blank and fall back.
+/// requested. `icon` draws it at `ICON_EM_SCALE` times that, for a two-cell icon.
+/// Returns None for a missing glyph (`.notdef`) — callers leave the cell blank.
 pub fn rasterize(
     font_name: &str,
     font_data: &[u8],
@@ -30,11 +48,12 @@ pub fn rasterize(
     ch: char,
     bold: bool,
     wide: bool,
+    icon: bool,
 ) -> Option<GlyphBitmap> {
     #[cfg(target_os = "macos")]
     {
         let _ = (font_data, font_index, bold_data, wide);
-        mac::rasterize(font_name, em_px, ch, bold)
+        mac::rasterize(font_name, em_px, ch, bold, icon)
     }
     #[cfg(target_os = "windows")]
     {
@@ -42,13 +61,13 @@ pub fn rasterize(
         // bold_data (the bundled bold .ttf) is loaded into a real bold font face so
         // bold renders crisp instead of a synthesised faux-bold.
         let _ = (font_data, font_index);
-        dwrite::rasterize(font_name, bold_data, em_px, ch, bold, wide)
+        dwrite::rasterize(font_name, bold_data, em_px, ch, bold, wide, icon)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // Linux: swash with fontdb fallback (incl. Noto Color Emoji).
         let _ = (font_name, bold, bold_data, wide);
-        swash_raster::rasterize(font_data, font_index, em_px, ch)
+        swash_raster::rasterize(font_data, font_index, em_px, ch, icon)
     }
 }
 
@@ -72,18 +91,20 @@ mod swash_raster {
         static FALLBACK: RefCell<Fallback> = RefCell::new(Fallback::new());
     }
 
-    pub fn rasterize(font_data: &[u8], font_index: u32, em_px: f32, ch: char) -> Option<GlyphBitmap> {
+    pub fn rasterize(font_data: &[u8], font_index: u32, em_px: f32, ch: char, icon: bool) -> Option<GlyphBitmap> {
         // 1. Primary (terminal) font: a normal mono glyph.
         let primary = FontRef::from_index(font_data, font_index as usize)?;
         let gid = primary.charmap().map(ch);
         if gid != 0 {
             return render(&primary, gid, em_px, false);
         }
-        // 2. The bundled symbols font (see `font::SYMBOLS`), before any system font.
+        // 2. The bundled symbols font (see `font::SYMBOLS`), before any system font; an
+        // icon given two cells is drawn larger (see `ICON_EM_SCALE`).
         if let Some(symbols) = FontRef::from_index(crate::font::SYMBOLS, 0) {
             let gid = symbols.charmap().map(ch);
             if gid != 0 {
-                return render(&symbols, gid, em_px, false);
+                let em = if icon { em_px * super::ICON_EM_SCALE } else { em_px };
+                return render(&symbols, gid, em, false);
             }
         }
         // 3. Fallback to a system font that has this glyph (emoji / symbols / CJK).
@@ -266,13 +287,15 @@ mod mac {
         /// The bundled symbols font (`font::SYMBOLS`) at this size: the stop for an icon
         /// before CoreText's cascade, which has nothing for the Private Use Area.
         symbols: Option<CTFont>,
+        /// The same at `ICON_EM_SCALE` times the size, for an icon given two cells.
+        symbols_icon: Option<CTFont>,
     }
 
     thread_local! {
         static FONT: RefCell<Option<Cached>> = RefCell::new(None);
     }
 
-    pub fn rasterize(font_name: &str, em_px: f32, ch: char, bold: bool) -> Option<GlyphBitmap> {
+    pub fn rasterize(font_name: &str, em_px: f32, ch: char, bold: bool, icon: bool) -> Option<GlyphBitmap> {
         let em_key = em_px.round() as u32;
         FONT.with(|cell| {
             let mut cell = cell.borrow_mut();
@@ -298,11 +321,15 @@ mod mac {
                     unsafe { CTFont::wrap_under_create_rule(bold_ref) }
                 };
                 let symbols = bundled_symbols(em_px);
-                *cell = Some(Cached { name: font_name.to_string(), em_key, regular, bold, symbols });
+                let symbols_icon = bundled_symbols(em_px * super::ICON_EM_SCALE);
+                *cell = Some(Cached { name: font_name.to_string(), em_key, regular, bold, symbols, symbols_icon });
             }
             let c = cell.as_ref().unwrap();
             let font = if bold { &c.bold } else { &c.regular };
-            rasterize_with(font, c.symbols.as_ref(), ch)
+            // An icon given two cells comes from the larger symbols font (see
+            // `ICON_EM_SCALE`); the base font is asked first either way.
+            let symbols = if icon { c.symbols_icon.as_ref().or(c.symbols.as_ref()) } else { c.symbols.as_ref() };
+            rasterize_with(font, symbols, ch)
         })
     }
 
@@ -463,12 +490,34 @@ mod tests {
     // icons still come out as glyphs (from the bundled symbols font); letters untouched.
     #[test]
     fn icons_render_with_nothing_installed_or_configured() {
-        let raster = |ch: char| sig(super::rasterize("Cascadia Mono", &[], 0, None, 16.0, ch, false, false));
+        let raster = |ch: char| sig(super::rasterize("Cascadia Mono", &[], 0, None, 16.0, ch, false, false, false));
         let notdef = raster(NOWHERE);
         for ch in ICONS {
             assert_ne!(raster(ch), notdef, "U+{:04X} came out as the .notdef box", ch as u32);
         }
         assert!(raster('a').2 > 0);
+    }
+
+    // An icon at the text size is already wider than a cell and taller than a capital:
+    // what the one-cell renderer had been shrinking (see `gpu::fit_to_box`'s tests).
+    #[test]
+    fn an_icon_is_naturally_wider_than_a_cell() {
+        let h = sig(super::rasterize("Cascadia Mono", &[], 0, None, 16.0, 'H', false, false, false));
+        let tag = sig(super::rasterize("Cascadia Mono", &[], 0, None, 16.0, '\u{F02B}', false, false, false));
+        assert!(tag.0 > h.0 && tag.1 > h.1, "H {h:?} tag {tag:?}");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    // Icons are the Private Use Area minus Powerline, whose separators must keep one cell.
+    #[test]
+    fn powerline_is_not_an_icon_but_the_rest_of_the_pua_is() {
+        use super::is_icon;
+        assert!(is_icon('\u{E000}') && is_icon('\u{F013}') && is_icon('\u{F8FF}') && is_icon('\u{F0001}'));
+        assert!(!is_icon('\u{E0B0}') && !is_icon('\u{E0A0}') && !is_icon('\u{E0D7}'), "Powerline");
+        assert!(is_icon('\u{E09F}') && is_icon('\u{E0D8}'), "either side of Powerline");
+        assert!(!is_icon('a') && !is_icon('\u{2022}') && !is_icon('\u{1F600}'));
     }
 }
 
@@ -562,6 +611,7 @@ mod dwrite {
         ch: char,
         bold: bool,
         wide: bool,
+        icon: bool,
     ) -> Option<GlyphBitmap> {
         CTX.with(|cell| {
             let mut cell = cell.borrow_mut();
@@ -572,7 +622,10 @@ mod dwrite {
                 *cell = build_ctx(font_name, bold_data, em_px).ok();
             }
             let ctx = cell.as_ref()?;
-            render(ctx, ch, bold, !wide && emoji_block(ch)).ok().flatten()
+            // An icon given two cells is drawn larger (see `ICON_EM_SCALE`); the context
+            // is size-independent apart from the layout, so no rebuild for that.
+            let em = if icon { em_px * super::ICON_EM_SCALE } else { em_px };
+            render(ctx, em, ch, bold, !wide && emoji_block(ch)).ok().flatten()
         })
     }
 
@@ -720,7 +773,7 @@ mod dwrite {
         face.GetGlyphIndices(cps.as_ptr(), 1, gids.as_mut_ptr()).is_ok() && gids[0] != 0
     }
 
-    fn render(ctx: &Ctx, ch: char, bold: bool, text_presentation: bool) -> Result<Option<GlyphBitmap>> {
+    fn render(ctx: &Ctx, em: f32, ch: char, bold: bool, text_presentation: bool) -> Result<Option<GlyphBitmap>> {
         unsafe {
             // Pick the font source. For bold, prefer our private collection holding the
             // REAL bundled bold face — DirectWrite would otherwise synthesise a soft
@@ -761,21 +814,21 @@ mod dwrite {
                 weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                ctx.em,
+                em,
                 PCWSTR(locale.as_ptr()),
             )?;
 
             let mut buf = [0u16; 2];
             let text: &[u16] = ch.encode_utf16(&mut buf);
-            let boxw = (ctx.em * 2.5).ceil() + 4.0;
-            let boxh = (ctx.em * 2.0).ceil() + 4.0;
+            let boxw = (em * 2.5).ceil() + 4.0;
+            let boxh = (em * 2.0).ceil() + 4.0;
             let layout = ctx.dwrite.CreateTextLayout(text, &format, boxw, boxh)?;
 
             // Baseline (box-top → baseline) for placement.
             let mut lm = [DWRITE_LINE_METRICS::default(); 1];
             let mut count = 0u32;
             let _ = layout.GetLineMetrics(Some(&mut lm), &mut count);
-            let baseline = if lm[0].baseline > 0.0 { lm[0].baseline } else { ctx.em * 0.8 };
+            let baseline = if lm[0].baseline > 0.0 { lm[0].baseline } else { em * 0.8 };
 
             let (w, h) = (boxw as u32, boxh as u32);
             let bitmap = ctx.wic.CreateBitmap(
@@ -882,3 +935,4 @@ mod dwrite {
         }
     }
 }
+

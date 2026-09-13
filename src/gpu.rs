@@ -178,7 +178,9 @@ pub struct TermGpu {
     is_srgb: bool,
     atlas_cpu: Vec<u8>,
     color_atlas_cpu: Vec<u8>,
-    glyphs: HashMap<(char, bool), Glyph>,
+    /// Cached glyphs by (char, bold, drawn as a two-cell icon): the same icon exists at
+    /// text size and at two-cell size, depending on what follows it (see `prepare`).
+    glyphs: HashMap<(char, bool, bool), Glyph>,
     next_slot: u32,
     color_next: u32,
     per_row: u32,
@@ -435,14 +437,27 @@ impl TermGpu {
         slot
     }
 
+    /// Reserve `cells` horizontally-contiguous slots in the mono atlas (a two-cell icon
+    /// needs 2), never straddling a row wrap.
+    fn alloc_mono(&mut self, cells: u32) -> u32 {
+        let col = self.next_slot % self.per_row;
+        if col + cells > self.per_row {
+            self.next_slot += self.per_row - col; // skip the row's tail
+        }
+        let slot = self.next_slot;
+        self.next_slot += cells;
+        slot
+    }
+
     /// Resolve `ch` (regular/bold) to a cached glyph: a programmatic block/box glyph
     /// or a rasterised mono glyph in the R8 atlas, or a colour glyph (emoji) in the
-    /// RGBA atlas spanning `wide_hint ? 2 : 1` cells.
-    fn slot_for(&mut self, ch: char, bold: bool, wide_hint: bool) -> Glyph {
+    /// RGBA atlas spanning `wide_hint ? 2 : 1` cells. `icon2` draws an icon larger
+    /// across two cells (see `prepare`).
+    fn slot_for(&mut self, ch: char, bold: bool, wide_hint: bool, icon2: bool) -> Glyph {
         if ch == ' ' || ch == '\0' {
             return Glyph { slot: SLOT_BLANK, color: false, cells: 1 };
         }
-        if let Some(&g) = self.glyphs.get(&(ch, bold)) {
+        if let Some(&g) = self.glyphs.get(&(ch, bold, icon2)) {
             return g;
         }
         let cp = ch as u32;
@@ -461,7 +476,7 @@ impl TermGpu {
             self.next_slot += 1;
             self.atlas_dirty = true;
             let g = Glyph { slot: mslot, color: false, cells: 1 };
-            self.glyphs.insert((ch, bold), g);
+            self.glyphs.insert((ch, bold, icon2), g);
             return g;
         }
         // Pick the bold face when we carry one (swash path); otherwise pass the
@@ -475,7 +490,7 @@ impl TermGpu {
         // bold (not a synthesised faux-bold). Other platforms ignore this.
         let bold_data = self.bold_face.as_ref().map(|(b, _)| b.as_slice());
         let raster = crate::raster::rasterize(
-            &self.font_name, data, index, bold_data, self.em_px, ch, bold, wide_hint,
+            &self.font_name, data, index, bold_data, self.em_px, ch, bold, wide_hint, icon2,
         );
         // Diagnostic: ARBITER_GLYPH_DEBUG logs how non-ASCII symbols (e.g. ✻ U+273B,
         // ⏵ U+23F5) rasterise — mono vs colour, size + bearing vs the cell, and the
@@ -512,6 +527,20 @@ impl TermGpu {
                 self.color_dirty = true;
                 Glyph { slot, color: true, cells }
             }
+            Some(bmp) if icon2 => {
+                // A two-cell icon (see `prepare`): drawn at `ICON_EM_SCALE`, fitted into
+                // the pair of cells (every platform: it is oversized by design), seated on
+                // the baseline, in two adjacent mono slots. The pre-reserved `mslot` is
+                // simply not used.
+                let bmp = fit_to_box(bmp, 2 * self.cell_w, self.cell_h, self.baseline);
+                let bmp = seat_on_baseline(bmp, self.baseline);
+                let slot = self.alloc_mono(2);
+                let ox = (slot % self.per_row) * self.cell_w;
+                let oy = (slot / self.per_row) * self.cell_h;
+                blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, 2 * self.cell_w, self.cell_h, ox, oy);
+                self.atlas_dirty = true;
+                Glyph { slot, color: false, cells: 2 }
+            }
             Some(bmp) => {
                 // Scale oversized fallback symbols to fit the cell — WINDOWS ONLY.
                 // On macOS the fallback glyphs already fit, and pixel-rounding can
@@ -528,7 +557,7 @@ impl TermGpu {
             // No glyph anywhere → blank (don't consume the mono slot).
             None => Glyph { slot: SLOT_BLANK, color: false, cells: 1 },
         };
-        self.glyphs.insert((ch, bold), g);
+        self.glyphs.insert((ch, bold, icon2), g);
         g
     }
 
@@ -573,9 +602,38 @@ impl TermGpu {
             }
         });
 
+        // An icon (a Private Use Area glyph, which the symbols font supplies shrunk to one
+        // cell) gets the cell after it too when that one is blank with the same
+        // background, as Windows Terminal and WezTerm let icons overflow: drawn larger
+        // across both cells, the blank's own quad dropped so it cannot paint over the
+        // right half. The cells are in row order and blank default-background cells were
+        // not collected, so the neighbour is either the next entry or such a blank.
+        let cols = term.size().0;
+        let mut mode = vec![0u8; cells.len()]; // 0 as is, 1 two-cell icon, 2 dropped blank
+        for i in 0..cells.len() {
+            let (row, col, c, _, bg, _, wide) = cells[i];
+            if wide || col + 1 >= cols || !crate::raster::is_icon(c) {
+                continue;
+            }
+            let neighbour = cells.get(i + 1).filter(|&&(r, k, ..)| r == row && k == col + 1);
+            let next_blank = match neighbour {
+                Some(&(_, _, nc, _, nbg, _, _)) => (nc == ' ' || nc == '\0') && nbg == bg,
+                None => bg == default_bg,
+            };
+            if next_blank {
+                mode[i] = 1;
+                if neighbour.is_some() {
+                    mode[i + 1] = 2;
+                }
+            }
+        }
+
         self.scratch.clear();
-        for (row, col, c, fg, bg, bold, wide) in &cells {
-            let g = self.slot_for(*c, *bold, *wide);
+        for (i, (row, col, c, fg, bg, bold, wide)) in cells.iter().enumerate() {
+            if mode[i] == 2 {
+                continue;
+            }
+            let g = self.slot_for(*c, *bold, *wide, mode[i] == 1);
             let (u, v) = self.uv(g.slot);
             let kind = if g.color { 1.0 } else { 0.0 };
             self.scratch.extend_from_slice(&[
@@ -929,6 +987,16 @@ fn blit_glyph(atlas: &mut [u8], bmp: &GlyphBitmap, baseline: f32, cell_w: u32, c
     }
 }
 
+/// Move a glyph so its ink stands on the baseline like a capital letter. Icon fonts centre
+/// their icons on the x-height, hanging two or three pixels under the baseline, which next
+/// to a line of text reads as the icon sagging; seated, a status line's icons share the
+/// ascender-to-baseline band with the letters. An icon taller than the ascent keeps its
+/// top at the cell top and hangs below by the difference instead.
+fn seat_on_baseline(bmp: GlyphBitmap, baseline: f32) -> GlyphBitmap {
+    let ascent_rows = baseline.round().max(0.0) as u32;
+    GlyphBitmap { top: bmp.height.min(ascent_rows) as i32, ..bmp }
+}
+
 /// Scale an oversized glyph down to fit `box_w`×`box_h`, centered, instead of letting
 /// the blit clip the overflow. Fallback-font symbols Cascadia Mono lacks (e.g. `✻`
 /// mono, or `⏵` as a Segoe UI Emoji colour glyph) are drawn near full-em and overflow
@@ -1177,3 +1245,35 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod icon_fit_tests {
+    use super::*;
+
+    fn icon(w: u32, h: u32) -> GlyphBitmap {
+        GlyphBitmap { left: 1, top: 12, width: w, height: h, coverage: vec![255; (w * h) as usize], color: false }
+    }
+
+    // A status-line icon at the text size (a 14x14 tag; the cell is 9x19, baseline 15)
+    // is squeezed into one cell but kept whole in two: that is all the two-cell path does.
+    #[test]
+    fn two_cells_keep_an_icon_at_its_natural_size_where_one_shrinks_it() {
+        let one = fit_to_box(icon(14, 14), 9, 19, 15.0);
+        assert!(one.width <= 9 && one.height < 14, "one cell: {}x{}", one.width, one.height);
+        let two = fit_to_box(icon(14, 14), 18, 19, 15.0);
+        assert_eq!((two.width, two.height), (14, 14), "two cells: untouched");
+        assert_eq!(two.left, 1, "and left where the font put it, so the gap stays on the right");
+    }
+
+    // An icon drawn hanging under the baseline (top 10 of height 12: two rows below) is
+    // seated so its bottom row is the last row above the baseline; one taller than the
+    // ascent keeps its top at the cell top instead.
+    #[test]
+    fn a_two_cell_icon_is_seated_on_the_baseline() {
+        let hanging = GlyphBitmap { top: 10, ..icon(13, 12) };
+        assert_eq!(seat_on_baseline(hanging, 15.05).top, 12);
+        let tall = GlyphBitmap { top: 13, ..icon(14, 17) };
+        assert_eq!(seat_on_baseline(tall, 15.05).top, 15, "hangs 2 below rather than poking above the cell");
+    }
+}
+

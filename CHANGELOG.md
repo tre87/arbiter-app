@@ -7,6 +7,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Icons are drawn at a readable size and sit on the baseline.** An icon squeezed into
+  one cell had been scaled down to the cell's width, smaller than a capital letter. When
+  the cell after an icon is blank with the same background, as it is after every icon in
+  a prompt or status line, the icon now takes both cells, as Windows Terminal and WezTerm
+  let icons overflow into the following space: drawn at four fifths of its natural size,
+  about the height of a capital, and seated on the baseline rather than hanging under it,
+  with part of the borrowed blank left as a gap before the text. An icon followed directly
+  by text keeps one cell as before; Powerline separators are never touched.
+
 ## [1.4.0] — 2026-09-13
 
 ### Added
