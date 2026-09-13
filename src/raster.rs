@@ -79,7 +79,14 @@ mod swash_raster {
         if gid != 0 {
             return render(&primary, gid, em_px, false);
         }
-        // 2. Fallback to a system font that has this glyph (emoji / symbols / CJK).
+        // 2. The bundled symbols font (see `font::SYMBOLS`), before any system font.
+        if let Some(symbols) = FontRef::from_index(crate::font::SYMBOLS, 0) {
+            let gid = symbols.charmap().map(ch);
+            if gid != 0 {
+                return render(&symbols, gid, em_px, false);
+            }
+        }
+        // 3. Fallback to a system font that has this glyph (emoji / symbols / CJK).
         FALLBACK.with(|fb| {
             let mut fb = fb.borrow_mut();
             let id = fb.resolve(ch)?;
@@ -208,6 +215,8 @@ mod mac {
     use core_graphics::base::{kCGImageAlphaNone, kCGImageAlphaPremultipliedLast};
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
+    use core_graphics::data_provider::CGDataProvider;
+    use core_graphics::font::CGFont;
     use core_graphics::geometry::CGPoint;
     use core_text::font::{CTFont, CTFontRef};
     use std::cell::RefCell;
@@ -254,6 +263,9 @@ mod mac {
         em_key: u32,
         regular: CTFont,
         bold: CTFont,
+        /// The bundled symbols font (`font::SYMBOLS`) at this size: the stop for an icon
+        /// before CoreText's cascade, which has nothing for the Private Use Area.
+        symbols: Option<CTFont>,
     }
 
     thread_local! {
@@ -285,23 +297,40 @@ mod mac {
                 } else {
                     unsafe { CTFont::wrap_under_create_rule(bold_ref) }
                 };
-                *cell = Some(Cached { name: font_name.to_string(), em_key, regular, bold });
+                let symbols = bundled_symbols(em_px);
+                *cell = Some(Cached { name: font_name.to_string(), em_key, regular, bold, symbols });
             }
             let c = cell.as_ref().unwrap();
             let font = if bold { &c.bold } else { &c.regular };
-            rasterize_with(font, ch)
+            rasterize_with(font, c.symbols.as_ref(), ch)
         })
     }
 
-    /// Resolve `ch` to (font, glyph): the base font if it has the glyph, else a
-    /// system fallback via CoreText's cascade (so ▶, emoji, etc. still render).
-    fn resolve_glyph(base: &CTFont, units: &[u16], ch: char) -> Option<(CTFont, u16)> {
-        let mut g = [0u16; 2];
-        let have = unsafe {
-            base.get_glyphs_for_characters(units.as_ptr(), g.as_mut_ptr(), units.len() as isize)
+    /// The bundled symbols font (`font::SYMBOLS`) at `size`, straight from its bytes.
+    fn bundled_symbols(size: f32) -> Option<CTFont> {
+        let provider = CGDataProvider::from_buffer(std::sync::Arc::new(crate::font::SYMBOLS));
+        let cg = CGFont::from_data_provider(provider).ok()?;
+        Some(core_text::font::new_from_CGFont(&cg, size as f64))
+    }
+
+    /// Resolve `ch` to (font, glyph): the base font if it has the glyph, else the bundled
+    /// symbols font (icons, which no system font has), else a system fallback via
+    /// CoreText's cascade (so ▶, emoji, etc. still render).
+    fn resolve_glyph(base: &CTFont, symbols: Option<&CTFont>, units: &[u16], ch: char) -> Option<(CTFont, u16)> {
+        let glyph_in = |font: &CTFont| {
+            let mut g = [0u16; 2];
+            let have = unsafe {
+                font.get_glyphs_for_characters(units.as_ptr(), g.as_mut_ptr(), units.len() as isize)
+            };
+            (have && g[0] != 0).then_some(g[0])
         };
-        if have && g[0] != 0 {
-            return Some((base.clone(), g[0]));
+        if let Some(g) = glyph_in(base) {
+            return Some((base.clone(), g));
+        }
+        if let Some(s) = symbols {
+            if let Some(g) = glyph_in(s) {
+                return Some((s.clone(), g));
+            }
         }
         let s = CFString::new(&ch.to_string());
         let range = CFRange { location: 0, length: units.len() as isize };
@@ -321,10 +350,10 @@ mod mac {
         Some((fb, g2[0]))
     }
 
-    fn rasterize_with(base: &CTFont, ch: char) -> Option<GlyphBitmap> {
+    fn rasterize_with(base: &CTFont, symbols: Option<&CTFont>, ch: char) -> Option<GlyphBitmap> {
         let mut utf16 = [0u16; 2];
         let units = ch.encode_utf16(&mut utf16);
-        let (font, glyph) = resolve_glyph(base, units, ch)?;
+        let (font, glyph) = resolve_glyph(base, symbols, units, ch)?;
 
         // Ink bounding box (baseline-relative, y-up) at the font's px size.
         let bbox = font.get_bounding_rects_for_glyphs(0, &[glyph]);
@@ -410,6 +439,39 @@ mod mac {
     }
 }
 
+#[cfg(all(test, windows))]
+mod tests {
+    /// (width, height, ink) of a rendered glyph: enough to tell one glyph from another.
+    fn sig(g: Option<super::GlyphBitmap>) -> (u32, u32, u64) {
+        let g = g.expect("a glyph");
+        assert!(!g.color, "a mono glyph, not a colour one");
+        (g.width, g.height, g.coverage.iter().map(|&c| c as u64).sum::<u64>())
+    }
+
+    /// Powerline's triangle plus the Font Awesome and Octicons code points a status line
+    /// uses: in the bundled symbols font, in no system font.
+    const ICONS: [char; 12] = [
+        '\u{E0B0}', '\u{F02B}', '\u{F49B}', '\u{F1C0}', '\u{F07B}', '\u{F418}', '\u{F00C}', '\u{F040}',
+        '\u{F067}', '\u{F071}', '\u{F0AA}', '\u{F0AB}',
+    ];
+
+    /// A Private Use Area code point no font has, so the layout draws the terminal font's
+    /// .notdef box: the bitmap an icon must NOT come out as.
+    const NOWHERE: char = '\u{F8F0}';
+
+    // Out of the box: the terminal font alone, nothing installed or configured, and the
+    // icons still come out as glyphs (from the bundled symbols font); letters untouched.
+    #[test]
+    fn icons_render_with_nothing_installed_or_configured() {
+        let raster = |ch: char| sig(super::rasterize("Cascadia Mono", &[], 0, None, 16.0, ch, false, false));
+        let notdef = raster(NOWHERE);
+        for ch in ICONS {
+            assert_ne!(raster(ch), notdef, "U+{:04X} came out as the .notdef box", ch as u32);
+        }
+        assert!(raster('a').2 > 0);
+    }
+}
+
 /// DirectWrite + Direct2D rasteriser (Windows). Renders one character through an
 /// `IDWriteTextLayout` — which does system font fallback automatically (emoji →
 /// Segoe UI Emoji, CJK/symbols → their fonts) — into a WIC RGBA bitmap with colour
@@ -465,7 +527,11 @@ mod dwrite {
         /// path as regular (just pointed at this collection), so they're as crisp as
         /// regular — instead of DirectWrite synthesising a soft faux-bold by name. None
         /// if the bytes weren't supplied or failed to load.
-        bold: Option<BoldFont>,
+        bold: Option<PrivateFont>,
+        /// The bundled symbols font (`font::SYMBOLS`) in a private collection: the stop
+        /// for an icon before DirectWrite's own fallback, which has nothing for the
+        /// Private Use Area.
+        symbols: Option<PrivateFont>,
         /// The primary family's regular face, for the glyph-presence check that decides
         /// whether a symbol is laid out in `symbol` instead (see `render`).
         regular: Option<IDWriteFontFace>,
@@ -474,10 +540,11 @@ mod dwrite {
         symbol: Vec<u16>,
     }
 
-    /// The bundled bold face + the private collection wrapping it (for CreateTextFormat)
-    /// + that collection's family name. `_loader` is kept alive + registered for the
-    /// collection/face's lifetime (they read the in-memory bytes through it).
-    struct BoldFont {
+    /// A bundled font: its face (for the glyph-presence check) + the private collection
+    /// wrapping it (for CreateTextFormat) + that collection's family name. `_loader` is
+    /// kept alive + registered for the collection/face's lifetime (they read the
+    /// in-memory bytes through it).
+    struct PrivateFont {
         _loader: IDWriteInMemoryFontFileLoader,
         face: IDWriteFontFace,
         collection: IDWriteFontCollection,
@@ -525,11 +592,11 @@ mod dwrite {
             || (0x1F000..=0x1FAFF).contains(&c)
     }
 
-    /// Load the bundled bold .ttf into a private DirectWrite font collection (in-memory
-    /// loader, no dependency on the system fonts) plus a font face for glyph-coverage
-    /// checks, and read back the collection's family name. None on any failure (caller
-    /// then falls back to the by-name path). The loader must outlive the collection/face.
-    unsafe fn build_bold_face(dwrite: &IDWriteFactory, data: &[u8]) -> Option<BoldFont> {
+    /// Load a bundled .ttf into a private DirectWrite font collection (in-memory loader,
+    /// no dependency on the system fonts) plus a font face for glyph-coverage checks, and
+    /// read back the collection's family name. None on any failure (the caller then does
+    /// without). The loader must outlive the collection/face.
+    unsafe fn build_private_font(dwrite: &IDWriteFactory, data: &[u8]) -> Option<PrivateFont> {
         let f5: IDWriteFactory5 = dwrite.cast().ok()?;
         let loader = f5.CreateInMemoryFontFileLoader().ok()?;
         f5.RegisterFontFileLoader(&loader).ok()?;
@@ -562,7 +629,7 @@ mod dwrite {
         let mut family = vec![0u16; len + 1];
         names.GetString(0, &mut family).ok()?;
         let collection: IDWriteFontCollection = coll.cast().ok()?;
-        Some(BoldFont { _loader: loader, face, collection, family })
+        Some(PrivateFont { _loader: loader, face, collection, family })
     }
 
     fn build_ctx(font_name: &str, bold_data: Option<&[u8]>, em_px: f32) -> Result<Ctx> {
@@ -599,10 +666,17 @@ mod dwrite {
             )?;
             // Load the bundled bold into a private collection (best-effort; falls back
             // to the by-name path if it fails).
-            let bold = bold_data.and_then(|d| build_bold_face(&dwrite, d));
+            let bold = bold_data.and_then(|d| build_private_font(&dwrite, d));
+            let symbols = build_private_font(&dwrite, crate::font::SYMBOLS);
             let regular = primary_face(&dwrite, &family);
             let mut symbol: Vec<u16> = "Segoe UI Symbol".encode_utf16().collect();
             symbol.push(0);
+            crate::claude_shim::debug_log(&format!(
+                "raster: dwrite ctx for {font_name:?} at {em_px}px: family installed={}, bundled bold={}, bundled symbols={}",
+                regular.is_some(),
+                bold.is_some(),
+                symbols.is_some()
+            ));
             Ok(Ctx {
                 dwrite,
                 d2d,
@@ -612,6 +686,7 @@ mod dwrite {
                 em: em_px,
                 params,
                 bold,
+                symbols,
                 regular,
                 symbol,
             })
@@ -661,13 +736,23 @@ mod dwrite {
             // blocks reaches for Segoe UI Emoji and returns its colour button glyph (a
             // blue square for ⏺, a teal one for ✳). If Segoe UI Symbol lacks it too, the
             // layout falls back from there as it always did.
-            let in_symbol_font = text_presentation
-                && bold_src.is_none()
-                && !ctx.regular.as_ref().is_some_and(|f| face_has(f, ch));
-            let (collection, family): (Option<&IDWriteFontCollection>, &[u16]) = match bold_src {
-                Some(b) => (Some(&b.collection), &b.family),
-                None if in_symbol_font => (None, &ctx.symbol),
-                None => (None, &ctx.family),
+            let primary_has = ctx.regular.as_ref().is_some_and(|f| face_has(f, ch));
+            let in_symbol_font = text_presentation && bold_src.is_none() && !primary_has;
+            // Then the bundled symbols font, for what nothing above has: the icons in the
+            // Private Use Area, which DirectWrite's own fallback would leave as boxes.
+            let symbols_src = if bold_src.is_none() && !primary_has && !in_symbol_font {
+                ctx.symbols.as_ref().filter(|s| face_has(&s.face, ch))
+            } else {
+                None
+            };
+            let (collection, family): (Option<&IDWriteFontCollection>, &[u16]) = if let Some(b) = bold_src {
+                (Some(&b.collection), &b.family)
+            } else if in_symbol_font {
+                (None, &ctx.symbol)
+            } else if let Some(s) = symbols_src {
+                (Some(&s.collection), &s.family)
+            } else {
+                (None, &ctx.family)
             };
             let locale: Vec<u16> = "en-us\0".encode_utf16().collect();
             let format = ctx.dwrite.CreateTextFormat(

@@ -76,6 +76,16 @@ without painting over (erasing) the neighbour. Consequences, both intentional / 
   full-size. A colour glyph that does land in one cell is downscaled to it; proper
   **overflow rendering** (alpha-composited glyphs or variable-size atlas tiles) is a real
   renderer change, deliberately deferred.
+- **Icons (Private Use Area) come from a bundled font, no setting.** `font::SYMBOLS` is
+  "Symbols Nerd Font Mono" (the icons-only Nerd Font, `assets/`, MIT, as WezTerm ships it).
+  Each rasteriser tries it for a glyph the terminal font lacks, before the OS fallback,
+  which has nothing for the PUA (DirectWrite: after the Segoe UI Symbol rule above, so
+  Claude's own symbols are untouched; CoreText: before the cascade; swash: before fontdb).
+  No font is looked up by name; the user's terminal font stays what it is. Windows Terminal
+  makes you set a Nerd Font as the face instead; this was chosen so nothing is manual.
+  Test: `raster::tests::icons_render_with_nothing_installed_or_configured` (Windows, in
+  the suite). The macOS side cannot be type-checked from Windows (`objc_exception` needs a
+  C compiler and the SDK), so CoreText changes are verified on the Mac.
 - `fit_to_box` (`src/gpu.rs`) instead **center-clips** a mono fallback symbol that's only
   slightly wider than the cell (e.g. ✻), keeping full height, unless the clip would cut
   through solid ink (`clip_cuts_solid_ink`: a filled ⏺ came out as a square that way, so

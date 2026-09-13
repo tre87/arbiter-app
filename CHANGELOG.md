@@ -7,6 +7,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Icons render out of the box.** The icons a prompt (starship, oh-my-posh), a status
+  line or `eza --icons` draws live in Unicode's Private Use Area, where no system font has
+  glyphs, so every terminal shows them as small boxes until you install a Nerd Font and set
+  it as the terminal font. Arbiter now bundles the icons-only "Symbols Nerd Font Mono" (as
+  WezTerm does) and takes exactly those glyphs from it when the terminal font lacks them,
+  before the OS's own fallback. Nothing to install, nothing to set, and the terminal font
+  stays what it is; Claude's own symbols (⏺, ✳) render as before. Licence in
+  `assets/SymbolsNerdFont-LICENSE.txt` (MIT).
+
 ## [1.3.0] — 2026-09-13
 
 ### Added

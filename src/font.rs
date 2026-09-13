@@ -5,6 +5,16 @@
 //! **Cascadia Mono** (SIL OFL — Windows Terminal's font) so it looks right
 //! without depending on what's installed, and ships the bold face too (the
 //! swash rasteriser can't synthesise bold, so we carry a real bold font).
+//!
+//! What makes icons work with nothing installed is `SYMBOLS`, a bundled icons-only font
+//! every rasteriser tries for a glyph the terminal font lacks, before the OS's fallback.
+
+/// The bundled symbols font: "Symbols Nerd Font Mono", the icons-only Nerd Font, as
+/// WezTerm ships it. Each rasteriser tries it for a glyph the terminal font lacks, before
+/// the OS's own fallback, which has nothing for the Private Use Area where a prompt's or
+/// `eza --icons`' icons live. "Mono": every icon is one cell wide. Licence:
+/// `assets/SymbolsNerdFont-LICENSE.txt` (MIT).
+pub const SYMBOLS: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
 
 /// The regular (and optional bold) face for the terminal. `bold` is None when
 /// the rasteriser can synthesise bold itself (CoreText on macOS); it's Some when
@@ -56,4 +66,17 @@ fn pick(db: &fontdb::Database) -> fontdb::ID {
     }
     let q = fontdb::Query { families: &[fontdb::Family::Monospace], ..Default::default() };
     db.query(&q).expect("no monospace font")
+}
+
+#[cfg(test)]
+mod tests {
+    // The bundled symbols font is intact and is the font it says it is.
+    #[test]
+    fn the_bundled_symbols_font_loads() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(super::SYMBOLS.to_vec());
+        let names: Vec<String> =
+            db.faces().flat_map(|f| f.families.iter().map(|(n, _)| n.clone())).collect();
+        assert!(names.iter().any(|n| n.contains("Symbols Nerd Font")), "{names:?}");
+    }
 }
