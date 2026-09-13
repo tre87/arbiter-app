@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-09-13
+
 ### Added
 - **Icons render out of the box.** The icons a prompt (starship, oh-my-posh), a status
   line or `eza --icons` draws live in Unicode's Private Use Area, where no system font has
