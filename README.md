@@ -115,6 +115,8 @@ Font size, scrollback length, background colour and bold style for the terminals
 - [portable-pty](https://crates.io/crates/portable-pty) for real PTYs (ConPTY on Windows)
 - DirectWrite on Windows and CoreText on macOS for text that matches each platform's own terminal
 
+Co-developed with [Claude Code](https://claude.com/claude-code), running Fable and Opus.
+
 ## Run it
 
 ```bash
