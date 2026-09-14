@@ -542,13 +542,11 @@ impl TermGpu {
                 Glyph { slot, color: false, cells: 2 }
             }
             Some(bmp) => {
-                // Scale oversized fallback symbols to fit the cell — WINDOWS ONLY.
-                // On macOS the fallback glyphs already fit, and pixel-rounding can
-                // leave an ordinary glyph's ink ~1px past the rounded cell width,
-                // which would wrongly trigger a rescale + recenter and mangle normal
-                // text. Cascadia's metrics on Windows fit, so only real symbols trip it.
-                #[cfg(target_os = "windows")]
-                let bmp = fit_to_box(bmp, self.cell_w, self.cell_h, self.baseline);
+                let bmp = if fits_into_cell(ch) {
+                    fit_to_box(bmp, self.cell_w, self.cell_h, self.baseline)
+                } else {
+                    bmp
+                };
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
                 self.next_slot += 1;
                 self.atlas_dirty = true;
@@ -997,12 +995,24 @@ fn seat_on_baseline(bmp: GlyphBitmap, baseline: f32) -> GlyphBitmap {
     GlyphBitmap { top: bmp.height.min(ascent_rows) as i32, ..bmp }
 }
 
+/// Whether a one-cell glyph is scaled into the cell (`fit_to_box`) instead of being blitted
+/// and clipped.
+///
+/// Windows fits every glyph: Cascadia Mono's own metrics fit the cell, so only a fallback
+/// symbol ever trips it. Elsewhere only a Private Use Area glyph is fitted: the bundled
+/// symbols font draws icons and Powerline separators at near full-em, half again the cell's
+/// width (a 13px tag, an 11px separator, in a 7px Menlo cell), and the clip cut them in
+/// half. Ordinary macOS glyphs must NOT be fitted: pixel rounding leaves an `M`'s ink ~1px
+/// past the rounded cell width, and rescaling + recentering that mangles normal text.
+fn fits_into_cell(ch: char) -> bool {
+    cfg!(target_os = "windows") || crate::raster::is_pua(ch)
+}
+
 /// Scale an oversized glyph down to fit `box_w`×`box_h`, centered, instead of letting
 /// the blit clip the overflow. Fallback-font symbols Cascadia Mono lacks (e.g. `✻`
 /// mono, or `⏵` as a Segoe UI Emoji colour glyph) are drawn near full-em and overflow
 /// the narrow cell on Windows — clipping cut their edges/tips off. Handles both mono
 /// (1 byte/px) and colour (RGBA) coverage. No-op when the glyph already fits.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphBitmap {
     let base = baseline.round() as i32;
     let top_y = base - bmp.top; // glyph's top edge vs the cell top (= blit's base_y)
@@ -1062,7 +1072,6 @@ fn fit_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphB
 /// cut through solid ink: a surviving edge column that is mostly inked reads as a straight
 /// edge, which is how a filled circle turns into a square. Thin spoke tips (✻) pass. Only
 /// the sides actually clipped are examined.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn clip_cuts_solid_ink(bmp: &GlyphBitmap, skip: u32, box_w: u32) -> bool {
     /// Inked share of a column at which its cut edge becomes a visible straight line.
     const SOLID: f32 = 0.4;
@@ -1274,6 +1283,25 @@ mod icon_fit_tests {
         assert_eq!(seat_on_baseline(hanging, 15.05).top, 12);
         let tall = GlyphBitmap { top: 13, ..icon(14, 17) };
         assert_eq!(seat_on_baseline(tall, 15.05).top, 15, "hangs 2 below rather than poking above the cell");
+    }
+
+    // An icon that did NOT get a second cell (the next cell holds text) is fitted into the
+    // one it has on every platform, not left to the blit's clip: from the bundled symbols
+    // font it is drawn near full-em, about twice a Menlo cell's width, and clipping showed
+    // half a glyph. Powerline's separators, which never take a second cell, likewise.
+    #[test]
+    fn a_one_cell_icon_is_fitted_everywhere_but_ordinary_text_is_not() {
+        for ch in ['\u{F02B}', '\u{E0B0}'] {
+            assert!(fits_into_cell(ch), "U+{:04X}", ch as u32);
+        }
+        assert_eq!(fits_into_cell('M'), cfg!(target_os = "windows"), "ordinary text");
+
+        // A 13x13 tag and an 11x15 separator, measured at Menlo 12px: cell 7x14, baseline 11.
+        for (w, h) in [(13u32, 13u32), (11, 15)] {
+            let out = fit_to_box(icon(w, h), 7, 14, 11.0);
+            assert!(out.width <= 7 && out.height <= 14, "{w}x{h} came out {}x{}", out.width, out.height);
+            assert!(out.left >= 0, "and inside the cell, not clipped: left {}", out.left);
+        }
     }
 }
 

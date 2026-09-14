@@ -16,6 +16,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   about the height of a capital, and seated on the baseline rather than hanging under it,
   with part of the borrowed blank left as a gap before the text. An icon followed directly
   by text keeps one cell as before; Powerline separators are never touched.
+- **Icons that keep one cell are no longer cut in half on macOS.** An icon followed
+  directly by text, and every Powerline separator, keeps a single cell, where the bundled
+  symbols font draws it at nearly the full em: about twice the width of a Menlo cell. Only
+  Windows was scaling such a glyph into its cell, so on macOS the blit clipped it and half
+  the icon was missing. Both platforms now fit it, while ordinary text on macOS is still
+  left alone (pixel rounding puts an `M`'s ink a hair past the cell, and rescaling that
+  would mangle normal text).
 
 ## [1.4.0] — 2026-09-13
 

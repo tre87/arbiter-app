@@ -27,13 +27,20 @@ pub struct GlyphBitmap {
 /// left before the text. `gpu::fit_to_box` catches an icon that still overflows.
 pub const ICON_EM_SCALE: f32 = 0.8;
 
+/// A Private Use Area code point: what the bundled symbols font (`font::SYMBOLS`) draws and
+/// no system font has. Powerline's separators included: the test is "this glyph comes from
+/// the symbols font, at its own near-full-em size", which is what `TermGpu::slot_for` needs.
+pub fn is_pua(ch: char) -> bool {
+    let c = ch as u32;
+    (0xE000..=0xF8FF).contains(&c) || (0xF0000..=0xFFFFD).contains(&c)
+}
+
 /// A Private Use Area code point other than Powerline's (U+E0A0..=U+E0D7): an icon that
 /// may spill into a following blank cell, as Windows Terminal and WezTerm let it (see
 /// `TermGpu::prepare`). Powerline's separators are drawn to exactly one cell against
 /// their segment colours and must stay put.
 pub fn is_icon(ch: char) -> bool {
-    let c = ch as u32;
-    ((0xE000..=0xF8FF).contains(&c) && !(0xE0A0..=0xE0D7).contains(&c)) || (0xF0000..=0xFFFFD).contains(&c)
+    is_pua(ch) && !(0xE0A0..=0xE0D7).contains(&(ch as u32))
 }
 
 /// Rasterise `ch` at `em_px` (the CSS-style em size in device px), in bold if
