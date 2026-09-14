@@ -7,6 +7,15 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Panes announce themselves as Arbiter to the far end of an ssh session.** Every pane
+  now carries `LC_TERMINAL=Arbiter` next to its pane id, the variable iTerm2 uses for the
+  same purpose and for the same reason: sshd accepts `LC_*` by default (macOS, Debian
+  family), so with `SendEnv LC_TERMINAL` under `Host *` in the client's `~/.ssh/config` the
+  remote shell can tell its output is drawn by Arbiter. A remote Claude status line can
+  then emit Nerd Font icons, which the bundled symbols font renders, instead of the plain
+  fallback it uses when no Nerd Font is installed on that host.
+
 ### Fixed
 - **Icons are drawn at a readable size and sit on the baseline.** An icon squeezed into
   one cell had been scaled down to the cell's width, smaller than a capital letter. When

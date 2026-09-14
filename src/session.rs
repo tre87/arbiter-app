@@ -25,6 +25,14 @@ type GitWatcher = Debouncer<RecommendedWatcher>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// `LC_TERMINAL=Arbiter` on every pane, the way iTerm2 announces itself. The `LC_` prefix
+/// is the point: sshd accepts `LANG` and `LC_*` by default (macOS, Debian family), so with
+/// `SendEnv LC_TERMINAL` in the client's ssh config the far host's shell learns it is drawn
+/// by Arbiter, which the user's Claude status line reads to emit Nerd Font icons. Nothing
+/// else in the environment crosses ssh without server-side configuration.
+pub const TERMINAL_ENV: &str = "LC_TERMINAL";
+pub const TERMINAL_NAME: &str = "Arbiter";
+
 /// Last-resort delay before a queued startup command is sent even though the pane never
 /// reported itself ready. Only reachable when shell integration is broken (no OSC-133 at
 /// all), where the alternative is the command silently never running.
@@ -708,6 +716,7 @@ impl Session {
         // when many Claudes launch at once or several share a cwd.
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         cmd.env(crate::claude_shim::PANE_ID_ENV, id.to_string());
+        cmd.env(TERMINAL_ENV, TERMINAL_NAME);
         // Read before `cmd` is consumed by the spawn. The pane's private history file
         // (set on the command by the shell layer) is a second source for its startup
         // command when keystroke tracking gives up on an up-arrow recall.

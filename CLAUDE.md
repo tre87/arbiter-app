@@ -43,6 +43,17 @@ A rejected alternative, for the record: a status-line script on the far host pri
 `ESC ] 7777 ; arbiter ; session=<id> ; cwd=<path> BEL` for the reader to parse. It works
 but needs a file copied to every host, which the user did not want (2026-09-12).
 
+## Pane environment — how a shell knows it is in Arbiter
+
+Every pane's shell gets `ARBITER_PANE_ID` (the shim keys its captures by it) and
+`LC_TERMINAL=Arbiter` (`Session::spawn`, `session::TERMINAL_ENV`). The `LC_` prefix is the
+point, copied from iTerm2: sshd accepts `LANG` and `LC_*` by default (macOS, Debian family),
+so once the client's `~/.ssh/config` has `SendEnv LC_TERMINAL` under `Host *` the far host's
+shell can tell it is drawn by Arbiter; nothing else crosses ssh without server-side
+configuration. The user's Claude status line (`~/.claude/scripts/statusline.sh`, a git repo
+synced to the Mac) reads both to emit Nerd Font icons instead of its plain fallback set
+(2026-09-14).
+
 ## Remote attach — how a local file reaches the far host
 
 Ctrl+Shift+S, Ctrl+Shift+A and a file drop all end in `attach_paths` (`iced_shell.rs`). A
