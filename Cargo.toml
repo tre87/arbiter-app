@@ -91,6 +91,12 @@ tiny-skia = "0.11"
 # File-explorer "Delete" moves to the OS trash (recoverable), like the web app's
 # `trash_path`. Cross-platform (Finder Trash / Recycle Bin / freedesktop).
 trash = "5"
+# One-shot delays inside iced Tasks (a notification card's timeout). iced's executor is
+# already this runtime (its `tokio` feature), so nothing new is compiled.
+tokio = { version = "1", features = ["time"] }
+# Direct dependency on the vendored fork (see [patch.crates-io]) for its
+# `NEXT_WINDOW_INACTIVE` switch: a notification window opens without taking focus.
+iced_winit = "0.13"
 
 # Claude usage bars: a native webview (WebView2 on Windows, WKWebView on macOS)
 # logs into claude.ai and polls the usage API, streaming JSON to the app over
@@ -145,6 +151,11 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_Media_Audio",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",

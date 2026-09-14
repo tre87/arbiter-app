@@ -181,6 +181,21 @@ pub struct Settings {
     /// default: the menu is also on Ctrl+Shift+M, and most people have nothing to wake.
     #[serde(default)]
     pub show_wol_button: bool,
+    /// Show notification cards (lower right corner of the main monitor). Off by default:
+    /// the user turns them on when wanted. Off silences the sound too, since there is
+    /// nothing to announce.
+    #[serde(default)]
+    pub notifications: bool,
+    /// Play the chime with each notification card. On by default.
+    #[serde(default = "default_true")]
+    pub notification_sound: bool,
+    /// Announce Claude stopping to ask for input (a permission or a question). On by
+    /// default.
+    #[serde(default = "default_true")]
+    pub notify_attention: bool,
+    /// Announce Claude finishing a turn. On by default.
+    #[serde(default = "default_true")]
+    pub notify_finished: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -290,6 +305,10 @@ impl Default for Settings {
             name_remote_claude_sessions: false,
             wol_hosts: Vec::new(),
             show_wol_button: false,
+            notifications: false,
+            notification_sound: true,
+            notify_attention: true,
+            notify_finished: true,
         }
     }
 }

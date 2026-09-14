@@ -156,6 +156,14 @@ struct State {
     wol_new_name: String,
     wol_new_mac: String,
     wol_add_error: Option<String>,
+    /// Notification cards on screen, oldest first (see `Toast`).
+    toasts: Vec<Toast>,
+    /// Id for the next card. A timeout names the card it was set for, so a card clicked
+    /// away early can never take a newer one with it.
+    next_toast_id: u64,
+    /// Each pane's Claude lifecycle as last seen, by session id. Transitions between
+    /// looks raise the cards (see `notify_claude_transitions`).
+    claude_seen: HashMap<u64, ClaudeSeen>,
     /// User preferences (the Settings dialog) — persisted with the session.
     settings: persist::Settings,
     /// Whether the Settings modal is open, and which tab it's showing.
@@ -317,6 +325,51 @@ struct WolMenu {
 /// How long the checkmark shows after a magic packet went out before the menu closes.
 const WOL_SENT_SHOW_MS: u64 = 900;
 
+/// A notification card: its own small always-on-top window in the lower right corner of
+/// the main monitor, until its time is up or it is clicked. The newest card sits nearest
+/// the corner; older ones move up.
+struct Toast {
+    id: u64,
+    title: String,
+    body: String,
+    /// The terminal (its session id) the card is about; a click goes there.
+    target: Option<u64>,
+    /// The card's window, once opened.
+    window: Option<iced::window::Id>,
+}
+
+/// How long a notification card stays up unless it is clicked away.
+const TOAST_SHOW_MS: u64 = 6000;
+/// The least time between two notifications about the same terminal, so a lifecycle
+/// that flickers (a prompt redrawn as the screen scrolls) raises one card, not a stack.
+const NOTIFY_QUIET_MS: u64 = 5000;
+/// Work that begins within this long of Claude appearing in a pane is its start-up, or a
+/// session being resumed, whose output reads as work: its end is no turn of yours. The
+/// process scan sees Claude running a moment before that output, so the gap is measured
+/// from there.
+const LAUNCH_SETTLE_MS: u64 = 8000;
+
+/// A pane's Claude lifecycle as last seen (see `notify_claude_transitions`). Times in ms
+/// since the epoch, 0 for never.
+#[derive(Clone, Copy)]
+struct ClaudeSeen {
+    lifecycle: Lifecycle,
+    /// When Claude was first seen running in this pane; 0 while it is not.
+    running_since: u64,
+    /// When the current, or latest, `Working` began.
+    working_since: u64,
+    /// When this pane last raised a card.
+    last_raised: u64,
+}
+/// The most cards on screen at once; the oldest leaves to make room.
+const TOAST_MAX: usize = 4;
+/// A card window's size, the gap between stacked cards, and the margin to the work
+/// area's edges. Logical px.
+const TOAST_W: f32 = 320.0;
+const TOAST_H: f32 = 60.0;
+const TOAST_GAP: f32 = 8.0;
+const TOAST_MARGIN: f32 = 16.0;
+
 /// Width of the Wake-on-LAN menu card.
 const WOL_MENU_W: f32 = 260.0;
 
@@ -395,6 +448,7 @@ enum SettingsTab {
     Files,
     ClaudeUsage,
     WakeOnLan,
+    Notifications,
 }
 
 /// Which default folder the file-attach picker opens in (web Ctrl+Shift+S vs +A).
@@ -643,6 +697,19 @@ enum Message {
     WolAdd,
     WolRemove(usize),
     ToggleWolButton(bool),
+    /// Raise a notification card, and its sound, as Settings allow; `target` is the
+    /// session id of the terminal it is about, which a click on the card goes to.
+    Notify { title: String, body: String, target: Option<u64> },
+    /// A card's time is up.
+    ToastExpired(u64),
+    /// A card was clicked: away with it, and to its terminal if it named one.
+    ToastClick(u64),
+    /// Settings, Notifications: the cards, the sound on its own, and which of the two
+    /// events to announce.
+    ToggleNotifications(bool),
+    ToggleNotificationSound(bool),
+    ToggleNotifyAttention(bool),
+    ToggleNotifyFinished(bool),
     /// Jump to a pane from the overview (select its workspace + focus it).
     JumpTo(usize, pane_grid::Pane),
     /// A window was closed (main → exit; overview → forget it).
@@ -1379,7 +1446,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // The readers' requests (retry a dropped connection, re-ask a rejected
             // secret) ride this same wake: each is raised while handling the output
             // that triggered the redraw.
-            return poll_connection_signals(state);
+            return Task::batch([poll_connection_signals(state), notify_claude_transitions(state)]);
         }
         Message::Tick => {
             // Persist when a Claude session newly bound in a pane (the watcher sets
@@ -1426,6 +1493,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 state.wol_menu = None;
             }
+            // A turn ends by its activity going stale, which no output announces: the
+            // tick that runs while Claude works is what sees it.
+            return notify_claude_transitions(state);
         }
         Message::Input(bytes) => {
             // While the Wake-on-LAN menu is open the keyboard drives it: arrows move the
@@ -2193,6 +2263,87 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.settings.show_wol_button = v;
             save_session(state);
         }
+        Message::Notify { title, body, target } => {
+            if !state.settings.notifications {
+                return Task::none();
+            }
+            if state.settings.notification_sound {
+                arbiter_native::notify::play_sound();
+            }
+            // A game or video in full screen, a presentation: the chime is all it gets. A
+            // card would sit on top of it, or knock it out of full screen.
+            if !arbiter_native::notify::desktop_accepts_notifications() {
+                return Task::none();
+            }
+            let id = state.next_toast_id;
+            state.next_toast_id += 1;
+            let mut tasks = Vec::new();
+            if state.toasts.len() >= TOAST_MAX {
+                let oldest = state.toasts.remove(0);
+                tasks.extend(oldest.window.map(iced::window::close));
+            }
+            // The newest card takes the corner slot; the others shift up (`place_toasts`).
+            let (window, open) = open_toast_window(toast_position(0));
+            tasks.push(open);
+            state.toasts.push(Toast { id, title, body, target, window: Some(window) });
+            tasks.push(place_toasts(state));
+            tasks.push(Task::perform(tokio::time::sleep(Duration::from_millis(TOAST_SHOW_MS)), move |_| {
+                Message::ToastExpired(id)
+            }));
+            return Task::batch(tasks);
+        }
+        Message::ToastExpired(id) => {
+            let Some(i) = state.toasts.iter().position(|t| t.id == id) else { return Task::none() };
+            let gone = state.toasts.remove(i);
+            let close = gone.window.map(iced::window::close).unwrap_or_else(Task::none);
+            return Task::batch([close, place_toasts(state)]);
+        }
+        Message::ToastClick(id) => {
+            let Some(i) = state.toasts.iter().position(|t| t.id == id) else { return Task::none() };
+            let gone = state.toasts.remove(i);
+            let mut tasks = vec![gone.window.map(iced::window::close).unwrap_or_else(Task::none), place_toasts(state)];
+            // The card named a terminal: select it and bring the window to the front, out
+            // of the taskbar if it was minimized.
+            let found = gone.target.and_then(|session| {
+                state.workspaces.iter().enumerate().find_map(|(wi, ws)| {
+                    ws.panes.iter().find(|(_, d)| d.session.id() == session).map(|(p, _)| (wi, *p))
+                })
+            });
+            if let Some((wi, pane)) = found {
+                state.active = wi;
+                state.workspaces[wi].focus = pane;
+                #[cfg(target_os = "macos")]
+                trafficlights::activate_app();
+                let main = state.main_window;
+                #[cfg(target_os = "windows")]
+                let restore = iced::window::run_with_handle(main, |handle| {
+                    if let iced::window::raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                        arbiter_native::notify::restore_if_minimized(h.hwnd.get());
+                    }
+                })
+                .map(|_| Message::Noop);
+                #[cfg(not(target_os = "windows"))]
+                let restore = Task::none();
+                tasks.push(restore.chain(iced::window::gain_focus(main)));
+            }
+            return Task::batch(tasks);
+        }
+        Message::ToggleNotifications(v) => {
+            state.settings.notifications = v;
+            save_session(state);
+        }
+        Message::ToggleNotificationSound(v) => {
+            state.settings.notification_sound = v;
+            save_session(state);
+        }
+        Message::ToggleNotifyAttention(v) => {
+            state.settings.notify_attention = v;
+            save_session(state);
+        }
+        Message::ToggleNotifyFinished(v) => {
+            state.settings.notify_finished = v;
+            save_session(state);
+        }
         Message::ToggleOverview => {
             if let Some(id) = state.overview_window.take() {
                 save_session(state); // persist "overview closed"
@@ -2213,6 +2364,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.overview_window == Some(id) {
                 state.overview_window = None;
                 save_session(state); // persist "overview closed" (e.g. via its own close button)
+            }
+            // A card whose window went away on its own (ours are removed before closing).
+            if let Some(i) = state.toasts.iter().position(|t| t.window == Some(id)) {
+                state.toasts.remove(i);
+                return place_toasts(state);
             }
         }
         Message::WindowMoved(id, p) => {
@@ -2299,6 +2455,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::WindowOpened(id, pos, size) => {
+            if state.toasts.iter().any(|t| t.window == Some(id)) {
+                // A click on a card must not move the keyboard focus to it.
+                #[cfg(target_os = "windows")]
+                return iced::window::run_with_handle(id, |handle| {
+                    if let iced::window::raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                        arbiter_native::notify::keep_window_inactive(h.hwnd.get());
+                    }
+                })
+                .map(|_| Message::Noop);
+                #[cfg(not(target_os = "windows"))]
+                return Task::none();
+            }
             let known = id == state.main_window || state.overview_window == Some(id);
             if id == state.main_window {
                 if let Some(p) = pos.filter(|p| on_screen_ish(*p)) {
@@ -2533,6 +2701,8 @@ fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
 fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
     if Some(window) == state.overview_window {
         overview_view(state)
+    } else if let Some(t) = state.toasts.iter().find(|t| t.window == Some(window)) {
+        toast_window_view(t)
     } else {
         main_view(state)
     }
@@ -2875,7 +3045,9 @@ fn settings_toggle(
         labels = labels.push(text(s.to_string()).size(11).color(TXT_MUTED));
     }
     let tog = toggler(value).size(20.0).on_toggle(on_toggle).style(toggle_style);
-    container(row![labels, horizontal_space(), tog].spacing(12).align_y(iced::Center))
+    // The labels fill what the toggler leaves, so a long description wraps inside the
+    // panel instead of pushing the toggler past its edge.
+    container(row![labels.width(Length::Fill), tog].spacing(12).align_y(iced::Center))
         .padding([10, 4])
         .into()
 }
@@ -3180,6 +3352,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 settings_tab_item("Files", SettingsTab::Files, state.settings_tab),
                 settings_tab_item("Claude Usage", SettingsTab::ClaudeUsage, state.settings_tab),
                 settings_tab_item("Wake on LAN", SettingsTab::WakeOnLan, state.settings_tab),
+                settings_tab_item("Notifications", SettingsTab::Notifications, state.settings_tab),
             ]
             .spacing(2),
             Space::with_height(Length::Fill),
@@ -3363,6 +3536,41 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             ));
             col
         }
+        SettingsTab::Notifications => column![
+            settings_section("Notifications"),
+            settings_toggle(
+                "Show notifications",
+                Some(
+                    "A card in the lower right corner of your main screen, above other windows, when \
+                     Claude in a terminal finishes or waits for your input. It leaves after a few \
+                     seconds, or when clicked, which takes you to that terminal. Off silences the \
+                     sound as well.",
+                ),
+                state.settings.notifications,
+                Message::ToggleNotifications,
+            ),
+            settings_toggle(
+                "Play a sound",
+                Some("A soft sound with each notification. Off keeps the card and drops the sound."),
+                state.settings.notification_sound,
+                Message::ToggleNotificationSound,
+            ),
+            Space::with_height(Length::Fixed(8.0)),
+            settings_section("Announce"),
+            settings_toggle(
+                "Claude needs your input",
+                Some("A permission to grant, or a question to answer."),
+                state.settings.notify_attention,
+                Message::ToggleNotifyAttention,
+            ),
+            settings_toggle(
+                "Claude finished",
+                Some("A turn ended and Claude waits for the next prompt."),
+                state.settings.notify_finished,
+                Message::ToggleNotifyFinished,
+            ),
+        ]
+        .spacing(12),
         SettingsTab::ClaudeUsage => column![
             settings_section("Account"),
             settings_account(&state.usage),
@@ -3540,6 +3748,8 @@ const TXT_SECONDARY: iced::Color = iced::Color { r: 0xa0 as f32 / 255.0, g: 0xaa
 const TXT_PRIMARY: iced::Color = iced::Color { r: 0xe8 as f32 / 255.0, g: 0xea as f32 / 255.0, b: 0xed as f32 / 255.0, a: 1.0 };
 const TXT_MUTED: iced::Color = iced::Color { r: 0x6b as f32 / 255.0, g: 0x7a as f32 / 255.0, b: 0x8d as f32 / 255.0, a: 1.0 };
 const AZURE: iced::Color = iced::Color { r: 0x33 as f32 / 255.0, g: 0x99 as f32 / 255.0, b: 0xff as f32 / 255.0, a: 1.0 };
+/// The attention amber of the status dot (`indicator`), for the overview's attention row.
+const AMBER: iced::Color = iced::Color { r: 0xe5 as f32 / 255.0, g: 0xa0 as f32 / 255.0, b: 0x3c as f32 / 255.0, a: 1.0 };
 
 /// Truncate `name` to `max_chars`, appending "…" when cut (keeps 3–4 chars min).
 fn truncate_name(name: &str, max_chars: usize) -> String {
@@ -5264,6 +5474,174 @@ fn main_view(state: &State) -> Element<'_, Message> {
     }
 }
 
+/// Where card `i` goes, counted from the newest at 0: stacked upward from the lower right
+/// corner of the main monitor's work area. None where the desktop cannot say where that
+/// is, and the window manager places the card.
+fn toast_position(i: usize) -> Option<iced::Point> {
+    let area = arbiter_native::notify::primary_work_area()?;
+    let x = area.right - TOAST_MARGIN - TOAST_W;
+    let y = area.bottom - TOAST_MARGIN - (i as f32 + 1.0) * TOAST_H - i as f32 * TOAST_GAP;
+    Some(iced::Point::new(x, y))
+}
+
+/// Move every card's window to its slot, the newest nearest the corner.
+fn place_toasts(state: &State) -> Task<Message> {
+    let n = state.toasts.len();
+    Task::batch(state.toasts.iter().enumerate().filter_map(|(idx, t)| {
+        let window = t.window?;
+        let slot = toast_position(n - 1 - idx)?;
+        Some(iced::window::move_to(window, slot))
+    }))
+}
+
+/// Raise a card for what changed in the panes' Claude lifecycles since the last look: a
+/// prompt that appeared ("needs your input") and a turn that ended ("finished"). Called
+/// from the two messages that follow every change, the PTY wake and the tick. A pane's
+/// first sighting only records it, so a launch or a restore raises nothing. The pane
+/// being looked at raises a card like any other: the user asked for every event.
+fn notify_claude_transitions(state: &mut State) -> Task<Message> {
+    let now = now_ms();
+    let mut seen: HashMap<u64, ClaudeSeen> = HashMap::with_capacity(state.claude_seen.len());
+    let mut raised: Vec<Message> = Vec::new();
+    for ws in &state.workspaces {
+        for (_, d) in ws.panes.iter() {
+            let id = d.session.id();
+            let lifecycle = if d.session.claude_running() {
+                d.session.claude_status().lifecycle
+            } else {
+                Lifecycle::Closed
+            };
+            let prev = state.claude_seen.get(&id).copied();
+            let mut next = prev.unwrap_or(ClaudeSeen {
+                lifecycle: Lifecycle::Closed,
+                running_since: 0,
+                working_since: 0,
+                last_raised: 0,
+            });
+            let was = next.lifecycle;
+            next.lifecycle = lifecycle;
+            if lifecycle == Lifecycle::Closed {
+                next.running_since = 0;
+            } else if next.running_since == 0 {
+                next.running_since = now;
+            }
+            if lifecycle == Lifecycle::Working && was != Lifecycle::Working {
+                next.working_since = now;
+            }
+            let changed = prev.is_some() && was != lifecycle;
+            let quiet = now.saturating_sub(next.last_raised) < NOTIFY_QUIET_MS;
+            let settled = next.working_since.saturating_sub(next.running_since) >= LAUNCH_SETTLE_MS;
+            let title = match (was, lifecycle) {
+                _ if !changed || quiet => None,
+                (_, Lifecycle::Attention) if state.settings.notify_attention => Some("Claude needs your input"),
+                (Lifecycle::Working, Lifecycle::Ready) if settled && state.settings.notify_finished => {
+                    Some("Claude finished")
+                }
+                _ => None,
+            };
+            if let Some(title) = title {
+                raised.push(Message::Notify {
+                    title: title.to_string(),
+                    body: format!("{} · {}", d.name, ws.name),
+                    target: Some(id),
+                });
+                next.last_raised = now;
+            }
+            seen.insert(id, next);
+        }
+    }
+    state.claude_seen = seen;
+    let tasks: Vec<Task<Message>> = raised.into_iter().map(|m| update(state, m)).collect();
+    Task::batch(tasks)
+}
+
+/// Open a card's window: borderless, always on top, out of the taskbar, and shown without
+/// taking focus (the fork's `NEXT_WINDOW_INACTIVE`). On Windows the window is opaque and
+/// DWM shadows and rounds it; on macOS it is transparent and the card draws its own
+/// rounded corners (see `toast_theme`).
+fn open_toast_window(pos: Option<iced::Point>) -> (iced::window::Id, Task<Message>) {
+    let mut settings = iced::window::Settings {
+        size: iced::Size::new(TOAST_W, TOAST_H),
+        resizable: false,
+        decorations: false,
+        level: iced::window::Level::AlwaysOnTop,
+        ..Default::default()
+    };
+    if let Some(p) = pos {
+        settings.position = iced::window::Position::Specific(p);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        settings.platform_specific.skip_taskbar = true;
+        settings.platform_specific.undecorated_shadow = true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        settings.transparent = true;
+    }
+    iced_winit::conversion::NEXT_WINDOW_INACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (id, open) = iced::window::open(settings);
+    let mut task = open.map(|_| Message::Noop);
+    // As for the overview: the at-creation position is not always honoured, a move after
+    // opening is.
+    if let Some(p) = pos {
+        task = Task::batch([task, iced::window::move_to(id, p)]);
+    }
+    (id, task)
+}
+
+/// The card windows' theme: on macOS a transparent clear colour, so the card's rounded
+/// corners show the desktop behind them; on Windows the card colour itself, the window
+/// being opaque there with DWM rounding its corners.
+fn toast_theme() -> iced::Theme {
+    let background = if cfg!(target_os = "macos") {
+        iced::Color::TRANSPARENT
+    } else {
+        iced::Color::from_rgb8(0x1c, 0x1c, 0x1c)
+    };
+    iced::Theme::custom(
+        "Arbiter notification".to_string(),
+        iced::theme::Palette { background, ..arbiter_theme().palette() },
+    )
+}
+
+/// One card, filling its window: the bell, a title and a line of detail. A click
+/// anywhere on it dismisses it.
+fn toast_window_view(t: &Toast) -> Element<'static, Message> {
+    let words = column![
+        text(t.title.clone()).size(13).font(ui_semibold()).color(TXT_PRIMARY),
+        text(t.body.clone())
+            .size(12)
+            .color(TXT_SECONDARY)
+            .wrapping(iced::widget::text::Wrapping::None),
+    ]
+    .spacing(3)
+    .width(Length::Fill);
+    button(row![cmdi(mdi_path::BELL, 16.0, AZURE), words].spacing(10).align_y(iced::Center))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding([10, 12])
+        .on_press(Message::ToastClick(t.id))
+        .style(|_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: Some(iced::Background::Color(if hovered {
+                    iced::Color::from_rgb8(0x24, 0x24, 0x24)
+                } else {
+                    iced::Color::from_rgb8(0x1c, 0x1c, 0x1c)
+                })),
+                text_color: TXT_PRIMARY,
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c),
+                },
+                shadow: iced::Shadow::default(),
+            }
+        })
+        .into()
+}
+
 /// A full-window overlay of thin resize hit-zones for the borderless Windows
 /// window (a decorations-off winit window has no OS resize hit-zones and iced
 /// 0.13 exposes no drag-resize). Edge/corner `mouse_area`s sit at the window
@@ -5325,6 +5703,18 @@ fn overview_row_style(_t: &iced::Theme, status: button::Status) -> button::Style
         s.background = Some(iced::Background::Color(iced::Color::from_rgb8(0x2c, 0x2c, 0x2c)));
     }
     s
+}
+
+/// The row of a terminal whose Claude waits for input: washed and edged in the status
+/// dot's amber, so it stands out of the list at a glance and not only by the dot.
+fn overview_attention_row_style(_t: &iced::Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(iced::Background::Color(iced::Color { a: if hovered { 0.30 } else { 0.16 }, ..AMBER })),
+        text_color: iced::Color::from_rgb8(0xe8, 0xea, 0xed),
+        border: iced::Border { radius: 4.0.into(), width: 1.0, color: iced::Color { a: 0.6, ..AMBER } },
+        shadow: Default::default(),
+    }
 }
 
 /// Git stat counts (●staged ✎unstaged +untracked) for one overview row.
@@ -5450,6 +5840,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             let lc = data.session.claude_status().lifecycle;
             let busy = data.session.shell_busy();
             let dot = pane_dot(running, lc, busy);
+            let attention = matches!(dot, Dot::Attention);
 
             // Truncate the title so it can't push the right cluster (git stats + status
             // dot) out of its column or wrap to a second line. Width-aware char budget:
@@ -5479,17 +5870,14 @@ fn overview_view(state: &State) -> Element<'_, Message> {
                     .wrapping(iced::widget::text::Wrapping::None),
             );
 
+            // Fill → the left cluster takes the remaining width, pinning git + dot to a
+            // fixed right column (always aligned). The fixed height + clip is the hard
+            // guarantee against a second line: iced's wrapping(None) isn't honoured for
+            // a Fill-width text in this flex layout, so an over-long title still wraps —
+            // clamping to one line's height (16px) and clipping renders only that first
+            // line, so the row can never grow to two lines regardless.
             let r = row![
-                // Fill → the left cluster takes the remaining width, pinning git + dot to a
-                // fixed right column (always aligned). The fixed height + clip is the hard
-                // guarantee against a second line: iced's wrapping(None) isn't honoured for
-                // a Fill-width text in this flex layout, so an over-long title still wraps —
-                // clamping to one line's height (16px) and clipping renders only that first
-                // line, so the row can never grow to two lines regardless.
-                container(left)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(16.0))
-                    .clip(true),
+                container(left).width(Length::Fill).height(Length::Fixed(16.0)).clip(true),
                 overview_git(&data.session),
                 container(indicator(dot, 12))
                     .width(Length::Fixed(22.0))
@@ -5498,12 +5886,15 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             .spacing(8)
             .align_y(iced::Center);
 
+            // A waiting Claude gets its row washed amber, not only its dot.
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if attention { overview_attention_row_style } else { overview_row_style };
             col = col.push(
                 button(r)
                     .on_press(Message::JumpTo(wi, *pane))
                     .padding([5, 12])
                     .width(Length::Fill)
-                    .style(overview_row_style),
+                    .style(style),
             );
         }
     }
@@ -5742,6 +6133,8 @@ mod mdi_path {
     /// mdi `access-point`: the titlebar's Wake-on-LAN button. Radio waves, not a power
     /// symbol, which next to the window's close button would read as "turn off".
     pub const ACCESS_POINT: &str = "M4.93,4.93C3.12,6.74 2,9.24 2,12C2,14.76 3.12,17.26 4.93,19.07L6.34,17.66C4.89,16.22 4,14.22 4,12C4,9.79 4.89,7.78 6.34,6.34L4.93,4.93M19.07,4.93L17.66,6.34C19.11,7.78 20,9.79 20,12C20,14.22 19.11,16.22 17.66,17.66L19.07,19.07C20.88,17.26 22,14.76 22,12C22,9.24 20.88,6.74 19.07,4.93M7.76,7.76C6.67,8.85 6,10.35 6,12C6,13.65 6.67,15.15 7.76,16.24L9.17,14.83C8.45,14.11 8,13.11 8,12C8,10.89 8.45,9.89 9.17,9.17L7.76,7.76M16.24,7.76L14.83,9.17C15.55,9.89 16,10.89 16,12C16,13.11 15.55,14.11 14.83,14.83L16.24,16.24C17.33,15.15 18,13.65 18,12C18,10.35 17.33,8.85 16.24,7.76M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10Z";
+    /// mdi `bell`: the mark on each notification card.
+    pub const BELL: &str = "M21,19V20H3V19L5,17V11C5,7.9 7.03,5.17 10,4.29C10,4.19 10,4.1 10,4A2,2 0 0,1 12,2A2,2 0 0,1 14,4C14,4.1 14,4.19 14,4.29C16.97,5.17 19,7.9 19,11V17L21,19M14,21A2,2 0 0,1 12,23A2,2 0 0,1 10,21";
     /// mdi `check`: a magic packet went out.
     pub const CHECK_BOLD: &str = "M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,6.59L21,7Z";
     /// mdi `upload`: an arrow rising from a tray, for a copy to a far host under way.
@@ -8086,6 +8479,8 @@ fn main() -> iced::Result {
     let title = |state: &State, id: iced::window::Id| {
         if state.overview_window == Some(id) {
             "Arbiter · Overview".to_string()
+        } else if state.toasts.iter().any(|t| t.window == Some(id)) {
+            "Arbiter · Notification".to_string()
         } else {
             "Arbiter native".to_string()
         }
@@ -8093,7 +8488,13 @@ fn main() -> iced::Result {
 
     iced::daemon(title, update, view)
         .subscription(subscription)
-        .theme(|s: &State, _id| s.theme.clone())
+        .theme(|s: &State, id| {
+            if s.toasts.iter().any(|t| t.window == Some(id)) {
+                toast_theme()
+            } else {
+                s.theme.clone()
+            }
+        })
         .font(INTER_FONT)
         .font(ARBITER_WORDMARK_FONT)
         .font(ARBITER_SYMBOLS_FONT)
@@ -8250,6 +8651,9 @@ fn main() -> iced::Result {
                 wol_new_name: String::new(),
                 wol_new_mac: String::new(),
                 wol_add_error: None,
+                toasts: Vec::new(),
+                next_toast_id: 1,
+                claude_seen: HashMap::new(),
                 font_size_input: saved_settings.font_size.to_string(),
                 settings: saved_settings,
                 settings_open: false,

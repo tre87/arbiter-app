@@ -7,6 +7,23 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Notifications.** When Claude in a terminal finishes a turn or stops to ask for
+  input, a card appears in the lower right corner of the main monitor (its start-up, and
+  a session being resumed, read as work too but announce nothing):
+  above every other window, shown without taking the keyboard from wherever you are
+  typing, naming the terminal and its workspace. It leaves after a few seconds, or when
+  clicked, which selects that terminal and brings Arbiter to the front, out of the
+  taskbar if need be; up to four stack upward with the newest nearest the corner. Each
+  one comes with a short, soft sound bundled with the app, played through the OS (winmm on
+  Windows, `afplay` on macOS). While a game or video runs full
+  screen, or a presentation, only the chime plays: no card is put over it (Windows' own
+  rule for its toasts; a macOS fullscreen app has its own Space, which the card does not
+  enter). Off by default: the Notifications tab in Settings turns them on, and there
+  chooses which of the two events to announce and whether the sound plays.
+- **The overview shows a waiting Claude in more than a dot.** Its row is washed and edged
+  in the dot's amber.
+
 ### Fixed
 - **`arbiter` typed in a pane of the installed app draws the about screen again.** The
   Windows release exe is a GUI program with no console of its own, so `about` and

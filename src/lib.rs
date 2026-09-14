@@ -9,6 +9,7 @@ pub mod claude_status;
 pub mod font;
 pub mod git;
 pub mod gpu;
+pub mod notify;
 pub mod persist;
 pub mod raster;
 pub mod remote;

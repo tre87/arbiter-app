@@ -8,6 +8,13 @@ use crate::core::touch;
 use crate::core::window;
 use crate::core::{Event, Point, Size};
 
+/// Arbiter's addition: set right before `window::open` and the next window is shown
+/// without taking focus (winit's `with_active(false)`; `SW_SHOWNOACTIVATE` on Windows,
+/// `orderFront` on macOS). A notification card must never take a keystroke. Cleared as
+/// that window's attributes are built. `window::Settings` has no field for it.
+pub static NEXT_WINDOW_INACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Converts some [`window::Settings`] into some `WindowAttributes` from `winit`.
 pub fn window_attributes(
     settings: window::Settings,
@@ -35,6 +42,10 @@ pub fn window_attributes(
         .with_window_icon(settings.icon.and_then(icon))
         .with_window_level(window_level(settings.level))
         .with_visible(settings.visible);
+
+    if NEXT_WINDOW_INACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        attributes = attributes.with_active(false);
+    }
 
     if let Some(position) =
         position(primary_monitor.as_ref(), settings.size, settings.position)
