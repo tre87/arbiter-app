@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-09-14
+
 ### Added
 - **Notifications.** When Claude in a terminal finishes a turn or stops to ask for
   input, a card appears in the lower right corner of the main monitor (its start-up, and
