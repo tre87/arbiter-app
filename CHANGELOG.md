@@ -15,7 +15,7 @@ history belongs to the prior Tauri/Vue web app it replaced.
   let icons overflow into the following space: drawn at four fifths of its natural size,
   about the height of a capital, and seated on the baseline rather than hanging under it,
   with part of the borrowed blank left as a gap before the text. An icon followed directly
-  by text keeps one cell as before; Powerline separators are never touched.
+  by text keeps one cell as before; Powerline separators never take a second cell.
 - **Icons that keep one cell are no longer cut in half on macOS.** An icon followed
   directly by text, and every Powerline separator, keeps a single cell, where the bundled
   symbols font draws it at nearly the full em: about twice the width of a Menlo cell. Only
@@ -23,6 +23,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   the icon was missing. Both platforms now fit it, while ordinary text on macOS is still
   left alone (pixel rounding puts an `M`'s ink a hair past the cell, and rescaling that
   would mangle normal text).
+- **Powerline separators fill their cell.** Where the terminal font lacks them (the
+  installed Cascadia Mono and Menlo both do), the separators came from the bundled symbols
+  font and were fitted into the cell keeping their shape, which left a notch of about a
+  third of the cell above and below each one. The four straight separators (U+E0B0 to
+  U+E0B3) are now drawn by the renderer at exact cell size, like box drawing, and the rest
+  of the range (rounded, slanted, flame and the others up to U+E0D7) is stretched to the
+  cell on each axis, the way a patched Nerd Font sizes them.
 - **Clicks, drags and wheel scrolling land on the row under the cursor.** The mouse hit
   test divided the pane's height by its row count, but the grid leaves a blank strip below
   the last row, so every row boundary sat too low, by nearly a full row at the bottom of a

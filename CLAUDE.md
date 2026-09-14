@@ -105,3 +105,8 @@ without painting over (erasing) the neighbour. Consequences, both intentional / 
   it scales down instead), and downscales anything
   larger. Don't re-add an "upscale undersized symbols" path — it enlarges glyphs like ⏵
   past their natural size (reverted once already).
+- **Powerline separators (U+E0B0..=U+E0D7) are never fitted.** The straight four are drawn
+  programmatically at exact cell size like box drawing (`gpu::draw_powerline_glyph`), the
+  rest are stretched to the cell on each axis (`gpu::stretch_to_box`): a segment edge with a
+  gap above or below shows as a notch, and uniform fitting of the bundled font's glyphs left
+  one. They never take a second cell either (`raster::is_icon` excludes them).

@@ -465,13 +465,14 @@ impl TermGpu {
         let mslot = self.next_slot;
         let ox = (mslot % self.per_row) * self.cell_w;
         let oy = (mslot / self.per_row) * self.cell_h;
-        // Block Elements + Box Drawing are drawn programmatically with consistent
-        // stroke centres so lines AND corners tile seamlessly — what the web's
-        // canvas renderer and GPU terminals (Alacritty/Kitty/WezTerm) do.
-        // Font-rendering them leaves sub-pixel gaps and, for rounded corners
-        // Menlo lacks, mismatched glyphs from a fallback font.
+        // Block Elements, Box Drawing and Powerline's straight separators are drawn
+        // programmatically with consistent stroke centres so lines AND corners tile
+        // seamlessly: what the web's canvas renderer and GPU terminals
+        // (Alacritty/Kitty/WezTerm) do. Font-rendering them leaves sub-pixel gaps and,
+        // for rounded corners Menlo lacks, mismatched glyphs from a fallback font.
         if draw_block_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
             || draw_box_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
+            || draw_powerline_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
         {
             self.next_slot += 1;
             self.atlas_dirty = true;
@@ -542,7 +543,9 @@ impl TermGpu {
                 Glyph { slot, color: false, cells: 2 }
             }
             Some(bmp) => {
-                let bmp = if fits_into_cell(ch) {
+                let bmp = if crate::raster::is_powerline_separator(ch) {
+                    stretch_to_box(bmp, self.cell_w, self.cell_h, self.baseline)
+                } else if fits_into_cell(ch) {
                     fit_to_box(bmp, self.cell_w, self.cell_h, self.baseline)
                 } else {
                     bmp
@@ -948,6 +951,51 @@ fn draw_box_glyph(atlas: &mut [u8], cp: u32, ox: u32, oy: u32, w: u32, h: u32) -
     true
 }
 
+/// Powerline's four straight separators (U+E0B0..=U+E0B3) drawn to the exact cell, like box
+/// drawing: a segment edge has to meet the cell's top, bottom and side with no gap, and a
+/// font glyph scaled into the cell never quite does (the bundled symbols font draws them
+/// wider than a cell and a hair taller, so fitting the width left a third of the height
+/// empty). Bit 0 of the code point picks the thin chevron over the filled triangle, bit 1
+/// the left-pointing mirror. 4x4 supersampled so the diagonals are smooth. Returns true if
+/// `cp` was handled.
+fn draw_powerline_glyph(atlas: &mut [u8], cp: u32, ox: u32, oy: u32, w: u32, h: u32) -> bool {
+    if !(0xE0B0..=0xE0B3).contains(&cp) || w == 0 || h == 0 {
+        return false;
+    }
+    let (wf, hf) = (w as f32, h as f32);
+    let half_stroke = (hf / 10.0).round().max(1.0) / 2.0; // box drawing's stroke
+    // Distance to the right-pointing chevron (0,0) → (wf, hf/2) → (0, hf). Folding y about
+    // the middle maps both arms onto the one segment (0, hf/2) → (wf, 0).
+    let chevron_distance = |x: f32, y: f32| -> f32 {
+        let y = (y - hf / 2.0).abs();
+        let (dx, dy) = (wf, -hf / 2.0);
+        let u = ((x * dx + (y - hf / 2.0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        ((x - u * dx).powi(2) + (y - (hf / 2.0 + u * dy)).powi(2)).sqrt()
+    };
+    let inside = |x: f32, y: f32| -> bool {
+        let x = if cp & 2 != 0 { wf - x } else { x };
+        if cp & 1 == 0 {
+            x / wf + (2.0 * y / hf - 1.0).abs() <= 1.0
+        } else {
+            chevron_distance(x, y) <= half_stroke
+        }
+    };
+    const N: u32 = 4;
+    for py in 0..h {
+        for px in 0..w {
+            let hits = (0..N * N)
+                .filter(|i| {
+                    let x = px as f32 + ((i % N) as f32 + 0.5) / N as f32;
+                    let y = py as f32 + ((i / N) as f32 + 0.5) / N as f32;
+                    inside(x, y)
+                })
+                .count() as u32;
+            atlas[((oy + py) * ATLAS + (ox + px)) as usize] = (hits * 255 / (N * N)) as u8;
+        }
+    }
+    true
+}
+
 fn fill_slot(atlas: &mut [u8], slot: u32, per_row: u32, cell_w: u32, cell_h: u32, value: u8) {
     let ox = (slot % per_row) * cell_w;
     let oy = (slot / per_row) * cell_h;
@@ -1006,6 +1054,24 @@ fn seat_on_baseline(bmp: GlyphBitmap, baseline: f32) -> GlyphBitmap {
 /// past the rounded cell width, and rescaling + recentering that mangles normal text.
 fn fits_into_cell(ch: char) -> bool {
     cfg!(target_os = "windows") || crate::raster::is_pua(ch)
+}
+
+/// Stretch a Powerline separator to exactly the cell, each axis on its own. It is a segment
+/// edge: any gap between it and the cell's top, bottom or side shows as a notch in the
+/// segment colour, and the uniform `fit_to_box` leaves one (the bundled symbols font draws
+/// the separators wider than a cell and a little taller, so fitting the width left a third
+/// of the height empty). A patched Nerd Font sizes them to the cell the same way. The
+/// straight four never get here (`draw_powerline_glyph`).
+fn stretch_to_box(bmp: GlyphBitmap, box_w: u32, box_h: u32, baseline: f32) -> GlyphBitmap {
+    if bmp.width == 0 || bmp.height == 0 {
+        return bmp;
+    }
+    let coverage = if bmp.color {
+        resample_rgba(&bmp.coverage, bmp.width, bmp.height, box_w, box_h)
+    } else {
+        resample_coverage(&bmp.coverage, bmp.width, bmp.height, box_w, box_h)
+    };
+    GlyphBitmap { left: 0, top: baseline.round() as i32, width: box_w, height: box_h, coverage, color: bmp.color }
 }
 
 /// Scale an oversized glyph down to fit `box_w`×`box_h`, centered, instead of letting
@@ -1087,8 +1153,7 @@ fn clip_cuts_solid_ink(bmp: &GlyphBitmap, skip: u32, box_w: u32) -> bool {
         || (last < bmp.width && column_ink(last - 1) > SOLID)
 }
 
-/// Bilinear-downscale an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Bilinear-resample an 8-bit coverage bitmap from `sw`×`sh` to `dw`×`dh`.
 fn resample_coverage(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let mut out = vec![0u8; (dw * dh) as usize];
     let sample = |x: u32, y: u32| src[(y * sw + x) as usize] as f32;
@@ -1112,7 +1177,6 @@ fn resample_coverage(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> 
 
 /// Bilinear-downscale a straight-alpha RGBA bitmap (4 bytes/px) from `sw`×`sh` to
 /// `dw`×`dh` — the colour-glyph counterpart of [`resample_coverage`].
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn resample_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let mut out = vec![0u8; (dw * dh * 4) as usize];
     let sample = |x: u32, y: u32, c: usize| src[((y * sw + x) * 4) as usize + c] as f32;
@@ -1252,6 +1316,67 @@ mod tests {
     fn resample_single_row_does_not_panic() {
         let out = resample_coverage(&[10, 250], 2, 1, 1, 1);
         assert_eq!(out.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod powerline_tests {
+    use super::*;
+
+    /// The cell `draw_powerline_glyph` draws for `cp`, row-major.
+    fn cell(cp: u32, w: u32, h: u32) -> Vec<u8> {
+        let mut atlas = vec![0u8; (ATLAS * ATLAS) as usize];
+        assert!(draw_powerline_glyph(&mut atlas, cp, 0, 0, w, h), "U+{cp:04X} handled");
+        let atlas = &atlas;
+        (0..h).flat_map(|y| (0..w).map(move |x| atlas[(y * ATLAS + x) as usize])).collect()
+    }
+
+    // The filled right-pointing separator: its base is the cell's left edge at full height,
+    // its tip meets the right edge at mid height, and the right corners stay empty. The
+    // left-pointing one is the mirror.
+    #[test]
+    fn filled_triangle_spans_the_cell() {
+        let (w, h) = (8u32, 16u32);
+        let px = cell(0xE0B0, w, h);
+        let at = |x: u32, y: u32| px[(y * w + x) as usize];
+        assert!((1..h - 1).all(|y| at(0, y) == 255), "base column solid");
+        assert!((0..w).all(|x| at(x, h / 2) > 0), "mid row inked to the right edge");
+        assert_eq!((at(w - 1, 0), at(w - 1, h - 1)), (0, 0), "right corners empty");
+        let mirrored = cell(0xE0B2, w, h);
+        assert!((1..h - 1).all(|y| mirrored[(y * w + w - 1) as usize] == 255), "left-pointing: base on the right");
+        assert_eq!(mirrored[0], 0, "and its top-left corner empty");
+    }
+
+    // The thin right-pointing separator is a stroke from the top-left corner to the right
+    // edge's middle and back to the bottom-left corner: the cell's centre and the middle
+    // of its left edge stay clear, and it carries less ink than the filled one.
+    #[test]
+    fn thin_chevron_is_a_stroke_not_a_fill() {
+        let (w, h) = (8u32, 16u32);
+        let px = cell(0xE0B1, w, h);
+        let at = |x: u32, y: u32| px[(y * w + x) as usize];
+        assert!(at(0, 0) > 0 && at(0, h - 1) > 0, "starts and ends at the left corners");
+        assert!(at(w - 1, h / 2) > 0 || at(w - 1, h / 2 - 1) > 0, "reaches the right edge at mid height");
+        assert_eq!((at(w / 2, h / 2), at(0, h / 2)), (0, 0), "centre and left middle clear");
+        let ink: u32 = px.iter().map(|&c| c as u32).sum();
+        let filled: u32 = cell(0xE0B0, w, h).iter().map(|&c| c as u32).sum();
+        assert!(ink < filled, "thin: {ink} of ink against the filled {filled}");
+        assert!(!draw_powerline_glyph(&mut vec![0u8; (ATLAS * ATLAS) as usize], 0xE0B4, 0, 0, w, h), "rounded: not drawn here");
+    }
+
+    // Any other separator (a rounded one, say) is stretched to exactly the cell, each axis
+    // on its own: the bundled font's 11x15 glyph in a 7x14 cell becomes 7x14 at the cell's
+    // top-left, where uniform fitting had left a third of the height empty.
+    #[test]
+    fn other_separators_are_stretched_to_the_cell() {
+        let bmp = GlyphBitmap { left: -2, top: 12, width: 11, height: 15, coverage: vec![255; 11 * 15], color: false };
+        let out = stretch_to_box(bmp, 7, 14, 11.0);
+        assert_eq!((out.width, out.height, out.left, out.top), (7, 14, 0, 11));
+        assert!(out.coverage.iter().all(|&c| c == 255), "solid stays solid");
+        use crate::raster::{is_icon, is_powerline_separator};
+        assert!(is_powerline_separator('\u{E0B4}') && is_powerline_separator('\u{E0D7}'));
+        assert!(!is_powerline_separator('\u{E0A0}'), "the branch symbol is an ordinary glyph");
+        assert!(!is_icon('\u{E0B4}'), "and a separator never takes a second cell");
     }
 }
 

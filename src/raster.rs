@@ -43,6 +43,14 @@ pub fn is_icon(ch: char) -> bool {
     is_pua(ch) && !(0xE0A0..=0xE0D7).contains(&(ch as u32))
 }
 
+/// A Powerline separator (U+E0B0..=U+E0D7): a segment edge meant to fill its cell exactly,
+/// which `TermGpu::slot_for` draws itself (the straight four) or stretches to the cell. Not
+/// the Powerline symbols before it (U+E0A0.., branch, line number, lock), which are ordinary
+/// one-cell glyphs.
+pub fn is_powerline_separator(ch: char) -> bool {
+    (0xE0B0..=0xE0D7).contains(&(ch as u32))
+}
+
 /// Rasterise `ch` at `em_px` (the CSS-style em size in device px), in bold if
 /// requested. `icon` draws it at `ICON_EM_SCALE` times that, for a two-cell icon.
 /// Returns None for a missing glyph (`.notdef`) — callers leave the cell blank.
