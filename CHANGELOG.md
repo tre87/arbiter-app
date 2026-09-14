@@ -23,6 +23,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
   the icon was missing. Both platforms now fit it, while ordinary text on macOS is still
   left alone (pixel rounding puts an `M`'s ink a hair past the cell, and rescaling that
   would mangle normal text).
+- **Clicks, drags and wheel scrolling land on the row under the cursor.** The mouse hit
+  test divided the pane's height by its row count, but the grid leaves a blank strip below
+  the last row, so every row boundary sat too low, by nearly a full row at the bottom of a
+  tall pane. It now uses the cell size the renderer actually drew with.
 
 ## [1.4.0] — 2026-09-13
 

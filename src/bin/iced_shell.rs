@@ -5640,6 +5640,22 @@ fn ui_scale() -> f32 {
     if b == 0 { 2.0 } else { f32::from_bits(b) }
 }
 
+/// The terminal cell size in logical px (f32 bits), published by the renderer each frame
+/// (see `TermPrimitive::prepare`) for the mouse hit test. Every pane shares one font and
+/// one display scale, so one value serves them all. Zero until the first frame.
+static CELL_LOGICAL_W_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CELL_LOGICAL_H_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn set_cell_logical(w: f32, h: f32) {
+    CELL_LOGICAL_W_BITS.store(w.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    CELL_LOGICAL_H_BITS.store(h.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+/// (width, height) of a cell in logical px, once a frame has been drawn.
+fn cell_logical() -> Option<(f32, f32)> {
+    let w = CELL_LOGICAL_W_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    let h = CELL_LOGICAL_H_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    (w != 0 && h != 0).then(|| (f32::from_bits(w), f32::from_bits(h)))
+}
+
 /// Last absolute cursor position over the main window (x|y f32 bits packed into a
 /// u64). Recorded for EVERY move by the global event listener — unlike `state.cursor`
 /// (tracked only over the titlebar/left-strip band), this covers the whole window so a
@@ -7450,12 +7466,15 @@ fn handle_key(event: iced::Event) -> Option<Message> {
 }
 
 /// Map a cursor position (logical px, relative to the widget) to a visible
-/// (row, col) cell plus whether the cursor is in the cell's right half. Cell
-/// size is derived from the widget bounds and the grid dimensions.
+/// (row, col) cell plus whether the cursor is in the cell's right half. Uses the
+/// renderer's real cell size (`cell_logical`): the grid does not fill the widget, so
+/// dividing the widget by the grid dimensions put every row boundary too low (up to a
+/// row at the bottom). Falls back to that estimate only before the first frame.
 fn cell_at(pos: iced::Point, bounds: Rectangle, term: &SharedTerm) -> (usize, usize, bool) {
     let (cols, rows) = term.lock().unwrap().size();
-    let cw = (bounds.width / cols.max(1) as f32).max(1.0);
-    let ch = (bounds.height / rows.max(1) as f32).max(1.0);
+    let (cw, ch) = cell_logical().unwrap_or_else(|| {
+        ((bounds.width / cols.max(1) as f32).max(1.0), (bounds.height / rows.max(1) as f32).max(1.0))
+    });
     let fx = pos.x / cw;
     let col = (fx.max(0.0).floor() as usize).min(cols.saturating_sub(1));
     let row = ((pos.y / ch).max(0.0).floor() as usize).min(rows.saturating_sub(1));
@@ -7604,7 +7623,7 @@ impl shader::Program<Message> for TermProgram {
             shader::Event::Mouse(WheelScrolled { delta }) if cursor.is_over(bounds) || state.dragging => {
                 let modes = self.term.lock().unwrap().mouse_modes();
                 let rows = self.term.lock().unwrap().size().1.max(1) as f32;
-                let ch = (bounds.height / rows).max(1.0);
+                let ch = cell_logical().map(|(_, h)| h).unwrap_or((bounds.height / rows).max(1.0));
                 // Raw notches (no ×3): one wheel report / arrow key per notch.
                 let notches = match delta {
                     ScrollDelta::Lines { y, .. } => y.round() as i32,
@@ -7923,6 +7942,11 @@ impl shader::Primitive for TermPrimitive {
         let ph = (bounds.height * scale).max(1.0) as u32;
         let cols = (pw / gpu.cell_w).max(1) as usize;
         let rows = (ph / gpu.cell_h).max(1) as usize;
+        // The grid fills `rows × cell_h`, not the whole widget: the remainder is a blank
+        // strip at the bottom (and right). The mouse hit test needs the real cell size,
+        // not the widget size divided by the row count, or every row boundary drifts
+        // downward, by nearly a row at the bottom of a tall pane.
+        set_cell_logical(gpu.cell_w as f32 / scale, gpu.cell_h as f32 / scale);
         {
             let mut t = self.term.lock().unwrap();
             let resized = t.size() != (cols, rows);
