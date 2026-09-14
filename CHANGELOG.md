@@ -7,6 +7,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **`arbiter` typed in a pane of the installed app draws the about screen again.** The
+  Windows release exe is a GUI program with no console of its own, so `about` and
+  `--version` had nowhere to print: the text was dropped, and the `claude --version` probe
+  behind one of the facts flashed an empty console window instead, which is all a user saw.
+  Both now attach to the terminal that launched them, and the probe runs without a window.
+  Debug builds, and any run with output redirected to a file, were never affected.
+
 ## [1.4.1] — 2026-09-14
 
 ### Added

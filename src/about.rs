@@ -327,7 +327,16 @@ fn claude_version() -> Option<String> {
     std::thread::spawn(move || {
         let output = if cfg!(windows) {
             let target = real.unwrap_or_else(|| "claude".to_string());
-            std::process::Command::new("cmd").args(["/c", &target, "--version"]).output()
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/c", &target, "--version"]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // CREATE_NO_WINDOW: the release exe has no console of its own for cmd to
+                // share, and a fresh one would flash on screen.
+                cmd.creation_flags(0x0800_0000);
+            }
+            cmd.output()
         } else {
             match real {
                 Some(path) => std::process::Command::new(path).arg("--version").output(),
@@ -385,6 +394,35 @@ fn spin_angle(i: usize, n: usize) -> f32 {
     let eased = t * t * (3.0 - 2.0 * t);
     eased * std::f32::consts::TAU
 }
+
+/// Give `about` and `--version` the terminal they were typed in. The Windows release exe
+/// is a GUI-subsystem program (so Claude's shim calls never flash a console), which means
+/// a process launched from a prompt starts with no console at all and everything it prints
+/// is dropped. Attach to the launcher's console and point stdout and stderr at its screen,
+/// keeping any handle the launcher wired itself (`arbiter about > file`). A no-op where
+/// there is already a console (debug builds) or none to join (started from Explorer).
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+        return;
+    }
+    for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        if unsafe { GetStdHandle(id) }.is_ok() {
+            continue;
+        }
+        if let Ok(screen) = std::fs::OpenOptions::new().read(true).write(true).open("CONOUT$") {
+            let _ = unsafe { SetStdHandle(id, HANDLE(screen.into_raw_handle())) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn attach_parent_console() {}
 
 /// Print it. Turning where the terminal allows, plain otherwise.
 pub fn run() {

@@ -8065,10 +8065,12 @@ fn main() -> iced::Result {
         }
         // `arbiter` typed in a pane (via the shim launcher): the mark and the build facts.
         Some("about") => {
+            arbiter_native::about::attach_parent_console();
             arbiter_native::about::run();
             return Ok(());
         }
         Some("--version") | Some("-V") => {
+            arbiter_native::about::attach_parent_console();
             println!("{}", arbiter_native::about::Build::current().one_line());
             return Ok(());
         }
