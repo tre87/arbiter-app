@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-09-14
+
 ### Added
 - **Panes announce themselves as Arbiter to the far end of an ssh session.** Every pane
   now carries `LC_TERMINAL=Arbiter` next to its pane id, the variable iTerm2 uses for the
