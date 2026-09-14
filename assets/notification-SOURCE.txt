@@ -1,0 +1,12 @@
+notification.wav
+
+"Warning Notification" by Universfield
+https://pixabay.com/sound-effects/film-special-effects-warning-notification-199277/
+
+Used under the Pixabay Content License
+https://pixabay.com/service/license-summary/
+
+Free for commercial and non-commercial use, no attribution required (this credit
+is given anyway). The licence does not permit distributing the sound on its own,
+so it is not covered by this repository's MIT licence: it is bundled here as part
+of the application only.

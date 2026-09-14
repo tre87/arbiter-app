@@ -14,6 +14,9 @@ Tabs, panes, folders, Claude conversations, SSH sessions: close it, open it, car
 
 <p align="center">
   <img src="docs/screenshot.png" alt="Arbiter screenshot" width="100%" />
+  <br />
+  <em>One workspace of eight, split three ways: a Claude Code session, a git shell and a PowerShell.
+  The tab bar carries the other workspaces, and the title bar your Claude usage for the last 5 hours and 7 days.</em>
 </p>
 
 ## What it is
@@ -49,6 +52,13 @@ Arbiter knows what Claude is doing in every pane, whether it runs locally or on 
 The dots sit in each pane's header and roll up to the workspace tab, so a tab tells you when something inside it needs you.
 
 **The overview window** is the same information as a compact list: every workspace, every terminal, its Claude state, and its git status (staged, unstaged, untracked). It opens with `Ctrl+Shift+O` and can stay on top of everything else, so when the main window is covered or minimised you still see who is working and who is waiting. Click a row to jump to that pane. It can be filtered to Claude panes only.
+
+<p align="center">
+  <img src="docs/overview_screenshot.png" alt="The Arbiter overview window" width="340" />
+  <br />
+  <em>Three workspaces and their terminals in one list. The amber row is a Claude waiting for an answer,
+  <code>&#9675;1</code> is one unstaged file in that terminal's repo, and the footer repeats the usage bars.</em>
+</p>
 
 **Claude usage in the title bar.** Your 5 hour and 7 day usage from claude.ai, refreshing on its own.
 
@@ -129,4 +139,12 @@ cargo packager --release
 
 ## Downloads
 
-Grab the latest build for your platform from the [Releases page](https://github.com/tre87/arbiter-app/releases/latest).
+Grab the latest build for your platform from the [Releases page](https://github.com/tre87/arbiter-app/releases/latest). What changed in each version is in the [changelog](CHANGELOG.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+The bundled fonts keep their own licences, each next to the font in `assets/`: Cascadia Mono, DM Sans, Inter and Noto Sans Symbols 2 under the SIL Open Font License, Symbols Nerd Font Mono under MIT.
+
+The notification sound is [Warning Notification](https://pixabay.com/sound-effects/film-special-effects-warning-notification-199277/) by Universfield, under the [Pixabay Content License](https://pixabay.com/service/license-summary/) (`assets/notification-SOURCE.txt`). Like the fonts, it is bundled as part of the app and is not covered by the MIT grant above.

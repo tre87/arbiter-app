@@ -4,6 +4,7 @@ version = "1.4.2"
 edition = "2021"
 publish = false
 description = "Cross-platform terminal application with Claude support"
+license = "MIT"
 # Don't auto-discover bins: src/bin/file_icons.rs is a *module* of iced_shell
 # (sibling of the crate root), not a binary. List the real bins explicitly.
 autobins = false
