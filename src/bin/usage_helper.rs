@@ -347,6 +347,13 @@ pub fn run() {
 /// reports `needs_org` with the list so the app can show its picker.
 const INIT_SCRIPT: &str = r#"
 (function () {
+  // Top frame only. WebView2 runs an AddScriptToExecuteOnDocumentCreated script in
+  // EVERY frame (it takes no frame filter, unlike WKWebView's forMainFrameOnly and
+  // WebKitGTK's TopFrame, which wry does pass), so without this guard the location
+  // rescue below navigated each of claude.ai's own subframes to claude.ai, whose
+  // subframes were then navigated in turn: a page load every ~2s, around the clock,
+  // until the renderer ran out of memory and took the whole webview down with it.
+  if (window.top !== window.self) return;
   function post(x) { try { window.ipc.postMessage(JSON.stringify(x)); } catch (_) {} }
   function per(p) {
     if (!p) return null;

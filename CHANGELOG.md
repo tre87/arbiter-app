@@ -33,6 +33,22 @@ history belongs to the prior Tauri/Vue web app it replaced.
   arriving in several chunks is drawn whole. Output arriving faster than the settle time,
   chunk after chunk, re-armed that wait indefinitely and could keep one frame up until the
   output paused. A frame is now kept at most as long as a redraw is ever held (40 ms).
+- **The usage webview no longer navigates itself to death (Windows).** The script
+  Arbiter injects into claude.ai to read usage sends any frame that isn't claude.ai
+  back to claude.ai, a rescue meant for the page itself. WebView2 runs injected
+  scripts in every frame, not just the top one (macOS and Linux inject into the main
+  frame only), so each of claude.ai's own subframes was navigated to claude.ai, and
+  the subframes of those in turn: a page load every couple of seconds, around the
+  clock, for as long as Arbiter ran. A few hours of that exhausted the renderer's
+  memory, WebView2 crashed and wrote a 20 MB dump, and the usage bars died until the
+  app restarted. The script now runs in the top frame only.
+- **A silent usage webview is restarted instead of being left for dead.** The
+  background poll escalated an unanswered refresh to a page reload and stopped there,
+  which reaches nothing once the webview's browser process is gone. It now takes one
+  more step after two silent cycles and replaces the helper process, so the bars come
+  back on their own within a few minutes rather than at the next launch. A helper that
+  exits for any other reason is likewise respawned, unless three runs in a row produce
+  nothing (no webview to be had on this machine), when it stops trying.
 
 ## [1.4.2] — 2026-09-14
 

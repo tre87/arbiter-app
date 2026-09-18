@@ -4126,6 +4126,14 @@ static USAGE_POLL_RETRY: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// UI loop, so an idle app emits zero frames); `UsageUpdated` clears it.
 static USAGE_FETCH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The live helper process, so the watchdog can kill it: its stdout then closes, which
+/// is what makes `usage_worker` spawn a replacement.
+static HELPER_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+/// Consecutive poll cycles whose poke went unanswered; any line from the helper resets
+/// it. Drives the escalation ladder in `start_usage_poll`.
+static USAGE_MISSED_POLLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Keep the poll's gate flags in lockstep with the usage state: `Ok` runs the normal
 /// refetch cadence, `Error` keeps reloading to recover, everything else stays quiet.
 /// Call after every assignment to `state.usage.state` so the background thread (which
@@ -4208,88 +4216,151 @@ fn usage_subscription() -> Subscription<Message> {
     Subscription::run(usage_worker)
 }
 
+/// Spawn the helper: THIS binary re-run with `--usage-helper` (own process, hosts the
+/// webview), one binary, no separate build/placement. Its stdin goes to `HELPER_STDIN`
+/// so the Sign-in button can raise its window, the process to `HELPER_CHILD` so the
+/// watchdog can kill it, and its stdout back to the caller. None if it can't start.
+fn spawn_usage_helper() -> Option<std::process::ChildStdout> {
+    let exe = std::env::current_exe().ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--usage-helper")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take();
+    *HELPER_STDIN.lock().unwrap() = child.stdin.take();
+    let previous = HELPER_CHILD.lock().unwrap().replace(child);
+    // Kill before waiting: a predecessor still running would block this (async) task in
+    // `wait` forever. The wait itself is what keeps a restart from leaving a zombie.
+    if let Some(mut old) = previous {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+    stdout
+}
+
+/// Kill the helper so `usage_worker` replaces it with a fresh process and webview. The
+/// watchdog's last resort, and the only way back once the webview's browser process is
+/// gone: a `reload` then reaches nothing, and the bars stay dead until the app restarts.
+/// Dropping the stdin pipe first means a helper that survives the kill still sees EOF
+/// and exits on its own.
+fn restart_usage_helper() {
+    use std::sync::atomic::Ordering::Relaxed;
+    USAGE_FETCH_PENDING.store(false, Relaxed);
+    USAGE_MISSED_POLLS.store(0, Relaxed);
+    *HELPER_STDIN.lock().unwrap() = None;
+    if let Some(child) = HELPER_CHILD.lock().unwrap().as_mut() {
+        let _ = child.kill();
+    }
+}
+
+/// Own the 120s auto-refresh cadence on a BACKGROUND thread, not the UI tick, so an idle
+/// app emits zero frames. It pokes the helper directly via stdin; fresh data returns
+/// through the same stdout path as any other update. While signed out / loading it stays
+/// quiet (USAGE_POLL_OK). (The helper's own setInterval is unreliable while hidden,
+/// webviews throttle background timers, so the app owns the cadence.) Started once.
+fn start_usage_poll() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(|| {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            std::thread::sleep(Duration::from_millis(USAGE_REFRESH_MS));
+            let (ok, retry) = (USAGE_POLL_OK.load(Relaxed), USAGE_POLL_RETRY.load(Relaxed));
+            if !ok && !retry {
+                // Signed out / loading / needs-login: stay quiet, and don't carry a
+                // stale miss into the next live cycle.
+                USAGE_MISSED_POLLS.store(0, Relaxed);
+                continue;
+            }
+            // One rung per cycle for as long as the helper stays silent: refetch, then
+            // reload (respawns a renderer Windows discarded), then a whole new helper
+            // process. A still-set USAGE_FETCH_PENDING is what "silent" means here.
+            let missed = if USAGE_FETCH_PENDING.swap(true, Relaxed) {
+                USAGE_MISSED_POLLS.fetch_add(1, Relaxed) + 1
+            } else {
+                USAGE_MISSED_POLLS.store(0, Relaxed);
+                0
+            };
+            match usage_poke(missed, retry) {
+                UsagePoke::Restart => restart_usage_helper(),
+                UsagePoke::Reload => usage_helper_cmd("reload"),
+                UsagePoke::Fetch => usage_helper_cmd("fetch"),
+            }
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UsagePoke {
+    Fetch,
+    Reload,
+    Restart,
+}
+
+/// What a poll cycle does, given how many of its pokes went unanswered and whether the
+/// bars are in the error state. Split out of the thread so the ladder is testable
+/// without a helper process or a 120s wait.
+fn usage_poke(missed: u32, retry: bool) -> UsagePoke {
+    if missed >= USAGE_RESTART_AFTER_MISSES {
+        UsagePoke::Restart
+    } else if missed > 0 || retry {
+        // Error state (signed in, fetch failed) reloads from its first cycle: it re-runs
+        // the fetch on a fresh page until it recovers.
+        UsagePoke::Reload
+    } else {
+        UsagePoke::Fetch
+    }
+}
+
 fn usage_worker() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(8, |mut output| async move {
         use iced::futures::{SinkExt, StreamExt};
-        // Re-spawn THIS binary as the usage helper (own process, hosts the webview)
-        // — one binary, no separate build/placement. Without `--features
-        // usage-helper` the child sees the flag, no-ops and exits — handled below
-        // (its stdout closes → we surface "Sign in").
-        let exe = std::env::current_exe().unwrap_or_default();
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--usage-helper")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        let Ok(mut child) = cmd.spawn() else {
-            std::future::pending::<()>().await;
-            unreachable!()
-        };
-        // Keep the helper's stdin so the Sign-in button can raise its window.
-        *HELPER_STDIN.lock().unwrap() = child.stdin.take();
-        // Own the 120s auto-refresh cadence on a BACKGROUND thread, not the UI tick —
-        // so an idle app emits zero frames. It pokes the helper directly via stdin;
-        // fresh data returns through the same stdout path as any other update. While
-        // signed out / loading it stays quiet (USAGE_POLL_OK). If the previous fetch
-        // was never answered (USAGE_FETCH_PENDING still set), the hidden renderer
-        // likely died, so it escalates to a reload to respawn it. (The helper's own
-        // setInterval is unreliable while hidden — webviews throttle background timers
-        // — so the app owns the cadence.) Started once; this worker runs once.
-        static POLL_THREAD_STARTED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !POLL_THREAD_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            std::thread::spawn(|| {
-                use std::sync::atomic::Ordering::Relaxed;
-                loop {
-                    std::thread::sleep(Duration::from_millis(USAGE_REFRESH_MS));
-                    if USAGE_POLL_OK.load(Relaxed) {
-                        // Live data: normal refetch, escalating to a reload if the
-                        // previous fetch went unanswered (hidden renderer likely died).
-                        if USAGE_FETCH_PENDING.swap(true, Relaxed) {
-                            usage_helper_cmd("reload");
-                        } else {
-                            usage_helper_cmd("fetch");
+        start_usage_poll();
+        // Consecutive runs that posted nothing at all. A single line resets this; only a
+        // helper that can never speak (built without `--features usage-helper`, or no
+        // working webview on this machine) reaches the limit, and respawning stops.
+        let mut silent_runs = 0u32;
+        loop {
+            let mut spoke = false;
+            if let Some(stdout) = spawn_usage_helper() {
+                // Bridge the helper's (blocking) stdout lines into this async task.
+                let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<String>();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                        if tx.unbounded_send(line).is_err() {
+                            break;
                         }
-                    } else if USAGE_POLL_RETRY.load(Relaxed) {
-                        // Error state (signed in, fetch failed): keep reloading to
-                        // respawn the renderer and re-run the fetch until it recovers.
-                        usage_helper_cmd("reload");
                     }
-                    // else: signed out / loading / needs-login → stay quiet.
-                }
-            });
-        }
-        // Bridge the helper's (blocking) stdout lines into this async task.
-        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<String>();
-        if let Some(stdout) = child.stdout.take() {
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if tx.unbounded_send(line).is_err() {
-                        break;
+                });
+                while let Some(line) = rx.next().await {
+                    spoke = true;
+                    if let Some(data) = parse_usage_line(&line) {
+                        let _ = output.send(Message::UsageUpdated(data)).await;
                     }
                 }
-            });
-        }
-        // Holding `child` keeps its piped stdin open; the helper exits on EOF when
-        // this process dies, so no orphan webview.
-        while let Some(line) = rx.next().await {
-            if let Some(data) = parse_usage_line(&line) {
-                let _ = output.send(Message::UsageUpdated(data)).await;
             }
+            // Helper's stdout closed: it exited (the watchdog killed it, it crashed, or
+            // this build has no `usage-helper` feature). Surface "Sign in" now rather
+            // than leaving the bars on "Loading" until the long fallback timeout, which
+            // is only for a helper that's still ALIVE but silent.
+            let _ = output
+                .send(Message::UsageUpdated(UsageData {
+                    state: UsageState::NeedsLogin,
+                    ..Default::default()
+                }))
+                .await;
+            silent_runs = if spoke { 0 } else { silent_runs + 1 };
+            if silent_runs >= USAGE_HELPER_MAX_SILENT_RUNS {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            tokio::time::sleep(Duration::from_millis(USAGE_HELPER_RESPAWN_MS)).await;
         }
-        // Helper's stdout closed → it exited (no `--features usage-helper`, or it
-        // crashed). Surface "Sign in" now rather than leaving the bars on "Loading"
-        // until the long fallback timeout — that timeout is only for a helper that's
-        // still ALIVE but silent.
-        let _ = output
-            .send(Message::UsageUpdated(UsageData {
-                state: UsageState::NeedsLogin,
-                ..Default::default()
-            }))
-            .await;
-        let _ = child.kill();
-        std::future::pending::<()>().await;
     })
 }
 
@@ -4611,6 +4682,19 @@ fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Elemen
 /// How often usage auto-refreshes (the countdown length). The app drives this on
 /// the Tick (the helper's own background timer throttles while hidden).
 const USAGE_REFRESH_MS: u64 = 120_000;
+
+/// Unanswered poll cycles before the watchdog restarts the helper process. Two, so the
+/// cheap rungs run first (refetch, reload): usage recovers within ~6 minutes of the
+/// webview going silent, without a restart for every transient slow fetch.
+const USAGE_RESTART_AFTER_MISSES: u32 = 2;
+
+/// Pause before respawning a helper that exited, so one that dies on startup can't turn
+/// into a spawn loop.
+const USAGE_HELPER_RESPAWN_MS: u64 = 2_000;
+
+/// Consecutive helper runs posting nothing before respawning stops for good. Three, to
+/// ride out a one-off failed start but not to relaunch a binary that has no webview.
+const USAGE_HELPER_MAX_SILENT_RUNS: u32 = 3;
 
 /// Last-resort fallback: how long the titlebar shows "Loading" before offering
 /// "Sign in" when the helper is ALIVE but silent (e.g. the claude.ai webview is
@@ -8778,7 +8862,22 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_mouse, trim_history_file, MouseModes};
+    use super::{encode_mouse, trim_history_file, usage_poke, MouseModes, UsagePoke};
+
+    #[test]
+    fn usage_poll_escalates_to_a_restart_when_the_helper_stays_silent() {
+        // Answers arriving: the cheap refetch in the live page.
+        assert_eq!(usage_poke(0, false), UsagePoke::Fetch);
+        // One silent cycle: reload, which respawns a renderer Windows discarded.
+        assert_eq!(usage_poke(1, false), UsagePoke::Reload);
+        // Still silent: the webview itself is gone, and only a new helper process can
+        // bring it back.
+        assert_eq!(usage_poke(2, false), UsagePoke::Restart);
+        assert_eq!(usage_poke(9, false), UsagePoke::Restart);
+        // The error state reloads from its first cycle, then climbs the same ladder.
+        assert_eq!(usage_poke(0, true), UsagePoke::Reload);
+        assert_eq!(usage_poke(2, true), UsagePoke::Restart);
+    }
 
     #[test]
     fn trim_history_keeps_the_last_n_lines() {
