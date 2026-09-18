@@ -122,6 +122,10 @@ pub struct Settings {
     /// default on — Sonnet is rarely the binding limit).
     #[serde(default = "default_true")]
     pub hide_sonnet_usage: bool,
+    /// Show Fable's weekly usage meter in the titlebar, left of the 5h bar. Off by
+    /// default; only plans that cap Fable separately have the window at all.
+    #[serde(default)]
+    pub show_fable_usage: bool,
     /// Overview popout lists only terminals running Claude (web
     /// `devStore.overviewClaudeOnly`). Off by default — show all terminals.
     #[serde(default)]
@@ -290,6 +294,7 @@ impl Default for Settings {
         Self {
             hide_usage_bar: false,
             hide_sonnet_usage: true,
+            show_fable_usage: false,
             overview_claude_only: false,
             overview_topmost: true,
             overview_usage_footer: true,
@@ -499,6 +504,7 @@ mod tests {
         // Settings default when absent: Sonnet meter hidden, usage bar shown.
         assert!(s.settings.hide_sonnet_usage);
         assert!(!s.settings.hide_usage_bar);
+        assert!(!s.settings.show_fable_usage);
         match &s.workspaces[0].layout {
             SavedNode::Leaf {
                 claude_running,

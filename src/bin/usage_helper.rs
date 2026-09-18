@@ -8,7 +8,8 @@
 //! Protocol (one JSON object per stdout line):
 //!   { "ok": true, "plan": "Pro|Max|Free",
 //!     "five_hour": {"utilization": 0-100, "resets_at_ms": <epoch ms|null>} | null,
-//!     "seven_day": …, "seven_day_opus": …, "seven_day_sonnet": … }
+//!     "seven_day": …, "seven_day_opus": …, "seven_day_sonnet": …,
+//!     "seven_day_fable": … (Fable's weekly cap, from the API's scoped limits) }
 //!   { "ok": false, "error": "needs_login" }   ← shows the sign-in window
 //!
 //! Exits when the parent closes (parent pipes our stdin; EOF on stdin = parent gone).
@@ -416,6 +417,20 @@ const INIT_SCRIPT: &str = r#"
     if (!usage) { post({ ok: false, error: 'error' }); return; }
     var plan = (usage.seven_day_opus || usage.seven_day_sonnet) ? 'Max' : (usage.seven_day ? 'Pro' : 'Free');
     var chosenName = (list.find(function (o) { return o.uuid === chosen; }) || {}).name || null;
+    // A per-model weekly cap is not a top-level window but a `limits` entry of kind
+    // weekly_scoped, the model named in its scope. Fable's is the one Arbiter can show.
+    function scoped(model) {
+      var ls = Array.isArray(usage.limits) ? usage.limits : [];
+      for (var i = 0; i < ls.length; i++) {
+        var l = ls[i];
+        var m = l && l.kind === 'weekly_scoped' && l.scope && l.scope.model && l.scope.model.display_name;
+        if (m && String(m).toLowerCase() === model && typeof l.percent === 'number') {
+          return { utilization: l.percent, resets_at: l.resets_at };
+        }
+      }
+      // No such limit (the plan has none, or the API dropped it): no window, no bar.
+      return null;
+    }
     post({
       ok: true, plan: plan,
       // The chosen org + full list travel with every poll so Settings can show the
@@ -424,7 +439,8 @@ const INIT_SCRIPT: &str = r#"
       five_hour: per(usage.five_hour),
       seven_day: per(usage.seven_day),
       seven_day_opus: per(usage.seven_day_opus),
-      seven_day_sonnet: per(usage.seven_day_sonnet)
+      seven_day_sonnet: per(usage.seven_day_sonnet),
+      seven_day_fable: per(scoped('fable'))
     });
   }
   setTimeout(fetchUsage, 800);

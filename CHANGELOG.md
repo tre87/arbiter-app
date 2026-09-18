@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **A Fable usage meter in the titlebar, on request.** Plans that cap Fable separately
+  report that cap as a scoped weekly limit rather than a window of its own, so the usage
+  bars never showed it. Settings → Claude usage → "Show Fable usage" (off by default) adds
+  a purple Fable bar left of the 5h bar. It resets together with the 7d bar and so carries
+  no timer. The overview footer is unchanged.
+
 ## [1.4.3] — 2026-09-18
 
 ### Fixed

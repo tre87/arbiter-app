@@ -547,6 +547,7 @@ enum Message {
     /// Settings toggles (persisted).
     ToggleHideUsageBar(bool),
     ToggleHideSonnetUsage(bool),
+    ToggleShowFableUsage(bool),
     ToggleOverviewClaudeOnly(bool),
     ToggleOverviewTopmost(bool),
     ToggleOverviewUsageFooter(bool),
@@ -1730,6 +1731,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleHideSonnetUsage(v) => {
             state.settings.hide_sonnet_usage = v;
+            save_session(state);
+        }
+        Message::ToggleShowFableUsage(v) => {
+            state.settings.show_fable_usage = v;
             save_session(state);
         }
         Message::ToggleOverviewClaudeOnly(v) => {
@@ -3671,6 +3676,12 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 Message::ToggleHideSonnetUsage,
             ),
             settings_toggle(
+                "Show Fable usage",
+                Some("Add Fable's weekly meter to the titlebar, left of the 5h bar. It resets with the 7d meter, so it shows no timer."),
+                state.settings.show_fable_usage,
+                Message::ToggleShowFableUsage,
+            ),
+            settings_toggle(
                 "Show usage footer in overview",
                 Some("Show the Claude usage bars at the bottom of the overview window, when usage isn't hidden."),
                 state.settings.overview_usage_footer,
@@ -3835,6 +3846,9 @@ const TXT_SECONDARY: iced::Color = iced::Color { r: 0xa0 as f32 / 255.0, g: 0xaa
 const TXT_PRIMARY: iced::Color = iced::Color { r: 0xe8 as f32 / 255.0, g: 0xea as f32 / 255.0, b: 0xed as f32 / 255.0, a: 1.0 };
 const TXT_MUTED: iced::Color = iced::Color { r: 0x6b as f32 / 255.0, g: 0x7a as f32 / 255.0, b: 0x8d as f32 / 255.0, a: 1.0 };
 const AZURE: iced::Color = iced::Color { r: 0x33 as f32 / 255.0, g: 0x99 as f32 / 255.0, b: 0xff as f32 / 255.0, a: 1.0 };
+/// Fable's usage meter: the palette's one purple, apart from azure (5h, Sonnet) and green
+/// (7d, Opus). Mid violet, so the white percentage on it stays readable.
+const PURPLE: iced::Color = iced::Color { r: 0x8b as f32 / 255.0, g: 0x5c as f32 / 255.0, b: 0xf6 as f32 / 255.0, a: 1.0 };
 /// The attention amber of the status dot (`indicator`), for the overview's attention row.
 const AMBER: iced::Color = iced::Color { r: 0xe5 as f32 / 255.0, g: 0xa0 as f32 / 255.0, b: 0x3c as f32 / 255.0, a: 1.0 };
 
@@ -4034,6 +4048,9 @@ struct UsageData {
     seven_day: Option<UsagePeriod>,
     seven_day_opus: Option<UsagePeriod>,
     seven_day_sonnet: Option<UsagePeriod>,
+    /// Fable's weekly cap, where the plan has one. Shown in the titlebar on request
+    /// (Settings → "Show Fable usage"); it resets with `seven_day`.
+    seven_day_fable: Option<UsagePeriod>,
     /// Plan name from the usage API ("Pro" / "Max" / "Free"), shown in Settings.
     plan: Option<String>,
     /// Display name of the org usage is being read from (shown in Settings).
@@ -4072,6 +4089,8 @@ struct HelperLine {
     seven_day_opus: Option<HelperPeriod>,
     #[serde(default)]
     seven_day_sonnet: Option<HelperPeriod>,
+    #[serde(default)]
+    seven_day_fable: Option<HelperPeriod>,
 }
 
 /// Parse one stdout line from the usage helper into a [`UsageData`].
@@ -4095,6 +4114,7 @@ fn parse_usage_line(line: &str) -> Option<UsageData> {
         seven_day: cv(l.seven_day),
         seven_day_opus: cv(l.seven_day_opus),
         seven_day_sonnet: cv(l.seven_day_sonnet),
+        seven_day_fable: cv(l.seven_day_fable),
         plan: l.plan,
         org_name: l.org_name,
         orgs: l.orgs.into_iter().map(|o| OrgInfo { uuid: o.uuid, name: o.name }).collect(),
@@ -4388,6 +4408,7 @@ fn fmt_reset(resets_at_ms: Option<i64>) -> String {
 fn usage_section(
     u: &UsageData,
     hide_sonnet: bool,
+    show_fable: bool,
 ) -> Option<(Element<'static, Message>, f32)> {
     // The separator between the usage section and the action buttons is added by
     // `titlebar_row` (a `group_sep`), so the sections here don't carry a trailing one.
@@ -4400,36 +4421,42 @@ fn usage_section(
         UsageState::Error => Some((usage_warning(), 168.0)),
         UsageState::Ok => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
-            // Sonnet is hidden by default (Settings → "Hide Sonnet usage").
+            // Sonnet is hidden by default (Settings → "Hide Sonnet usage"). Fable shows
+            // only on request (Settings → "Show Fable usage"), first in the row and with
+            // no timer of its own: it resets with the 7d meter.
             let sonnet = if hide_sonnet { None } else { u.seven_day_sonnet };
-            let entries: [(&str, iced::Color, Option<UsagePeriod>); 4] = [
-                ("5h", AZURE, u.five_hour),
-                ("7d", green, u.seven_day),
-                ("Opus", green, u.seven_day_opus),
-                ("Sonnet", AZURE, sonnet),
+            let fable = if show_fable { u.seven_day_fable } else { None };
+            let entries: [(&str, iced::Color, Option<UsagePeriod>, bool); 5] = [
+                ("Fable", PURPLE, fable, false),
+                ("5h", AZURE, u.five_hour, true),
+                ("7d", green, u.seven_day, true),
+                ("Opus", green, u.seven_day_opus, true),
+                ("Sonnet", AZURE, sonnet, true),
             ];
             let mut row = row![].spacing(8).align_y(iced::Center);
-            let mut n = 0u32;
-            for (label, color, period) in entries {
+            let mut width = 0.0_f32;
+            for (label, color, period, timer) in entries {
                 if let Some(p) = period {
+                    let reset = if timer { fmt_reset(p.resets_at_ms) } else { String::new() };
                     row = row.push(usage_stat(
                         label,
                         p.utilization.round() as u16,
                         color,
-                        &fmt_reset(p.resets_at_ms),
+                        &reset,
                         72.0,
                         None, // main titlebar: no border
                     ));
                     row = row.push(vsep());
-                    n += 1;
+                    // Label, bar, separator and spacing; the timer text is the difference.
+                    width += if timer { 150.0 } else { 112.0 };
                 }
             }
-            if n == 0 {
+            if width == 0.0 {
                 return None;
             }
             row = row.push(refresh_btn());
             // +10 for the group separator titlebar_row adds after the usage section.
-            Some((row.into(), 70.0 + n as f32 * 150.0))
+            Some((row.into(), 70.0 + width))
         }
     }
 }
@@ -4597,22 +4624,27 @@ fn usage_stat(
             },
             ..Default::default()
         });
-    row![
+    let mut r = row![
         text(label.to_string())
             .size(11)
             .color(TXT_SECONDARY)
             .line_height(lh)
             .wrapping(iced::widget::text::Wrapping::None),
         track,
-        text(reset.to_string())
-            .size(11)
-            .color(TXT_SECONDARY)
-            .line_height(lh)
-            .wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(5)
-    .align_y(iced::Center)
-    .into()
+    .align_y(iced::Center);
+    // A meter that resets with another one (Fable with 7d) carries no timer of its own.
+    if !reset.is_empty() {
+        r = r.push(
+            text(reset.to_string())
+                .size(11)
+                .color(TXT_SECONDARY)
+                .line_height(lh)
+                .wrapping(iced::widget::text::Wrapping::None),
+        );
+    }
+    r.into()
 }
 
 /// The overview footer's usage bars — the same data/state + look as the titlebar
@@ -5327,7 +5359,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let usage_el = if state.settings.hide_usage_bar {
         None
     } else {
-        usage_section(&state.usage, state.settings.hide_sonnet_usage)
+        usage_section(&state.usage, state.settings.hide_sonnet_usage, state.settings.show_fable_usage)
     };
     let usage_w = usage_el.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
     let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
@@ -8862,7 +8894,21 @@ fn main() -> iced::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_mouse, trim_history_file, usage_poke, MouseModes, UsagePoke};
+    use super::{encode_mouse, parse_usage_line, trim_history_file, usage_poke, MouseModes, UsagePoke};
+
+    #[test]
+    fn a_helper_line_carries_fable_as_its_own_window() {
+        let line = r#"{"ok":true,"plan":"Pro","orgs":[],
+            "five_hour":{"utilization":57,"resets_at_ms":1},
+            "seven_day":{"utilization":14,"resets_at_ms":2},
+            "seven_day_fable":{"utilization":21,"resets_at_ms":2}}"#;
+        let d = parse_usage_line(line).unwrap();
+        assert_eq!(d.seven_day_fable.map(|p| p.utilization), Some(21.0));
+        assert!(d.seven_day_opus.is_none());
+        // Older helpers post no such field; the window is simply absent.
+        let d = parse_usage_line(r#"{"ok":true,"five_hour":{"utilization":1,"resets_at_ms":null}}"#).unwrap();
+        assert!(d.seven_day_fable.is_none());
+    }
 
     #[test]
     fn usage_poll_escalates_to_a_restart_when_the_helper_stays_silent() {
