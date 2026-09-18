@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-09-18
+
 ### Fixed
 - **Scrolling a working Claude's transcript no longer freezes its spinner, and Arbiter's
   working bar with it.** Claude Code's fullscreen UI (2.1.27x) stops animating its status
