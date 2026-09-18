@@ -64,6 +64,16 @@ pub struct ClaudeHandle {
     /// re-emitting the same static star can't false-trigger working however often it
     /// repeats. 0 = none yet.
     last_spinner_glyphs: AtomicU64,
+    /// Time of the last chunk carrying any spinner glyph, suppressed or not; 0 = none. A
+    /// static star in a repaint counts too, so this says whether Claude is drawing at all,
+    /// not whether it is working (see `star_age_ms`).
+    last_star_ms: AtomicU64,
+    /// Claude's fullscreen UI is scrolled away from its live bottom (see
+    /// `VtTerm::visible_scrolled`), where it stops drawing its status row.
+    scrolled: AtomicBool,
+    /// Set when the transcript was scrolled away during a live turn: the turn is held as
+    /// working, frames or not, until the row is back in view (then it gets a fresh TTL).
+    scroll_holds_working: AtomicBool,
     /// Spinner detection is ignored until this time — set briefly on app-initiated
     /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
     suppress_until_ms: AtomicU64,
@@ -198,6 +208,9 @@ impl ClaudeHandle {
             stop_ms: AtomicU64::new(0),
             last_spinner_ms: AtomicU64::new(0),
             last_spinner_glyphs: AtomicU64::new(0),
+            last_star_ms: AtomicU64::new(0),
+            scrolled: AtomicBool::new(false),
+            scroll_holds_working: AtomicBool::new(false),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
@@ -635,6 +648,7 @@ impl ClaudeHandle {
     /// pending permission attention: Claude has resumed, so it's working, not waiting.
     pub fn note_activity(&self, glyphs: u64) {
         let now = now_ms();
+        self.last_star_ms.store(now, Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
         // A spinner frame inside the post-Stop window is the turn's FINAL redraw —
         // ignore it so it can't revive "working" after Stop already ended the turn.
@@ -707,6 +721,31 @@ impl ClaudeHandle {
         self.menu_on_screen.store(on, Ordering::Relaxed);
     }
 
+    /// Reader: whether Claude's transcript is scrolled away from its live bottom. While it
+    /// is, Claude draws no spinner frames, so a turn that was live when the scroll began
+    /// is held as working rather than read as over; when the view returns, the turn gets
+    /// a fresh TTL to resume in (the nudge in the UI sees to that).
+    pub fn set_scrolled(&self, on: bool) {
+        let was = self.scrolled.swap(on, Ordering::Relaxed);
+        if on == was {
+            return;
+        }
+        let now = now_ms();
+        let act = self.activity_ms.load(Ordering::Relaxed);
+        let stop = self.stop_ms.load(Ordering::Relaxed);
+        let live = act > stop && now.saturating_sub(act) < WORKING_TTL_MS;
+        if on {
+            self.scroll_holds_working.store(live, Ordering::Relaxed);
+        } else if self.scroll_holds_working.swap(false, Ordering::Relaxed) {
+            self.activity_ms.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether Claude's transcript is currently scrolled away from its live bottom.
+    pub fn scrolled(&self) -> bool {
+        self.scrolled.load(Ordering::Relaxed)
+    }
+
     /// Reader: a menu/prompt just LEFT the screen (answered or escaped) → resolve
     /// any hook-set attention. AskUserQuestion fires a permission/elicitation hook
     /// but escaping it produces no spinner/Stop to clear that hook, so it would
@@ -768,11 +807,20 @@ impl ClaudeHandle {
         if stop != 0 && now.saturating_sub(stop) < STOP_SUPPRESS_MS {
             return Lifecycle::Ready;
         }
-        // Working while activity is fresh and more recent than the last turn-end.
-        if act > stop && now.saturating_sub(act) < WORKING_TTL_MS {
+        // Working while activity is fresh and more recent than the last turn-end, or
+        // while a live turn's row is scrolled out of view and cannot show frames.
+        let held = self.scrolled.load(Ordering::Relaxed)
+            && self.scroll_holds_working.load(Ordering::Relaxed);
+        if act > stop && (held || now.saturating_sub(act) < WORKING_TTL_MS) {
             return Lifecycle::Working;
         }
         Lifecycle::Ready
+    }
+
+    /// Milliseconds since a chunk last carried a spinner glyph, None if none has yet.
+    pub fn star_age_ms(&self) -> Option<u64> {
+        let t = self.last_star_ms.load(Ordering::Relaxed);
+        (t != 0).then(|| now_ms().saturating_sub(t))
     }
 
     /// Snapshot for the view: stats + the currently-derived lifecycle.
@@ -985,6 +1033,27 @@ mod tests {
     // Chrome on screen latches the pane as running Claude; chrome gone clears it. This
     // is what makes a remote pane light up and, when Claude exits on the far host, go
     // dark again on the very next chunk (the returning remote prompt).
+    #[test]
+    fn a_scrolled_transcript_holds_a_live_turn_but_invents_none() {
+        // Idle: scrolling away does not make it working.
+        let h = handle();
+        h.set_scrolled(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        h.set_scrolled(false);
+
+        // Live: the hold is latched at the scroll, and survives the frames stopping.
+        h.note_activity(1);
+        std::thread::sleep(FRAME);
+        h.note_activity(2);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.set_scrolled(true);
+        assert!(h.scroll_holds_working.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.set_scrolled(false);
+        assert!(!h.scroll_holds_working.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+    }
+
     #[test]
     fn chrome_latches_claude_on_and_off() {
         let h = handle();

@@ -610,16 +610,22 @@ fn wake_ui() {
 const OUTPUT_SETTLE: Duration = Duration::from_millis(10);
 
 /// The most a redraw is held in a row, so continuous output (a long build log) still gets
-/// frames at a steady rate instead of waiting for a pause that never comes.
+/// frames at a steady rate instead of waiting for a pause that never comes. Bounds the
+/// held wake and, through `WakeHold::frame_due`, how long the renderer keeps a frame.
 const OUTPUT_HOLD_MAX: Duration = Duration::from_millis(40);
 
 /// A redraw held while output is still arriving (see `OUTPUT_SETTLE`). One waiter thread
 /// runs while a hold is armed and wakes the UI when the hold lapses. Armed per chunk, so
-/// nothing runs while the pane is quiet. The renderer asks `settled` before it rebuilds a
-/// frame from the grid: a frame that is drawn anyway mid-burst (the working animation
-/// runs a repaint clock) keeps showing the previous one instead of half an update.
+/// nothing runs while the pane is quiet. The renderer asks `frame_due` before it rebuilds
+/// a frame from the grid: a frame that is drawn anyway mid-burst (the working animation
+/// runs a repaint clock) keeps showing the previous one instead of half an update, though
+/// never past `OUTPUT_HOLD_MAX`. A `freeze` overrides that cap for a while: a nudge that
+/// makes the program repaint its whole screen must not show its intermediate screens.
 #[derive(Default, Clone)]
-pub struct WakeHold(Arc<Mutex<Option<Hold>>>);
+pub struct WakeHold {
+    slot: Arc<Mutex<Option<Hold>>>,
+    frozen_until: Arc<Mutex<Option<Instant>>>,
+}
 
 struct Hold {
     started: Instant,
@@ -631,13 +637,13 @@ impl WakeHold {
     /// first chunk of the burst; starts the waiter if none is running.
     fn extend(&self) {
         let now = Instant::now();
-        let mut slot = self.0.lock().unwrap();
+        let mut slot = self.slot.lock().unwrap();
         if let Some(h) = slot.as_mut() {
             h.until = (now + OUTPUT_SETTLE).min(h.started + OUTPUT_HOLD_MAX);
             return;
         }
         *slot = Some(Hold { started: now, until: now + OUTPUT_SETTLE });
-        let slot = self.0.clone();
+        let slot = self.slot.clone();
         std::thread::spawn(move || loop {
             let until = match *slot.lock().unwrap() {
                 Some(ref h) => h.until,
@@ -656,10 +662,45 @@ impl WakeHold {
 
     /// Whether the grid is between bursts, so a frame built from it is a whole update.
     pub fn settled(&self) -> bool {
-        match *self.0.lock().unwrap() {
+        match *self.slot.lock().unwrap() {
             None => true,
             Some(ref h) => Instant::now() >= h.until,
         }
+    }
+
+    /// Keep the current frame for `dur`, whatever the output does, then redraw once it has
+    /// settled. The UI is woken at the end so the final frame appears even if nothing else
+    /// arrives by then. A longer freeze already in place is left alone.
+    pub fn freeze(&self, dur: Duration) {
+        let until = Instant::now() + dur;
+        {
+            let mut frozen = self.frozen_until.lock().unwrap();
+            if frozen.is_some_and(|u| u >= until) {
+                return;
+            }
+            *frozen = Some(until);
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(dur);
+            wake_ui();
+        });
+    }
+
+    /// Whether a frame built `age` ago is to be rebuilt from the grid now: between bursts
+    /// always, mid-burst only once it is as old as a redraw is ever held. Continuous output
+    /// (a build log, Claude redrawing its whole screen for each wheel notch it is handed)
+    /// re-arms the hold with every chunk, before the UI has drawn the wake it just sent, so
+    /// on `settled` alone one frame would stay up for as long as the output lasts. Never
+    /// while frozen; and just after a thaw the age counts from the thaw, so the first frame
+    /// still waits for the output to settle instead of being forced mid-repaint.
+    pub fn frame_due(&self, age: Duration) -> bool {
+        let now = Instant::now();
+        let age = match *self.frozen_until.lock().unwrap() {
+            Some(until) if now < until => return false,
+            Some(until) => age.min(now.saturating_duration_since(until)),
+            None => age,
+        };
+        age >= OUTPUT_HOLD_MAX || self.settled()
     }
 }
 
@@ -1142,6 +1183,54 @@ impl Session {
         self.claude.snapshot()
     }
 
+    /// Milliseconds since Claude last drew a spinner glyph here, None if never. Static
+    /// stars in a repaint count too: this says whether its status row is being drawn.
+    pub fn spinner_age_ms(&self) -> Option<u64> {
+        self.claude.star_age_ms()
+    }
+
+    /// Keep this pane's frame as it is for `dur`, then redraw once the output has settled
+    /// (see `WakeHold::freeze`).
+    pub fn hold_frames(&self, dur: Duration) {
+        self.wake_hold.freeze(dur);
+    }
+
+    /// Whether Claude's transcript here is scrolled away from its live bottom (see
+    /// `VtTerm::visible_scrolled`).
+    pub fn claude_scrolled(&self) -> bool {
+        self.claude.scrolled()
+    }
+
+    /// Nudge the program with a resize it cannot ignore: the PTY one column narrower,
+    /// then back to the grid's size a moment later. The grid itself is untouched, so the
+    /// repaint for the narrower screen still fits it. Claude's fullscreen UI re-renders
+    /// everything on a resize, which is what un-freezes its status row
+    /// (anthropics/claude-code#94443) where a focus event does not: on Windows the console
+    /// hands focus to node as a record it ignores. One column, not one row, so the layout
+    /// keeps its rows; the caller holds the frame across both repaints (`hold_frames`).
+    pub fn nudge_resize(&self) {
+        let master = self.master.clone();
+        let term = self.term.clone();
+        std::thread::spawn(move || {
+            let size = |cols: usize, rows: usize| PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            let (cols, rows) = term.lock().map(|t| t.size()).unwrap_or((80, 24));
+            if let Ok(m) = master.lock() {
+                let _ = m.resize(size(cols.saturating_sub(1).max(1), rows));
+            }
+            std::thread::sleep(Duration::from_millis(120));
+            // Back to whatever the grid is by now, in case a real resize landed meanwhile.
+            let (cols, rows) = term.lock().map(|t| t.size()).unwrap_or((cols, rows));
+            if let Ok(m) = master.lock() {
+                let _ = m.resize(size(cols, rows));
+            }
+        });
+    }
+
     /// True if Claude is running in this pane right now, whether that is a local
     /// `claude` process or one on the far side of an ssh session (recognised from its
     /// on-screen chrome). Every Claude-gated affordance reads this, so the remote case
@@ -1448,8 +1537,12 @@ fn reader_loop(
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
             // glyph in the *new* bytes (chunk-based like the web — instant, and a
             // stale star left on screen can't pin it to "working").
-            let menu = term.lock().unwrap().visible_menu();
+            let (menu, scrolled) = {
+                let t = term.lock().unwrap();
+                (t.visible_menu(), t.visible_scrolled())
+            };
             claude.set_menu(menu);
+            claude.set_scrolled(scrolled);
             if prev_menu && !menu {
                 // A menu just LEFT the screen (answered or escaped). AskUserQuestion
                 // fires a permission/elicitation hook, but escaping it produces no
@@ -2394,12 +2487,44 @@ mod tests {
     fn a_held_redraw_is_capped_across_a_burst() {
         let hold = super::WakeHold::default();
         hold.extend();
-        let started = hold.0.lock().unwrap().as_ref().unwrap().started;
+        let started = hold.slot.lock().unwrap().as_ref().unwrap().started;
         for _ in 0..50 {
             hold.extend();
         }
-        let until = hold.0.lock().unwrap().as_ref().unwrap().until;
+        let until = hold.slot.lock().unwrap().as_ref().unwrap().until;
         assert!(until <= started + super::OUTPUT_HOLD_MAX);
         assert!(until >= started + super::OUTPUT_SETTLE);
+    }
+
+    // A frozen hold keeps the frame however old it is. After the thaw the age counts from
+    // the thaw, so a frame mid-burst is still not due, however old it really is.
+    #[test]
+    fn a_frozen_hold_keeps_the_frame_until_it_thaws() {
+        use std::time::Duration;
+        let hold = super::WakeHold::default();
+        hold.freeze(Duration::from_millis(40));
+        assert!(!hold.frame_due(Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(hold.frame_due(Duration::from_secs(1)));
+
+        hold.freeze(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        hold.extend();
+        assert!(!hold.frame_due(Duration::from_secs(1)));
+    }
+
+    // Mid-burst the previous frame is kept, but only until it is as old as the cap:
+    // continuous output re-arms the hold on every chunk, so it never settles on its own.
+    #[test]
+    fn a_frame_mid_burst_is_rebuilt_once_it_is_as_old_as_the_cap() {
+        use std::time::Duration;
+        let quiet = super::WakeHold::default();
+        assert!(quiet.frame_due(Duration::ZERO));
+
+        let hold = super::WakeHold::default();
+        hold.extend();
+        assert!(!hold.settled());
+        assert!(!hold.frame_due(super::OUTPUT_HOLD_MAX - Duration::from_millis(1)));
+        assert!(hold.frame_due(super::OUTPUT_HOLD_MAX));
     }
 }

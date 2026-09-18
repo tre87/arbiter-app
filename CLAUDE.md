@@ -85,6 +85,36 @@ starts the checkmark (fast tick while `sent` is set) and `Tick` closes the menu 
 `WOL_SENT_SHOW_MS`. The dropdown's x is estimated from the titlebar button widths in
 `wol_menu_view`, not measured.
 
+## Wheel over Claude: the frozen status row and the nudge
+
+Claude Code enables mouse reporting, so a wheel notch over a Claude pane is handed to it
+as a mouse report (`Message::WheelReport`) and Claude scrolls its own transcript. Its
+fullscreen UI (2.1.27x) then stops animating the status row once the row has scrolled out
+of view and does not resume when it comes back; only a change of the row's own phrase, a
+focus event or a resize re-renders it (anthropics/claude-code#94443). Without spinner
+frames Arbiter's working detection lapses after `WORKING_TTL_MS` and the working bar goes
+too. After a gesture settles, `Message::WheelSettled` checks the pane every
+`WHEEL_CHECK_MS` for `WHEEL_CHECKS` rounds; while no spinner glyph has been drawn for
+`WHEEL_FROZEN_MS` (`Session::spinner_age_ms`) it nudges: a focus pulse (`CSI O` `CSI I`,
+only if the program asked for focus events) and, if that changed nothing, a resize
+(`Session::nudge_resize`: the PTY one column narrower and back 120 ms later, grid
+untouched). Either nudge makes Claude clear and repaint the whole screen, so the pane's
+frame is frozen for `WHEEL_NUDGE_HOLD_MS` first (`WakeHold::freeze`, via
+`Session::hold_frames`), and the first frame after the thaw waits for the output to settle;
+without that the repaints showed as a full-screen flicker. Measured 2026-09-18 with Claude
+2.1.276 in a ConPTY probe: Claude asks for
+focus events (`?1004h`) and ConPTY forwards them, but node hands them to Claude as console
+focus records it ignores, so on Windows the pulse does nothing and the resize is what
+works. An earlier run that seemed to show the pulse working was Claude's own phrase change
+("thinking" to "still thinking"). While scrolled away Claude shows "Jump to bottom
+(ctrl+End) ↓" (`VtTerm::visible_scrolled`, `ClaudeHandle::set_scrolled`): a turn live at
+that moment is held as working until the view returns (`scroll_holds_working`), else the
+frameless two seconds read as a turn end and raised a false "Claude finished" card; and no
+nudge is sent while scrolled, a repaint there could lose the reader's place. Remove once
+Claude fixes the issue. Rejected: scrolling
+Arbiter's own scrollback instead (the transcript is not in it under the fullscreen UI) and
+a row resize (shifts the whole layout for a frame; a column does not).
+
 ## Terminal renderer — known limitation (intentional)
 
 The GPU renderer draws **one opaque quad per cell**, so a glyph cannot overflow its cell

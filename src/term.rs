@@ -389,6 +389,12 @@ impl VtTerm {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Whether the program asked for focus events (DECSET 1004), to be told of a focus
+    /// change as `CSI I` (in) / `CSI O` (out).
+    pub fn reports_focus(&self) -> bool {
+        self.term.mode().contains(TermMode::FOCUS_IN_OUT)
+    }
+
 
     /// Snapshot the active mouse-reporting + scroll modes (see [`MouseModes`]).
     pub fn mouse_modes(&self) -> MouseModes {
@@ -418,6 +424,18 @@ impl VtTerm {
     pub fn visible_menu(&self) -> bool {
         // The exact markers the web used (AskUserQuestion / plan-mode menus).
         const MENU: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
+        self.screen_contains(MENU)
+    }
+
+    /// True while Claude's fullscreen UI is scrolled away from its live bottom: it then
+    /// shows a "Jump to bottom (ctrl+End) ↓" bar (or "N new messages (ctrl+End) ↓") and
+    /// stops drawing its status row, so no spinner frames say anything about the turn.
+    pub fn visible_scrolled(&self) -> bool {
+        self.screen_contains(&["(ctrl+End)"])
+    }
+
+    /// Whether any of the last 40 visible rows contains one of `needles`.
+    fn screen_contains(&self, needles: &[&str]) -> bool {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
@@ -429,7 +447,7 @@ impl VtTerm {
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if MENU.iter().any(|m| buf.contains(m)) {
+            if needles.iter().any(|m| buf.contains(m)) {
                 return true;
             }
         }

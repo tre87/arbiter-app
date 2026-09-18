@@ -7,6 +7,33 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Scrolling a working Claude's transcript no longer freezes its spinner, and Arbiter's
+  working bar with it.** Claude Code's fullscreen UI (2.1.27x) stops animating its status
+  row once the row has scrolled out of view, and scrolling back does not resume it; only
+  a change of the row's own text, a focus event or a resize re-renders it
+  ([anthropics/claude-code#94443](https://github.com/anthropics/claude-code/issues/94443)).
+  With no spinner frames arriving, Arbiter read the turn as over two seconds later and
+  took the working bar down too, until Claude next printed something. After a wheel
+  gesture handed to Claude, Arbiter now watches whether the row keeps drawing and, while
+  it has stopped, nudges Claude into the re-render it needs: a focus pulse, and if that
+  changes nothing (it does not on Windows, where node never sees console focus events), a
+  resize of the PTY by one column and back. The pane keeps its frame while Claude repaints
+  for the nudge, so the screen does not flicker; it simply resumes. Only a pane running
+  Claude is ever nudged, and never while its transcript is scrolled away from the bottom.
+- **Scrolling up during a turn no longer ends it in Arbiter's eyes.** While Claude's
+  transcript is scrolled away from its live bottom (its "Jump to bottom (ctrl+End)" bar is
+  showing), Claude draws no spinner frames at all, so two seconds later Arbiter took the
+  turn for over: the working bar went out and a "Claude finished" card appeared, sound and
+  all, mid-turn. A turn that was live when the scroll began is now held as working until
+  the view comes back, where it gets a fresh window to resume in. An idle Claude scrolled
+  away stays idle.
+- **A pane keeps drawing under output that never pauses.** Since 1.3.0 a redraw waits for a
+  burst of output to settle before the terminal is rebuilt from the grid, so an update
+  arriving in several chunks is drawn whole. Output arriving faster than the settle time,
+  chunk after chunk, re-armed that wait indefinitely and could keep one frame up until the
+  output paused. A frame is now kept at most as long as a redraw is ever held (40 ms).
+
 ## [1.4.2] — 2026-09-14
 
 ### Added

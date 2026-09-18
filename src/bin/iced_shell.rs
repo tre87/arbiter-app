@@ -116,6 +116,9 @@ struct State {
     /// glyph colour (white when active, dimmed when not), like native controls.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     main_focused: bool,
+    /// Counts wheel gestures handed to Claude, so only the latest gesture's settle timer
+    /// sends its focus pulse (see `Message::WheelSettled`).
+    wheel_nudge: u64,
     /// Whether the main window is maximized — swaps the Windows caption button
     /// between the maximize square and the restore (double-square) glyph.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -655,6 +658,13 @@ enum Message {
     /// keys under alternate-scroll). Separate from `MouseReport` because scrolling a
     /// TUI makes it repaint, which must not read as Claude working.
     WheelReport(pane_grid::Pane, Vec<u8>),
+    /// A check on the pane some time after a wheel gesture handed to Claude: its status
+    /// row stops animating once scrolled out of view, and scrolling back does not resume
+    /// it (anthropics/claude-code#94443). While the row has stopped drawing, the pane is
+    /// nudged: a focus pulse first, a resize if that changed nothing. `gesture` names the
+    /// gesture (a later notch supersedes the chain), `check` counts the checks so far,
+    /// `nudged` what has been tried (0 nothing, 1 the pulse, 2 the resize).
+    WheelSettled { pane: pane_grid::Pane, gesture: u64, check: u8, nudged: u8 },
     /// Workspace-tab drag-reorder: press a tab (selects + arms the drag), drag over
     /// another tab (drop target), release anywhere (commit the move). The press also
     /// serves as the plain "select this workspace" click.
@@ -1250,6 +1260,19 @@ const EDIT_KEY_SUPPRESS_MS: u64 = 300;
 /// Covers the notch to repaint round-trip; each further notch extends it, so a long
 /// scroll gesture stays covered end to end.
 const SCROLL_SUPPRESS_MS: u64 = 300;
+
+/// After a wheel gesture handed to Claude, the pane is checked this often, this many
+/// times, for a status row that has stopped drawing (see `Message::WheelSettled`).
+const WHEEL_CHECK_MS: u64 = 500;
+const WHEEL_CHECKS: u8 = 6;
+/// The bloom draws a star about every 250 ms and its dot frames are not stars; this long
+/// without one while Claude runs means the row is frozen (or Claude is idle, which a
+/// nudge does not disturb).
+const WHEEL_FROZEN_MS: u64 = 800;
+/// A nudge makes Claude repaint its whole screen, twice for the resize (the narrower
+/// layout, then the real one, 120 ms apart). The pane's frame is kept this long so neither
+/// repaint shows; the first frame after it waits for the output to settle.
+const WHEEL_NUDGE_HOLD_MS: u64 = 300;
 
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
@@ -2150,9 +2173,73 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // false "working" for as long as the user keeps scrolling, so hold off
             // spinner-detection across the gesture (each notch extends the window). A
             // turn that's genuinely working still sustains itself.
-            if let Some(p) = state.active_mut().panes.get_mut(pane) {
+            let ws = state.active_mut();
+            let Some(p) = ws.panes.get_mut(pane) else { return Task::none() };
+            p.session.suppress_claude_activity(SCROLL_SUPPRESS_MS);
+            p.session.write(&bytes);
+            let nudge_claude = p.session.claude_running();
+            arbiter_native::claude_shim::debug_log(&format!(
+                "wheel notch handed to pane {}: claude={nudge_claude}",
+                p.session.id()
+            ));
+            // Claude's fullscreen UI stops animating its status row once the row has
+            // scrolled out of view, and scrolling back does not resume it (see
+            // `WheelSettled`). Once the gesture has settled, start checking on the pane;
+            // each notch starts a new chain and retires the old one.
+            if nudge_claude {
+                state.wheel_nudge += 1;
+                let gesture = state.wheel_nudge;
+                return Task::perform(
+                    tokio::time::sleep(Duration::from_millis(SCROLL_SUPPRESS_MS)),
+                    move |_| Message::WheelSettled { pane, gesture, check: 0, nudged: 0 },
+                );
+            }
+        }
+        Message::WheelSettled { pane, gesture, check, nudged } => {
+            if gesture != state.wheel_nudge {
+                return Task::none();
+            }
+            let Some(p) = state.active_mut().panes.get_mut(pane) else { return Task::none() };
+            // Scrolled away from the bottom, Claude hides its status row on purpose, and a
+            // repaint there could throw the reader's place away: nothing to do until the
+            // gesture that brings the view back, which starts a chain of its own.
+            if !p.session.claude_running() || p.session.claude_scrolled() {
+                return Task::none();
+            }
+            let age = p.session.spinner_age_ms();
+            let frozen = age.map_or(true, |a| a >= WHEEL_FROZEN_MS);
+            let mut nudged = nudged;
+            if frozen {
+                // Either nudge makes Claude repaint its whole screen, static stars
+                // included: keep spinner-detection held off across it, as for the notches.
                 p.session.suppress_claude_activity(SCROLL_SUPPRESS_MS);
-                p.session.write(&bytes);
+                // A local Windows Claude never sees the pulse (node drops console focus
+                // records), so there the resize goes first rather than a check later.
+                let wants_focus = p.session.term().lock().map(|t| t.reports_focus()).unwrap_or(false)
+                    && (p.session.is_remote() || !cfg!(windows));
+                match nudged {
+                    0 if wants_focus => {
+                        p.session.hold_frames(Duration::from_millis(WHEEL_NUDGE_HOLD_MS));
+                        p.session.write(b"\x1b[O\x1b[I");
+                        nudged = 1;
+                    }
+                    0 | 1 => {
+                        p.session.hold_frames(Duration::from_millis(WHEEL_NUDGE_HOLD_MS));
+                        p.session.nudge_resize();
+                        nudged = 2;
+                    }
+                    _ => {}
+                }
+            }
+            arbiter_native::claude_shim::debug_log(&format!(
+                "wheel check {check} on pane {}: spinner_age={age:?} frozen={frozen} nudged={nudged}",
+                p.session.id()
+            ));
+            if nudged < 2 && check + 1 < WHEEL_CHECKS {
+                return Task::perform(
+                    tokio::time::sleep(Duration::from_millis(WHEEL_CHECK_MS)),
+                    move |_| Message::WheelSettled { pane, gesture, check: check + 1, nudged },
+                );
             }
         }
         Message::TabDragStart(i) => {
@@ -8361,8 +8448,9 @@ impl shader::Primitive for TermPrimitive {
             // Between two chunks of one screen update the grid is half-drawn, and the
             // repaint clock that runs while Claude works would draw it that way. Keep
             // the previous frame instead; the held wake redraws once the burst has
-            // landed (see `WakeHold`). A resize or a first frame is drawn regardless.
-            if resized || !gpu.has_frame() || self.hold.settled() {
+            // landed, and under output that never pauses the frame's age does (see
+            // `WakeHold::frame_due`). A resize or a first frame is drawn regardless.
+            if resized || gpu.frame_age().map_or(true, |age| self.hold.frame_due(age)) {
                 gpu.prepare(device, queue, &t, pw, ph);
             }
         }
@@ -8634,6 +8722,7 @@ fn main() -> iced::Result {
                 overview_size,
                 overview_pos,
                 main_focused: true,
+                wheel_nudge: 0,
                 main_maximized: false,
                 overview_focused: false,
                 overview_maximized: false,

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ab_glyph::{Font, FontVec, ScaleFont};
 use wgpu::util::DeviceExt;
@@ -189,6 +190,9 @@ pub struct TermGpu {
 
     scratch: Vec<f32>,
     count: u32,
+    /// When `prepare` last rebuilt the frame, None before the first. The host keeps a frame
+    /// mid-burst, and this bounds for how long (see `frame_age`).
+    prepared_at: Option<Instant>,
 }
 
 /// The ab_glyph `PxScale` that renders `font`'s em square at `em_px` pixels.
@@ -401,7 +405,7 @@ impl TermGpu {
             is_srgb: format.is_srgb(),
             atlas_cpu, color_atlas_cpu, glyphs: HashMap::new(), next_slot: 2, color_next: 0,
             per_row, atlas_dirty: true, color_dirty: true,
-            scratch: Vec::new(), count: 0,
+            scratch: Vec::new(), count: 0, prepared_at: None,
         }
     }
 
@@ -419,10 +423,11 @@ impl TermGpu {
         self.built_pts
     }
 
-    /// Whether a frame has been prepared and can be drawn again as it is. The host
-    /// keeps the previous frame while a burst of output is still landing in the grid.
-    pub fn has_frame(&self) -> bool {
-        self.count > 0
+    /// How long ago `prepare` last rebuilt the frame, None before the first. The host
+    /// keeps the previous frame while a burst of output is still landing in the grid,
+    /// and bounds that by this age (see `session::WakeHold::frame_due`).
+    pub fn frame_age(&self) -> Option<Duration> {
+        self.prepared_at.map(|at| at.elapsed())
     }
 
     /// Reserve `cells` horizontally-contiguous slots in the colour atlas (a wide
@@ -653,6 +658,7 @@ impl TermGpu {
             ]);
         }
         self.count = (self.scratch.len() / 12) as u32;
+        self.prepared_at = Some(Instant::now());
 
         if self.atlas_dirty {
             queue.write_texture(
