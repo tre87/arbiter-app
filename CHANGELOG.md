@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-09-18
+
 ### Added
 - **A Fable usage meter in the titlebar, on request.** Plans that cap Fable separately
   report that cap as a scoped weekly limit rather than a window of its own, so the usage
