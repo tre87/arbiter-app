@@ -1019,6 +1019,52 @@ fn release_connections(state: &mut State, skipped: &HashSet<String>) {
     }
 }
 
+/// A pane whose shell ended on its own terms (exit code 0: `exit`, Ctrl+D) closes, the way
+/// Ctrl+Shift+W would close it; a shell that died any other way keeps its last screen and
+/// offers Reconnect. The last pane of a workspace takes the workspace with it, unless it
+/// is the only workspace, where the exited pane stays so the app is never left empty. The
+/// exit code is known by the time `exited` is raised (see `Session::spawn`).
+fn close_exited_panes(state: &mut State) {
+    let mut changed = false;
+    let mut wi = 0;
+    while wi < state.workspaces.len() {
+        let only_workspace = state.workspaces.len() == 1;
+        let ws = &mut state.workspaces[wi];
+        let clean: Vec<pane_grid::Pane> = ws
+            .panes
+            .iter()
+            .filter(|(_, d)| d.session.exited() && d.session.exit_status() == Some(0))
+            .map(|(p, _)| *p)
+            .collect();
+        let mut remove_ws = false;
+        for pane in clean {
+            match ws.panes.close(pane) {
+                Some((_, sibling)) => {
+                    if ws.focus == pane {
+                        ws.focus = sibling;
+                    }
+                    changed = true;
+                }
+                None => remove_ws = !only_workspace,
+            }
+        }
+        if remove_ws {
+            state.workspaces.remove(wi);
+            if state.active >= wi {
+                state.active = state.active.saturating_sub(1);
+            }
+            state.active = state.active.min(state.workspaces.len() - 1);
+            changed = true;
+            continue;
+        }
+        wi += 1;
+    }
+    if changed {
+        state.term_menu = None;
+        save_session(state);
+    }
+}
+
 /// Bring one pane's connection back. The live local shell is reused when it is sitting
 /// idle at its prompt, so the scrollback survives. A pane whose shell has exited, is
 /// still inside a session, or is running something else is respawned, its connection
@@ -1469,7 +1515,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             // The readers' requests (retry a dropped connection, re-ask a rejected
             // secret) ride this same wake: each is raised while handling the output
-            // that triggered the redraw.
+            // that triggered the redraw. So does a shell's exit (its watcher wakes the
+            // UI the same way).
+            close_exited_panes(state);
             return Task::batch([poll_connection_signals(state), notify_claude_transitions(state)]);
         }
         Message::Tick => {
@@ -8519,11 +8567,16 @@ impl shader::Primitive for TermPrimitive {
             storage.store(Renderers::default());
         }
         let renderers = storage.get_mut::<Renderers>().unwrap();
+        // Renderers of panes that closed since the last frame (a dropped Session retires
+        // its id): freed here, since this store is reachable from nowhere else.
+        for id in arbiter_native::session::take_retired() {
+            renderers.0.remove(&id);
+        }
         let gpu = renderers
             .0
             .entry(self.id)
             .or_insert_with(|| {
-                TermGpu::new(device, format, &self.font, scale)
+                TermGpu::new(device, format, self.font.clone(), scale)
             });
         // Rebuild when the window moves to a display with a different scale (so the
         // font px / cell size match the new DPI, else text halves/doubles), or when
@@ -8531,7 +8584,7 @@ impl shader::Primitive for TermPrimitive {
         // atlas at the new size; the cols/rows reflow below then resizes the PTY).
         let want_pts = arbiter_native::term::font_px();
         if (gpu.scale() - scale).abs() > 0.01 || gpu.built_pts() != want_pts {
-            *gpu = TermGpu::new(device, format, &self.font, scale);
+            *gpu = TermGpu::new(device, format, self.font.clone(), scale);
         }
 
         let pw = (bounds.width * scale).max(1.0) as u32;
@@ -8641,6 +8694,10 @@ fn wordmark_font() -> iced::Font {
     iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::with_name("DM Sans Arbiter") }
 }
 
+// Diagnostic allocator, inert unless ARBITER_MEM_DIAG is set (see memdiag.rs).
+#[global_allocator]
+static GLOBAL: arbiter_native::memdiag::DiagAlloc = arbiter_native::memdiag::DiagAlloc;
+
 fn main() -> iced::Result {
     // Re-spawned as the usage-helper webview process (same binary, own process).
     // Run the helper loop and never start the GUI (avoids recursive spawning).
@@ -8674,6 +8731,15 @@ fn main() -> iced::Result {
         _ => {}
     }
 
+    arbiter_native::memdiag::start_summary_thread();
+    // One graphics backend, the one the app uses. iced lets wgpu enumerate every backend
+    // it was built with, which on Windows loads the Vulkan and OpenGL drivers beside
+    // DX12 for nothing (tens of MB of baseline, measured 2026-09-20). A WGPU_BACKEND the
+    // user set themselves is respected.
+    #[cfg(windows)]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        std::env::set_var("WGPU_BACKEND", "dx12");
+    }
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();
     // Event-driven Claude status: a single notify watcher over the capture + hook

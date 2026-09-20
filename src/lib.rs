@@ -8,6 +8,7 @@ pub mod claude_shim;
 pub mod claude_status;
 pub mod font;
 pub mod git;
+pub mod memdiag;
 pub mod gpu;
 pub mod notify;
 pub mod persist;

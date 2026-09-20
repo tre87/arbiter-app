@@ -7,6 +7,46 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Memory no longer grows with the panes you have closed.** Every terminal keeps a GPU
+  renderer (its glyph atlases, some 6 MB) in a store the app never pruned, so a pane closed
+  or reconnected left its renderer behind for the life of the app. A two-day session held
+  30 of them for 18 panes. A dropped session now retires its id and the store frees the
+  renderer on the next frame; the Claude monitor thread each closed pane also left blocked
+  ends with it.
+- **A frame is rebuilt only when something on it changed.** Output in any pane re-walked
+  every visible terminal's grid and re-uploaded its whole instance buffer, at 60 fps while
+  Claude worked, for panes whose contents were identical frame to frame. The terminal now
+  carries a generation the renderer compares before doing either. The same traffic drove
+  the GPU upload heaps from 100 MB to over 300 MB in two days; they now see a fraction of it.
+- **A new glyph uploads its own atlas slot, not the whole atlas.** Each first appearance of
+  a character re-sent the 1 MB mono atlas or the 4 MB colour atlas; now only its rectangle
+  goes up. The renderers also share the bundled font bytes instead of each holding a copy.
+- **A full glyph atlas starts over instead of indexing past its end.** Enough distinct
+  glyphs in one pane (thousands; CJK or icon-heavy output over weeks) would have panicked
+  the renderer. The atlas now flushes and the glyphs in use re-rasterise.
+- **Output bursts no longer spawn a thread each.** The held redraw, the frozen frame and the
+  hidden cursor's grace each started a thread per event, eight or more a second under
+  Claude output. One deadline thread now serves them all, parked with no timer while
+  nothing is armed.
+- **Scrollback is capped while Claude owns a pane.** Claude takes the wheel there (mouse
+  reporting), so the pane's history is unreachable, yet Claude's redraws filled it to the
+  configured 5000 lines, some 25 MB per pane. It is held at 1000 lines for the duration
+  and returns to the setting when Claude leaves.
+- **Only DX12 is loaded on Windows.** iced let wgpu enumerate every backend, which loaded
+  the Vulkan and OpenGL drivers beside DX12 for nothing. `WGPU_BACKEND` set by hand still
+  wins.
+- **`exit` closes the terminal.** A shell that ends with exit code 0 (`exit`, Ctrl+D)
+  closes its pane as Ctrl+Shift+W would; the last pane of a workspace closes the
+  workspace, unless it is the only one. A shell that dies otherwise keeps its screen and
+  offers Reconnect, as before. Detected by a per-session exit watcher, since ConPTY gives
+  the reader no EOF when the child ends.
+
+### Added
+- **`ARBITER_MEM_DIAG=1`** logs every allocation of 8 MiB or more with a backtrace, and a
+  summary of the live large blocks once a minute, to `<temp>/arbiter-mem-diag.log`. Off,
+  it costs one atomic load per allocation.
+
 ## [1.5.0] — 2026-09-18
 
 ### Added

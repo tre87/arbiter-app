@@ -151,3 +151,34 @@ without painting over (erasing) the neighbour. Consequences, both intentional / 
   rest are stretched to the cell on each axis (`gpu::stretch_to_box`): a segment edge with a
   gap above or below shows as a notch, and uniform fitting of the bundled font's glyphs left
   one. They never take a second cell either (`raster::is_icon` excludes them).
+
+## Memory: what is bounded, what is pooled, and how to look (2026-09-20)
+
+A two-day, 18-pane run was taken apart with a region census (VirtualQueryEx by allocation
+base, then reading the contents of the largest blocks) and isolated instances driven from
+crafted `session.json` files. Findings that shape the code:
+
+- **Per-pane renderers are freed via a retire list.** `Renderers` lives in iced's shader
+  storage, reachable only from `TermPrimitive::prepare`; a dropped `Session` pushes its id to
+  `session::RETIRED` and the next frame removes the entry. Every pane ever drawn used to
+  keep its 5 MB of atlas copies forever (30 renderers for 18 panes).
+- **One deadline thread** (`session::schedule`) replaces spawn-per-event for the redraw
+  hold, the frozen frame, the cursor grace and the resize nudge. It parks on a condvar with
+  no timeout while nothing is armed, so it is still event-driven under the no-polling rule.
+- **A frame is rebuilt only when `VtTerm::generation` (plus cursor, background, canvas)
+  changed** (`gpu::FrameKey`). Every `&mut self` method on `VtTerm` that can alter the
+  picture must bump the generation; `term::tests::generation_moves_with_every_visible_change`
+  pins the list. Atlas uploads are per dirty rectangle, and a full atlas flushes.
+- **Scrollback while Claude owns a pane is `term::CLAUDE_SCROLLBACK`** (the reader loop
+  switches it on the `claude_running || on_screen` edge). Blank pre-allocated alacritty rows
+  were the bulk of the Rust heap: rows are allocated 1000 at a time as history grows.
+- **The 16 MiB zero-filled heap blocks** seen in the long run (13 to 14 of them, appearing
+  under sustained 60 fps rendering, occasionally recycled) are not produced by any Rust
+  allocation site in this tree or its dependencies, and `ARBITER_MEM_DIAG` saw none in
+  isolated runs. The best-fitting owner is the NVIDIA in-game overlay's capture hook
+  (`nvspcap64.dll` was loaded in the process). Disable the overlay to test.
+- **Do not attach process-memory readers, ETW heap tracing or keystroke automation to a
+  running Arbiter from a shell descended from it.** Defender's behaviour classifier
+  attributed exactly that to `arbiter.exe` (Trojan:Win32/Bearfoos.A!ml) and killed the
+  app. Use `ARBITER_MEM_DIAG`, `Get-Process` counters, or an elevated console you open
+  yourself.

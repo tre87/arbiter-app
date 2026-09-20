@@ -6,14 +6,15 @@
 //! features land). cwd/shell-idle are tracked here and read by the UI; later
 //! they drive the per-pane status + the overview, and `core` grows claude/git/shim.
 
+use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::persist::CredentialKind;
 use crate::term::VtTerm;
@@ -600,6 +601,91 @@ fn wake_ui() {
     }
 }
 
+/// One thread for every timed wake in the process: a redraw hold lapsing, a frozen frame
+/// thawing, a hidden cursor's grace ending, the second half of a resize nudge. Jobs sit in
+/// a deadline heap; the thread waits on a condvar until the earliest deadline, or until a
+/// job with an earlier one arrives, and parks with no timeout at all while the heap is
+/// empty. Event-driven exactly like the per-hold threads it replaced (each was spawned by
+/// a chunk of output and slept once), without a thread creation per output burst: that
+/// churn measured at 8 or more spawns a second under Claude output (2026-09-20).
+struct Scheduler {
+    jobs: Mutex<BinaryHeap<Job>>,
+    cvar: Condvar,
+}
+
+struct Job {
+    at: Instant,
+    // Arrival order, so two jobs with one deadline run in the order they were scheduled.
+    seq: u64,
+    run: Box<dyn FnOnce() + Send>,
+}
+
+// BinaryHeap is a max-heap: the earliest deadline compares greatest.
+impl Ord for Job {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.at.cmp(&self.at).then(other.seq.cmp(&self.seq))
+    }
+}
+impl PartialOrd for Job {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at && self.seq == other.seq
+    }
+}
+impl Eq for Job {}
+
+static SCHEDULER: OnceLock<Arc<Scheduler>> = OnceLock::new();
+static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Run `job` at `at` (or as soon after as the scheduler thread gets to it).
+pub(crate) fn schedule(at: Instant, job: impl FnOnce() + Send + 'static) {
+    let s = SCHEDULER.get_or_init(|| {
+        let s = Arc::new(Scheduler { jobs: Mutex::new(BinaryHeap::new()), cvar: Condvar::new() });
+        let worker = s.clone();
+        std::thread::Builder::new()
+            .name("arbiter-deadlines".into())
+            .spawn(move || worker.run())
+            .expect("spawn deadline scheduler");
+        s
+    });
+    let mut jobs = s.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+    jobs.push(Job { at, seq: JOB_SEQ.fetch_add(1, Ordering::Relaxed), run: Box::new(job) });
+    s.cvar.notify_one();
+}
+
+impl Scheduler {
+    fn run(&self) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let Some(next) = jobs.peek().map(|j| j.at) else {
+                jobs = self.cvar.wait(jobs).unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let now = Instant::now();
+            if next > now {
+                jobs = self.cvar.wait_timeout(jobs, next - now).unwrap_or_else(PoisonError::into_inner).0;
+                continue;
+            }
+            let job = jobs.pop().expect("peeked");
+            drop(jobs);
+            (job.run)();
+            jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Session ids whose `Session` has been dropped and whose per-pane GPU renderer is
+/// therefore garbage; the renderer store drains this on its next frame.
+static RETIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+pub fn take_retired() -> Vec<u64> {
+    std::mem::take(&mut *RETIRED.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
 /// How long a redraw waits for more output after a chunk. A screen update from a program
 /// like Claude's UI leaves the far host as one write, but over ssh it arrives here in
 /// several chunks, and a frame drawn between them is half an update: the input line
@@ -643,20 +729,24 @@ impl WakeHold {
             return;
         }
         *slot = Some(Hold { started: now, until: now + OUTPUT_SETTLE });
-        let slot = self.slot.clone();
-        std::thread::spawn(move || loop {
+        drop(slot);
+        Self::arm(self.slot.clone(), now + OUTPUT_SETTLE);
+    }
+
+    /// Wake the UI when the hold lapses. A chunk that arrived meanwhile pushed `until`
+    /// out, so the job re-arms itself for the new deadline instead of waking early.
+    fn arm(slot: Arc<Mutex<Option<Hold>>>, at: Instant) {
+        schedule(at, move || {
             let until = match *slot.lock().unwrap() {
                 Some(ref h) => h.until,
                 None => return,
             };
-            let now = Instant::now();
-            if now < until {
-                std::thread::sleep(until - now);
-                continue;
+            if Instant::now() < until {
+                Self::arm(slot, until);
+                return;
             }
             *slot.lock().unwrap() = None;
             wake_ui();
-            return;
         });
     }
 
@@ -680,10 +770,7 @@ impl WakeHold {
             }
             *frozen = Some(until);
         }
-        std::thread::spawn(move || {
-            std::thread::sleep(dur);
-            wake_ui();
-        });
+        schedule(until, wake_ui);
     }
 
     /// Whether a frame built `age` ago is to be rebuilt from the grid now: between bursts
@@ -747,7 +834,26 @@ pub struct Session {
     /// holds and so can latch one the instant it sees an ssh client.
     typed_line: Arc<Mutex<TypedLine>>,
     _watcher: Arc<Mutex<Option<GitWatcher>>>,
-    _child: Box<dyn Child + Send + Sync>,
+    /// The shell's exit code, set by the exit watcher before `exited` (see `spawn`).
+    exit_code: Arc<Mutex<Option<u32>>>,
+    /// The busy-edge epoch the Claude monitor waits on; Drop notifies it so the monitor
+    /// thread can see `closed` and end instead of waiting on for a pane that is gone.
+    cmd_epoch: CmdEpoch,
+    closed: Arc<AtomicBool>,
+}
+
+// Dropping a session releases its PTY (which ends the shell and the reader thread), ends
+// its Claude monitor thread, and retires its id so the GPU renderer store frees the pane's
+// renderer on the next frame. Without the last two, a closed pane kept a blocked thread
+// and 6 MB of atlas copies for the life of the app.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Relaxed);
+        let (lock, cvar) = &*self.cmd_epoch;
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        cvar.notify_all();
+        RETIRED.lock().unwrap_or_else(PoisonError::into_inner).push(self.id);
+    }
 }
 
 impl Session {
@@ -838,12 +944,37 @@ impl Session {
         // Event-driven Claude monitor: on each busy edge, scan the shell's descendants
         // for a `claude` process (it execs shortly after the edge), or for an ssh/mosh
         // client, which means the foreground program is on another machine.
+        let closed = Arc::new(AtomicBool::new(false));
         if let Some(pid) = shell_pid {
             let claude_running = claude_running.clone();
             let shell_idle = shell_idle.clone();
             let claude = claude.clone();
+            let cmd_epoch = cmd_epoch.clone();
+            let closed = closed.clone();
             std::thread::spawn(move || {
-                claude_monitor(pid, cmd_epoch, claude_running, shell_idle, claude)
+                claude_monitor(pid, cmd_epoch, claude_running, shell_idle, claude, closed)
+            });
+        }
+
+        // The shell's exit is watched on its own thread: ConPTY gives the reader no EOF
+        // when the child ends, so without this a pane whose shell exited sat on a frozen
+        // screen with nothing knowing. The code is recorded before `exited` is raised, so
+        // whoever sees the flag can read it. Closing the PTY (Session drop) ends the child
+        // and so this thread; nothing is left behind.
+        let exit_code: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        {
+            let mut child = child;
+            let exit_code = exit_code.clone();
+            let exited = exited.clone();
+            let claude_running = claude_running.clone();
+            let claude = claude.clone();
+            std::thread::spawn(move || {
+                let status = child.wait().ok();
+                *exit_code.lock().unwrap_or_else(PoisonError::into_inner) = status.map(|s| s.exit_code());
+                exited.store(true, Ordering::Release);
+                claude_running.store(false, Ordering::Relaxed);
+                claude.set_remote(false);
+                wake_ui();
             });
         }
 
@@ -864,7 +995,9 @@ impl Session {
             followup,
             typed_line: Arc::new(Mutex::new(TypedLine::default())),
             _watcher: watcher,
-            _child: child,
+            exit_code,
+            cmd_epoch,
+            closed,
         })
     }
 
@@ -872,7 +1005,14 @@ impl Session {
     /// nothing can be written to it any more, so the pane offers Reconnect (which
     /// respawns the session) rather than pretending to still be live.
     pub fn exited(&self) -> bool {
-        self.exited.load(Ordering::Relaxed)
+        self.exited.load(Ordering::Acquire)
+    }
+
+    /// How the shell ended: its exit code, None while it runs or when the code could not
+    /// be read. 0 is a shell that was told to exit (`exit`, Ctrl+D), anything else a shell
+    /// that died, which is worth leaving on screen.
+    pub fn exit_status(&self) -> Option<u32> {
+        *self.exit_code.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Record keystrokes on their way to the PTY, so the pane can remember the command
@@ -1211,18 +1351,17 @@ impl Session {
     pub fn nudge_resize(&self) {
         let master = self.master.clone();
         let term = self.term.clone();
-        std::thread::spawn(move || {
-            let size = |cols: usize, rows: usize| PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            };
-            let (cols, rows) = term.lock().map(|t| t.size()).unwrap_or((80, 24));
-            if let Ok(m) = master.lock() {
-                let _ = m.resize(size(cols.saturating_sub(1).max(1), rows));
-            }
-            std::thread::sleep(Duration::from_millis(120));
+        let size = |cols: usize, rows: usize| PtySize {
+            rows: rows as u16,
+            cols: cols as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let (cols, rows) = term.lock().map(|t| t.size()).unwrap_or((80, 24));
+        if let Ok(m) = master.lock() {
+            let _ = m.resize(size(cols.saturating_sub(1).max(1), rows));
+        }
+        schedule(Instant::now() + Duration::from_millis(120), move || {
             // Back to whatever the grid is by now, in case a real resize landed meanwhile.
             let (cols, rows) = term.lock().map(|t| t.size()).unwrap_or((cols, rows));
             if let Ok(m) = master.lock() {
@@ -1431,6 +1570,7 @@ fn reader_loop(
     let mut prev_cwd: Option<String> = None;
     let mut prev_idle: Option<bool> = None;
     let mut prev_menu = false;
+    let mut prev_claude_owns = false;
     let hide_wake_pending = Arc::new(AtomicBool::new(false));
 
     loop {
@@ -1493,12 +1633,22 @@ fn reader_loop(
         if let Some(remaining) = cursor_grace {
             if !hide_wake_pending.swap(true, Ordering::Relaxed) {
                 let pending = hide_wake_pending.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(remaining + Duration::from_millis(5));
+                schedule(Instant::now() + remaining + Duration::from_millis(5), move || {
                     pending.store(false, Ordering::Relaxed);
                     wake_ui();
                 });
             }
+        }
+        // While Claude owns the pane its wheel goes to Claude (mouse reporting), so
+        // Arbiter's scrollback cannot be read there, yet Claude's redraws fill it: a
+        // 5000-line history of redraw churn per Claude pane, some 25 MB each. Cap it for
+        // the duration and give the configured depth back when Claude leaves.
+        let claude_owns = claude_running.load(Ordering::Relaxed) || claude.on_screen();
+        if claude_owns != prev_claude_owns {
+            prev_claude_owns = claude_owns;
+            let configured = crate::term::SCROLLBACK.load(Ordering::Relaxed);
+            let lines = if claude_owns { configured.min(crate::term::CLAUDE_SCROLLBACK) } else { configured };
+            term.lock().unwrap().set_history(lines);
         }
 
         // Tier-3b: while Claude runs here, reflect the live turn from the *rendered
@@ -1870,14 +2020,15 @@ fn repoint_watcher(
 /// then scans the shell's descendants for `claude` — with a short retry since
 /// `claude` execs a moment after the edge. Bails early if the shell returns to
 /// idle (a quick command that wasn't Claude). The reader clears `claude_running`
-/// on the idle edge. (Currently leaks one blocked thread per closed session —
-/// cleanup when sessions get a shutdown signal.)
+/// on the idle edge. Ends when the session is dropped: Drop raises `closed` and
+/// notifies the epoch condvar (see `Session`'s Drop).
 fn claude_monitor(
     shell_pid: u32,
     cmd_epoch: CmdEpoch,
     claude_running: Arc<AtomicBool>,
     shell_idle: Arc<Mutex<Option<bool>>>,
     claude: Arc<crate::claude_status::ClaudeHandle>,
+    closed: Arc<AtomicBool>,
 ) {
     // How long to keep looking for Claude after a command starts. Enough to catch a
     // slow cold launch (Windows especially: $PROFILE + shim + node + MCP servers,
@@ -1894,10 +2045,16 @@ fn claude_monitor(
         // unchanged, so we loop back WITHOUT scanning — nothing runs while idle.
         let prev = last;
         {
-            let guard = lock.lock().unwrap();
-            let (guard, _to) =
-                cvar.wait_timeout_while(guard, Duration::from_secs(60), |e| *e == prev).unwrap();
+            let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let (guard, _to) = cvar
+                .wait_timeout_while(guard, Duration::from_secs(60), |e| {
+                    *e == prev && !closed.load(Ordering::Relaxed)
+                })
+                .unwrap_or_else(PoisonError::into_inner);
             last = *guard;
+        }
+        if closed.load(Ordering::Relaxed) {
+            return;
         }
         if last == prev {
             continue; // woke on the timeout with no new command → don't scan
@@ -2479,6 +2636,27 @@ mod tests {
         assert!(!connect_failed("Connection to 10.0.0.16 closed by remote host."));
         assert!(!connect_failed("client_loop: send disconnect: Connection reset by peer"));
         assert!(!connect_failed("Connection to 10.0.0.16 closed."));
+    }
+
+    // The deadline scheduler runs jobs in deadline order, not arrival order, and a hold
+    // clears itself once it lapses (the job the scheduler runs for it).
+    #[test]
+    fn deadlines_run_in_order_and_a_lapsed_hold_clears() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
+        for (delay, tag) in [(60u64, 'c'), (20, 'a'), (40, 'b')] {
+            let order = order.clone();
+            super::schedule(now + Duration::from_millis(delay), move || order.lock().unwrap().push(tag));
+        }
+        let hold = super::WakeHold::default();
+        hold.extend();
+        assert!(hold.slot.lock().unwrap().is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(*order.lock().unwrap(), vec!['a', 'b', 'c']);
+        assert!(hold.slot.lock().unwrap().is_none(), "the lapsed hold is cleared by its job");
+        assert!(hold.settled());
     }
 
     // A chunk arms a held redraw, and a burst of chunks cannot push its deadline past

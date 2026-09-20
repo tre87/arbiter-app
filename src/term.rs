@@ -130,6 +130,11 @@ impl EventListener for Responder {
 /// every `Session::spawn`/`VtTerm::new` call site; existing grids keep their size.
 pub static SCROLLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(5000);
 
+/// Scrollback kept while Claude owns a pane (see the reader loop in `session.rs`): its
+/// wheel goes to Claude, so Arbiter's history is unreachable there and only holds redraw
+/// churn. Enough to keep the shell's recent output around Claude's launch.
+pub const CLAUDE_SCROLLBACK: usize = 1000;
+
 #[derive(Clone, Copy)]
 struct Size {
     cols: usize,
@@ -165,6 +170,11 @@ pub struct VtTerm {
     /// PTY replies the term produced (query responses), drained by the reader loop
     /// and written back to the PTY. Shared with the `Responder` event sink.
     responses: Arc<Mutex<Vec<u8>>>,
+    /// Bumped by every change that can alter what a frame shows: output, resize, scroll,
+    /// selection, search, history depth. The renderer skips rebuilding a frame whose
+    /// generation it already drew (see `gpu::TermGpu::prepare`), so a mutating method
+    /// that forgets to bump it leaves a stale frame until the next change.
+    generation: u64,
 }
 
 impl VtTerm {
@@ -186,10 +196,25 @@ impl VtTerm {
             hidden_since: None,
             last_scroll: None,
             responses,
+            generation: 0,
         }
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Change how many lines of history the primary screen keeps. Shrinking drops the
+    /// oldest lines and frees their rows; growing only raises the cap.
+    pub fn set_history(&mut self, lines: usize) {
+        let mut config = Config::default();
+        config.scrolling_history = lines;
+        self.term.set_options(config);
+        self.generation += 1;
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.generation += 1;
         self.parser.advance(&mut self.term, bytes);
         if self.term.mode().contains(TermMode::SHOW_CURSOR) {
             let p = self.term.grid().cursor.point;
@@ -212,6 +237,7 @@ impl VtTerm {
     /// empty/invalid query clears the search. Case-insensitive unless the query has
     /// an uppercase letter (alacritty's smart-case).
     pub fn set_search(&mut self, query: &str) {
+        self.generation += 1;
         if query.is_empty() {
             self.search = None;
             return;
@@ -237,6 +263,7 @@ impl VtTerm {
 
     /// Move to the next (or previous) match, wrapping, and scroll it into view.
     pub fn search_jump(&mut self, forward: bool) {
+        self.generation += 1;
         let len = self.search.as_ref().map_or(0, |s| s.matches.len());
         if len == 0 {
             return;
@@ -249,6 +276,7 @@ impl VtTerm {
     }
 
     pub fn clear_search(&mut self) {
+        self.generation += 1;
         self.search = None;
     }
 
@@ -290,6 +318,7 @@ impl VtTerm {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.generation += 1;
         self.term.resize(Size { cols, rows });
     }
 
@@ -297,6 +326,7 @@ impl VtTerm {
     /// clamped to the history. The next `for_each_cell` renders the new view.
     /// Records the scroll time so the scroll indicator shows then fades.
     pub fn scroll(&mut self, lines: i32) {
+        self.generation += 1;
         self.term.scroll_display(Scroll::Delta(lines));
         self.last_scroll = Some(std::time::Instant::now());
     }
@@ -304,6 +334,7 @@ impl VtTerm {
     /// Jump back to the live bottom (display offset 0). Does NOT mark a user
     /// scroll, so typing/jump-to-bottom never flashes the scroll indicator.
     pub fn scroll_to_bottom(&mut self) {
+        self.generation += 1;
         self.term.scroll_display(Scroll::Bottom);
     }
 
@@ -329,6 +360,7 @@ impl VtTerm {
     /// right half (which edge the selection snaps to). `kind` sets the
     /// granularity (single/double/triple click → char/word/line).
     pub fn start_selection(&mut self, row: usize, col: usize, right: bool, kind: SelectKind) {
+        self.generation += 1;
         let point = Point::new(self.abs_line(row), Column(col));
         let side = if right { Side::Right } else { Side::Left };
         let ty = match kind {
@@ -341,6 +373,7 @@ impl VtTerm {
 
     /// Extend the active selection to a visible (row, col).
     pub fn update_selection(&mut self, row: usize, col: usize, right: bool) {
+        self.generation += 1;
         let point = Point::new(self.abs_line(row), Column(col));
         let side = if right { Side::Right } else { Side::Left };
         if let Some(sel) = self.term.selection.as_mut() {
@@ -349,6 +382,9 @@ impl VtTerm {
     }
 
     pub fn clear_selection(&mut self) {
+        if self.term.selection.is_some() {
+            self.generation += 1;
+        }
         self.term.selection = None;
     }
 
@@ -359,6 +395,7 @@ impl VtTerm {
     /// Select the entire buffer (scrollback + visible screen) — the terminal
     /// context menu's "Select All".
     pub fn select_all(&mut self) {
+        self.generation += 1;
         let history = self.term.grid().history_size() as i32;
         let cols = self.term.grid().columns();
         let lines = self.term.screen_lines() as i32;
@@ -372,6 +409,7 @@ impl VtTerm {
     /// Buffer". Leaves the cursor where it is (the running program owns it).
     pub fn clear(&mut self) {
         use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        self.generation += 1;
         self.term.clear_screen(ClearMode::All);
         self.term.grid_mut().clear_history();
         self.term.scroll_display(Scroll::Bottom);
@@ -863,6 +901,59 @@ mod tests {
     /// Scrolling (wheel or drag auto-scroll) while a selection drag is active must
     /// keep extending the marked region: scroll the view, then re-extend to the same
     /// screen row — the selection should grow to cover the lines scrolled into view.
+    // Every change the renderer must draw moves the generation; the renderer relies on
+    // this to skip frames whose inputs are unchanged.
+    #[test]
+    fn generation_moves_with_every_visible_change() {
+        let mut t = super::VtTerm::new(20, 4);
+        let mut last = t.generation();
+        let mut step = |t: &mut super::VtTerm, what: &str| {
+            assert!(t.generation() > last, "{what} did not bump the generation");
+            last = t.generation();
+        };
+        t.feed(b"hello\r\n");
+        step(&mut t, "feed");
+        t.resize(30, 5);
+        step(&mut t, "resize");
+        t.scroll(1);
+        step(&mut t, "scroll");
+        t.scroll_to_bottom();
+        step(&mut t, "scroll_to_bottom");
+        t.start_selection(0, 0, false, super::SelectKind::Simple);
+        step(&mut t, "start_selection");
+        t.update_selection(0, 3, true);
+        step(&mut t, "update_selection");
+        t.clear_selection();
+        step(&mut t, "clear_selection");
+        t.set_search("hell");
+        step(&mut t, "set_search");
+        t.clear_search();
+        step(&mut t, "clear_search");
+        t.set_history(100);
+        step(&mut t, "set_history");
+        t.clear();
+        step(&mut t, "clear");
+    }
+
+    // Shrinking the history drops the oldest lines and reports the smaller size; growing
+    // it back gives capacity, not content.
+    #[test]
+    fn history_shrinks_and_regrows_on_demand() {
+        let mut t = super::VtTerm::new(10, 2);
+        for i in 0..60 {
+            t.feed(format!("L{i:02}\r\n").as_bytes());
+        }
+        assert!(t.scroll_state().1 >= 50, "lines scrolled into history");
+        t.set_history(20);
+        assert_eq!(t.scroll_state().1, 20);
+        t.set_history(5000);
+        assert_eq!(t.scroll_state().1, 20, "growing the cap does not bring lines back");
+        for i in 0..30 {
+            t.feed(format!("M{i:02}\r\n").as_bytes());
+        }
+        assert_eq!(t.scroll_state().1, 50);
+    }
+
     #[test]
     fn selection_extends_while_scrolling() {
         use super::{SelectKind, VtTerm};
