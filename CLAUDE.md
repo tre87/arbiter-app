@@ -22,6 +22,11 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   vice-versa — they're separate (CoreText vs DirectWrite) and easy to regress.
 - **No polling.** Every live signal must be event-driven (file watchers / PTY reader
   callbacks); web parity depends on it.
+- **Every `git` read reached from a watcher needs `--no-optional-locks`.** A plain
+  `git status` refreshes `.git/index`, and a watcher over the working tree sees that as a
+  change and runs the status again, forever. The explorer shipped that loop once
+  (`git::file_status`, 4.7% of a core on an idle repo). Measure idle CPU after touching
+  anything a watcher triggers.
 - **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`:
   `iced_winit` (inactive notification windows) and `iced_widget` (the text editor
   hit-tests with the padding on swapped axes, which the editor's line-number gutter

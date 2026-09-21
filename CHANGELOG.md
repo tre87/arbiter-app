@@ -28,6 +28,17 @@ history belongs to the prior Tauri/Vue web app it replaced.
   have no unsaved edits, and asks first when you do, checked when you switch to its tab and
   when the watcher reports it. Ctrl+S saves, Ctrl+W closes a tab, and quitting with unsaved
   work always asks, whatever the quit setting says.
+- **The explorer no longer keeps a repo busy at idle.** Its per-file `git status` was the
+  one status read without `--no-optional-locks`, so it refreshed `.git/index`, which the
+  explorer's own watcher saw as a change, which ran it again: a loop once per debounce for
+  as long as the pane was open. It cost 4.7% of a core on an idle repo; it is now 0.16%,
+  the same as with the explorer closed.
+- **An open file no longer holds memory it is not using.** Tabs that are off screen and
+  unedited release their buffer and re-read on the way back, so memory follows the file
+  being looked at rather than the sum of everything open: six tabs including a 9,600 line
+  file went from 457 MB to 354 MB. Undo and redo are both bounded now (they were whole
+  document snapshots, with redo uncapped), and the line-number gutter, which costs a shaped
+  copy of every line, gives way above 5,000 lines.
 - **A second iced crate is forked.** `vendor/iced_widget` carries a one-line fix: iced
   0.13's text editor hit-tests a click with the padding applied to swapped axes, so an
   editor with uneven padding puts the caret nowhere near the pointer. The editor's line

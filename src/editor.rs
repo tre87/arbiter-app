@@ -21,7 +21,11 @@ pub const COALESCE_MS: u64 = 500;
 /// Undo history caps. The stack holds whole-document snapshots, so both a count
 /// and a byte budget are needed: 200 edits of a small file, or fewer of a big one.
 pub const UNDO_MAX_ENTRIES: usize = 200;
-pub const UNDO_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// An entry is a copy of the whole document, so the byte budget is what really
+/// bounds this: 200 snapshots of a 400 KB file would be 80 MB per tab, and the
+/// redo stack can hold as many again. 8 MiB keeps the full 200 steps for an
+/// ordinary source file and trims the history early on a large one.
+pub const UNDO_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Line ending a file was read with, so saving writes back what was there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

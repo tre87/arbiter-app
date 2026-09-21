@@ -56,7 +56,14 @@ const GUTTER_GAP: f32 = 10.0;
 /// Above this many lines the editor drops its gutter and scrolls itself, rather
 /// than being laid out in full. The whole-document layout is what keeps the
 /// gutter aligned, and it costs a shaping pass over every line.
-const MAX_GUTTER_LINES: usize = 20_000;
+/// Above this the editor drops its gutter and goes back to scrolling itself.
+///
+/// Laying the whole document out is what keeps the numbers in step with the
+/// text, and it costs cosmic-text a shaped copy of every line rather than only
+/// the visible ones. Measured at roughly 5 KB a line: 47 MB of the 197 MB a
+/// 9,600 line file takes. 5,000 lines caps that contribution near 25 MB and
+/// still covers all but the largest source files.
+const MAX_GUTTER_LINES: usize = 5_000;
 const EDITOR_SCROLL: &str = "editor-scroll";
 pub const PROMPT_INPUT: &str = "explorer-prompt-input";
 
@@ -117,7 +124,8 @@ pub struct EditorTab {
     dirty: bool,
     saved_hash: u64,
     undo: UndoStack,
-    redo: Vec<Snapshot>,
+    /// Same bounded stack as `undo`: a redo entry is another whole-document copy.
+    redo: UndoStack,
     disk: Option<ed::DiskStamp>,
     eol: ed::Eol,
     trailing_newline: bool,
@@ -141,7 +149,7 @@ impl EditorTab {
             dirty: false,
             saved_hash: 0,
             undo: UndoStack::default(),
-            redo: Vec::new(),
+            redo: UndoStack::default(),
             disk: None,
             eol: ed::Eol::Lf,
             trailing_newline: true,
@@ -1136,6 +1144,7 @@ fn open_file(state: &mut State, path: PathBuf) -> Task<Message> {
     ed.active = Some(ed.tabs.len() - 1);
     ed.visible = true;
     ed.scroll_y = 0.0;
+    release_background_tabs(state);
     save_session(state);
     Task::batch([
         iced::widget::scrollable::scroll_to(
@@ -1176,7 +1185,33 @@ fn load_into(tab: &mut EditorTab) -> Result<(), String> {
 
 /// Load the active tab if it has not been read yet, and check the disk if a
 /// watcher event arrived while it was off screen.
+/// Let go of the buffers of tabs that are not on screen.
+///
+/// A tab's buffer is not just its text: the editor is laid out at its full
+/// height so the gutter can track it, which makes cosmic-text shape and keep
+/// every line rather than only the visible ones. That runs to a couple of
+/// hundred megabytes for a ten-thousand-line file, and it would otherwise be
+/// paid for every tab at once, for as long as the app is open.
+///
+/// Only untouched tabs are released: one with unsaved edits obviously cannot be
+/// re-read from disk, and one with an undo history would lose it, which is not
+/// a trade to make silently. They reload on the way back in, the same lazy path
+/// a restored session already uses.
+fn release_background_tabs(state: &mut State) {
+    let active = state.active().editor.active;
+    for (i, t) in state.active_mut().editor.tabs.iter_mut().enumerate() {
+        if Some(i) == active || t.content.is_none() {
+            continue;
+        }
+        if t.dirty || t.missing || !t.undo.is_empty() || !t.redo.is_empty() {
+            continue;
+        }
+        t.content = None;
+    }
+}
+
 fn ensure_active_loaded(state: &mut State) -> Task<Message> {
+    release_background_tabs(state);
     let Some(i) = state.active().editor.active else { return Task::none() };
     let needs_load = state
         .active()
