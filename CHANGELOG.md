@@ -31,9 +31,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   state it is best at: Claude's own spinner turning while a turn is in flight (out of phase
   per desk, so five agents are not five copies of one frame), output scrolling up under it,
   a highlighted choice waiting when an agent is blocked. Each occupied desk has a bias light
-  behind its monitor washing the wall warm, off at a free desk. Plants on the floor, on the
-  clerestory sill and on some desks, with which desks keep one fixed by slot so a desk's
-  clutter is as stable as its position. Four rules are enforced by tests rather than by intent: a desk never
+  behind its monitor washing the wall warm, off at a free desk. Every desk keeps a plant, in one of four
+  sizes chosen by slot so a desk's clutter is as stable as its position, with more growth
+  trailing from the clerestory sill. The figures sit properly: a task chair with a gas post
+  and a castor base, a torso of about two head-heights, a thigh running forward under a
+  cantilevered desktop whose pedestal is on the far side, and a shin and foot down to the
+  floor. The near floor is a shallow walkway with a cable trunk rather than a deep empty
+  band of tiles, which read as a missing wall. Four rules are enforced by tests rather than by intent: a desk never
   moves, the working and attention colours are painted by nothing but those two states
   (checked across every sky and every pose), nothing is random (variety comes from a hash,
   so any frame reproduces), and only real activity animates — a quiet room under a still

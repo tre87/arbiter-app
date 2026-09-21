@@ -155,8 +155,10 @@ pub const W: i32 = COLS as i32 * SLOT_W;
 pub const CEIL_H: i32 = 46;
 /// One row of desks: wall above, desk, floor strip below.
 pub const ROW_H: i32 = 92;
-/// Foreground floor, drawn once at the bottom. Where ambient life will go.
-pub const FORE_H: i32 = 28;
+/// The near floor, drawn once at the bottom: the walkway in front of the last
+/// row of desks, and where a passing colleague will go in stage 3. Shallow on
+/// purpose — a deep empty band under the desks reads as a missing wall.
+pub const FORE_H: i32 = 18;
 
 /// Rows needed for `slots` desks. Always at least one, so an empty room is still
 /// a room.
@@ -545,23 +547,23 @@ fn room(b: &mut Buf, scene: &Scene, t: f32) {
         b.fill(0, top + ROW_H - 10, w, 10, FLOOR);
     }
 
-    // Foreground floor. Ambient life lands here in stage 3; for now it is a
-    // plant, which does not move, because nothing that is not information may.
+    // The near floor. It continues the last row's floor toward the viewer, so
+    // it is lit a touch more and seamed horizontally; the vertical grid that used
+    // to be here read as an empty tiled void rather than as a walkway, and the
+    // plants standing on it read as a garden centre. Both are gone. A cable
+    // trunk runs along the base, which is what an open-plan floor actually has.
     let fy = h - FORE_H;
     b.fill(0, fy, w, FORE_H, FLOOR);
     b.fill(0, fy, w, 1, TRIM);
-    let mut x = 0;
+    b.fill(0, fy + 1, w, 2, FLOOR_LINE.alpha(0.5));
+    b.fill(0, fy + 8, w, 1, FLOOR_LINE.alpha(0.35));
+    b.fill(0, h - 5, w, 4, rgb(0x1a, 0x21, 0x2a));
+    b.fill(0, h - 5, w, 1, TRIM);
+    let mut x = 6;
     while x < w {
-        b.fill(x, fy + 1, 1, FORE_H - 1, FLOOR_LINE);
-        x += 16;
+        b.fill(x, h - 4, 3, 2, METAL_DK);
+        x += 46;
     }
-    // Greenery, all of it in the two bands that belong to nobody, so no plant
-    // can ever be mistaken for part of a workstation.
-    plant(b, 6, fy + 11, 2, 0x101);
-    plant(b, 92, fy + 15, 0, 0x202);
-    plant(b, 166, fy + 10, 3, 0x303);
-    plant(b, 248, fy + 16, 0, 0x404);
-    plant(b, W - 30, fy + 13, 1, 0x505);
 
     // A sunny day spills past the sill. It stops above the desks on purpose:
     // reading an agent's state must never depend on the weather.
@@ -790,30 +792,9 @@ fn screen(b: &mut Buf, sx: i32, sy: i32, sw: i32, sh: i32, d: Desk, t: f32, seed
     }
 }
 
-/// Foliage. Four greens and a jittered leaf height, so a row of plants does not
-/// read as one shape stamped three times.
-fn plant(b: &mut Buf, x: i32, y: i32, size: i32, seed: i64) {
-    let w = 7 + size * 2;
-    b.fill(x + 1, y + 3, w - 2, 9 + size, POT_DK);
-    b.fill(x + 2, y + 4, w - 4, 8 + size, POT);
-    b.fill(x, y + 1, w, 3, POT);
-    for i in 0..(3 + size) {
-        let lx = x + 1 + i * 2;
-        let lh = 5 + (hash(seed, i as i64) % 6) as i32 + size * 3;
-        let c = [PLANT_DK, PLANT, PLANT_LT, PLANT_HI][(hash(seed, i as i64 + 9) % 4) as usize];
-        b.fill(lx, y + 1 - lh, 2, lh, c);
-    }
-}
-
-/// A succulent small enough to live on a desk.
-fn succulent(b: &mut Buf, x: i32, y: i32) {
-    b.fill(x, y + 4, 5, 3, POT);
-    b.fill(x, y + 2, 5, 2, PLANT);
-    b.fill(x + 1, y + 1, 3, 2, PLANT_LT);
-    b.fill(x + 2, y, 1, 2, PLANT_HI);
-}
-
-/// A pot on the clerestory sill with its growth hanging down the wall.
+/// A pot on the clerestory sill with its growth hanging down the wall. The only
+/// greenery that is not on a desk: the floor is kept clear so the foreground
+/// reads as a walkway rather than as a shelf of pot plants.
 fn trailing(b: &mut Buf, x: i32, y: i32, seed: i64) {
     b.fill(x, y, 13, 4, POT);
     b.fill(x, y, 13, 1, POT_DK);
@@ -825,19 +806,95 @@ fn trailing(b: &mut Buf, x: i32, y: i32, seed: i64) {
     }
 }
 
+/// A plant for the end of a desk, in four sizes. Which one a desk gets is fixed
+/// by its slot, so the clutter on a desk is as stable as the desk's position and
+/// a row of five reads as five people rather than one stamped five times.
+/// `base` is the desk surface; the plant grows up from it.
+fn desk_plant(b: &mut Buf, x: i32, base: i32, variant: u32, seed: i64) {
+    let green = |k: i64| [PLANT_DK, PLANT, PLANT_LT, PLANT_HI][(hash(seed, k) % 4) as usize];
+    match variant {
+        // A succulent barely taller than the mug.
+        0 => {
+            b.fill(x + 1, base - 3, 5, 3, POT);
+            b.fill(x + 1, base - 4, 5, 1, POT_DK);
+            b.fill(x + 1, base - 6, 5, 2, PLANT);
+            b.fill(x + 2, base - 7, 3, 1, PLANT_LT);
+        }
+        // A squat bushy thing.
+        1 => {
+            b.fill(x, base - 5, 7, 5, POT);
+            b.fill(x, base - 6, 7, 1, POT_DK);
+            for k in 0..3i64 {
+                let h = 4 + (hash(seed, k) % 4) as i32;
+                b.fill(x + 1 + k as i32 * 2, base - 6 - h, 2, h, green(k));
+            }
+            b.fill(x + 1, base - 8, 5, 2, green(9));
+        }
+        // Tall fronds, the one that reads from across the room.
+        2 => {
+            b.fill(x + 1, base - 7, 5, 7, POT);
+            b.fill(x + 1, base - 8, 5, 1, POT_DK);
+            for k in 0..3i64 {
+                let h = 7 + (hash(seed, k) % 6) as i32;
+                b.fill(x + 1 + k as i32 * 2, base - 8 - h, 1, h, green(k));
+                b.fill(x + k as i32 * 2, base - 9 - h, 3, 2, green(k + 4));
+            }
+        }
+        // Growth spilling over the desk edge.
+        _ => {
+            b.fill(x, base - 5, 7, 5, POT);
+            b.fill(x, base - 6, 7, 1, POT_DK);
+            b.fill(x + 1, base - 8, 5, 2, green(1));
+            b.fill(x + 2, base - 9, 3, 1, green(2));
+            for k in 0..3i64 {
+                let len = 3 + (hash(seed, k + 5) % 5) as i32;
+                b.fill(x + 5 + k as i32, base - 4 + k as i32, 1, len, green(k + 6));
+            }
+        }
+    }
+}
+
+// --- one workstation, in row-relative pixels ---------------------------------
+// The figure is seated, and every part of that has to be visible or it reads as
+// somebody standing at a desk (which is exactly how the first version read).
+// So: the hip meets the seat, the thigh runs forward under the desktop, the
+// lower leg drops to the floor, and the desk is a cantilever with its pedestal
+// on the far side, leaving the legs and the chair post in open view.
+const HAIR_Y: i32 = 30;
+const HEAD_Y: i32 = 32;
+const SHOULDER_Y: i32 = 43;
+const HIP_Y: i32 = 62;
+const SEAT_Y: i32 = 62;
+const KNEE_Y: i32 = 68;
+const DESK_Y: i32 = 56;
+const KB_Y: i32 = 52;
+const FLOOR_Y: i32 = 80;
+const MON_TOP: i32 = 20;
+const MON_BOT: i32 = 49;
+
 /// One workstation. Everything is positioned from the slot's centre `cx` and the
 /// row band top `r`, so a desk is identical wherever it lands.
 fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     let (cx, r) = slot_origin(i);
     let shirt = SHIRTS[i % COLS];
+    let trews = rgb(0x39, 0x42, 0x4d);
+    // One step down from the shirt, to seam the arm off the torso it grows out
+    // of; at the same value the two merged into a single slab.
+    let shirt_dk = Rgba(
+        (shirt.0 as f32 * 0.72) as u8,
+        (shirt.1 as f32 * 0.72) as u8,
+        (shirt.2 as f32 * 0.72) as u8,
+        1.0,
+    );
     let glow = d.glow();
     let occupied = d != Desk::Empty;
     // 12fps sprite cadence: smooth motion reads as an animation, chunky motion
     // reads as a machine.
     let frame = (t * 12.0) as i64;
     let job = (d == Desk::Working).then(|| task(i, t));
-    // Idle and done slump back a pixel or two, and so does a pondering agent.
-    // Posture is a free state channel and it costs no colour.
+    // Idle, done and pondering slump back into the chair. Posture is a free
+    // state channel and it costs no colour. Only the upper body leans: the legs
+    // stay where they are, which is what makes the lean read as a lean.
     let lean = i32::from(
         matches!(d, Desk::Idle | Desk::Done | Desk::Ready) || job == Some(Task::Pondering),
     ) - i32::from(job == Some(Task::Reading) || job == Some(Task::Noting));
@@ -851,144 +908,183 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
             Desk::Attention => 0.07 + 0.03 * (t * 1.9).sin(),
             _ => 0.04,
         };
-        b.fill_checker(cx - 18, r + 16, 48, 42, g.alpha(b0 * 0.55));
-        b.fill(cx - 8, r + 20, 36, 34, g.alpha(b0 * 0.7));
-        b.fill(cx, r + 22, 28, 28, g.alpha(b0));
+        b.fill_checker(cx - 18, r + 14, 50, 44, g.alpha(b0 * 0.55));
+        b.fill(cx - 8, r + 18, 38, 36, g.alpha(b0 * 0.7));
+        b.fill(cx, r + 20, 28, 30, g.alpha(b0));
     }
 
-    // Chair. An unoccupied one is pushed in under the desk, which is how a free
-    // desk reads as free rather than as a person who has gone very still.
-    let ch = cx - 28 + if occupied { 0 } else { 12 };
-    b.fill(ch, r + 24 + lean, 4, 34, CHAIR);
-    b.fill(ch + 1, r + 25 + lean, 2, 32, CHAIR_LT);
-    b.fill(ch, r + 44, 14, 3, CHAIR);
-    b.fill(ch + 5, r + 47, 3, 15, CHAIR);
-    b.fill(ch, r + 62, 14, 2, CHAIR);
+    // Task chair, drawn behind the figure. An unoccupied one is pushed in under
+    // the desk, which is how a free desk reads as free rather than as somebody
+    // who has gone very still.
+    let ch = cx - 31 + if occupied { 0 } else { 13 };
+    b.fill(ch, r + 40 + lean, 5, SEAT_Y - 40, CHAIR);
+    b.fill(ch + 1, r + 42 + lean, 3, SEAT_Y - 44, CHAIR_LT);
+    b.fill(ch, r + SEAT_Y, 20, 3, CHAIR_LT);
+    b.fill(ch, r + SEAT_Y + 3, 20, 2, CHAIR);
+    b.fill(ch + 7, r + SEAT_Y + 5, 3, 11, METAL_DK);
+    b.fill(ch + 1, r + FLOOR_Y - 4, 17, 2, METAL_DK);
+    b.fill(ch, r + FLOOR_Y - 2, 3, 2, METAL);
+    b.fill(ch + 16, r + FLOOR_Y - 2, 3, 2, METAL);
 
     if occupied {
-        // Head. In profile while working; turned to camera, with eyes, when the
-        // agent is blocked. The turn is a state change, not a personality.
-        b.fill(cx - 24 + lean, r + 20, 8, 9, SKIN);
-        b.fill(cx - 25 + lean, r + 18, 10, 4, HAIR);
-        b.fill(cx - 25 + lean, r + 21, 2, 5, HAIR);
+        // Head, in profile while working; turned to camera, with two eyes, when
+        // the agent is blocked. The turn is a state change, not a personality.
+        b.fill(cx - 24 + lean, r + HEAD_Y, 8, 10, SKIN);
+        b.fill(cx - 25 + lean, r + HAIR_Y, 10, 5, HAIR);
+        b.fill(cx - 25 + lean, r + HEAD_Y + 3, 2, 5, HAIR);
         if d == Desk::Attention {
-            b.fill(cx - 21, r + 23, 1, 1, HAIR);
-            b.fill(cx - 18, r + 23, 1, 1, HAIR);
+            b.fill(cx - 21, r + HEAD_Y + 5, 1, 1, HAIR);
+            b.fill(cx - 18, r + HEAD_Y + 5, 1, 1, HAIR);
         } else {
-            b.fill(cx - 18 + lean, r + 23, 1, 1, HAIR);
+            b.fill(cx - 18 + lean, r + HEAD_Y + 5, 1, 1, HAIR);
         }
 
-        // Torso.
-        b.fill(cx - 25 + lean, r + 29, 10, 24, shirt);
-        b.fill(cx - 26 + lean, r + 31, 2, 14, shirt);
+        // Shoulders, then a torso of about two head-heights down to the hip. Any
+        // longer and the figure reads as standing behind the desk, which is
+        // exactly how the first attempt at this read.
+        let torso = HIP_Y - SHOULDER_Y;
+        b.fill(cx - 26 + lean, r + SHOULDER_Y, 13, 4, shirt);
+        b.fill(
+            cx - 17 + lean,
+            r + SHOULDER_Y + 2,
+            2,
+            HIP_Y - SHOULDER_Y - 4,
+            shirt_dk,
+        );
+        b.fill(cx - 25 + lean, r + SHOULDER_Y, 11, torso, shirt);
+        b.fill(cx - 26 + lean, r + SHOULDER_Y + 3, 2, torso - 7, shirt);
 
-        // Arms. This is where the variety lives: every pose below means exactly
-        // Working, so none of them may introduce a colour or a motion the other
+        // Seated legs: thigh forward under the desktop, shin down to the floor.
+        // The thigh is darker than the seat slab beneath it and carries a lit top
+        // edge, which is the only reason the two read as separate objects here.
+        let trews_lit = rgb(0x4c, 0x57, 0x64);
+        let shin = FLOOR_Y - 3 - KNEE_Y;
+        b.fill(cx - 24, r + HIP_Y, 17, KNEE_Y - HIP_Y - 1, trews);
+        b.fill(cx - 24, r + HIP_Y, 17, 1, trews_lit);
+        b.fill(cx - 24, r + KNEE_Y - 1, 17, 1, rgb(0x24, 0x2a, 0x33));
+        b.fill(cx - 12, r + KNEE_Y, 5, shin, trews);
+        b.fill(cx - 12, r + KNEE_Y, 1, shin, trews_lit);
+        b.fill(cx - 13, r + FLOOR_Y - 3, 10, 3, rgb(0x1b, 0x1f, 0x25));
+        b.fill(cx - 13, r + FLOOR_Y - 3, 10, 1, rgb(0x2b, 0x31, 0x39));
+
+        // Arms. This is where the work variety lives: every pose below means
+        // exactly Working, so none may introduce a colour or a motion the other
         // states do not already have.
         match (d, job) {
             (Desk::Working, Some(Task::Typing)) | (Desk::Running, _) => {
                 let k = (frame % 2) as i32;
-                b.fill(cx - 15, r + 42, 10, 4, shirt);
-                b.fill(cx - 6, r + 45 + k, 8, 3, SKIN);
-                b.fill(cx - 15, r + 47, 9, 4, shirt);
-                b.fill(cx - 7, r + 49 - k, 8, 3, SKIN);
+                b.fill(cx - 16, r + 46, 10, 4, shirt);
+                b.fill(cx - 7, r + 48 + k, 8, 3, SKIN);
+                b.fill(cx - 16, r + 51, 9, 4, shirt);
+                b.fill(cx - 8, r + 52 - k, 8, 3, SKIN);
             }
             // Hands in the lap, head in close.
             (Desk::Working, Some(Task::Reading)) => {
-                b.fill(cx - 16, r + 44, 8, 4, shirt);
-                b.fill(cx - 12, r + 47, 6, 4, SKIN);
+                b.fill(cx - 17, r + 48, 8, 4, shirt);
+                b.fill(cx - 13, r + 52, 6, 4, SKIN);
             }
             // One hand on the keys, the other writing. The pen is the only thing
-            // that moves, at a tenth the rate of typing.
+            // that moves, at a third the rate of typing.
             (Desk::Working, Some(Task::Noting)) => {
                 let k = ((frame / 3) % 3) as i32;
-                b.fill(cx - 15, r + 42, 10, 4, shirt);
-                b.fill(cx - 6, r + 45, 8, 3, SKIN);
-                b.fill(cx - 16, r + 48, 7, 4, shirt);
-                b.fill(cx - 10 + k, r + 51, 4, 3, SKIN);
-                b.fill(cx - 12, r + 54, 12, 2, PAPER.alpha(0.85));
+                b.fill(cx - 16, r + 46, 10, 4, shirt);
+                b.fill(cx - 7, r + 49, 8, 3, SKIN);
+                b.fill(cx - 17, r + 52, 7, 4, shirt);
+                b.fill(cx - 11 + k, r + 54, 4, 3, SKIN);
             }
             // Back in the chair, hand to chin.
             (Desk::Working, Some(Task::Pondering)) => {
-                b.fill(cx - 16 + lean, r + 36, 4, 10, shirt);
-                b.fill(cx - 17 + lean, r + 30, 4, 7, SKIN);
+                b.fill(cx - 17 + lean, r + 47, 4, 10, shirt);
+                b.fill(cx - 18 + lean, r + 41, 4, 7, SKIN);
             }
             // Mug up, which is why there is no mug on the desk this phase.
             (Desk::Working, Some(Task::Sipping)) => {
-                b.fill(cx - 16, r + 34, 4, 10, shirt);
-                b.fill(cx - 17, r + 30, 5, 5, SKIN);
-                b.fill(cx - 18, r + 27, 5, 5, CERAMIC);
+                b.fill(cx - 17, r + 45, 4, 11, shirt);
+                b.fill(cx - 18, r + 41, 5, 5, SKIN);
+                b.fill(cx - 19, r + 38, 5, 5, CERAMIC);
             }
             // Hands off the keyboard: the agent has stopped and is waiting.
             (Desk::Attention, _) => {
-                b.fill(cx - 15, r + 42, 7, 4, shirt);
-                b.fill(cx - 9, r + 34, 4, 12, SKIN);
+                b.fill(cx - 16, r + 48, 7, 4, shirt);
+                b.fill(cx - 10, r + 42, 4, 11, SKIN);
             }
             _ => {
-                b.fill(cx - 15 + lean, r + 44, 9, 4, shirt);
-                b.fill(cx - 7 + lean, r + 47, 6, 3, SKIN);
+                b.fill(cx - 16 + lean, r + 49, 9, 4, shirt);
+                b.fill(cx - 8 + lean, r + 52, 6, 3, SKIN);
             }
         }
     }
 
-    // Desk, drawn after the figure so the modesty panel occludes the legs.
-    b.fill(cx - 16, r + 56, 50, 4, DESK_LT);
-    b.fill(cx - 16, r + 60, 50, 2, rgb(0x24, 0x1e, 0x18));
-    b.fill(cx - 14, r + 62, 46, 18, DESK);
-    b.fill(cx - 14, r + 62, 46, 1, DESK_LT);
-    b.fill(cx - 16, r + 80, 50, 2, Rgba(0, 0, 0, 0.35));
-
-    // Desk light: a bias bar behind the monitor, washing the wall above it. Off
-    // at a free desk, which is one more way an empty slot reads as empty.
-    if occupied {
-        b.fill(cx + 5, r + 18, 22, 2, LAMP_WARM.alpha(0.8));
-        b.fill(cx + 7, r + 15, 18, 3, LAMP_WARM.alpha(0.09));
-        b.fill_checker(cx + 3, r + 10, 26, 6, LAMP_WARM.alpha(0.07));
-        b.fill_checker(cx - 1, r + 5, 34, 6, LAMP_WARM.alpha(0.035));
-    }
+    // Desk: a cantilever top with its pedestal on the far side, so the near side
+    // stays open and the seated legs are actually visible.
+    b.fill(cx - 16, r + DESK_Y, 52, 3, DESK_LT);
+    b.fill(cx - 16, r + DESK_Y + 3, 52, 2, rgb(0x24, 0x1e, 0x18));
+    b.fill(cx + 22, r + DESK_Y + 5, 14, FLOOR_Y - DESK_Y - 5, DESK);
+    b.fill(cx + 22, r + DESK_Y + 5, 14, 1, DESK_LT);
+    b.fill(cx + 24, r + DESK_Y + 11, 10, 1, POT_DK);
+    b.fill(cx + 24, r + DESK_Y + 18, 10, 1, POT_DK);
+    b.fill(cx - 16, r + FLOOR_Y, 52, 2, Rgba(0, 0, 0, 0.3));
 
     // Monitor. The screen faces the camera while the figure beside it stays in
     // profile: the standard side-view cheat, and the only way the screen can
     // carry state at all.
-    b.fill(cx + 13, r + 48, 6, 8, METAL_DK);
-    b.fill(cx + 8, r + 55, 16, 3, METAL_DK);
-    b.fill(cx + 3, r + 20, 26, 29, METAL);
-    b.fill(cx + 3, r + 20, 26, 1, METAL_LT);
-    screen(b, cx + 5, r + 22, 22, 25, d, t, i as i64);
-
-    // Keyboard.
-    b.fill(cx - 8, r + 52, 15, 4, METAL_DK);
-    b.fill(cx - 7, r + 53, 13, 2, rgb(0x32, 0x3a, 0x42));
+    b.fill(cx + 13, r + MON_BOT, 6, 5, METAL_DK);
+    b.fill(cx + 8, r + DESK_Y - 2, 16, 2, METAL_DK);
+    b.fill(cx + 3, r + MON_TOP, 26, MON_BOT - MON_TOP, METAL);
+    b.fill(cx + 3, r + MON_TOP, 26, 1, METAL_LT);
+    screen(b, cx + 5, r + MON_TOP + 2, 22, 25, d, t, i as i64);
 
     if occupied {
-        // The one signal object. A paddle that rises above the monitor only when
-        // the agent is blocked on you, breathing at well under 1Hz. Nothing else
-        // in the room is allowed to move like this.
+        // Desk light: a bar clipped over the top of the monitor, throwing light
+        // down onto the desk the way the real thing does. Warm, but deliberately
+        // desaturated: a saturated warm glow at this size reads as ATTENTION,
+        // and the room depends on that colour meaning exactly one thing.
+        b.fill(cx + 14, r + MON_TOP - 4, 4, 5, METAL_DK);
+        b.fill(cx + 7, r + MON_TOP - 7, 18, 3, METAL);
+        b.fill(cx + 7, r + MON_TOP - 7, 18, 1, METAL_LT);
+        b.fill(cx + 8, r + MON_TOP - 4, 16, 1, LAMP_WARM.alpha(0.9));
+        b.fill_checker(cx + 4, r + KB_Y - 4, 24, 8, LAMP_WARM.alpha(0.1));
+        b.fill(cx + 7, r + KB_Y, 18, 4, LAMP_WARM.alpha(0.07));
+    }
+
+    // Keyboard.
+    b.fill(cx - 8, r + KB_Y, 15, 4, METAL_DK);
+    b.fill(cx - 7, r + KB_Y + 1, 13, 2, rgb(0x32, 0x3a, 0x42));
+
+    if occupied {
+        // Every desk keeps a plant; which one is fixed by slot.
+        desk_plant(
+            b,
+            cx + 29,
+            r + DESK_Y,
+            hash(i as i64, 0x91) % 4,
+            i as i64 * 7 + 3,
+        );
+
+        // The mug and the out-tray share the near end of the desk, which they
+        // can because Working and Done never happen at the same desk at once.
+        if d == Desk::Working && job != Some(Task::Sipping) {
+            b.fill(cx - 13, r + DESK_Y - 6, 5, 6, CERAMIC);
+            b.fill(cx - 8, r + DESK_Y - 5, 2, 3, CERAMIC);
+        }
+        if d == Desk::Done {
+            b.fill(cx - 14, r + DESK_Y - 4, 10, 4, METAL_DK);
+            for k in 0..3 {
+                b.fill(cx - 13, r + DESK_Y - 6 - k, 8, 1, PAPER);
+            }
+        }
+
+        // The one signal object: a paddle that rises clear of the monitor only
+        // when the agent is blocked on you, breathing at well under 1Hz. Nothing
+        // else in the room is allowed to move like this.
         if d == Desk::Attention {
             let rise = ((t * 3.0).min(1.0) * 8.0) as i32;
-            let y = r + 16 - rise;
-            b.fill(cx + 20, y + 6, 2, r + 20 - (y + 6), METAL_DK);
+            let y = r + 14 - rise;
+            b.fill(cx + 20, y + 6, 2, r + MON_TOP - 7 - (y + 6), METAL_DK);
             let pulse = 0.75 + 0.25 * (t * 2.2).sin();
             b.fill(cx + 16, y, 10, 7, ATTENTION.alpha(pulse));
             b.fill(cx + 18, y + 3, 2, 1, rgb(0x3a, 0x2c, 0x10));
             b.fill(cx + 22, y + 3, 2, 1, rgb(0x3a, 0x2c, 0x10));
-        }
-        // Finished work stacks in the out-tray. Accumulation, not a number.
-        if d == Desk::Done {
-            b.fill(cx + 22, r + 52, 10, 4, METAL_DK);
-            for k in 0..3 {
-                b.fill(cx + 23, r + 50 - k, 8, 1, PAPER);
-            }
-        }
-        // Not every desk keeps a plant, and which ones do is fixed by slot so a
-        // desk's clutter is as stable as its position.
-        if hash(i as i64, 0x91) % 5 < 2 {
-            succulent(b, cx + 30, r + 50);
-        }
-        // The mug lives on the desk except in the phase it is being drunk from.
-        if d == Desk::Working && job != Some(Task::Sipping) {
-            b.fill(cx - 13, r + 50, 5, 6, CERAMIC);
-            b.fill(cx - 8, r + 51, 2, 3, CERAMIC);
         }
     }
 
@@ -999,7 +1095,7 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         b.fill(cx - 34, fy, SLOT_W - 8, 1, PAPER.alpha(0.7));
         b.fill(cx - 34, fy, 1, 4, PAPER.alpha(0.7));
         b.fill(cx + 33, fy, 1, 4, PAPER.alpha(0.7));
-        b.fill(cx - 34, r + 14, SLOT_W - 8, ROW_H - 26, PAPER.alpha(0.03));
+        b.fill(cx - 34, r + 10, SLOT_W - 8, ROW_H - 22, PAPER.alpha(0.03));
     }
 }
 
