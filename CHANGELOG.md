@@ -33,8 +33,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   terminal's — this is a picture in the corner of the eye, not a progress bar), output scrolling up under it,
   a highlighted choice waiting when an agent is blocked. Each occupied desk has a bias light
   behind its monitor washing the wall warm, off at a free desk. Every desk keeps a plant, in one of four
-  sizes chosen by slot so a desk's clutter is as stable as its position, with more growth
-  trailing from the clerestory sill. The figures sit properly: a task chair with a gas post
+  sizes chosen by slot so a desk's clutter is as stable as its position, and that is all
+  the greenery there is: the clerestory and the near floor stay clear so they read as a
+  ceiling and a walkway. The figures sit properly: a task chair with a gas post
   and a castor base, a torso of about two head-heights, a thigh running forward under a
   cantilevered desktop whose pedestal is on the far side, and a shin and foot down to the
   floor. The near floor is a shallow walkway with a cable trunk rather than a deep empty

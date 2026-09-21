@@ -583,9 +583,6 @@ fn clerestory(b: &mut Buf, weather: Weather, t: f32) {
     }
     // Sill under the glass, then the light fixtures.
     b.fill(0, 36, W, 2, TRIM);
-    trailing(b, 72, 38, 0x11);
-    trailing(b, 186, 38, 0x22);
-    trailing(b, 296, 38, 0x33);
     b.fill(0, CEIL_H - 3, W, 2, TRIM);
     for c in 0..COLS {
         let cx = c as i32 * SLOT_W + SLOT_W / 2;
@@ -806,24 +803,14 @@ fn screen(b: &mut Buf, sx: i32, sy: i32, sw: i32, sh: i32, d: Desk, t: f32, seed
     }
 }
 
-/// A pot on the clerestory sill with its growth hanging down the wall. The only
-/// greenery that is not on a desk: the floor is kept clear so the foreground
-/// reads as a walkway rather than as a shelf of pot plants.
-fn trailing(b: &mut Buf, x: i32, y: i32, seed: i64) {
-    b.fill(x, y, 13, 4, POT);
-    b.fill(x, y, 13, 1, POT_DK);
-    for i in 0..6i64 {
-        let len = 9 + (hash(seed, i) % 16) as i32;
-        let c = if i % 2 == 0 { PLANT } else { PLANT_LT };
-        b.fill(x + 1 + i as i32 * 2, y + 4, 1, len, c);
-        b.fill(x + 1 + i as i32 * 2, y + 4 + len - 2, 2, 3, c);
-    }
-}
-
 /// A plant for the end of a desk, in four sizes. Which one a desk gets is fixed
 /// by its slot, so the clutter on a desk is as stable as the desk's position and
 /// a row of five reads as five people rather than one stamped five times.
 /// `base` is the desk surface; the plant grows up from it.
+///
+/// All the greenery in the room is here. The clerestory and the near floor stay
+/// clear so they read as a ceiling and a walkway; plants put in either of them
+/// read as a garden centre, and both were tried.
 fn desk_plant(b: &mut Buf, x: i32, base: i32, variant: u32, seed: i64) {
     let green = |k: i64| [PLANT_DK, PLANT, PLANT_LT, PLANT_HI][(hash(seed, k) % 4) as usize];
     match variant {
