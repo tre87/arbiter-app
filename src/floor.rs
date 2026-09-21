@@ -1076,17 +1076,30 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
             }
         }
 
-        // The one signal object: a paddle that rises clear of the monitor only
-        // when the agent is blocked on you, breathing at well under 1Hz. Nothing
-        // else in the room is allowed to move like this.
-        if d == Desk::Attention {
-            let rise = ((t * 3.0).min(1.0) * 8.0) as i32;
-            let y = r + 14 - rise;
-            b.fill(cx + 20, y + 6, 2, r + MON_TOP - 7 - (y + 6), METAL_DK);
-            let pulse = 0.75 + 0.25 * (t * 2.2).sin();
-            b.fill(cx + 16, y, 10, 7, ATTENTION.alpha(pulse));
-            b.fill(cx + 18, y + 3, 2, 1, rgb(0x3a, 0x2c, 0x10));
-            b.fill(cx + 22, y + 3, 2, 1, rgb(0x3a, 0x2c, 0x10));
+        // The one signal object: an andon, the light over a workstation that has
+        // meant "this one needs a person" on factory floors for sixty years. It
+        // is bolted to the wall above every desk and it is always this shape;
+        // only the lens changes. That matters twice over. Nothing pops into
+        // existence, so the eye is caught by a colour rather than by a new
+        // object; and a lamp cannot be mistaken for a face, which the paddle it
+        // replaces was, two dark pixels being quite enough to read as eyes in a
+        // room whose whole argument is that nothing here is a mascot.
+        let lit = d == Desk::Attention;
+        if lit {
+            b.fill_checker(cx + 6, r + 1, 22, 15, ATTENTION.alpha(0.16));
+        }
+        b.fill(cx + 11, r + 2, 12, 7, METAL_DK);
+        b.fill(cx + 11, r + 2, 12, 1, METAL);
+        b.fill(cx + 16, r + 9, 2, 3, METAL_DK);
+        if lit {
+            // Breathing at about a third of a hertz: findable from across the
+            // room, and never fast enough to pull an eye off something else.
+            let pulse = 0.72 + 0.28 * (t * 2.2).sin();
+            b.fill(cx + 12, r + 4, 10, 4, ATTENTION.alpha(pulse));
+            b.fill(cx + 12, r + 4, 10, 1, ATTENTION);
+        } else {
+            b.fill(cx + 12, r + 4, 10, 4, rgb(0x2b, 0x33, 0x3d));
+            b.fill(cx + 12, r + 4, 10, 1, rgb(0x35, 0x3e, 0x49));
         }
     }
 

@@ -31,7 +31,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
   state it is best at: Claude's own spinner turning while a turn is in flight (out of phase
   per desk, so five agents are not five copies of one frame, and paced well below a
   terminal's — this is a picture in the corner of the eye, not a progress bar), output scrolling up under it,
-  a highlighted choice waiting when an agent is blocked. Each occupied desk has a bias light
+  a highlighted choice waiting when an agent is blocked. A blocked agent also lights the
+  andon over its desk: a lamp bolted to the wall above every workstation, dark until it is
+  needed, so what catches the eye is a colour rather than an object appearing from nowhere.
+  Each occupied desk has a bias light
   behind its monitor washing the wall warm, off at a free desk. Every desk keeps a plant, in one of four
   sizes chosen by slot so a desk's clutter is as stable as its position, and that is all
   the greenery there is: the clerestory and the near floor stay clear so they read as a
