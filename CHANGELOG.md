@@ -29,7 +29,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
   desks, because reading an agent's state must never depend on the weather. Monitors face
   the camera while the figure beside them stays in profile, so the screen can carry the
   state it is best at: Claude's own spinner turning while a turn is in flight (out of phase
-  per desk, so five agents are not five copies of one frame), output scrolling up under it,
+  per desk, so five agents are not five copies of one frame, and paced well below a
+  terminal's — this is a picture in the corner of the eye, not a progress bar), output scrolling up under it,
   a highlighted choice waiting when an agent is blocked. Each occupied desk has a bias light
   behind its monitor washing the wall warm, off at a free desk. Every desk keeps a plant, in one of four
   sizes chosen by slot so a desk's clutter is as stable as its position, with more growth

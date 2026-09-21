@@ -718,8 +718,22 @@ const SPINNER: [[u8; 7]; 3] = [
     [0x41, 0x22, 0x14, 0x08, 0x14, 0x22, 0x41],
 ];
 /// Out and back, so the star reads as turning rather than flicking between two
-/// poses. Four steps at 8fps is one revolution every half second.
+/// poses.
 const SPINNER_ORDER: [usize; 4] = [0, 1, 2, 1];
+
+// Everything below is deliberately slower than a spinner in a terminal. This is
+// a picture somebody leaves open all day in the corner of their eye, not a
+// progress bar they are waiting on: at a glance it should read as "turning",
+// and never pull the eye off whatever they are actually doing.
+/// Spinner steps per second. Four steps to a revolution, so one turn per 1.3s.
+const SPIN_HZ: f32 = 3.0;
+/// Lines of output per second on a working screen.
+const OUT_HZ: f32 = 1.1;
+/// Lines per second for a plain shell command, which streams faster than a turn.
+const RUN_HZ: f32 = 1.6;
+/// Sprite cadence for hands and pens. Chunky on purpose: smooth motion reads as
+/// an animation, chunky motion reads as a machine.
+const SPRITE_FPS: f32 = 7.0;
 
 fn spinner(b: &mut Buf, x: i32, y: i32, c: Rgba, frame: i64) {
     let glyph = &SPINNER[SPINNER_ORDER[frame.rem_euclid(4) as usize]];
@@ -752,7 +766,7 @@ fn screen(b: &mut Buf, sx: i32, sy: i32, sw: i32, sh: i32, d: Desk, t: f32, seed
     let body = METAL_LT.alpha(0.3);
     match d {
         Desk::Working => {
-            spinner(b, sx + (sw - 7) / 2, sy + 3, g, (t * 8.0) as i64 + seed);
+            spinner(b, sx + (sw - 7) / 2, sy + 3, g, (t * SPIN_HZ) as i64 + seed);
             out_lines(
                 b,
                 sx + 2,
@@ -760,7 +774,7 @@ fn screen(b: &mut Buf, sx: i32, sy: i32, sw: i32, sh: i32, d: Desk, t: f32, seed
                 sw - 8,
                 3,
                 g.alpha(0.4),
-                (t * 2.5) as i64 + seed * 5,
+                (t * OUT_HZ) as i64 + seed * 5,
             );
         }
         Desk::Running => out_lines(
@@ -770,7 +784,7 @@ fn screen(b: &mut Buf, sx: i32, sy: i32, sw: i32, sh: i32, d: Desk, t: f32, seed
             sw - 8,
             7,
             body,
-            (t * 3.5) as i64 + seed * 5,
+            (t * RUN_HZ) as i64 + seed * 5,
         ),
         Desk::Ready => {
             out_lines(b, sx + 2, sy + 4, sw - 8, 3, body, 7);
@@ -825,19 +839,19 @@ fn desk_plant(b: &mut Buf, x: i32, base: i32, variant: u32, seed: i64) {
             b.fill(x, base - 5, 7, 5, POT);
             b.fill(x, base - 6, 7, 1, POT_DK);
             for k in 0..3i64 {
-                let h = 4 + (hash(seed, k) % 4) as i32;
+                let h = 3 + (hash(seed, k) % 3) as i32;
                 b.fill(x + 1 + k as i32 * 2, base - 6 - h, 2, h, green(k));
             }
             b.fill(x + 1, base - 8, 5, 2, green(9));
         }
         // Tall fronds, the one that reads from across the room.
         2 => {
-            b.fill(x + 1, base - 7, 5, 7, POT);
-            b.fill(x + 1, base - 8, 5, 1, POT_DK);
+            b.fill(x + 1, base - 5, 5, 5, POT);
+            b.fill(x + 1, base - 6, 5, 1, POT_DK);
             for k in 0..3i64 {
-                let h = 7 + (hash(seed, k) % 6) as i32;
-                b.fill(x + 1 + k as i32 * 2, base - 8 - h, 1, h, green(k));
-                b.fill(x + k as i32 * 2, base - 9 - h, 3, 2, green(k + 4));
+                let h = 3 + (hash(seed, k) % 3) as i32;
+                b.fill(x + 1 + k as i32 * 2, base - 6 - h, 1, h, green(k));
+                b.fill(x + k as i32 * 2, base - 7 - h, 3, 2, green(k + 4));
             }
         }
         // Growth spilling over the desk edge.
@@ -890,7 +904,7 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     let occupied = d != Desk::Empty;
     // 12fps sprite cadence: smooth motion reads as an animation, chunky motion
     // reads as a machine.
-    let frame = (t * 12.0) as i64;
+    let frame = (t * SPRITE_FPS) as i64;
     let job = (d == Desk::Working).then(|| task(i, t));
     // Idle, done and pondering slump back into the chair. Posture is a free
     // state channel and it costs no colour. Only the upper body leans: the legs
@@ -904,7 +918,7 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     // loudness budget in one place.
     if let Some(g) = glow {
         let b0 = match d {
-            Desk::Working => 0.10 + 0.03 * (t * 9.0).sin(),
+            Desk::Working => 0.10 + 0.02 * (t * 1.6).sin(),
             Desk::Attention => 0.07 + 0.03 * (t * 1.9).sin(),
             _ => 0.04,
         };
@@ -1064,13 +1078,14 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         // The mug and the out-tray share the near end of the desk, which they
         // can because Working and Done never happen at the same desk at once.
         if d == Desk::Working && job != Some(Task::Sipping) {
-            b.fill(cx - 13, r + DESK_Y - 6, 5, 6, CERAMIC);
-            b.fill(cx - 8, r + DESK_Y - 5, 2, 3, CERAMIC);
+            b.fill(cx + 9, r + DESK_Y - 6, 5, 6, CERAMIC);
+            b.fill(cx + 14, r + DESK_Y - 5, 2, 3, CERAMIC);
+            b.fill(cx + 9, r + DESK_Y - 6, 5, 1, rgb(0xa5, 0xac, 0xb4));
         }
         if d == Desk::Done {
-            b.fill(cx - 14, r + DESK_Y - 4, 10, 4, METAL_DK);
+            b.fill(cx + 18, r + DESK_Y - 4, 11, 4, METAL_DK);
             for k in 0..3 {
-                b.fill(cx - 13, r + DESK_Y - 6 - k, 8, 1, PAPER);
+                b.fill(cx + 19, r + DESK_Y - 6 - k, 9, 1, PAPER);
             }
         }
 
