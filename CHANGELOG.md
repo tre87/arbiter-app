@@ -7,6 +7,44 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **A file explorer beside the terminals.** Settings, General, "Show the file explorer" (off
+  by default) puts a folder button in the titlebar and on Ctrl+Shift+F. The first press in a
+  workspace asks for a folder, the way Open Folder does in VS Code; after that the button
+  shows and hides the pane. It hugs the left edge, stays out of Ctrl+Shift+E, and is dragged
+  to any width. The tree brings back the file-type icons, chevrons, git colours and
+  right-click menu of the explorer retired with project workspaces, with a folder now
+  carrying the strongest git state beneath it, and with New file, New folder, Copy path and
+  Copy relative path added. A file watcher keeps it current without polling, and each
+  workspace remembers its folder, width and expanded folders across a restart.
+- **A built-in editor.** Double-click a file in the explorer, or right-click and Open, and it
+  opens in an editor with line numbers, syntax colouring by file type, undo and redo, cut,
+  copy, paste and select all, a tab per file and a right-click menu. A `.vue` file colours
+  its template, script and style blocks with the HTML, JavaScript and CSS grammars at once;
+  TOML is bundled too, which syntect does not ship. The editor takes the terminals' place
+  while it shows and the explorer's toggle brings them back, so nothing typed into it can
+  reach a terminal you cannot see. Open tabs are remembered per workspace, though a relaunch
+  always opens on the terminals. A file changed by something else reloads by itself when you
+  have no unsaved edits, and asks first when you do, checked when you switch to its tab and
+  when the watcher reports it. Ctrl+S saves, Ctrl+W closes a tab, and quitting with unsaved
+  work always asks, whatever the quit setting says.
+- **A second iced crate is forked.** `vendor/iced_widget` carries a one-line fix: iced
+  0.13's text editor hit-tests a click with the padding applied to swapped axes, so an
+  editor with uneven padding puts the caret nowhere near the pointer. The editor's line
+  numbers are drawn inside its own left padding, which is what lets a drag across them
+  keep selecting instead of stopping at the gutter's edge.
+- **A crash now leaves a note behind.** Panics are appended to `panic.log` in Arbiter's data
+  folder with the build they came from. A release build on Windows has no console, and
+  Windows Error Reporting does not record a Rust panic, so until now a crash took the window
+  down leaving nothing at all to read. `ARBITER_OPEN_FILE` opens files in the editor at
+  startup, so a fault can be reproduced without driving the UI by hand.
+- **Send to Agent.** Select text in the editor and the top item of its right-click menu sends
+  it to the Claude running in that workspace, as a fenced block carrying the file's full path
+  and line numbers, with the cursor left two lines below it ready for your question. One
+  Claude gets it directly; with several, a short list asks which, and with none the same list
+  offers every terminal in the workspace. Arrows and Enter or a click choose, Escape cancels.
+  Sending hides the editor and focuses the terminal it went to.
+
 ## [1.5.1] - 2026-09-21
 
 ### Added

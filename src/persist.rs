@@ -109,6 +109,34 @@ pub struct SavedWindow {
 pub struct SavedWorkspace {
     pub name: String,
     pub layout: SavedNode,
+    /// The workspace's file explorer, once a folder has been picked for it.
+    #[serde(default)]
+    pub explorer: Option<SavedExplorer>,
+    /// Files open in the editor, as absolute paths. Kept on the workspace rather
+    /// than inside `explorer` so closing the explorer pane does not lose them.
+    #[serde(default)]
+    pub editor_tabs: Vec<String>,
+    #[serde(default)]
+    pub editor_active: Option<usize>,
+}
+
+/// Default width of the explorer pane, in logical pixels.
+pub fn default_explorer_width() -> f32 {
+    260.0
+}
+
+/// A workspace's file explorer. The editor's visibility is deliberately absent:
+/// a restart comes back to the terminals, with the tabs still open behind them.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SavedExplorer {
+    pub root: String,
+    #[serde(default = "default_explorer_width")]
+    pub width: f32,
+    #[serde(default)]
+    pub shown: bool,
+    /// Absolute paths of the expanded folders.
+    #[serde(default)]
+    pub expanded: Vec<String>,
 }
 
 /// User-tweakable preferences (the Settings dialog). Kept small + serialised whole
@@ -205,6 +233,11 @@ pub struct Settings {
     /// workspace's first terminal starts.
     #[serde(default = "default_true")]
     pub split_keeps_cwd: bool,
+    /// Offer the file explorer: a folder button in the titlebar and Ctrl+Shift+F.
+    /// Off by default, like the Wake-on-LAN button, so nothing appears for anyone
+    /// who only wants terminals. Off hides an open explorer without forgetting it.
+    #[serde(default)]
+    pub show_file_explorer: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -320,6 +353,7 @@ impl Default for Settings {
             notify_attention: true,
             notify_finished: true,
             split_keeps_cwd: true,
+            show_file_explorer: false,
         }
     }
 }
@@ -424,9 +458,20 @@ mod tests {
                             remote_session: Some("abc-123".into()),
                         }),
                     },
+                    explorer: Some(SavedExplorer {
+                        root: "/tmp/project".into(),
+                        width: 300.0,
+                        shown: true,
+                        expanded: vec!["/tmp/project/src".into()],
+                    }),
+                    editor_tabs: vec!["/tmp/project/src/main.rs".into()],
+                    editor_active: Some(0),
                 },
                 SavedWorkspace {
                     name: "Workspace 2".into(),
+                    explorer: None,
+                    editor_tabs: Vec::new(),
+                    editor_active: None,
                     layout: SavedNode::Leaf {
                         name: "Terminal 1".into(),
                         shell: SavedShell::PowerShell,
@@ -451,6 +496,14 @@ mod tests {
         assert_eq!(back.active, 1);
         assert_eq!(back.workspaces.len(), 2);
         assert_eq!(back.main_window.unwrap().width, 1200.0);
+        let explorer = back.workspaces[0].explorer.as_ref().expect("explorer round-trips");
+        assert_eq!(explorer.root, "/tmp/project");
+        assert_eq!(explorer.width, 300.0);
+        assert!(explorer.shown);
+        assert_eq!(explorer.expanded, vec!["/tmp/project/src".to_string()]);
+        assert_eq!(back.workspaces[0].editor_tabs, vec!["/tmp/project/src/main.rs".to_string()]);
+        assert_eq!(back.workspaces[0].editor_active, Some(0));
+        assert!(back.workspaces[1].explorer.is_none());
         match &back.workspaces[0].layout {
             SavedNode::Split { vertical, ratio, a, b } => {
                 assert!(*vertical);
@@ -511,6 +564,10 @@ mod tests {
         assert!(s.settings.hide_sonnet_usage);
         assert!(!s.settings.hide_usage_bar);
         assert!(!s.settings.show_fable_usage);
+        // The file explorer is opt-in, and a save from before it existed has none.
+        assert!(!s.settings.show_file_explorer);
+        assert!(s.workspaces[0].explorer.is_none());
+        assert!(s.workspaces[0].editor_tabs.is_empty());
         match &s.workspaces[0].layout {
             SavedNode::Leaf {
                 claude_running,

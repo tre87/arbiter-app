@@ -37,6 +37,11 @@ use arbiter_native::term::{MouseModes, SelectKind};
 #[cfg(feature = "usage-helper")]
 mod usage_helper;
 
+/// Per-file-type icons for the explorer tree (MDI paths + colours).
+mod file_icons;
+/// The file explorer pane and the editor it opens files into.
+mod files_pane;
+
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).
 #[derive(Clone, Copy, PartialEq)]
@@ -58,6 +63,12 @@ struct Workspace {
     panes: pane_grid::State<PaneData>,
     focus: pane_grid::Pane,
     name: String,
+    /// The workspace's file explorer, once a folder has been picked for it. It
+    /// hugs the left edge outside the `pane_grid`, which is what keeps it out of
+    /// Ctrl+Shift+E while still letting it be dragged to any width.
+    explorer: Option<files_pane::Explorer>,
+    /// Files opened from the explorer. Shown in place of the terminal grid.
+    editor: files_pane::Editor,
 }
 
 impl Workspace {
@@ -70,7 +81,13 @@ impl Workspace {
             history_id,
         };
         let (panes, first) = pane_grid::State::new(first_pane);
-        Workspace { panes, focus: first, name }
+        Workspace {
+            panes,
+            focus: first,
+            name,
+            explorer: None,
+            editor: files_pane::Editor::default(),
+        }
     }
 
     /// The next terminal name for THIS workspace: the lowest unused "Terminal N"
@@ -222,6 +239,18 @@ struct State {
     /// The workspace tab the cursor is over (for hover styling — the tabs are now
     /// mouse_areas, not buttons, so hover is tracked here).
     hovered_tab: Option<usize>,
+    /// Open file-explorer right-click menu (anchor + the row it was opened on).
+    explorer_menu: Option<files_pane::Menu>,
+    /// The one-field dialog behind Rename, New file and New folder.
+    explorer_prompt: Option<files_pane::Prompt>,
+    /// Entries waiting on a "move to trash" confirmation.
+    explorer_delete: Option<files_pane::Delete>,
+    /// An explorer-width drag in progress (see `files_pane::drag_overlay`).
+    explorer_drag: Option<files_pane::Drag>,
+    /// Open editor right-click menu, at this anchor.
+    editor_menu: Option<(f32, f32)>,
+    /// The "send this to which terminal" picker, while it waits for an answer.
+    send_target: Option<files_pane::SendTarget>,
 }
 
 /// A workspace-tab drag-reorder in progress.
@@ -506,6 +535,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 enum Message {
+    /// Everything the file explorer and the editor do, nested so this enum grows
+    /// by one variant rather than forty (see `files_pane::Msg`).
+    Files(files_pane::Msg),
     Tick,
     /// No-op whose only purpose is to make iced redraw — sent by the terminal-output
     /// wake (a PTY reader produced output) so the grid renders without polling.
@@ -1230,12 +1262,25 @@ fn poll_connection_signals(state: &mut State) -> Task<Message> {
 fn restore_workspaces(
     saved: persist::SavedState,
     git_bash: Option<&str>,
+    win_w: f32,
 ) -> Option<(Vec<Workspace>, usize)> {
+    let explorer_on = saved.settings.show_file_explorer;
     let mut workspaces = Vec::new();
     for sw in saved.workspaces {
         let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
         let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
-        workspaces.push(Workspace { panes, focus, name: sw.name });
+        workspaces.push(Workspace {
+            panes,
+            focus,
+            name: sw.name,
+            explorer: sw
+                .explorer
+                .as_ref()
+                .and_then(|e| files_pane::from_saved(e, win_w, explorer_on)),
+            // The tabs come back, the editor does not: a relaunch opens on the
+            // terminals, and each tab reads its file when it is first shown.
+            editor: files_pane::editor_from_saved(&sw.editor_tabs, sw.editor_active),
+        });
     }
     if workspaces.is_empty() {
         return None;
@@ -1423,9 +1468,15 @@ fn save_session(state: &State) {
         workspaces: state
             .workspaces
             .iter()
-            .map(|ws| persist::SavedWorkspace {
-                name: ws.name.clone(),
-                layout: node_to_saved(&ws.panes, ws.panes.layout()),
+            .map(|ws| {
+                let (editor_tabs, editor_active) = files_pane::saved_tabs(&ws.editor);
+                persist::SavedWorkspace {
+                    name: ws.name.clone(),
+                    layout: node_to_saved(&ws.panes, ws.panes.layout()),
+                    explorer: ws.explorer.as_ref().map(files_pane::to_saved),
+                    editor_tabs,
+                    editor_active,
+                }
             })
             .collect(),
     });
@@ -1460,7 +1511,9 @@ fn gc_history_files(state: &State) {
 /// `WindowClosed(main)` path that saves the session and exits. Shared by the macOS
 /// close button / Cmd+Q (via `RequestQuit`) and the Windows caption × (`WinClose`).
 fn begin_quit(state: &mut State) -> Task<Message> {
-    if state.settings.confirm_on_quit {
+    // Unsaved edits always ask, whatever the quit setting says: they are the one
+    // thing here that cannot be respawned on the next launch.
+    if state.settings.confirm_on_quit || !files_pane::unsaved_names(state).is_empty() {
         state.quit_confirm = true;
         Task::none()
     } else {
@@ -1488,11 +1541,21 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
         return true;
     }
     if state.notice.is_some() { take!(state.notice) }
+    if state.send_target.is_some() { take!(state.send_target) }
+    // The editor's two dialogs live on the active workspace. Escape answers each
+    // the conservative way: keep the tab, keep the edits.
+    if files_pane::dismiss_dialog(state) {
+        return true;
+    }
     if state.close_confirm.is_some() { take!(state.close_confirm) }
     if state.quit_confirm { take!(state.quit_confirm) }
     if state.usage_login_prompt { take!(state.usage_login_prompt) }
     if state.rename_terminal.is_some() { take!(state.rename_terminal) }
+    if state.explorer_prompt.is_some() { take!(state.explorer_prompt) }
+    if state.explorer_delete.is_some() { take!(state.explorer_delete) }
     if state.term_menu.is_some() { take!(state.term_menu) }
+    if state.editor_menu.is_some() { take!(state.editor_menu) }
+    if state.explorer_menu.is_some() { take!(state.explorer_menu) }
     if state.ws_tab_menu.is_some() { take!(state.ws_tab_menu) }
     if state.wol_menu.is_some() { take!(state.wol_menu) }
     if state.usage_org_menu { take!(state.usage_org_menu) }
@@ -1505,6 +1568,7 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        Message::Files(m) => return files_pane::update(state, m),
         // A no-op: processing any message makes iced redraw, which is the whole point
         // (the terminal-output wake fires this so new PTY output renders on-demand).
         Message::Redraw => {
@@ -1603,6 +1667,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     _ => Task::none(),
                 };
             }
+            // The "send to which terminal" picker takes the arrows and Enter the
+            // same way, and swallows the rest.
+            if let Some(task) = files_pane::send_target_input(state, bytes.as_slice()) {
+                return task;
+            }
+            // The terminals are behind the editor, so nothing typed into it may
+            // reach them. Keys the editor itself handles never come through here.
+            if files_pane::editor_visible(state) {
+                return Task::none();
+            }
             let name_sessions = state.settings.name_remote_claude_sessions;
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
@@ -1641,6 +1715,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ShiftEnter => {
             if state.connect_prompt.is_some() {
                 return connect_answer(state, true);
+            }
+            if files_pane::editor_visible(state) {
+                return Task::none();
             }
             // Claude (Ink) wants the kitty Shift+Enter sequence to insert a
             // newline; a plain shell would echo those bytes as garbage, so send
@@ -1684,6 +1761,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Close => {
             state.term_menu = None;
+            // Ctrl+Shift+W with the editor up closes the tab, not a terminal the
+            // user cannot currently see.
+            if files_pane::editor_visible(state) {
+                if let Some(i) = state.active().editor.active {
+                    return files_pane::update(state, files_pane::Msg::TabClose(i));
+                }
+            }
             let ws = state.active_mut();
             if let Some((_, sibling)) = ws.panes.close(ws.focus) {
                 ws.focus = sibling;
@@ -2180,6 +2264,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::ToggleFind => {
+            // The find bar belongs to a terminal; with the editor over them it
+            // would open where nothing can see it.
+            if files_pane::editor_visible(state) {
+                return Task::none();
+            }
             if state.find_open {
                 state.find_open = false;
                 with_focused_term(state, |t| t.clear_search());
@@ -2207,6 +2296,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             } else if state.find_open {
                 state.find_open = false;
                 with_focused_term(state, |t| t.clear_search());
+            } else if files_pane::editor_visible(state) {
+                // The editor has it (the widget unfocuses on Escape); a raw ESC
+                // must not reach the terminal hidden behind it.
             } else {
                 let ws = state.active_mut();
                 if let Some(p) = ws.panes.get_mut(ws.focus) {
@@ -2728,6 +2820,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Copy(allow_interrupt) => {
             state.term_menu = None;
+            // With the editor up, a Ctrl+C the editor did not take must not
+            // become an interrupt for the terminal hidden behind it.
+            if files_pane::editor_visible(state) {
+                return files_pane::update(state, files_pane::Msg::Copy);
+            }
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
                 let text = if let Ok(mut t) = p.session.term().lock() {
@@ -2756,29 +2853,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Paste => {
             state.term_menu = None;
+            if files_pane::editor_visible(state) {
+                return files_pane::update(state, files_pane::Msg::Paste);
+            }
             return iced::clipboard::read().map(Message::Pasted);
         }
         Message::Pasted(text) => {
             if let Some(text) = text.filter(|t| !t.is_empty()) {
                 let ws = state.active_mut();
-                if let Some(p) = ws.panes.get_mut(ws.focus) {
-                    // Pasting, like typing, returns the view to the live bottom (the paste
-                    // lands at the prompt) and clears the selection.
-                    let bracketed = if let Ok(mut t) = p.session.term().lock() {
-                        t.scroll_to_bottom();
-                        t.clear_selection();
-                        t.bracketed_paste()
-                    } else {
-                        false
-                    };
-                    if bracketed {
-                        p.session.write(b"\x1b[200~");
-                        p.session.write(text.as_bytes());
-                        p.session.write(b"\x1b[201~");
-                    } else {
-                        p.session.write(text.as_bytes());
-                    }
-                }
+                let focus = ws.focus;
+                paste_into(ws, focus, &text);
             }
         }
         Message::SwitchShell(pane) => {
@@ -2930,6 +3014,71 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Paste text into one pane, wrapped in bracketed-paste markers when the program
+/// there asked for them. That wrapping is what stops a multi-line paste being
+/// submitted line by line, which is why "Send to Agent" goes through here too.
+fn paste_into(ws: &mut Workspace, pane: pane_grid::Pane, text: &str) {
+    let Some(p) = ws.panes.get_mut(pane) else { return };
+    // Pasting, like typing, returns the view to the live bottom (the paste lands
+    // at the prompt) and clears the selection.
+    let bracketed = if let Ok(mut t) = p.session.term().lock() {
+        t.scroll_to_bottom();
+        t.clear_selection();
+        t.bracketed_paste()
+    } else {
+        false
+    };
+    if bracketed {
+        p.session.write(b"\x1b[200~");
+        p.session.write(text.as_bytes());
+        p.session.write(b"\x1b[201~");
+    } else {
+        p.session.write(text.as_bytes());
+    }
+}
+
+/// Show a path in the OS file manager, selected (web `reveal_path`). Best-effort.
+fn reveal_path(path: &str) {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").args(["-R", path]).spawn();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // No space after the comma: explorer.exe treats one as part of the path.
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select this file", so open the folder holding it.
+        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// What the "reveal" menu item is called on this OS.
+fn reveal_label() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Reveal in File Explorer"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Reveal in Finder"
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "Open containing folder"
+    }
+}
+
 /// Open a file/dir with its default app (web `open_path`). Best-effort.
 fn open_path(path: &str) {
     if !std::path::Path::new(path).exists() {
@@ -2979,6 +3128,32 @@ fn open_or_create_config(path: Option<std::path::PathBuf>, default: &str) {
     open_path(&path.to_string_lossy());
 }
 
+/// Whether anything is layered over the workspace. A focused `text_editor` sits
+/// under every modal in the view stack and would otherwise capture the arrows
+/// and Enter a dialog is waiting for, so its key bindings stand down while this
+/// is true. Mirrors `modal_overlay`.
+fn modal_is_open(state: &State) -> bool {
+    state.connect_prompt.is_some()
+        || state.notice.is_some()
+        || state.send_target.is_some()
+        || state.close_confirm.is_some()
+        || state.quit_confirm
+        || state.usage_login_prompt
+        || state.rename_terminal.is_some()
+        || state.explorer_prompt.is_some()
+        || state.explorer_delete.is_some()
+        || state.term_menu.is_some()
+        || state.editor_menu.is_some()
+        || state.explorer_menu.is_some()
+        || state.ws_tab_menu.is_some()
+        || state.wol_menu.is_some()
+        || state.usage_org_menu
+        || state.rename_ws.is_some()
+        || state.rename_confirm.is_some()
+        || state.shortcuts_open
+        || state.settings_open
+}
+
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     // First: every restored connection is held until this is answered, so it outranks
     // anything else that might be open.
@@ -2988,11 +3163,20 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if let Some(n) = &state.notice {
         return Some(notice_view(n));
     }
+    if let Some(t) = &state.send_target {
+        return Some(files_pane::send_target_view(t));
+    }
+    if let Some(v) = files_pane::close_confirm_view(state) {
+        return Some(v);
+    }
+    if let Some(v) = files_pane::reload_view(state) {
+        return Some(v);
+    }
     if let Some(c) = &state.close_confirm {
         return Some(close_confirm_view(c));
     }
     if state.quit_confirm {
-        return Some(quit_confirm_view());
+        return Some(quit_confirm_view(&files_pane::unsaved_names(state)));
     }
     if state.usage_login_prompt {
         return Some(usage_login_prompt_view());
@@ -3000,8 +3184,20 @@ fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
     if let Some(rt) = &state.rename_terminal {
         return Some(rename_terminal_view(rt));
     }
+    if let Some(p) = &state.explorer_prompt {
+        return Some(files_pane::prompt_view(p));
+    }
+    if let Some(d) = &state.explorer_delete {
+        return Some(files_pane::delete_view(d));
+    }
     if let Some(m) = &state.term_menu {
         return Some(term_menu_view(state, m.x, m.y));
+    }
+    if let Some((x, y)) = state.editor_menu {
+        return Some(files_pane::editor_menu_view(state, x, y));
+    }
+    if let Some(m) = &state.explorer_menu {
+        return Some(files_pane::menu_view(state, m));
     }
     if let Some(m) = &state.ws_tab_menu {
         return Some(ws_tab_menu_view(state, m.index, m.x, m.y));
@@ -3526,6 +3722,18 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 Message::ToggleSplitKeepsCwd,
             ),
             Space::with_height(Length::Fixed(8.0)),
+            settings_section("Files"),
+            settings_toggle(
+                "Show the file explorer",
+                Some(
+                    "Put a folder button in the titlebar, on Ctrl+Shift+F, that opens a folder \
+                     tree down the left of the workspace. Files open in an editor that takes the \
+                     terminals' place while it shows.",
+                ),
+                state.settings.show_file_explorer,
+                files_pane::show_setting_msg,
+            ),
+            Space::with_height(Length::Fixed(8.0)),
             settings_section("Quitting"),
             settings_toggle(
                 "Confirm before quitting",
@@ -3835,7 +4043,7 @@ fn kbd_combo(keys: &str) -> Element<'static, Message> {
 /// The keyboard-shortcuts cheat sheet — a centred card listing every binding
 /// (Ctrl on all platforms, like the web).
 fn shortcuts_dialog_view() -> Element<'static, Message> {
-    const ROWS: [(&str, &str); 16] = [
+    const ROWS: [(&str, &str); 17] = [
         ("New workspace", "Ctrl + Shift + T"),
         ("Next workspace", "Ctrl + Tab"),
         ("Previous workspace", "Ctrl + Shift + Tab"),
@@ -3852,6 +4060,7 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
         ("Attach files", "Ctrl + Shift + A"),
         ("Wake a machine (Wake on LAN)", "Ctrl + Shift + M"),
         ("Show a test notification", "Ctrl + Shift + P"),
+        ("Toggle the file explorer", "Ctrl + Shift + F"),
     ];
     let mut list = column![].spacing(0);
     for (i, (action, keys)) in ROWS.iter().enumerate() {
@@ -4274,6 +4483,39 @@ fn quit_request_worker() -> impl iced::futures::Stream<Item = Message> {
             }
             while rx.try_recv().is_ok() {}
             let _ = output.send(Message::RequestQuit).await;
+        }
+    })
+}
+
+fn explorer_fs_subscription() -> Subscription<Message> {
+    Subscription::run(explorer_fs_worker)
+}
+
+/// Debounced filesystem changes under an explorer root, from the watcher thread
+/// to the UI. Same shape as `term_wake_worker`: event-driven, nothing polls.
+fn explorer_fs_worker() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(64, |mut output| async move {
+        use iced::futures::{SinkExt, StreamExt};
+        let (tx, mut rx) =
+            iced::futures::channel::mpsc::unbounded::<(std::path::PathBuf, Vec<std::path::PathBuf>)>();
+        arbiter_native::explorer::set_change_sink(Box::new(move |root, paths| {
+            let _ = tx.unbounded_send((root, paths));
+        }));
+        while let Some((root, mut paths)) = rx.next().await {
+            // Drain the backlog, merging batches for the same root so a burst
+            // (a branch switch, a build) reloads once.
+            let mut batches: Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)> = Vec::new();
+            while let Ok((r, p)) = rx.try_recv() {
+                match batches.iter_mut().find(|(br, _)| *br == r) {
+                    Some((_, bp)) => bp.extend(p),
+                    None if r == root => paths.extend(p),
+                    None => batches.push((r, p)),
+                }
+            }
+            batches.insert(0, (root, paths));
+            for (root, paths) in batches {
+                let _ = output.send(Message::Files(files_pane::Msg::FsChanged(root, paths))).await;
+            }
         }
     })
 }
@@ -5246,6 +5488,17 @@ fn primary_btn_style(t: &iced::Theme, s: button::Status) -> button::Style {
     button::Style { text_color: iced::Color::WHITE, ..button::primary(t, s) }
 }
 
+/// A destructive action: grey like Cancel but with red text, turning into a full
+/// red button on hover. The same look `close_confirm_view` has always had.
+fn danger_btn_style(t: &iced::Theme, s: button::Status) -> button::Style {
+    match s {
+        button::Status::Hovered | button::Status::Pressed => {
+            button::Style { text_color: iced::Color::WHITE, ..button::danger(t, s) }
+        }
+        _ => button::Style { text_color: t.palette().danger, ..button::secondary(t, s) },
+    }
+}
+
 /// The terminal rename dialog (context menu → Rename): a prefilled name input.
 fn rename_terminal_view(rt: &RenameTerminal) -> Element<'static, Message> {
     let input = text_input("Terminal name", &rt.text)
@@ -5329,10 +5582,18 @@ fn notice_view(n: &Notice) -> Element<'static, Message> {
 
 /// "Quit Arbiter?" confirmation (the app-close gesture), gated by `confirm_on_quit`.
 /// Mirrors `close_confirm_view`; the scrim / Cancel dismiss, Quit closes the app.
-fn quit_confirm_view() -> Element<'static, Message> {
+fn quit_confirm_view(unsaved: &[String]) -> Element<'static, Message> {
+    let body = match unsaved.len() {
+        0 => "All open terminals will be closed.".to_string(),
+        1 => format!("All open terminals will be closed, and {} has unsaved changes.", unsaved[0]),
+        n => format!(
+            "All open terminals will be closed, and {n} files have unsaved changes: {}.",
+            unsaved.join(", ")
+        ),
+    };
     let panel = column![
         text("Quit Arbiter?").size(15).font(ui_semibold()),
-        text("All open terminals will be closed.").size(13).color(TXT_SECONDARY),
+        text(body).size(13).color(TXT_SECONDARY),
         row![
             horizontal_space(),
             button(text("Cancel").size(13))
@@ -5417,6 +5678,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     // the terminal buttons are enabled (+ Windows caption strip).
     let actions_w = (if state.settings.show_terminal_buttons { 216.0 } else { 104.0 })
         + (if state.settings.show_wol_button { 34.0 } else { 0.0 })
+        + (if state.settings.show_file_explorer { 34.0 } else { 0.0 })
         + caption_w;
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
@@ -5501,6 +5763,14 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
             .push(action_icon_btn(mdi_path::CLOSE, Message::Close, false))
             .push(group_sep());
     }
+    // The file explorer, left of the overview button, only when switched on.
+    if state.settings.show_file_explorer {
+        actions = actions.push(action_icon_btn(
+            mdi_path::FOLDER,
+            Message::Files(files_pane::Msg::Toggle),
+            files_pane::shown(state).is_some(),
+        ));
+    }
     actions = actions
         .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()));
     // Wake-on-LAN, right of the overview button, only when switched on in Settings.
@@ -5538,11 +5808,14 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let has_git_bash = state.git_bash.is_some() && !state.settings.hide_shell_button;
     // Approx per-pane pixel widths (from the split ratios × the window width), so
     // the working bar can keep a constant glow size + sweep speed across panes.
+    // The explorer takes its width plus its handle out of what the grid gets.
+    let grid_w = state.main_size.width
+        - files_pane::shown(state).map_or(0.0, |e| e.width + files_pane::HANDLE_W);
     let pane_widths: HashMap<pane_grid::Pane, f32> = state
         .active()
         .panes
         .layout()
-        .pane_regions(2.0, iced::Size::new(state.main_size.width.max(1.0), state.main_size.height.max(1.0)))
+        .pane_regions(2.0, iced::Size::new(grid_w.max(1.0), state.main_size.height.max(1.0)))
         .into_iter()
         .map(|(p, r)| (p, r.width))
         .collect();
@@ -5712,9 +5985,21 @@ fn main_view(state: &State) -> Element<'_, Message> {
         .height(Length::Fixed(40.0))
         .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
 
+    // The file explorer hugs the left edge as a sibling of the grid, so
+    // Ctrl+Shift+E (which walks the pane_grid alone) never touches it. The row's
+    // shape is constant whether or not it is shown, so the grid's subtree, and
+    // with it every terminal's widget state, survives the toggle.
+    let content: Element<Message> =
+        if files_pane::editor_visible(state) { files_pane::editor_view(state) } else { grid.into() };
+    let left: Element<Message> = match files_pane::shown(state) {
+        Some(e) => row![files_pane::pane_view(state, e), files_pane::handle_view()].into(),
+        None => Space::new(Length::Fixed(0.0), Length::Fill).into(),
+    };
+    let body = row![left, content].width(Length::Fill).height(Length::Fill);
+
     // Workspace body, inset from the window edges (web padding `0 6px 6px` — flush
     // under the titlebar, 6px on the other three sides).
-    let framed = container(grid)
+    let framed = container(body)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 });
@@ -5728,20 +6013,32 @@ fn main_view(state: &State) -> Element<'_, Message> {
             background: Some(iced::Background::Gradient(app_glow_gradient())),
             ..Default::default()
         });
-    // Windows: overlay thin resize hit-zones at the window edges via a stack so
-    // the content layout/spacing stays byte-identical to macOS (no extra inset).
-    // The stack delivers a press to the top layer first and stops if it captures,
-    // so an edge press resizes without also triggering the titlebar drag beneath.
+    // One stack for the whole window, always, with the workspace as layer 0.
+    //
+    // The layers above it come and go, but none may ever be inserted BELOW or
+    // change the type of one already there: iced reconciles a tree by comparing
+    // widget tags position by position, and a mismatch throws away the state of
+    // everything beneath it. Wrapping the workspace in a fresh stack each time a
+    // menu opened did exactly that, and the editor lost its focus (and with it
+    // the drawn selection) the moment it was right-clicked.
+    let mut layers: Vec<Element<Message>> = vec![chrome.into()];
+    // Windows: thin resize hit-zones at the window edges, so the content layout
+    // stays byte-identical to macOS (no extra inset). The stack delivers a press
+    // to the top layer first and stops if it captures, so an edge press resizes
+    // without also triggering the titlebar drag beneath.
     #[cfg(target_os = "windows")]
-    let base: Element<Message> = iced::widget::stack([chrome.into(), resize_overlay()]).into();
-    #[cfg(not(target_os = "windows"))]
-    let base: Element<Message> = chrome.into();
-
-    // A modal or context menu, if open, layers over everything else.
-    match modal_overlay(state) {
-        Some(modal) => iced::widget::stack([base, modal]).into(),
-        None => base,
+    layers.push(resize_overlay());
+    // While the explorer's edge is being dragged, one window-wide layer collects
+    // the moves and the release: a `mouse_area` only reports while the cursor is
+    // inside it, and this one always is.
+    if state.explorer_drag.is_some() {
+        layers.push(files_pane::drag_overlay());
     }
+    // A modal or context menu, if open, layers over everything else.
+    if let Some(modal) = modal_overlay(state) {
+        layers.push(modal);
+    }
+    iced::widget::stack(layers).into()
 }
 
 /// Where card `i` goes, counted from the newest at 0: stacked upward from the lower right
@@ -6433,6 +6730,23 @@ fn cmdi(path: &'static str, size: f32, color: iced::Color) -> Element<'static, M
 mod mdi_path {
     // Context menu: "Rename to Repo Name" (was the retired footer's folder segment).
     pub const FOLDER: &str = "M20,18H4V8H20M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6Z";
+    // The file explorer and its editor. The first five are the icons the retired
+    // explorer used; the rest are new for the editor's menu and tab strip.
+    pub const OPEN_IN_APP: &str = "M12,10L8,14H11V20H13V14H16M19,4H5C3.89,4 3,4.89 3,6V18A2,2 0 0,0 5,20H9V18H5V8H19V18H15V20H19A2,2 0 0,0 21,18V6A2,2 0 0,0 19,4Z";
+    pub const FOLDER_OPEN: &str = "M6.1,10L4,18V8H21A2,2 0 0,0 19,6H12L10,4H4A2,2 0 0,0 2,6V18A2,2 0 0,0 4,20H19C19.9,20 20.7,19.4 20.9,18.5L23.2,10H6.1M19,18H6L7.6,12H20.6L19,18Z";
+    pub const DELETE: &str = "M9,3V4H4V6H5V19A2,2 0 0,0 7,21H17A2,2 0 0,0 19,19V6H20V4H15V3H9M7,6H17V19H7V6M9,8V17H11V8H9M13,8V17H15V8H13Z";
+    pub const CHEVRON_RIGHT: &str = "M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z";
+    pub const CHEVRON_DOWN: &str = "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z";
+    pub const FILE_PLUS_OUTLINE: &str = "M14 2H6C4.89 2 4 2.9 4 4V20C4 21.11 4.89 22 6 22H13.81C13.28 21.09 13 20.05 13 19C13 18.67 13.03 18.33 13.08 18H6V4H13V9H18V13C18.7 13 19.37 13.12 20 13.34V8L14 2M18 15V18H15V20H18V23H20V20H23V18H20V15H18Z";
+    pub const FOLDER_PLUS_OUTLINE: &str = "M20 6H12L10 4H4C2.9 4 2 4.9 2 6V18C2 19.1 2.9 20 4 20H20C21.1 20 22 19.1 22 18V8C22 6.9 21.1 6 20 6M20 18H4V6H9.17L11.17 8H20V18M11 12H13V14H15V16H13V18H11V16H9V14H11V12Z";
+    pub const FILE_DOCUMENT_EDIT_OUTLINE: &str = "M5 3C3.9 3 3 3.9 3 5V19C3 20.1 3.9 21 5 21H12V19.1L19 12.1V9L13 3H5M12 4L18 10H12V4M21.04 12.1C20.9 12.1 20.76 12.16 20.65 12.27L19.65 13.27L21.72 15.34L22.72 14.34C22.94 14.12 22.94 13.75 22.72 13.53L21.47 12.28C21.36 12.17 21.2 12.1 21.04 12.1M19.06 13.88L13 19.94V22H15.06L21.12 15.95L19.06 13.88Z";
+    pub const LINK_VARIANT: &str = "M10.59,13.41C11,13.8 11,14.44 10.59,14.83C10.2,15.22 9.56,15.22 9.17,14.83C7.22,12.88 7.22,9.71 9.17,7.76V7.76L12.71,4.22C14.66,2.27 17.83,2.27 19.78,4.22C21.73,6.17 21.73,9.34 19.78,11.29L18.29,12.78C18.3,11.96 18.17,11.14 17.89,10.36L18.36,9.88C19.54,8.71 19.54,6.81 18.36,5.64C17.19,4.46 15.29,4.46 14.12,5.64L10.59,9.17C9.41,10.34 9.41,12.24 10.59,13.41M13.41,9.17C13.8,8.78 14.44,8.78 14.83,9.17C16.78,11.12 16.78,14.29 14.83,16.24V16.24L11.29,19.78C9.34,21.73 6.17,21.73 4.22,19.78C2.27,17.83 2.27,14.66 4.22,12.71L5.71,11.22C5.7,12.04 5.83,12.86 6.11,13.65L5.64,14.12C4.46,15.29 4.46,17.19 5.64,18.36C6.81,19.54 8.71,19.54 9.88,18.36L13.41,14.83C14.59,13.66 14.59,11.76 13.41,10.59C13,10.2 13,9.56 13.41,9.17Z";
+    pub const CONTENT_CUT: &str = "M19,3L13,9L15,11L22,4V3M12,12.5A0.5,0.5 0 0,1 11.5,12A0.5,0.5 0 0,1 12,11.5A0.5,0.5 0 0,1 12.5,12A0.5,0.5 0 0,1 12,12.5M6,20A2,2 0 0,1 4,18C4,16.89 4.9,16 6,16A2,2 0 0,1 8,18C8,19.11 7.1,20 6,20M6,8A2,2 0 0,1 4,6C4,4.89 4.9,4 6,4A2,2 0 0,1 8,6C8,7.11 7.1,8 6,8M9.64,7.64C9.87,7.14 10,6.59 10,6A4,4 0 0,0 6,2A4,4 0 0,0 2,6A4,4 0 0,0 6,10C6.59,10 7.14,9.87 7.64,9.64L10,12L7.64,14.36C7.14,14.13 6.59,14 6,14A4,4 0 0,0 2,18A4,4 0 0,0 6,22A4,4 0 0,0 10,18C10,17.41 9.87,16.86 9.64,16.36L12,14L19,21H22V20L9.64,7.64Z";
+    pub const UNDO: &str = "M12.5,8C9.85,8 7.45,9 5.6,10.6L2,7V16H11L7.38,12.38C8.77,11.22 10.54,10.5 12.5,10.5C16.04,10.5 19.05,12.81 20.1,16L22.47,15.22C21.08,11.03 17.15,8 12.5,8Z";
+    pub const REDO: &str = "M18.4,10.6C16.55,9 14.15,8 11.5,8C6.85,8 2.92,11.03 1.54,15.22L3.9,16C4.95,12.81 7.95,10.5 11.5,10.5C13.45,10.5 15.23,11.22 16.62,12.38L13,16H22V7L18.4,10.6Z";
+    pub const CONTENT_SAVE: &str = "M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z";
+    pub const SEND: &str = "M2,21L23,12L2,3V10L17,12L2,14V21Z";
+    pub const CIRCLE_MEDIUM: &str = "M12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7Z";
     pub const ARROW_DOWN: &str = "M11,4H13V16L18.5,10.5L19.92,11.92L12,19.84L4.08,11.92L5.5,10.5L11,16V4Z";
     pub const ARROW_UP: &str = "M13,20H11V8L5.5,13.5L4.08,12.08L12,4.16L19.92,12.08L18.5,13.5L13,8V20Z";
     /// mdi `access-point`: the titlebar's Wake-on-LAN button. Radio waves, not a power
@@ -7966,8 +8280,15 @@ fn subscription(state: &State) -> Subscription<Message> {
         }
         _ => Message::Noop,
     });
-    let base =
-        Subscription::batch([tick, keys, closes, geom, usage_subscription(), term_wake_subscription()]);
+    let base = Subscription::batch([
+        tick,
+        keys,
+        closes,
+        geom,
+        usage_subscription(),
+        term_wake_subscription(),
+        explorer_fs_subscription(),
+    ]);
     #[cfg(target_os = "macos")]
     let base = Subscription::batch([base, quit_request_subscription()]);
     base
@@ -8123,6 +8444,8 @@ fn handle_key(event: iced::Event) -> Option<Message> {
                     // cannot tell Ctrl+Shift+M from plain Enter in the legacy encoding.
                     Some('m') => return Some(Message::ToggleWolMenu),
                     Some('p') => return Some(Message::TestNotification),
+                    // F for folder. Plain Ctrl+F stays the terminal find bar.
+                    Some('f') => return Some(Message::Files(files_pane::Msg::Toggle)),
                     _ => {} // c/v fall through to copy/paste below
                 }
             }
@@ -8730,6 +9053,11 @@ const ARBITER_WORDMARK_FONT: &[u8] = include_bytes!("../../assets/DMSans-Arbiter
 /// 3KB subset of Noto Sans Symbols 2 (the `·✢✳✶✻✽` working-animation dingbats),
 /// renamed "ArbiterSymbols" — bundled so the ✻ is identical on macOS + Windows.
 const ARBITER_SYMBOLS_FONT: &[u8] = include_bytes!("../../assets/ArbiterSymbols.ttf");
+/// The editor's face, registered with iced (the terminal loads the same file
+/// through its own rasteriser, which shares nothing with the widget layer). The
+/// bundled copy means the editor looks the same on every OS, and its gutter is
+/// only aligned with its text because both are this one monospace family.
+const EDITOR_MONO_FONT: &[u8] = include_bytes!("../../assets/CascadiaMono-Regular.ttf");
 
 /// The base UI font (Inter), matching the web's `font-family: 'Inter', …`.
 fn ui_font() -> iced::Font {
@@ -8752,6 +9080,44 @@ fn wordmark_font() -> iced::Font {
 // Diagnostic allocator, inert unless ARBITER_MEM_DIAG is set (see memdiag.rs).
 #[global_allocator]
 static GLOBAL: arbiter_native::memdiag::DiagAlloc = arbiter_native::memdiag::DiagAlloc;
+
+/// Append panics to `<data dir>/panic.log` as well as stderr.
+///
+/// A release build on Windows is a GUI-subsystem binary with no console, so an
+/// unhandled panic otherwise takes the window down leaving nothing at all to
+/// read. Windows Error Reporting does not record a Rust panic either.
+fn install_panic_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".to_string());
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let line = format!(
+            "[{}] thread '{thread}' panicked at {where_}:\n  {what}\n",
+            arbiter_native::about::Build::current().one_line(),
+        );
+        if let Some(dir) = arbiter_native::shell::app_data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                use std::io::Write;
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        previous(info);
+    }));
+}
 
 fn main() -> iced::Result {
     // Re-spawned as the usage-helper webview process (same binary, own process).
@@ -8786,6 +9152,7 @@ fn main() -> iced::Result {
         _ => {}
     }
 
+    install_panic_log();
     arbiter_native::memdiag::start_summary_thread();
     // One graphics backend, chosen by a probe (see `gpu::windows_backend`). A WGPU_BACKEND
     // the user set themselves is respected.
@@ -8821,6 +9188,7 @@ fn main() -> iced::Result {
         .font(INTER_FONT)
         .font(ARBITER_WORDMARK_FONT)
         .font(ARBITER_SYMBOLS_FONT)
+        .font(EDITOR_MONO_FONT)
         .default_font(ui_font())
         .run_with(move || {
             // daemon starts with no windows — open the main one here.
@@ -8907,7 +9275,7 @@ fn main() -> iced::Result {
             // Restore the saved layout (respawning each terminal in its cwd/shell,
             // resuming Claude where it ran); fall back to one fresh workspace.
             let (workspaces, active) = saved
-                .and_then(|saved| restore_workspaces(saved, git_bash.as_deref()))
+                .and_then(|saved| restore_workspaces(saved, git_bash.as_deref(), main_size.width))
                 .unwrap_or_else(|| (vec![Workspace::new("Workspace 1".to_string())], 0));
 
             // Drop a saved off-screen sentinel so neither window starts tracking
@@ -9001,7 +9369,26 @@ fn main() -> iced::Result {
                 vault,
                 tab_drag: None,
                 hovered_tab: None,
+                explorer_menu: None,
+                explorer_prompt: None,
+                explorer_delete: None,
+                explorer_drag: None,
+                editor_menu: None,
+                send_target: None,
             };
+            // Colour a restored explorer's tree: the folders are already read,
+            // but `git status` runs off-thread and reports back as a message.
+            tasks.extend(files_pane::boot_tasks(&state));
+            // Diagnostic: open files in the editor at startup, so a crash or a
+            // rendering fault can be reproduced without driving the UI by hand.
+            // Semicolon-separated, like PATH.
+            if let Ok(p) = std::env::var("ARBITER_OPEN_FILE") {
+                for one in p.split(';').filter(|s| !s.is_empty()) {
+                    tasks.push(Task::done(Message::Files(files_pane::Msg::EditorOpen(
+                        std::path::PathBuf::from(one),
+                    ))));
+                }
+            }
             if asking.is_empty() {
                 release_connections(&mut state, &HashSet::new());
             } else {

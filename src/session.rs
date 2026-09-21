@@ -1948,7 +1948,7 @@ fn recompute_git(cwd: Arc<Mutex<Option<String>>>, git: Arc<Mutex<Option<crate::g
 ///     on commits/fetches/gc, and transient `*.lock` files. The `.lock` skip is
 ///     scoped to `.git/` so a working-tree `Cargo.lock` / `yarn.lock` still counts.
 /// Our status reads use `--no-optional-locks`, so observing `.git/` can't self-loop.
-fn git_relevant_change(rel: &std::path::Path) -> bool {
+pub fn git_relevant_change(rel: &std::path::Path) -> bool {
     use std::path::Component;
     let names: Vec<&str> = rel
         .components()

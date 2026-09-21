@@ -22,6 +22,16 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   vice-versa — they're separate (CoreText vs DirectWrite) and easy to regress.
 - **No polling.** Every live signal must be event-driven (file watchers / PTY reader
   callbacks); web parity depends on it.
+- **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`:
+  `iced_winit` (inactive notification windows) and `iced_widget` (the text editor
+  hit-tests with the padding on swapped axes, which the editor's line-number gutter
+  depends on; see `vendor/iced_widget/ARBITER-FORK.md`). An iced upgrade means
+  re-copying both from the registry and re-applying their diffs.
+- **Verify UI changes with a debug build**, not just `--release`. iced states several
+  layout contracts as `debug_assert!`, which release compiles out: a release build runs
+  a mis-specified layout silently where `cargo run` panics at once. A panic goes to
+  `panic.log` in the data dir, and `ARBITER_OPEN_FILE` opens files in the editor at
+  startup so a fault reproduces without driving the UI by hand.
 
 ## Remote Claude resume — how the session id is known
 
