@@ -163,6 +163,43 @@ struct FrameKey {
     canvas: (u32, u32),
 }
 
+/// Windows: the one wgpu backend to ask for (`WGPU_BACKEND`), decided before iced starts.
+/// Vulkan, which wgpu's own adapter order always chose here, wherever a Vulkan adapter
+/// exists; iced would otherwise initialise DX12 and OpenGL beside it, tens of MB of driver
+/// for nothing. DX12 only where none does, so the app still opens, with a notice: DX12 draws
+/// an unmaximised window soft (DXGI stretches the frame to the window, and winit's
+/// borderless-shadow hack leaves the client rect one row taller than the window shows).
+/// The probe enumerates adapters synchronously; the instance is dropped again at once.
+#[cfg(windows)]
+pub fn windows_backend() -> &'static str {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..Default::default()
+    });
+    if !instance.enumerate_adapters(wgpu::Backends::VULKAN).is_empty() {
+        return "vulkan";
+    }
+    warn_no_vulkan();
+    "dx12"
+}
+
+// On its own thread so the window opens behind it rather than after it.
+#[cfg(windows)]
+fn warn_no_vulkan() {
+    std::thread::spawn(|| {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+        let text = HSTRING::from(
+            "Arbiter found no Vulkan graphics driver and is running on DirectX 12.\n\n\
+             Text renders soft while the window is not maximised. Installing the graphics \
+             card's current driver brings Vulkan back.",
+        );
+        let caption = HSTRING::from("Arbiter");
+        unsafe { MessageBoxW(HWND::default(), &text, &caption, MB_OK | MB_ICONWARNING) };
+    });
+}
+
 /// Surface-agnostic renderer: pipeline + glyph atlas + instance buffer.
 pub struct TermGpu {
     pipeline: wgpu::RenderPipeline,

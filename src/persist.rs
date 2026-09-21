@@ -200,6 +200,11 @@ pub struct Settings {
     /// Announce Claude finishing a turn. On by default.
     #[serde(default = "default_true")]
     pub notify_finished: bool,
+    /// A split opens its new terminal in the directory of the terminal being split, as
+    /// Windows Terminal and iTerm2 do. On by default. Off starts it where a new
+    /// workspace's first terminal starts.
+    #[serde(default = "default_true")]
+    pub split_keeps_cwd: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -314,6 +319,7 @@ impl Default for Settings {
             notification_sound: true,
             notify_attention: true,
             notify_finished: true,
+            split_keeps_cwd: true,
         }
     }
 }

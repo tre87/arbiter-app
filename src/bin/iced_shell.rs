@@ -721,6 +721,11 @@ enum Message {
     ToggleNotificationSound(bool),
     ToggleNotifyAttention(bool),
     ToggleNotifyFinished(bool),
+    /// Ctrl+Shift+P: a card about the focused terminal, to look at, whatever Settings
+    /// say about cards.
+    TestNotification,
+    /// Settings, General: a split's new terminal starts in the split terminal's directory.
+    ToggleSplitKeepsCwd(bool),
     /// Jump to a pane from the overview (select its workspace + focus it).
     JumpTo(usize, pane_grid::Pane),
     /// A window was closed (main → exit; overview → forget it).
@@ -1667,12 +1672,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::SplitRight => {
             state.term_menu = None;
-            split(state.active_mut(), pane_grid::Axis::Vertical);
+            let cwd = split_start_dir(state);
+            split(state.active_mut(), pane_grid::Axis::Vertical, cwd);
             save_session(state);
         }
         Message::SplitDown => {
             state.term_menu = None;
-            split(state.active_mut(), pane_grid::Axis::Horizontal);
+            let cwd = split_start_dir(state);
+            split(state.active_mut(), pane_grid::Axis::Horizontal, cwd);
             save_session(state);
         }
         Message::Close => {
@@ -1817,6 +1824,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleNameRemoteSessions(v) => {
             state.settings.name_remote_claude_sessions = v;
+            save_session(state);
+        }
+        Message::ToggleSplitKeepsCwd(v) => {
+            state.settings.split_keeps_cwd = v;
             save_session(state);
         }
         Message::SetIntenseStyle(s) => {
@@ -2407,30 +2418,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if !state.settings.notifications {
                 return Task::none();
             }
-            if state.settings.notification_sound {
-                arbiter_native::notify::play_sound();
-            }
-            // A game or video in full screen, a presentation: the chime is all it gets. A
-            // card would sit on top of it, or knock it out of full screen.
-            if !arbiter_native::notify::desktop_accepts_notifications() {
-                return Task::none();
-            }
-            let id = state.next_toast_id;
-            state.next_toast_id += 1;
-            let mut tasks = Vec::new();
-            if state.toasts.len() >= TOAST_MAX {
-                let oldest = state.toasts.remove(0);
-                tasks.extend(oldest.window.map(iced::window::close));
-            }
-            // The newest card takes the corner slot; the others shift up (`place_toasts`).
-            let (window, open) = open_toast_window(toast_position(0));
-            tasks.push(open);
-            state.toasts.push(Toast { id, title, body, target, window: Some(window) });
-            tasks.push(place_toasts(state));
-            tasks.push(Task::perform(tokio::time::sleep(Duration::from_millis(TOAST_SHOW_MS)), move |_| {
-                Message::ToastExpired(id)
-            }));
-            return Task::batch(tasks);
+            return raise_notification(state, title, body, target);
+        }
+        Message::TestNotification => {
+            let ws = state.active();
+            let body = match ws.panes.get(ws.focus) {
+                Some(d) => format!("{} · {}", d.name, ws.name),
+                None => ws.name.clone(),
+            };
+            let target = ws.panes.get(ws.focus).map(|d| d.session.id());
+            return raise_notification(state, "Arbiter notification".to_string(), body, target);
         }
         Message::ToastExpired(id) => {
             let Some(i) = state.toasts.iter().position(|t| t.id == id) else { return Task::none() };
@@ -2822,11 +2819,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     Task::none()
 }
 
-fn split(ws: &mut Workspace, axis: pane_grid::Axis) {
+/// Where a split's new terminal starts: the focused terminal's directory when Settings
+/// say so and it is a directory on this machine, else `None` for the shell's own default.
+/// The directory is the one its local shell last reported (OSC 7); a terminal inside
+/// `ssh` reports the far host's elsewhere, so this stays the local one it left from.
+fn split_start_dir(state: &State) -> Option<String> {
+    if !state.settings.split_keeps_cwd {
+        return None;
+    }
+    let ws = state.active();
+    let focused = ws.panes.get(ws.focus)?;
+    focused.session.cwd().filter(|dir| std::path::Path::new(dir).is_dir())
+}
+
+fn split(ws: &mut Workspace, axis: pane_grid::Axis, cwd: Option<String>) {
     let name = ws.next_name();
     let history_id = new_history_id();
     let pane = PaneData {
-        session: spawn_session(None, None, &history_id),
+        session: spawn_session(None, cwd.as_deref(), &history_id),
         name,
         shell: ShellKind::PowerShell,
         history_id,
@@ -3508,6 +3518,14 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
 
     let body = match state.settings_tab {
         SettingsTab::General => column![
+            settings_section("Terminals"),
+            settings_toggle(
+                "Split into the same directory",
+                Some("A terminal opened by a split starts in the directory of the terminal you split."),
+                state.settings.split_keeps_cwd,
+                Message::ToggleSplitKeepsCwd,
+            ),
+            Space::with_height(Length::Fixed(8.0)),
             settings_section("Quitting"),
             settings_toggle(
                 "Confirm before quitting",
@@ -3817,7 +3835,7 @@ fn kbd_combo(keys: &str) -> Element<'static, Message> {
 /// The keyboard-shortcuts cheat sheet — a centred card listing every binding
 /// (Ctrl on all platforms, like the web).
 fn shortcuts_dialog_view() -> Element<'static, Message> {
-    const ROWS: [(&str, &str); 15] = [
+    const ROWS: [(&str, &str); 16] = [
         ("New workspace", "Ctrl + Shift + T"),
         ("Next workspace", "Ctrl + Tab"),
         ("Previous workspace", "Ctrl + Shift + Tab"),
@@ -3833,6 +3851,7 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
         ("Attach screenshot", "Ctrl + Shift + S"),
         ("Attach files", "Ctrl + Shift + A"),
         ("Wake a machine (Wake on LAN)", "Ctrl + Shift + M"),
+        ("Show a test notification", "Ctrl + Shift + P"),
     ];
     let mut list = column![].spacing(0);
     for (i, (action, keys)) in ROWS.iter().enumerate() {
@@ -5735,6 +5754,35 @@ fn toast_position(i: usize) -> Option<iced::Point> {
     Some(iced::Point::new(x, y))
 }
 
+/// Raise a card, with the chime if Settings keep it, unless the desktop is in no state
+/// for one. `target` is the session id of the terminal the card is about.
+fn raise_notification(state: &mut State, title: String, body: String, target: Option<u64>) -> Task<Message> {
+    if state.settings.notification_sound {
+        arbiter_native::notify::play_sound();
+    }
+    // A game or video in full screen, a presentation: the chime is all it gets. A
+    // card would sit on top of it, or knock it out of full screen.
+    if !arbiter_native::notify::desktop_accepts_notifications() {
+        return Task::none();
+    }
+    let id = state.next_toast_id;
+    state.next_toast_id += 1;
+    let mut tasks = Vec::new();
+    if state.toasts.len() >= TOAST_MAX {
+        let oldest = state.toasts.remove(0);
+        tasks.extend(oldest.window.map(iced::window::close));
+    }
+    // The newest card takes the corner slot; the others shift up (`place_toasts`).
+    let (window, open) = open_toast_window(toast_position(0));
+    tasks.push(open);
+    state.toasts.push(Toast { id, title, body, target, window: Some(window) });
+    tasks.push(place_toasts(state));
+    tasks.push(Task::perform(tokio::time::sleep(Duration::from_millis(TOAST_SHOW_MS)), move |_| {
+        Message::ToastExpired(id)
+    }));
+    Task::batch(tasks)
+}
+
 /// Move every card's window to its slot, the newest nearest the corner.
 fn place_toasts(state: &State) -> Task<Message> {
     let n = state.toasts.len();
@@ -5868,7 +5916,13 @@ fn toast_window_view(t: &Toast) -> Element<'static, Message> {
     ]
     .spacing(3)
     .width(Length::Fill);
-    button(row![cmdi(mdi_path::BELL, 16.0, AZURE), words].spacing(10).align_y(iced::Center))
+    // The row fills the card's height so the centring has something to centre in; a
+    // shrink-height row sits at the top padding and leaves the slack below.
+    let content = row![cmdi(mdi_path::BELL, 16.0, AZURE), words]
+        .spacing(10)
+        .height(Length::Fill)
+        .align_y(iced::Center);
+    button(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding([10, 12])
@@ -8068,6 +8122,7 @@ fn handle_key(event: iced::Event) -> Option<Message> {
                     // Free in the app and meaningless to programs in a terminal, which
                     // cannot tell Ctrl+Shift+M from plain Enter in the legacy encoding.
                     Some('m') => return Some(Message::ToggleWolMenu),
+                    Some('p') => return Some(Message::TestNotification),
                     _ => {} // c/v fall through to copy/paste below
                 }
             }
@@ -8732,13 +8787,11 @@ fn main() -> iced::Result {
     }
 
     arbiter_native::memdiag::start_summary_thread();
-    // One graphics backend, the one the app uses. iced lets wgpu enumerate every backend
-    // it was built with, which on Windows loads the Vulkan and OpenGL drivers beside
-    // DX12 for nothing (tens of MB of baseline, measured 2026-09-20). A WGPU_BACKEND the
-    // user set themselves is respected.
+    // One graphics backend, chosen by a probe (see `gpu::windows_backend`). A WGPU_BACKEND
+    // the user set themselves is respected.
     #[cfg(windows)]
     if std::env::var_os("WGPU_BACKEND").is_none() {
-        std::env::set_var("WGPU_BACKEND", "dx12");
+        std::env::set_var("WGPU_BACKEND", arbiter_native::gpu::windows_backend());
     }
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();

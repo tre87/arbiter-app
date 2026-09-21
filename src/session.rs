@@ -1687,12 +1687,13 @@ fn reader_loop(
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
             // glyph in the *new* bytes (chunk-based like the web — instant, and a
             // stale star left on screen can't pin it to "working").
-            let (menu, scrolled) = {
+            let (menu, scrolled, waiting) = {
                 let t = term.lock().unwrap();
-                (t.visible_menu(), t.visible_scrolled())
+                (t.visible_menu(), t.visible_scrolled(), t.visible_waiting_agents())
             };
             claude.set_menu(menu);
             claude.set_scrolled(scrolled);
+            claude.set_waiting_agents(waiting);
             if prev_menu && !menu {
                 // A menu just LEFT the screen (answered or escaped). AskUserQuestion
                 // fires a permission/elicitation hook, but escaping it produces no

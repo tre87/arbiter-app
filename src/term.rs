@@ -472,8 +472,22 @@ impl VtTerm {
         self.screen_contains(&["(ctrl+End)"])
     }
 
+    /// True while Claude's status row reads "✳ Waiting for N background agents to finish":
+    /// its turn is over by every other sign (the spinner stands still, the Stop hook has
+    /// fired), yet it picks the work up by itself when the agents report, so the pane is
+    /// not idle. The row is told from the same words in the transcript by its shape: a
+    /// spinner glyph, a space, the phrase; Claude's prose starts with a bullet or an indent.
+    pub fn visible_waiting_agents(&self) -> bool {
+        self.any_visible_row(is_waiting_agents_row)
+    }
+
     /// Whether any of the last 40 visible rows contains one of `needles`.
     fn screen_contains(&self, needles: &[&str]) -> bool {
+        self.any_visible_row(|row| needles.iter().any(|m| row.contains(m)))
+    }
+
+    /// Whether `matches` holds for the text of any of the last 40 visible rows.
+    fn any_visible_row(&self, matches: impl Fn(&str) -> bool) -> bool {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
@@ -485,7 +499,7 @@ impl VtTerm {
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if needles.iter().any(|m| buf.contains(m)) {
+            if matches(&buf) {
                 return true;
             }
         }
@@ -745,6 +759,20 @@ fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
 }
 
+/// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
+/// row (see `VtTerm::visible_waiting_agents`). The glyph is one of the spinner's frames
+/// (Claude's ✢✳✶✻✽ range, or its `·` frame), which no transcript line begins with.
+fn is_waiting_agents_row(row: &str) -> bool {
+    let mut chars = row.trim_start().chars();
+    let Some(glyph) = chars.next() else { return false };
+    let is_frame = matches!(glyph as u32, 0x2722..=0x273F) || glyph == '·';
+    if !is_frame || chars.next() != Some(' ') {
+        return false;
+    }
+    let rest = chars.as_str();
+    rest.starts_with("Waiting for ") && rest.contains(" background agent") && rest.contains(" to finish")
+}
+
 /// http(s):// scheme length at `t[i]` (8 for `https://`, 7 for `http://`), else
 /// `None`.
 fn url_scheme_len(t: &[char], i: usize) -> Option<usize> {
@@ -896,6 +924,21 @@ mod tests {
         assert!(matches("ftp://a.com no match").is_empty());
         assert!(matches("just text, no colon-slash").is_empty());
         assert!(matches("http://").is_empty()); // scheme with no body
+    }
+
+    // The status row while Claude waits on agents it launched, against the same words
+    // where Claude writes them in its transcript.
+    #[test]
+    fn the_waiting_for_agents_row_is_known_by_its_shape() {
+        use super::is_waiting_agents_row as row;
+        assert!(row("✳ Waiting for 3 background agents to finish"));
+        assert!(row("· Waiting for 1 background agent to finish"));
+        assert!(row("✻ Waiting for 2 background agents to finish · esc to interrupt   "));
+        assert!(!row("● Waiting for 3 background agents to finish."));
+        assert!(!row("  Waiting for 3 background agents to finish"));
+        assert!(!row("✳ Waiting for API response"));
+        assert!(!row("✳ Brewed for 7s"));
+        assert!(!row(""));
     }
 
     /// Scrolling (wheel or drag auto-scroll) while a selection drag is active must

@@ -115,6 +115,24 @@ Claude fixes the issue. Rejected: scrolling
 Arbiter's own scrollback instead (the transcript is not in it under the fullscreen UI) and
 a row resize (shifts the whole layout for a frame; a column does not).
 
+## Notification cards and what counts as a turn end (2026-09-21)
+
+- **A card must never take the keyboard.** Each card is its own iced window opened with
+  the fork's `NEXT_WINDOW_INACTIVE`. On Windows the flag lives in winit's window state, so
+  iced's hidden-then-`set_visible(true)` route shows it `SW_SHOWNOACTIVATE`; on macOS
+  `set_visible(true)` is `makeKeyAndOrderFront` and stole the key window from the main
+  one, so the fork (`vendor/iced_winit/src/program.rs`) creates such a window visible and
+  lets winit's creation `orderFront` it. Ctrl+Shift+P raises a test card
+  (`Message::TestNotification`), Settings or not.
+- **"Waiting for N background agents to finish" is not idle.** It is Claude's
+  `turn_duration` line: the turn is over (Stop hook fired, spinner still), yet Claude
+  resumes by itself when the agents report. The reader scans the visible rows for the row's
+  shape (`VtTerm::visible_waiting_agents`, `term::is_waiting_agents_row`: a spinner glyph,
+  a space, the phrase; prose starts with a bullet or an indent) and
+  `ClaudeHandle::set_waiting_agents` holds `Working` while it shows. The off edge stamps a
+  fresh activity TTL so the resumed turn's first frames have time to pair up; Escape during
+  the wait ends it the same way, one TTL later, with a "Claude finished" card.
+
 ## Terminal renderer — known limitation (intentional)
 
 The GPU renderer draws **one opaque quad per cell**, so a glyph cannot overflow its cell
@@ -177,6 +195,16 @@ crafted `session.json` files. Findings that shape the code:
   allocation site in this tree or its dependencies, and `ARBITER_MEM_DIAG` saw none in
   isolated runs. The best-fitting owner is the NVIDIA in-game overlay's capture hook
   (`nvspcap64.dll` was loaded in the process). Disable the overlay to test.
+- **Windows asks wgpu for Vulkan alone, after a probe** (`gpu::windows_backend`, set as
+  `WGPU_BACKEND` in `main`). Pinning DX12 to save the Vulkan and OpenGL driver DLLs drew
+  every unmaximised window blurry (2026-09-21): wgpu-hal creates the DXGI swapchain with
+  `DXGI_SCALING_STRETCH`, and winit's `undecorated_shadow` hack (`WM_NCCALCSIZE`:
+  `top += 1; bottom += 1`) makes the client rect one row taller than the window shows, so
+  DWM squeezed the frame by a pixel: edges crisp at the top, half a pixel soft mid-window,
+  the phase drifting one pixel over the height. Confirmed by measuring the user's
+  screenshot, not by theory. A maximised window takes winit's other `WM_NCCALCSIZE` branch
+  and is unaffected. Vulkan presents 1:1. Only a machine with no Vulkan adapter gets DX12,
+  with a message box saying so; `VK_DRIVER_FILES=<nonexistent>` forces that path for a test.
 - **Do not attach process-memory readers, ETW heap tracing or keystroke automation to a
   running Arbiter from a shell descended from it.** Defender's behaviour classifier
   attributed exactly that to `arbiter.exe` (Trojan:Win32/Bearfoos.A!ml) and killed the

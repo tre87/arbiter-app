@@ -10,8 +10,10 @@ use crate::core::{Event, Point, Size};
 
 /// Arbiter's addition: set right before `window::open` and the next window is shown
 /// without taking focus (winit's `with_active(false)`; `SW_SHOWNOACTIVATE` on Windows,
-/// `orderFront` on macOS). A notification card must never take a keystroke. Cleared as
-/// that window's attributes are built. `window::Settings` has no field for it.
+/// `orderFront` on macOS, where the window is also shown by its creation rather than
+/// by `set_visible`; see `program.rs`). A notification card must never take a
+/// keystroke. Cleared as that window's attributes are built. `window::Settings` has no
+/// field for it.
 pub static NEXT_WINDOW_INACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

@@ -74,6 +74,12 @@ pub struct ClaudeHandle {
     /// Set when the transcript was scrolled away during a live turn: the turn is held as
     /// working, frames or not, until the row is back in view (then it gets a fresh TTL).
     scroll_holds_working: AtomicBool,
+    /// Claude's status row says it is waiting for background agents it launched (see
+    /// `VtTerm::visible_waiting_agents`). Its turn has ended by every other sign, the
+    /// Stop hook included, yet it resumes by itself when they report, so the pane is held
+    /// as working for as long as the row shows; when the row goes, the resumed turn gets
+    /// a fresh TTL to show its first frames in.
+    waiting_agents: AtomicBool,
     /// Spinner detection is ignored until this time — set briefly on app-initiated
     /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
     suppress_until_ms: AtomicU64,
@@ -211,6 +217,7 @@ impl ClaudeHandle {
             last_star_ms: AtomicU64::new(0),
             scrolled: AtomicBool::new(false),
             scroll_holds_working: AtomicBool::new(false),
+            waiting_agents: AtomicBool::new(false),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
@@ -597,6 +604,7 @@ impl ClaudeHandle {
             self.note_login_evidence();
         } else if !self.activity_fresh() && self.on_screen.swap(false, Ordering::Relaxed) {
             // Its screen went away with no turn in flight: Claude exited, whatever was typed.
+            self.waiting_agents.store(false, Ordering::Relaxed);
             self.remote_claude_typed.store(false, Ordering::Relaxed);
             *self.remote_session.lock().unwrap() = None;
             SAVE_DIRTY.store(true, Ordering::Relaxed);
@@ -746,6 +754,18 @@ impl ClaudeHandle {
         self.scrolled.load(Ordering::Relaxed)
     }
 
+    /// Reader: whether Claude's status row says it is waiting for background agents.
+    /// While it does the pane is working (see `waiting_agents`); when the row goes, the
+    /// turn Claude resumes with gets a fresh TTL, so the moment before its first frames
+    /// pair up is not read as a turn end. A wait the user broke off with Escape ends the
+    /// same way, one TTL later.
+    pub fn set_waiting_agents(&self, on: bool) {
+        let was = self.waiting_agents.swap(on, Ordering::Relaxed);
+        if was && !on {
+            self.activity_ms.store(now_ms(), Ordering::Relaxed);
+        }
+    }
+
     /// Reader: a menu/prompt just LEFT the screen (answered or escaped) → resolve
     /// any hook-set attention. AskUserQuestion fires a permission/elicitation hook
     /// but escaping it produces no spinner/Stop to clear that hook, so it would
@@ -798,6 +818,11 @@ impl ClaudeHandle {
             || self.hook_attention.load(Ordering::Relaxed)
         {
             return Lifecycle::Attention;
+        }
+        // Waiting on its own agents: the turn is over on paper (Stop hook, still
+        // spinner) but Claude carries on by itself when they report.
+        if self.waiting_agents.load(Ordering::Relaxed) {
+            return Lifecycle::Working;
         }
         let act = self.activity_ms.load(Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
@@ -1052,6 +1077,30 @@ mod tests {
         h.set_scrolled(false);
         assert!(!h.scroll_holds_working.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+    }
+
+    // "Waiting for N background agents to finish": the turn is over by its Stop hook and
+    // its still spinner, but Claude resumes on its own, so the pane stays working until
+    // the row goes, and then for a TTL more so the resumed turn's first frames have time.
+    #[test]
+    fn waiting_for_agents_holds_working_across_the_stop() {
+        let h = handle();
+        h.note_activity(1);
+        std::thread::sleep(FRAME);
+        h.note_activity(2);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.set_waiting_agents(true);
+        h.stop_ms.store(super::now_ms(), std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        std::thread::sleep(Duration::from_millis(super::STOP_SUPPRESS_MS + 50));
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.set_waiting_agents(false);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+
+        // A prompt on screen still outranks the wait.
+        h.set_waiting_agents(true);
+        h.set_menu(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
     }
 
     #[test]

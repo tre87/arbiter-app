@@ -7,7 +7,26 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **A split opens where you are.** A terminal opened by a split starts in the directory of
+  the terminal you split, on Windows and macOS alike (Settings, General, "Split into the
+  same directory"; on by default). A terminal inside `ssh` hands on the local directory it
+  left from.
+- **Ctrl+Shift+P shows a test notification** about the focused terminal, cards enabled or
+  not, so a card can be looked at and the chime heard without waiting for Claude.
+
 ### Fixed
+- **Waiting for background agents no longer reads as idle.** While Claude's status row says
+  "Waiting for N background agents to finish" the pane stays working and no "Claude
+  finished" card is raised. Claude's turn is over by every other sign (the spinner stands
+  still and the Stop hook has fired), yet it resumes on its own when the agents report.
+- **A notification card no longer takes the keyboard on macOS.** iced shows every window it
+  opens through winit's `set_visible`, which on macOS is `makeKeyAndOrderFront` whatever
+  the window's inactive flag said, so the card became the key window and the terminal
+  stopped receiving keystrokes. The vendored runtime now lets such a window be shown by its
+  creation, where winit honours the flag.
+- **A card's text and bell are centred vertically.** The row hugged the top padding and
+  left the slack below.
 - **Memory no longer grows with the panes you have closed.** Every terminal keeps a GPU
   renderer (its glyph atlases, some 6 MB) in a store the app never pruned, so a pane closed
   or reconnected left its renderer behind for the life of the app. A two-day session held
@@ -33,9 +52,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
   reporting), so the pane's history is unreachable, yet Claude's redraws filled it to the
   configured 5000 lines, some 25 MB per pane. It is held at 1000 lines for the duration
   and returns to the setting when Claude leaves.
-- **Only DX12 is loaded on Windows.** iced let wgpu enumerate every backend, which loaded
-  the Vulkan and OpenGL drivers beside DX12 for nothing. `WGPU_BACKEND` set by hand still
-  wins.
+- **Only one graphics backend loads on Windows.** iced let wgpu initialise every backend it
+  was built with, DX12 and OpenGL beside the Vulkan it drew with, tens of MB of driver for
+  nothing. The app now probes for a Vulkan adapter before starting and asks for Vulkan
+  alone. A machine without one gets DX12 and a notice saying so: DX12 draws an unmaximised
+  window soft, because DXGI stretches the frame to the window and winit's borderless-shadow
+  hack leaves the client rect one row taller than the window shows, so the frame is squeezed
+  by a pixel. A DX12-only build was tried first and had every window that way.
+  `WGPU_BACKEND` set by hand still wins.
 - **`exit` closes the terminal.** A shell that ends with exit code 0 (`exit`, Ctrl+D)
   closes its pane as Ctrl+Shift+W would; the last pane of a workspace closes the
   workspace, unless it is the only one. A shell that dies otherwise keeps its screen and
