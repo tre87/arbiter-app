@@ -6,6 +6,7 @@ pub mod attach;
 pub mod claude;
 pub mod claude_shim;
 pub mod claude_status;
+pub mod floor;
 pub mod font;
 pub mod git;
 pub mod gpu;

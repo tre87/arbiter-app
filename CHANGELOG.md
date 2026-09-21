@@ -7,6 +7,40 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Ops Floor, stage 1: a pixel-art room where one desk is one pane** (`src/floor.rs`).
+  Groundwork only — nothing is wired to a `Session` yet. `floor-demo` is a standalone
+  harness with fake desks and test buttons (`cargo run --bin floor-demo
+  --no-default-features`) whose only job is to answer whether the room reads at a glance
+  before any of it is connected. The room is drawn, not imported: every pixel is a
+  rectangle fill, so the feature adds no asset files, no atlas, no dependency, and touches
+  neither the CoreText nor the DirectWrite glyph path. Desks fill five to a row and the
+  sixth opens a second row below, so the room grows downward like floors of a building
+  while every existing desk keeps its slot; the buffer is only ever blitted at a
+  whole-number scale, which steps 4x/3x/2x/1x rather than sliding, because a fractional
+  scale gives unevenly sized pixels. A working agent glows in the app's own `AZURE` and a
+  blocked one in its `AMBER`, rather than in near-misses of either. Working desks cycle
+  through five work poses (typing, reading, note-taking, pondering, a mug of something) on
+  per-desk phase offsets, so five agents mid-turn do not look like five copies of one
+  sprite; every pose means exactly the same thing, and none of them is a mood. A
+  clerestory of windows across the top carries the weather — clear, cloudy, rain, snow,
+  fog, and one daylight sky — drawn once however many rows the room has, so the sky costs
+  the same at one desk and at twenty; a sunny day spills past the sill but stops above the
+  desks, because reading an agent's state must never depend on the weather. Monitors face
+  the camera while the figure beside them stays in profile, so the screen can carry the
+  state it is best at: Claude's own spinner turning while a turn is in flight (out of phase
+  per desk, so five agents are not five copies of one frame), output scrolling up under it,
+  a highlighted choice waiting when an agent is blocked. Each occupied desk has a bias light
+  behind its monitor washing the wall warm, off at a free desk. Plants on the floor, on the
+  clerestory sill and on some desks, with which desks keep one fixed by slot so a desk's
+  clutter is as stable as its position. Four rules are enforced by tests rather than by intent: a desk never
+  moves, the working and attention colours are painted by nothing but those two states
+  (checked across every sky and every pose), nothing is random (variety comes from a hash,
+  so any frame reproduces), and only real activity animates — a quiet room under a still
+  sky is a single image that needs no clock at all. Precipitation is the one piece of
+  decoration that does cost a clock, which `Weather::moves` makes explicit rather than
+  hiding.
+
 ## [1.5.0] — 2026-09-18
 
 ### Added
