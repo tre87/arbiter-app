@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-09-21
+
 ### Added
 - **A split opens where you are.** A terminal opened by a split starts in the directory of
   the terminal you split, on Windows and macOS alike (Settings, General, "Split into the
