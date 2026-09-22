@@ -91,6 +91,23 @@ pub struct ClaudeHandle {
     /// resumes (activity) or the turn ends (Stop). Covers tool-permission prompts
     /// that don't show a grid marker.
     hook_attention: AtomicBool,
+    /// When the user last submitted a slash command here (0 = never). A chooser that
+    /// appears just after one is theirs, not Claude's: no hook reports `/model`, and
+    /// its footer is the one AskUserQuestion draws, so the screen alone cannot tell
+    /// them apart. Cleared by activity, so a command that sets Claude working
+    /// (`/init`) still reports the prompts that turn raises.
+    slash_submit_ms: AtomicU64,
+    /// The menu currently on screen is the one that slash command opened.
+    menu_user_opened: AtomicBool,
+    /// Claude's status row says it is working, read level-triggered from the grid.
+    /// Unlike spinner frames this survives a frozen row and a stalled read, neither
+    /// of which means the turn ended.
+    working_row: AtomicBool,
+    /// Bumped once per turn that is KNOWN to have ended: a Stop hook, or Claude's
+    /// working row leaving the screen. The notification reads this counter rather than
+    /// sampling the lifecycle, so a turn end can neither be invented by a timeout nor
+    /// missed by sampling at the wrong moment.
+    finish_seq: AtomicU64,
     /// An SSH/mosh client is running in this pane, so its foreground program lives on
     /// another machine. Set from the same busy-edge scan as `claude_running`; gates
     /// the on-screen probe below, which only remote panes need.
@@ -189,6 +206,9 @@ const MIN_FRAME_GAP_MS: u64 = 20;
 /// cadence; well below WORKING_TTL_MS so a one-shot can't accidentally pair with a much
 /// later unrelated repaint.
 const MAX_FRAME_GAP_MS: u64 = 600;
+/// A chooser appearing within this long of a slash command is the one it opened.
+/// Comfortably longer than Claude takes to draw it, far shorter than a turn.
+const SLASH_MENU_WINDOW_MS: u64 = 3000;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -221,6 +241,10 @@ impl ClaudeHandle {
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
+            slash_submit_ms: AtomicU64::new(0),
+            menu_user_opened: AtomicBool::new(false),
+            working_row: AtomicBool::new(false),
+            finish_seq: AtomicU64::new(0),
             remote: AtomicBool::new(false),
             was_remote: AtomicBool::new(false),
             last_command: Mutex::new(None),
@@ -657,6 +681,9 @@ impl ClaudeHandle {
     pub fn note_activity(&self, glyphs: u64) {
         let now = now_ms();
         self.last_star_ms.store(now, Ordering::Relaxed);
+        // Claude is doing something, so the last slash command is spent: a chooser
+        // raised later in this turn is Claude's, not the user's (`/init` and friends).
+        self.slash_submit_ms.store(0, Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
         // A spinner frame inside the post-Stop window is the turn's FINAL redraw —
         // ignore it so it can't revive "working" after Stop already ended the turn.
@@ -725,8 +752,52 @@ impl ClaudeHandle {
     }
 
     /// Reader: whether a menu/approval prompt is currently on the visible screen.
+    /// A menu appearing within `SLASH_MENU_WINDOW_MS` of a slash command is the one
+    /// the user just opened, and raises nothing.
     pub fn set_menu(&self, on: bool) {
-        self.menu_on_screen.store(on, Ordering::Relaxed);
+        let was = self.menu_on_screen.swap(on, Ordering::Relaxed);
+        if on && !was {
+            let since = now_ms().saturating_sub(self.slash_submit_ms.load(Ordering::Relaxed));
+            let mine = self.slash_submit_ms.load(Ordering::Relaxed) != 0
+                && since < SLASH_MENU_WINDOW_MS;
+            self.menu_user_opened.store(mine, Ordering::Relaxed);
+        } else if !on && was {
+            self.menu_user_opened.store(false, Ordering::Relaxed);
+            // The command is spent on the chooser it opened. Anything Claude puts up
+            // afterwards is Claude's, even within the window.
+            self.slash_submit_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// UI: the user submitted a slash command in this pane (see `slash_submit_ms`).
+    pub fn note_slash_command(&self) {
+        self.slash_submit_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Reader: whether Claude's working status row is on screen, and whether its idle
+    /// input box is. The row going away *and the box coming back* is a turn end we can
+    /// see, which is what panes with no hooks (every remote one) rely on instead of a
+    /// silence in the spinner stream.
+    ///
+    /// Requiring the box is what makes it safe: a resize or a reflow can catch Claude
+    /// mid-redraw, with neither the row nor the box on screen, and that must not read
+    /// as a finish. Claude swaps one hint for the other, so exactly one is present
+    /// whenever it is drawing at all.
+    pub fn set_working_row(&self, on: bool, idle_box: bool) {
+        let was = self.working_row.swap(on, Ordering::Relaxed);
+        let ended = was
+            && !on
+            && idle_box
+            && !self.waiting_agents.load(Ordering::Relaxed)
+            && now_ms() >= self.suppress_until_ms.load(Ordering::Relaxed);
+        if ended {
+            self.finish_seq.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How many turns are known to have ended here (see `finish_seq`).
+    pub fn finish_seq(&self) -> u64 {
+        self.finish_seq.load(Ordering::Relaxed)
     }
 
     /// Reader: whether Claude's transcript is scrolled away from its live bottom. While it
@@ -741,7 +812,12 @@ impl ClaudeHandle {
         let now = now_ms();
         let act = self.activity_ms.load(Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
-        let live = act > stop && now.saturating_sub(act) < WORKING_TTL_MS;
+        // Waiting on background agents counts as live even though the Stop hook has
+        // already fired: Claude resumes by itself, so scrolling away mid-wait must
+        // hold the turn exactly as scrolling away mid-spinner does.
+        let live = (act > stop && now.saturating_sub(act) < WORKING_TTL_MS)
+            || self.waiting_agents.load(Ordering::Relaxed)
+            || self.working_row.load(Ordering::Relaxed);
         if on {
             self.scroll_holds_working.store(live, Ordering::Relaxed);
         } else if self.scroll_holds_working.swap(false, Ordering::Relaxed) {
@@ -813,15 +889,28 @@ impl ClaudeHandle {
     /// Derived lifecycle: the most recent signal wins; activity counts as
     /// "working" only while fresh, then reverts to ready.
     fn lifecycle(&self) -> Lifecycle {
-        // Attention is level-based: a prompt on screen, or an unresolved hook.
-        if self.menu_on_screen.load(Ordering::Relaxed)
-            || self.hook_attention.load(Ordering::Relaxed)
-        {
+        // Attention is level-based: a prompt on screen, or an unresolved hook. A menu
+        // the user opened themselves is not a prompt (see `slash_submit_ms`).
+        let menu = self.menu_on_screen.load(Ordering::Relaxed)
+            && !self.menu_user_opened.load(Ordering::Relaxed);
+        if menu || self.hook_attention.load(Ordering::Relaxed) {
             return Lifecycle::Attention;
         }
         // Waiting on its own agents: the turn is over on paper (Stop hook, still
         // spinner) but Claude carries on by itself when they report.
         if self.waiting_agents.load(Ordering::Relaxed) {
+            return Lifecycle::Working;
+        }
+        // Claude's own status row says it is working. Level-triggered, so it holds
+        // through a frozen row and a stalled read, where the spinner stream below
+        // would decay into "ready" and read as a turn end.
+        if self.working_row.load(Ordering::Relaxed) {
+            return Lifecycle::Working;
+        }
+        // A turn held across a scroll, where Claude draws no status row at all.
+        let held = self.scrolled.load(Ordering::Relaxed)
+            && self.scroll_holds_working.load(Ordering::Relaxed);
+        if held {
             return Lifecycle::Working;
         }
         let act = self.activity_ms.load(Ordering::Relaxed);
@@ -832,11 +921,10 @@ impl ClaudeHandle {
         if stop != 0 && now.saturating_sub(stop) < STOP_SUPPRESS_MS {
             return Lifecycle::Ready;
         }
-        // Working while activity is fresh and more recent than the last turn-end, or
-        // while a live turn's row is scrolled out of view and cannot show frames.
-        let held = self.scrolled.load(Ordering::Relaxed)
-            && self.scroll_holds_working.load(Ordering::Relaxed);
-        if act > stop && (held || now.saturating_sub(act) < WORKING_TTL_MS) {
+        // Fallback for a pane whose Claude draws no row we recognise: activity fresh
+        // and more recent than the last turn-end. This decays on a timeout, so it
+        // drives the dot only — `finish_seq` is what raises a card.
+        if act > stop && now.saturating_sub(act) < WORKING_TTL_MS {
             return Lifecycle::Working;
         }
         Lifecycle::Ready
@@ -988,6 +1076,11 @@ fn process_hooks(dir: &Path) {
             "stop" => {
                 h.stop_ms.store(now_ms(), Ordering::Relaxed);
                 h.hook_attention.store(false, Ordering::Relaxed);
+                // The authoritative turn end. Not counted while Claude is waiting on
+                // its own agents: it fires then too, and Claude resumes by itself.
+                if !h.waiting_agents.load(Ordering::Relaxed) {
+                    h.finish_seq.fetch_add(1, Ordering::Relaxed);
+                }
             }
             _ => {}
         }
@@ -1019,6 +1112,87 @@ mod tests {
             std::thread::sleep(FRAME);
         }
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+    }
+
+    // `/model` and friends draw the footer a real prompt draws, and no hook reports
+    // them, so the only thing that tells them apart is that the user just typed one.
+    #[test]
+    fn a_chooser_the_user_opened_is_not_attention() {
+        let h = handle();
+        h.note_slash_command();
+        h.set_menu(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        // Answered or escaped: the latch goes with the menu.
+        h.set_menu(false);
+        h.set_menu(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
+    }
+
+    #[test]
+    fn a_chooser_claude_opened_is_attention() {
+        let h = handle();
+        h.set_menu(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
+    }
+
+    // `/init` sets Claude working; a permission prompt later in that turn is Claude's.
+    #[test]
+    fn a_slash_command_that_starts_work_still_reports_its_prompts() {
+        let h = handle();
+        h.note_slash_command();
+        h.note_activity(0b1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0100);
+        h.set_menu(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
+    }
+
+    // The turn end is an event, never a timeout: a lapse in the spinner stream leaves
+    // the pane ready but raises nothing, because nothing said the turn ended.
+    #[test]
+    fn only_a_real_turn_end_counts_as_finished() {
+        let h = handle();
+        assert_eq!(h.finish_seq(), 0);
+        // A spinner lapse: ready, but no finish.
+        h.note_activity(0b1000);
+        std::thread::sleep(FRAME);
+        h.note_activity(0b0100);
+        assert_eq!(h.finish_seq(), 0);
+        // Claude's working row going, with its input box back: that is a turn end.
+        h.set_working_row(true, false);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.set_working_row(false, true);
+        assert_eq!(h.finish_seq(), 1);
+    }
+
+    // A resize catches Claude mid-redraw with neither the row nor the box on screen.
+    #[test]
+    fn a_redraw_without_the_input_box_is_not_a_turn_end() {
+        let h = handle();
+        h.set_working_row(true, false);
+        h.set_working_row(false, false);
+        assert_eq!(h.finish_seq(), 0);
+    }
+
+    // The row is gone because the user scrolled, not because the turn ended.
+    #[test]
+    fn a_turn_held_across_a_scroll_stays_working() {
+        let h = handle();
+        h.set_working_row(true, false);
+        h.set_scrolled(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        assert_eq!(h.finish_seq(), 0);
+    }
+
+    // 1.5.1's background-agent hold, defeated by scrolling: the Stop hook has already
+    // fired, so the old `act > stop` test read the pane as idle the moment it scrolled.
+    #[test]
+    fn scrolling_away_during_an_agent_wait_holds_the_turn() {
+        let h = handle();
+        h.set_waiting_agents(true);
+        h.set_scrolled(true);
+        h.set_waiting_agents(false); // the row is off screen now
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
     }
 
     #[test]

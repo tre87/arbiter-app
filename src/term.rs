@@ -460,9 +460,15 @@ impl VtTerm {
     /// Working is NOT detected here — it's keyed off the live byte stream (see
     /// `session.rs`), so a spinner star left on screen can't pin it to "working".
     pub fn visible_menu(&self) -> bool {
-        // The exact markers the web used (AskUserQuestion / plan-mode menus).
-        const MENU: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
-        self.screen_contains(MENU)
+        self.rows_from_bottom(MENU_ROWS, is_menu_row)
+    }
+
+    /// True while Claude's status row says it is working: a spinner glyph, then text
+    /// ending in the interrupt hint. Level-triggered, unlike the spinner-frame stream,
+    /// so it reads correctly when the row is FROZEN (the text is still there) and when
+    /// a read stalls — neither of which says the turn ended.
+    pub fn visible_working(&self) -> bool {
+        self.any_visible_row(is_working_row)
     }
 
     /// True while Claude's fullscreen UI is scrolled away from its live bottom: it then
@@ -488,12 +494,19 @@ impl VtTerm {
 
     /// Whether `matches` holds for the text of any of the last 40 visible rows.
     fn any_visible_row(&self, matches: impl Fn(&str) -> bool) -> bool {
+        self.rows_from_bottom(40, matches)
+    }
+
+    /// Whether `matches` holds for any of the last `n` visible rows. A narrow window
+    /// is how a LIVE element is told from the same words sitting in the transcript:
+    /// Claude anchors its input box and menus to the bottom of the screen.
+    fn rows_from_bottom(&self, n: usize, matches: impl Fn(&str) -> bool) -> bool {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
         let mut buf = String::with_capacity(cols);
-        for row in rows.saturating_sub(40)..rows {
+        for row in rows.saturating_sub(n)..rows {
             buf.clear();
             let line = &grid[Line(row as i32 - off)];
             for col in 0..cols {
@@ -582,6 +595,14 @@ impl VtTerm {
             buf.push(line[Column(col)].c);
         }
         buf.trim_end().to_string()
+    }
+
+    /// Whether the row the cursor is on is a slash command in Claude's input box.
+    /// Read at Enter, this says the user is about to open a chooser themselves
+    /// (`/model`, `/config`), which no hook reports and which must not read as Claude
+    /// asking for something.
+    pub fn input_row_is_slash(&self) -> bool {
+        row_is_slash_command(&self.cursor_row_text())
     }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
@@ -759,18 +780,68 @@ fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
 }
 
-/// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
-/// row (see `VtTerm::visible_waiting_agents`). The glyph is one of the spinner's frames
-/// (Claude's ✢✳✶✻✽ range, or its `·` frame), which no transcript line begins with.
-fn is_waiting_agents_row(row: &str) -> bool {
-    let mut chars = row.trim_start().chars();
-    let Some(glyph) = chars.next() else { return false };
+/// Rows from the bottom that a LIVE menu can occupy. Claude anchors its input box and
+/// its choosers to the bottom of the screen, so a marker further up is transcript: an
+/// old approval box scrolled back into view, or prose quoting the words. Scanning the
+/// whole screen for them raised a card every time the user scrolled past one.
+const MENU_ROWS: usize = 12;
+
+/// The text after a spinner glyph at the start of `row`, if the row is one of Claude's
+/// status rows. The glyph is one of the spinner's frames (Claude's ✢✳✶✻✽ range, or its
+/// `·` frame) followed by a space, which no transcript line begins with.
+fn status_row_text(row: &str) -> Option<&str> {
+    let trimmed = row.trim_start();
+    let mut chars = trimmed.chars();
+    let glyph = chars.next()?;
     let is_frame = matches!(glyph as u32, 0x2722..=0x273F) || glyph == '·';
     if !is_frame || chars.next() != Some(' ') {
-        return false;
+        return None;
     }
-    let rest = chars.as_str();
+    Some(chars.as_str())
+}
+
+/// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
+/// row (see `VtTerm::visible_waiting_agents`).
+fn is_waiting_agents_row(row: &str) -> bool {
+    let Some(rest) = status_row_text(row) else { return false };
     rest.starts_with("Waiting for ") && rest.contains(" background agent") && rest.contains(" to finish")
+}
+
+/// Whether a screen row is Claude's working status row: a spinner frame and a line
+/// carrying the interrupt hint ("✻ Thinking… (esc to interrupt)"). The shape is what
+/// separates it from prose containing the same words, including Arbiter's own source
+/// shown in a diff.
+fn is_working_row(row: &str) -> bool {
+    status_row_text(row).is_some_and(|rest| rest.contains("esc to interrupt"))
+}
+
+/// Whether a row is the footer of a live chooser. Claude draws the same hint under
+/// AskUserQuestion, plan-mode approval and its own slash-command menus.
+fn is_menu_row(row: &str) -> bool {
+    if row.contains("Would you like to proceed") {
+        return true;
+    }
+    // Claude's footer reads "↑/↓ to navigate · Enter to select · Esc to cancel". Any
+    // ONE of those fragments also turns up in ordinary prose ("explains how to
+    // navigate the tree"), which is how scrolling a transcript used to raise a card,
+    // so a footer has to carry at least two of them.
+    const HINTS: &[&str] = &["to navigate", "to select", "Esc to cancel", "Enter to"];
+    HINTS.iter().filter(|h| row.contains(**h)).count() >= 2
+}
+
+/// Whether a rendered input row holds a slash command. Claude's box draws a border and
+/// a prompt marker before the text, so those are stripped first; everything after the
+/// first character must still look like a command, not prose that happens to start
+/// with a slash.
+fn row_is_slash_command(row: &str) -> bool {
+    let body = row.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '│' | '|' | '>' | '\u{276f}')
+    });
+    let Some(rest) = body.strip_prefix('/') else { return false };
+    // `/usr/bin/x` or `//` is a path or a comment, not a command.
+    let Some(first) = rest.chars().next() else { return false };
+    first.is_ascii_alphabetic()
+        && rest.chars().take_while(|c| !c.is_whitespace()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
 }
 
 /// http(s):// scheme length at `t[i]` (8 for `https://`, 7 for `http://`), else
@@ -924,6 +995,52 @@ mod tests {
         assert!(matches("ftp://a.com no match").is_empty());
         assert!(matches("just text, no colon-slash").is_empty());
         assert!(matches("http://").is_empty()); // scheme with no body
+    }
+
+    // Claude's working row, against the same words as they appear in a transcript —
+    // including Arbiter's own source, which contains the phrase in these very tests.
+    #[test]
+    fn the_working_row_is_known_by_its_shape() {
+        use super::is_working_row as row;
+        assert!(row("✻ Thinking… (esc to interrupt)"));
+        assert!(row("· Brewing… (esc to interrupt · ctrl+t to hide todos)"));
+        assert!(row("✳ Waiting for 2 background agents to finish · esc to interrupt   "));
+        // Prose, quoted text and source: same words, no status-row shape.
+        assert!(!row("  the hint reads (esc to interrupt) while it works"));
+        assert!(!row("● Ran tool, esc to interrupt was shown"));
+        assert!(!row("+    assert!(row(\"✻ Thinking… (esc to interrupt)\"));"));
+        assert!(!row("✻ Brewed for 7s"));
+        assert!(!row(""));
+    }
+
+    // A live chooser's footer, against an approval box sitting in the transcript.
+    #[test]
+    fn a_menu_footer_is_matched_by_its_words() {
+        use super::is_menu_row as row;
+        assert!(row("  ↑/↓ to navigate · Enter to select · Esc to cancel"));
+        assert!(row("Would you like to proceed?"));
+        assert!(row("  ↑/↓ to navigate · Esc to cancel"));
+        // One stray fragment is prose, which is what used to raise a card on every
+        // pass while scrolling back over a plan.
+        assert!(!row("  the plan explains how to navigate the tree"));
+        assert!(!row("  press Esc to cancel, it said, and I did"));
+        assert!(!row(""));
+    }
+
+    // Telling a slash command in Claude's input box from an ordinary prompt.
+    #[test]
+    fn a_slash_command_is_told_from_a_prompt() {
+        use super::row_is_slash_command as slash;
+        assert!(slash("> /model"));
+        assert!(slash("│ ❯ /config "));
+        assert!(slash("  /agents"));
+        assert!(slash("> /statusline setup"));
+        assert!(!slash("> fix the bug in /src/main.rs"));
+        assert!(!slash("> /usr/bin/env"));
+        assert!(!slash("> //"));
+        assert!(!slash("> how do I use /model?"));
+        assert!(!slash("> "));
+        assert!(!slash(""));
     }
 
     // The status row while Claude waits on agents it launched, against the same words

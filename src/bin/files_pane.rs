@@ -35,6 +35,9 @@ const ROW_INDENT: f32 = 16.0;
 /// the chevrons beneath it.
 const ROW_PAD_X: f32 = 8.0;
 const TREE_PAD: f32 = 4.0;
+/// How long spinner detection is ignored after a layout change resizes the PTYs. The
+/// same 500 ms a window resize uses, and for the same reason.
+const REFLOW_SUPPRESS_MS: u64 = 500;
 /// Size of a chevron, a folder and a file-type icon: one slot, so names line up.
 const ICON_PX: f32 = 16.0;
 /// Folders are deliberately a neutral slate rather than another bright colour:
@@ -461,6 +464,18 @@ fn boot_git_tasks(state: &State) -> Vec<Task<Message>> {
     tasks
 }
 
+/// Ignore spinner detection briefly in the panes about to be re-laid-out.
+///
+/// Anything that changes the grid's width resizes their PTYs, and ConPTY answers with a
+/// repaint that re-emits whatever stars were on screen. Two of those in a row look like
+/// an animation and read as Claude working, which then "finishes" a couple of seconds
+/// later. Only the active workspace is affected: nothing else is being laid out.
+pub fn suppress_reflow(state: &State) {
+    for (_, d) in state.active().panes.iter() {
+        d.session.suppress_claude_activity(REFLOW_SUPPRESS_MS);
+    }
+}
+
 /// Escape on one of the editor's own dialogs. Both answer the conservative way:
 /// keep the tab, keep the edits. True when one was open.
 pub fn dismiss_dialog(state: &mut State) -> bool {
@@ -540,6 +555,8 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             // Reaching for the explorer is the earliest reliable sign a file is
             // about to be opened.
             highlight::warm();
+            // Showing or hiding the pane moves the grid's edge by its whole width.
+            suppress_reflow(state);
             match state.active_mut().explorer.as_mut() {
                 None => return update(state, Msg::PickFolder),
                 Some(e) => {
@@ -558,6 +575,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             }
         }
         Msg::Hide => {
+            suppress_reflow(state);
             if let Some(e) = state.active_mut().explorer.as_mut() {
                 e.shown = false;
                 e.watcher = None;
@@ -734,6 +752,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             let w = state.active().explorer.as_ref().map(|e| e.width);
             if let Some(start_w) = w {
                 state.explorer_drag = Some(Drag { start_x: last_cursor().x, start_w });
+                suppress_reflow(state);
             }
         }
         Msg::DragMove(p) => {
@@ -742,16 +761,14 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             if let Some(e) = state.active_mut().explorer.as_mut() {
                 e.width = clamp_width(d.start_w + (p.x - d.start_x), win_w);
             }
-            // The grid re-lays out and every PTY resizes on each step, which
-            // makes ConPTY re-emit stale spinner frames (see `WindowResized`).
-            for ws in &state.workspaces {
-                for (_, d) in ws.panes.iter() {
-                    d.session.suppress_claude_activity(500);
-                }
-            }
+            // The suppression that covers the resulting PTY resizes is armed once at
+            // DragStart and once at DragEnd. Doing it per mouse move re-armed a
+            // 500 ms window continuously, and a window that never closes stops a
+            // genuinely working pane from being seen as working again.
         }
         Msg::DragEnd => {
             if state.explorer_drag.take().is_some() {
+                suppress_reflow(state);
                 save_session(state);
             }
         }
@@ -772,6 +789,10 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
                 return Task::none();
             }
             let now = !state.active().editor.visible;
+            // Hiding the editor is the important one: the terminals are out of the
+            // view tree while it shows, so they resize on the frame they come back,
+            // long after the window event that would otherwise have covered it.
+            suppress_reflow(state);
             state.active_mut().editor.visible = now;
             if now {
                 let task = ensure_active_loaded(state);

@@ -169,6 +169,12 @@ struct State {
     usage_org: Option<String>,
     /// Whether the org-selection modal is open.
     usage_org_menu: bool,
+    /// When a MANUAL usage refresh was asked for (epoch ms), while it is in flight.
+    /// Spins the refresh arrow, and is what tells a manual refresh from the background
+    /// poll, which runs on a thread that cannot reach `State` and so never animates.
+    usage_refresh_started_ms: Option<u64>,
+    /// Whether that refresh has already been escalated from a refetch to a reload.
+    usage_refresh_escalated: bool,
     /// The Wake-on-LAN menu, while open (see `WolMenu`).
     wol_menu: Option<WolMenu>,
     /// The Settings "Add a machine" form's fields, and why the last Add was refused
@@ -392,6 +398,8 @@ struct ClaudeSeen {
     working_since: u64,
     /// When this pane last raised a card.
     last_raised: u64,
+    /// `ClaudeHandle::finish_seq` as last seen: an increase is a turn that ended.
+    finish_seq: u64,
 }
 /// The most cards on screen at once; the oldest leaves to make room.
 const TOAST_MAX: usize = 4;
@@ -1634,6 +1642,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 state.wol_menu = None;
             }
+            // A manual refetch that went unanswered: escalate once to a reload, which
+            // rebuilds the page and respawns a renderer that may have died. Then give
+            // up spinning, so a helper that never replies cannot hold the 60fps clock.
+            if let Some(at) = state.usage_refresh_started_ms {
+                let age = now_ms().saturating_sub(at);
+                if age >= USAGE_SPIN_MAX_MS {
+                    state.usage_refresh_started_ms = None;
+                } else if age >= USAGE_MANUAL_ESCALATE_MS && !state.usage_refresh_escalated {
+                    state.usage_refresh_escalated = true;
+                    usage_helper_cmd("reload");
+                }
+            }
             // A turn ends by its activity going stale, which no output announces: the
             // tick that runs while Claude works is what sees it.
             return notify_claude_transitions(state);
@@ -1704,7 +1724,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // `claude` gets its conversation named before the Enter goes through (see
                 // `Session::on_remote_enter`).
                 if bytes.as_slice() == b"\r" {
-                    let row = p.session.term().lock().map(|t| t.cursor_row_text()).unwrap_or_default();
+                    // Also the cheapest way to know the user is opening a chooser
+                    // themselves: `/model` and friends report through no hook, and
+                    // draw the footer a real prompt draws.
+                    let (row, slash) = p
+                        .session
+                        .term()
+                        .lock()
+                        .map(|t| (t.cursor_row_text(), t.input_row_is_slash()))
+                        .unwrap_or_default();
+                    if slash && p.session.claude_running() {
+                        p.session.note_slash_command();
+                    }
                     if let Some(completion) = p.session.on_remote_enter(&row, name_sessions) {
                         p.session.write(&completion);
                     }
@@ -1775,6 +1806,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state);
         }
         Message::Resized(pane_grid::ResizeEvent { split, ratio }) => {
+            // Dragging a divider resizes the PTYs either side of it; their repaints
+            // must not pair into a false "working" (see `suppress_reflow`).
+            files_pane::suppress_reflow(state);
             state.active_mut().panes.resize(split, ratio);
         }
         Message::NewWorkspace => {
@@ -1807,7 +1841,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
             }
+            // A refresh that failed must not wipe the numbers. `parse_usage_line`
+            // builds a failure line from `Default`, so every meter arrives as None;
+            // keeping the last good ones means a transient error shows yesterday's
+            // figures rather than replacing the bars with "Usage unavailable".
+            if data.state != UsageState::Ok && state.usage.state == UsageState::Ok {
+                data.five_hour = data.five_hour.or(state.usage.five_hour);
+                data.seven_day = data.seven_day.or(state.usage.seven_day);
+                data.seven_day_opus = data.seven_day_opus.or(state.usage.seven_day_opus);
+                data.seven_day_sonnet = data.seven_day_sonnet.or(state.usage.seven_day_sonnet);
+                data.seven_day_fable = data.seven_day_fable.or(state.usage.seven_day_fable);
+                data.plan = data.plan.take().or_else(|| state.usage.plan.clone());
+                data.org_name = data.org_name.take().or_else(|| state.usage.org_name.clone());
+            }
             state.usage = data;
+            state.usage_refresh_started_ms = None;
             // Re-sync the background poll to the new state: normal cadence while Ok,
             // reload-to-recover while Error, quiet otherwise.
             set_usage_poll(state.usage.state);
@@ -1840,12 +1888,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state);
         }
         Message::RefreshUsage => {
-            // Manual refresh always RELOADs (not just a refetch): it respawns the
-            // renderer, so it recovers even if the hidden one died — the button can
-            // never silently "do nothing". Mark a fetch in flight so the background
-            // poll escalates to another reload if this one never answers.
-            usage_helper_cmd("reload");
+            // From a working page, ask it to refetch in place: sub-second, and it
+            // cannot fail the way a cold page can. A reload navigates claude.ai afresh,
+            // and the ~800ms bootstrap before its first call is exactly where the
+            // transient failure came from that used to blank the bars. Reload stays the
+            // recovery path from an error, where there is nothing to preserve and the
+            // renderer may genuinely be dead; `Tick` escalates a silent fetch to one.
+            usage_helper_cmd(if state.usage.state == UsageState::Ok { "fetch" } else { "reload" });
             USAGE_FETCH_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            state.usage_refresh_started_ms = Some(now_ms());
+            state.usage_refresh_escalated = false;
             // Refreshing from the error pill: show "Loading…" as feedback and re-arm the
             // pending timeout, so a reload that never answers falls back to Sign in
             // rather than sticking on "Usage unavailable". (From Ok we leave the bars in
@@ -4718,17 +4770,28 @@ fn usage_section(
     u: &UsageData,
     hide_sonnet: bool,
     show_fable: bool,
+    refreshing: bool,
 ) -> Option<(Element<'static, Message>, f32)> {
     // The separator between the usage section and the action buttons is added by
     // `titlebar_row` (a `group_sep`), so the sections here don't carry a trailing one.
+    //
+    // A failed refresh keeps whatever figures it had (see `Message::UsageUpdated`), so
+    // fall through to the bars whenever there are any: the last known usage is more use
+    // than a warning, and the bars are what the user asked to keep seeing. The warning
+    // is for having nothing at all.
+    let have_bars = u.five_hour.is_some()
+        || u.seven_day.is_some()
+        || u.seven_day_opus.is_some()
+        || u.seven_day_sonnet.is_some()
+        || u.seven_day_fable.is_some();
     match u.state {
-        UsageState::Pending => Some((usage_loading(), 60.0)),
+        UsageState::Pending if !have_bars => Some((usage_loading(), 60.0)),
         UsageState::NeedsLogin => Some((header_signin_row(), 190.0)),
         UsageState::NeedsOrg => {
             Some((tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu), 170.0))
         }
-        UsageState::Error => Some((usage_warning(), 168.0)),
-        UsageState::Ok => {
+        UsageState::Error if !have_bars => Some((usage_warning(), 168.0)),
+        _ => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
             // Sonnet is hidden by default (Settings → "Hide Sonnet usage"). Fable shows
             // only on request (Settings → "Show Fable usage"), first in the row and with
@@ -4763,7 +4826,7 @@ fn usage_section(
             if width == 0.0 {
                 return None;
             }
-            row = row.push(refresh_btn());
+            row = row.push(refresh_btn(refreshing));
             // +10 for the group separator titlebar_row adds after the usage section.
             Some((row.into(), 70.0 + width))
         }
@@ -4962,12 +5025,18 @@ fn usage_stat(
 /// width), then shrinks just enough to fit — never stretches past 72px, never wraps.
 /// None when there's nothing to show.
 fn overview_usage(u: &UsageData, hide_sonnet: bool, avail: f32) -> Option<Element<'static, Message>> {
+    // Keeps the last known figures through a failed refresh, exactly as the titlebar
+    // does; the two render the same state and must agree.
+    let have_bars = u.five_hour.is_some()
+        || u.seven_day.is_some()
+        || u.seven_day_opus.is_some()
+        || u.seven_day_sonnet.is_some();
     match u.state {
-        UsageState::Pending => Some(usage_loading()),
+        UsageState::Pending if !have_bars => Some(usage_loading()),
         UsageState::NeedsLogin => Some(sign_in_button()),
         UsageState::NeedsOrg => Some(tinted_pill_button("Choose Claude org", Message::ShowUsageOrgMenu)),
-        UsageState::Error => Some(usage_warning()),
-        UsageState::Ok => {
+        UsageState::Error if !have_bars => Some(usage_warning()),
+        _ => {
             let green = iced::Color::from_rgb8(0x22, 0xc5, 0x5e);
             let sonnet = if hide_sonnet { None } else { u.seven_day_sonnet };
             let entries: [(&str, iced::Color, Option<UsagePeriod>); 4] = [
@@ -5046,12 +5115,26 @@ const USAGE_HELPER_MAX_SILENT_RUNS: u32 = 3;
 /// data always wins sooner.
 const USAGE_PENDING_TIMEOUT_MS: u64 = 30_000;
 
+/// A manual refetch unanswered this long escalates once to a full reload. Well past a
+/// healthy in-page refetch, which answers in well under a second.
+const USAGE_MANUAL_ESCALATE_MS: u64 = 4_000;
+/// The refresh arrow stops spinning after this, answer or no answer, so a helper that
+/// never replies cannot hold the animation clock on.
+const USAGE_SPIN_MAX_MS: u64 = 15_000;
+
 /// The usage refresh button: a plain refresh icon that refetches now when clicked.
 /// (No live countdown to the next auto-poll: a per-second countdown would need a
 /// ~1Hz repaint, which is exactly the idle clock we removed — so the app would never
 /// be truly idle. The auto-refresh still runs every 120s on a background thread.)
-fn refresh_btn() -> Element<'static, Message> {
-    button(cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED))
+fn refresh_btn(spinning: bool) -> Element<'static, Message> {
+    let icon = if spinning {
+        // One turn a second while a refresh the user asked for is in flight.
+        let turns = (now_ms() % 1000) as f32 / 1000.0;
+        cmdi_spun(mdi_path::REFRESH, 13.0, AZURE, turns)
+    } else {
+        cmdi(mdi_path::REFRESH, 13.0, TXT_MUTED)
+    };
+    button(icon)
     .padding([5, 7])
     .on_press(Message::RefreshUsage)
     .style(|_t: &iced::Theme, s| button::Style {
@@ -5688,7 +5771,12 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let usage_el = if state.settings.hide_usage_bar {
         None
     } else {
-        usage_section(&state.usage, state.settings.hide_sonnet_usage, state.settings.show_fable_usage)
+        usage_section(
+            &state.usage,
+            state.settings.hide_sonnet_usage,
+            state.settings.show_fable_usage,
+            state.usage_refresh_started_ms.is_some(),
+        )
     };
     let usage_w = usage_el.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
     let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
@@ -6107,15 +6195,19 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
             } else {
                 Lifecycle::Closed
             };
+            let finished = d.session.claude_finish_seq();
             let prev = state.claude_seen.get(&id).copied();
             let mut next = prev.unwrap_or(ClaudeSeen {
                 lifecycle: Lifecycle::Closed,
                 running_since: 0,
                 working_since: 0,
                 last_raised: 0,
+                finish_seq: finished,
             });
             let was = next.lifecycle;
+            let was_finished = next.finish_seq;
             next.lifecycle = lifecycle;
+            next.finish_seq = finished;
             if lifecycle == Lifecycle::Closed {
                 next.running_since = 0;
             } else if next.running_since == 0 {
@@ -6127,11 +6219,16 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
             let changed = prev.is_some() && was != lifecycle;
             let quiet = now.saturating_sub(next.last_raised) < NOTIFY_QUIET_MS;
             let settled = next.working_since.saturating_sub(next.running_since) >= LAUNCH_SETTLE_MS;
+            // A turn END is an event Claude reports (its Stop hook, or its status row
+            // leaving the screen), never the absence of one. The lifecycle alone can
+            // read "ready" from any two-second gap in the spinner stream — a resize, a
+            // drag, a frozen row — and every one of those used to raise a card.
+            let ended = prev.is_some() && finished > was_finished;
             let title = match (was, lifecycle) {
-                _ if !changed || quiet => None,
-                (_, Lifecycle::Attention) if state.settings.notify_attention => Some("Claude needs your input"),
-                (Lifecycle::Working, Lifecycle::Ready) if settled && state.settings.notify_finished => {
-                    Some("Claude finished")
+                _ if quiet => None,
+                _ if ended && settled && state.settings.notify_finished => Some("Claude finished"),
+                (_, Lifecycle::Attention) if changed && state.settings.notify_attention => {
+                    Some("Claude needs your input")
                 }
                 _ => None,
             };
@@ -6693,6 +6790,18 @@ fn raster_svg(svg_bytes: &[u8], px: u32) -> iced::widget::image::Handle {
 /// shown 1:1. Cached by (path, colour, px). Use in the titlebar where the soft
 /// `svg`-widget icons (refresh/keyboard/etc.) read as pixelated.
 fn cmdi(path: &'static str, size: f32, color: iced::Color) -> Element<'static, Message> {
+    cmdi_spun(path, size, color, 0.0)
+}
+
+/// `cmdi`, turned `turns` of a full rotation clockwise. The rotation is a render
+/// transform, so the cached raster is reused and, being `Solid`, the widget's layout
+/// bounds do not grow with the angle — the titlebar's width budget stays put.
+fn cmdi_spun(
+    path: &'static str,
+    size: f32,
+    color: iced::Color,
+    turns: f32,
+) -> Element<'static, Message> {
     static CACHE: std::sync::Mutex<
         Option<std::collections::HashMap<(usize, u32, u32), iced::widget::image::Handle>>,
     > = std::sync::Mutex::new(None);
@@ -6722,6 +6831,9 @@ fn cmdi(path: &'static str, size: f32, color: iced::Color) -> Element<'static, M
         // Nearest at the exact physical size = pixel-crisp (Linear softens icons
         // whose on-screen position lands on a fractional pixel).
         .filter_method(iced::widget::image::FilterMethod::Nearest)
+        .rotation(iced::Rotation::Solid(iced::Radians(
+            turns * std::f32::consts::TAU,
+        )))
         .into()
 }
 
@@ -8169,6 +8281,12 @@ fn needs_fast_tick(state: &State) -> bool {
     if state.wol_menu.as_ref().is_some_and(|m| m.sent.is_some()) {
         return true;
     }
+    // The refresh arrow turns while a refresh the user ASKED for is in flight, and is
+    // given up on after `USAGE_SPIN_MAX_MS`. The background poll never sets this, so
+    // an automatic refresh still emits no frames at all.
+    if state.usage_refresh_started_ms.is_some() {
+        return true;
+    }
     state.workspaces.iter().any(|ws| {
         ws.panes.iter().any(|(_, d)| {
             // Only *Working* animates (the ✻ bloom / avatar bob). Attention is a
@@ -9339,6 +9457,8 @@ fn main() -> iced::Result {
                 usage_started_ms: now_ms(),
                 usage_org: saved_usage_org,
                 usage_org_menu: false,
+                usage_refresh_started_ms: None,
+                usage_refresh_escalated: false,
                 wol_menu: None,
                 wol_new_name: String::new(),
                 wol_new_mac: String::new(),

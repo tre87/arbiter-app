@@ -1323,6 +1323,16 @@ impl Session {
         self.claude.snapshot()
     }
 
+    /// How many turns are known to have ended here (see `ClaudeHandle::finish_seq`).
+    pub fn claude_finish_seq(&self) -> u64 {
+        self.claude.finish_seq()
+    }
+
+    /// The user submitted a slash command here, so the chooser it opens is theirs.
+    pub fn note_slash_command(&self) {
+        self.claude.note_slash_command();
+    }
+
     /// Milliseconds since Claude last drew a spinner glyph here, None if never. Static
     /// stars in a repaint count too: this says whether its status row is being drawn.
     pub fn spinner_age_ms(&self) -> Option<u64> {
@@ -1687,13 +1697,30 @@ fn reader_loop(
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
             // glyph in the *new* bytes (chunk-based like the web — instant, and a
             // stale star left on screen can't pin it to "working").
-            let (menu, scrolled, waiting) = {
+            let (menu, scrolled, waiting, working, idle_box) = {
                 let t = term.lock().unwrap();
-                (t.visible_menu(), t.visible_scrolled(), t.visible_waiting_agents())
+                (
+                    t.visible_menu(),
+                    t.visible_scrolled(),
+                    t.visible_waiting_agents(),
+                    t.visible_working(),
+                    t.claude_chrome(),
+                )
             };
+            // Scrolled away, everything on screen is history: an approval box the user
+            // is reading back over is not a prompt waiting on them.
+            let menu = menu && !scrolled;
+            // Order matters: the two holds below read `waiting_agents` and
+            // `working_row`, so both must be current before the scroll edge is taken.
+            claude.set_waiting_agents(waiting);
+            // While scrolled, Claude draws no status row, so its absence says nothing
+            // and must not count as a turn end. Leave the last reading standing; the
+            // redraw that puts the view back at the bottom refreshes it.
+            if !scrolled {
+                claude.set_working_row(working, idle_box);
+            }
             claude.set_menu(menu);
             claude.set_scrolled(scrolled);
-            claude.set_waiting_agents(waiting);
             if prev_menu && !menu {
                 // A menu just LEFT the screen (answered or escaped). AskUserQuestion
                 // fires a permission/elicitation hook, but escaping it produces no

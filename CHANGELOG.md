@@ -56,6 +56,35 @@ history belongs to the prior Tauri/Vue web app it replaced.
   offers every terminal in the workspace. Arrows and Enter or a click choose, Escape cancels.
   Sending hides the editor and focuses the terminal it went to.
 
+### Fixed
+- **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,
+  `/config` or any other slash command raised a "Claude needs your input" card, because
+  the chooser it opens draws the footer a real prompt draws and no hook reports it. The
+  pane now knows you opened it, and stays quiet. A command that sets Claude working, like
+  `/init`, still reports whatever that turn asks for.
+- **Scrolling back over a plan no longer raises cards.** The scan that finds a prompt read
+  the whole screen, so an approval box scrolled back into view looked like a live one, and
+  every pass over it raised another card. A prompt only counts at the live bottom, within
+  the rows Claude draws its input box in, and a footer now has to look like a footer
+  rather than merely contain one of its phrases.
+- **"Claude finished" now means Claude finished.** The turn end was inferred from two
+  seconds of silence in the spinner animation, so anything that interrupted it for that
+  long raised a card: dragging the explorer edge or a split divider, toggling the editor,
+  switching workspace, a frozen status row after scrolling, a narrow pane wrapping a
+  status line. A turn end is now the event that ends it, either Claude's Stop hook or its
+  working row giving way to its input box, and nothing else can invent one. Claude's
+  status row is also read directly, so a row that has frozen or a read that has stalled no
+  longer decays into "finished".
+- **Waiting for background agents survives scrolling.** Scrolling up during the wait ended
+  the hold added in 1.5.1 and raised a card about two seconds later.
+- **The usage refresh keeps the numbers on screen.** Clicking refresh flashed "Usage
+  unavailable": it reloaded the whole claude.ai page, and a failure during that cold load
+  was parsed into a state that discarded every meter. A refresh now asks the live page to
+  refetch, which is far quicker, and falls back to a reload only if that goes unanswered.
+  Figures that fail to refresh stay on screen instead of being replaced by a warning, and
+  the arrow turns while a refresh you asked for is in flight. An automatic refresh still
+  draws nothing at all.
+
 ## [1.5.1] - 2026-09-21
 
 ### Added
