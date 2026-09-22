@@ -1702,7 +1702,7 @@ fn reader_loop(
                 (
                     t.visible_menu(),
                     t.visible_scrolled(),
-                    t.visible_waiting_agents(),
+                    t.visible_waiting_background(),
                     t.visible_working(),
                     t.claude_chrome(),
                     t.input_row_is_slash(),
@@ -1711,9 +1711,9 @@ fn reader_loop(
             // Scrolled away, everything on screen is history: an approval box the user
             // is reading back over is not a prompt waiting on them.
             let menu = menu && !scrolled;
-            // Order matters: the two holds below read `waiting_agents` and
+            // Order matters: the two holds below read `waiting_background` and
             // `working_row`, so both must be current before the scroll edge is taken.
-            claude.set_waiting_agents(waiting);
+            claude.set_waiting_background(waiting);
             // While scrolled, Claude draws no status row, so its absence says nothing
             // and must not count as a turn end. Leave the last reading standing; the
             // redraw that puts the view back at the bottom refreshes it.

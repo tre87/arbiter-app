@@ -140,14 +140,20 @@ a row resize (shifts the whole layout for a frame; a column does not).
   one, so the fork (`vendor/iced_winit/src/program.rs`) creates such a window visible and
   lets winit's creation `orderFront` it. Ctrl+Shift+P raises a test card
   (`Message::TestNotification`), Settings or not.
-- **"Waiting for N background agents to finish" is not idle.** It is Claude's
-  `turn_duration` line: the turn is over (Stop hook fired, spinner still), yet Claude
-  resumes by itself when the agents report. The reader scans the visible rows for the row's
-  shape (`VtTerm::visible_waiting_agents`, `term::is_waiting_agents_row`: a spinner glyph,
-  a space, the phrase; prose starts with a bullet or an indent) and
-  `ClaudeHandle::set_waiting_agents` holds `Working` while it shows. The off edge stamps a
-  fresh activity TTL so the resumed turn's first frames have time to pair up; Escape during
-  the wait ends it the same way, one TTL later, with a "Claude finished" card.
+- **Outstanding background work is not idle.** Two rows say so: "Waiting for N background
+  agents to finish", and a finished turn's line ending "· 1 shell still running"
+  (`✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running`). Either way the turn is
+  over (Stop hook fired, spinner still), yet Claude resumes by itself when the work
+  reports. The reader scans the visible rows for either row's shape
+  (`VtTerm::visible_waiting_background`, `term::is_waiting_agents_row`,
+  `term::is_background_shell_row`: a spinner glyph, a space, the phrase; prose starts with
+  a bullet or an indent) and `ClaudeHandle::set_waiting_background` holds `Working` while
+  it shows, which also keeps the Stop hook from raising "Claude finished". The off edge
+  stamps a fresh activity TTL so the resumed turn's first frames have time to pair up;
+  Escape during the wait ends it the same way, one TTL later, with a "Claude finished"
+  card. **Known trade:** Claude draws the same shell line for a dev server it started in
+  the background, which never finishes, so such a pane stays Working (and keeps the fast
+  tick) for as long as the server runs. Nothing on screen tells a finite job from a server.
 
 ## The editor is the viewport, and the gutter follows it (2026-09-22)
 

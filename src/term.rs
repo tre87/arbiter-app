@@ -478,13 +478,15 @@ impl VtTerm {
         self.screen_contains(&["(ctrl+End)"])
     }
 
-    /// True while Claude's status row reads "✳ Waiting for N background agents to finish":
-    /// its turn is over by every other sign (the spinner stands still, the Stop hook has
-    /// fired), yet it picks the work up by itself when the agents report, so the pane is
-    /// not idle. The row is told from the same words in the transcript by its shape: a
-    /// spinner glyph, a space, the phrase; Claude's prose starts with a bullet or an indent.
-    pub fn visible_waiting_agents(&self) -> bool {
-        self.any_visible_row(is_waiting_agents_row)
+    /// True while Claude's status row says it has background work outstanding: either
+    /// "✳ Waiting for N background agents to finish", or a finished turn's line ending
+    /// "· 1 shell still running". Its turn is over by every other sign (the spinner
+    /// stands still, the Stop hook has fired), yet it picks the work up by itself when
+    /// that work reports, so the pane is not idle. The row is told from the same words in
+    /// the transcript by its shape: a spinner glyph, a space, the phrase; Claude's prose
+    /// starts with a bullet or an indent.
+    pub fn visible_waiting_background(&self) -> bool {
+        self.any_visible_row(|row| is_waiting_agents_row(row) || is_background_shell_row(row))
     }
 
     /// Whether any of the last 40 visible rows contains one of `needles`.
@@ -801,10 +803,21 @@ fn status_row_text(row: &str) -> Option<&str> {
 }
 
 /// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
-/// row (see `VtTerm::visible_waiting_agents`).
+/// row (see `VtTerm::visible_waiting_background`).
 fn is_waiting_agents_row(row: &str) -> bool {
     let Some(rest) = status_row_text(row) else { return false };
     rest.starts_with("Waiting for ") && rest.contains(" background agent") && rest.contains(" to finish")
+}
+
+/// Whether a screen row is a finished turn's line with a background shell still going:
+/// "✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running". Claude is woken when
+/// that shell exits, exactly as it is when a background agent reports. The count comes
+/// before "shell" and may be plural; anything else on the line (the verb, the duration,
+/// the clock) varies and is not relied on.
+fn is_background_shell_row(row: &str) -> bool {
+    let Some(rest) = status_row_text(row) else { return false };
+    rest.contains(" still running")
+        && (rest.contains(" shell still running") || rest.contains(" shells still running"))
 }
 
 /// Whether a screen row is Claude's working status row: a spinner frame and a line
@@ -1063,6 +1076,38 @@ mod tests {
         assert!(!row("✳ Waiting for API response"));
         assert!(!row("✳ Brewed for 7s"));
         assert!(!row(""));
+    }
+
+    // A finished turn's line while a shell Claude started in the background runs on.
+    // The first is captured from a real session; the verb and the clock both vary.
+    #[test]
+    fn the_background_shell_row_is_known_by_its_shape() {
+        use super::is_background_shell_row as row;
+        assert!(row("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
+        assert!(row("✳ Cooked for 3s · done 9:02 AM · 2 shells still running   "));
+        assert!(row("· Baked for 1m 12s · 1 shell still running"));
+        // The same turn with nothing left behind is an ordinary turn end.
+        assert!(!row("✻ Brewed for 14m 1s · done 11:40 PM"));
+        assert!(!row("✻ Brewed for 7s"));
+        // The same words where Claude writes them in its transcript, or in a pane that
+        // is not Claude's status row at all.
+        assert!(!row("● The build is done, 1 shell still running in the background."));
+        assert!(!row("  1 shell still running"));
+        assert!(!row("⏵⏵ auto mode on · 1 shell · ← for agents"));
+        assert!(!row(""));
+    }
+
+    // Either kind of outstanding work holds the pane, and a plain turn end does not.
+    #[test]
+    fn background_work_of_either_kind_is_seen_on_screen() {
+        let seen = |line: &str| {
+            let mut t = super::VtTerm::new(80, 4);
+            t.feed(line.as_bytes());
+            t.visible_waiting_background()
+        };
+        assert!(seen("✳ Waiting for 2 background agents to finish"));
+        assert!(seen("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
+        assert!(!seen("✻ Brewed for 14m 1s · done 11:40 PM"));
     }
 
     /// Scrolling (wheel or drag auto-scroll) while a selection drag is active must

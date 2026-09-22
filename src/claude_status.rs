@@ -74,12 +74,13 @@ pub struct ClaudeHandle {
     /// Set when the transcript was scrolled away during a live turn: the turn is held as
     /// working, frames or not, until the row is back in view (then it gets a fresh TTL).
     scroll_holds_working: AtomicBool,
-    /// Claude's status row says it is waiting for background agents it launched (see
-    /// `VtTerm::visible_waiting_agents`). Its turn has ended by every other sign, the
-    /// Stop hook included, yet it resumes by itself when they report, so the pane is held
+    /// Claude's status row says it has background work outstanding: agents it launched, or
+    /// a shell it started in the background (see `VtTerm::visible_waiting_background`). Its
+    /// turn has ended by every other sign, the Stop hook included, yet it resumes by itself
+    /// when that work reports, so the pane is held
     /// as working for as long as the row shows; when the row goes, the resumed turn gets
     /// a fresh TTL to show its first frames in.
-    waiting_agents: AtomicBool,
+    waiting_background: AtomicBool,
     /// Spinner detection is ignored until this time — set briefly on app-initiated
     /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
     suppress_until_ms: AtomicU64,
@@ -237,7 +238,7 @@ impl ClaudeHandle {
             last_star_ms: AtomicU64::new(0),
             scrolled: AtomicBool::new(false),
             scroll_holds_working: AtomicBool::new(false),
-            waiting_agents: AtomicBool::new(false),
+            waiting_background: AtomicBool::new(false),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             hook_attention: AtomicBool::new(false),
@@ -628,7 +629,7 @@ impl ClaudeHandle {
             self.note_login_evidence();
         } else if !self.activity_fresh() && self.on_screen.swap(false, Ordering::Relaxed) {
             // Its screen went away with no turn in flight: Claude exited, whatever was typed.
-            self.waiting_agents.store(false, Ordering::Relaxed);
+            self.waiting_background.store(false, Ordering::Relaxed);
             self.remote_claude_typed.store(false, Ordering::Relaxed);
             *self.remote_session.lock().unwrap() = None;
             SAVE_DIRTY.store(true, Ordering::Relaxed);
@@ -820,7 +821,7 @@ impl ClaudeHandle {
         let ended = was
             && !on
             && idle_box
-            && !self.waiting_agents.load(Ordering::Relaxed)
+            && !self.waiting_background.load(Ordering::Relaxed)
             && now_ms() >= self.suppress_until_ms.load(Ordering::Relaxed);
         if ended {
             self.finish_seq.fetch_add(1, Ordering::Relaxed);
@@ -844,11 +845,11 @@ impl ClaudeHandle {
         let now = now_ms();
         let act = self.activity_ms.load(Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
-        // Waiting on background agents counts as live even though the Stop hook has
+        // Waiting on background work counts as live even though the Stop hook has
         // already fired: Claude resumes by itself, so scrolling away mid-wait must
         // hold the turn exactly as scrolling away mid-spinner does.
         let live = (act > stop && now.saturating_sub(act) < WORKING_TTL_MS)
-            || self.waiting_agents.load(Ordering::Relaxed)
+            || self.waiting_background.load(Ordering::Relaxed)
             || self.working_row.load(Ordering::Relaxed);
         if on {
             self.scroll_holds_working.store(live, Ordering::Relaxed);
@@ -862,13 +863,14 @@ impl ClaudeHandle {
         self.scrolled.load(Ordering::Relaxed)
     }
 
-    /// Reader: whether Claude's status row says it is waiting for background agents.
-    /// While it does the pane is working (see `waiting_agents`); when the row goes, the
+    /// Reader: whether Claude's status row says it has background agents or a background
+    /// shell outstanding.
+    /// While it does the pane is working (see `waiting_background`); when the row goes, the
     /// turn Claude resumes with gets a fresh TTL, so the moment before its first frames
     /// pair up is not read as a turn end. A wait the user broke off with Escape ends the
     /// same way, one TTL later.
-    pub fn set_waiting_agents(&self, on: bool) {
-        let was = self.waiting_agents.swap(on, Ordering::Relaxed);
+    pub fn set_waiting_background(&self, on: bool) {
+        let was = self.waiting_background.swap(on, Ordering::Relaxed);
         if was && !on {
             self.activity_ms.store(now_ms(), Ordering::Relaxed);
         }
@@ -930,7 +932,7 @@ impl ClaudeHandle {
         }
         // Waiting on its own agents: the turn is over on paper (Stop hook, still
         // spinner) but Claude carries on by itself when they report.
-        if self.waiting_agents.load(Ordering::Relaxed) {
+        if self.waiting_background.load(Ordering::Relaxed) {
             return Lifecycle::Working;
         }
         // Claude's own status row says it is working. Level-triggered, so it holds
@@ -1109,8 +1111,8 @@ fn process_hooks(dir: &Path) {
                 h.stop_ms.store(now_ms(), Ordering::Relaxed);
                 h.hook_attention.store(false, Ordering::Relaxed);
                 // The authoritative turn end. Not counted while Claude is waiting on
-                // its own agents: it fires then too, and Claude resumes by itself.
-                if !h.waiting_agents.load(Ordering::Relaxed) {
+                // its own background work: it fires then too, and Claude resumes by itself.
+                if !h.waiting_background.load(Ordering::Relaxed) {
                     h.finish_seq.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1239,9 +1241,9 @@ mod tests {
     #[test]
     fn scrolling_away_during_an_agent_wait_holds_the_turn() {
         let h = handle();
-        h.set_waiting_agents(true);
+        h.set_waiting_background(true);
         h.set_scrolled(true);
-        h.set_waiting_agents(false); // the row is off screen now
+        h.set_waiting_background(false); // the row is off screen now
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
     }
 
@@ -1313,16 +1315,16 @@ mod tests {
         std::thread::sleep(FRAME);
         h.note_activity(2);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
-        h.set_waiting_agents(true);
+        h.set_waiting_background(true);
         h.stop_ms.store(super::now_ms(), std::sync::atomic::Ordering::Relaxed);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
         std::thread::sleep(Duration::from_millis(super::STOP_SUPPRESS_MS + 50));
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
-        h.set_waiting_agents(false);
+        h.set_waiting_background(false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
 
         // A prompt on screen still outranks the wait.
-        h.set_waiting_agents(true);
+        h.set_waiting_background(true);
         h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
     }

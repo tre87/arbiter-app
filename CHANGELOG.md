@@ -185,6 +185,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
   without anything having to light up in a colour the room has reserved.
 
 ### Fixed
+- **A shell Claude left running in the background keeps the pane working.** A turn that
+  ends with a background shell still going (`✻ Brewed for 14m 1s · done 11:40 PM · 1 shell
+  still running`) looked finished: the spinner stopped, the dot went idle and "Claude
+  finished" fired, although Claude picks the work up again by itself the moment the shell
+  exits. It is now held exactly as a wait on background agents already was, working until
+  the line goes and with no card at the turn end. One honest cost: Claude draws the same
+  line for a dev server it started in the background, which never exits, so that pane
+  stays working for as long as the server runs.
 - **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,
   `/config` or any other slash command raised a "Claude needs your input" card. Claude
   lists its commands on the first `/`, and that list carries the footer a real prompt
