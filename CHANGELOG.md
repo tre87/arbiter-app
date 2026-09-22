@@ -58,10 +58,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ### Fixed
 - **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,
-  `/config` or any other slash command raised a "Claude needs your input" card, because
-  the chooser it opens draws the footer a real prompt draws and no hook reports it. The
-  pane now knows you opened it, and stays quiet. A command that sets Claude working, like
-  `/init`, still reports whatever that turn asks for.
+  `/config` or any other slash command raised a "Claude needs your input" card. Claude
+  lists its commands on the first `/`, and that list carries the footer a real prompt
+  carries, which no hook distinguishes. The pane now reads its own input box, so the list
+  is quiet as you type and so is the chooser Enter opens. A command that sets Claude
+  working, like `/init`, still reports whatever that turn asks for.
 - **Scrolling back over a plan no longer raises cards.** The scan that finds a prompt read
   the whole screen, so an approval box scrolled back into view looked like a live one, and
   every pass over it raised another card. A prompt only counts at the live bottom, within

@@ -751,17 +751,25 @@ impl ClaudeHandle {
         self.suppress_until_ms.store(0, Ordering::Relaxed);
     }
 
-    /// Reader: whether a menu/approval prompt is currently on the visible screen.
-    /// A menu appearing within `SLASH_MENU_WINDOW_MS` of a slash command is the one
-    /// the user just opened, and raises nothing.
-    pub fn set_menu(&self, on: bool) {
+    /// Reader: whether a menu/approval prompt is on the visible screen, and whether
+    /// the input box currently holds a slash command.
+    ///
+    /// Two things make a menu the user's. Claude lists its slash commands as soon as
+    /// `/` is typed, so a box reading `/mod` is already showing one — that is what
+    /// `slash_input` catches, before Enter is pressed at all. Then Enter clears the
+    /// box and the chooser proper opens, which `slash_submit_ms` covers. Once either
+    /// has claimed the menu it stays claimed until the menu leaves, so the handover
+    /// between the two cannot show a gap.
+    pub fn set_menu(&self, on: bool, slash_input: bool) {
         let was = self.menu_on_screen.swap(on, Ordering::Relaxed);
-        if on && !was {
-            let since = now_ms().saturating_sub(self.slash_submit_ms.load(Ordering::Relaxed));
-            let mine = self.slash_submit_ms.load(Ordering::Relaxed) != 0
-                && since < SLASH_MENU_WINDOW_MS;
-            self.menu_user_opened.store(mine, Ordering::Relaxed);
-        } else if !on && was {
+        if on {
+            let submitted = self.slash_submit_ms.load(Ordering::Relaxed);
+            let just_submitted =
+                submitted != 0 && now_ms().saturating_sub(submitted) < SLASH_MENU_WINDOW_MS;
+            if slash_input || just_submitted {
+                self.menu_user_opened.store(true, Ordering::Relaxed);
+            }
+        } else if was {
             self.menu_user_opened.store(false, Ordering::Relaxed);
             // The command is spent on the chooser it opened. Anything Claude puts up
             // afterwards is Claude's, even within the window.
@@ -1120,18 +1128,36 @@ mod tests {
     fn a_chooser_the_user_opened_is_not_attention() {
         let h = handle();
         h.note_slash_command();
-        h.set_menu(true);
+        h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
         // Answered or escaped: the latch goes with the menu.
-        h.set_menu(false);
-        h.set_menu(true);
+        h.set_menu(false, false);
+        h.set_menu(true, false);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
+    }
+
+    // Claude lists its commands the moment `/` is typed, long before Enter, and that
+    // list carries the same footer. Typing is the whole signal here.
+    #[test]
+    fn the_command_list_shown_while_typing_is_not_attention() {
+        let h = handle();
+        h.set_menu(true, true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        // Enter clears the box and the chooser proper opens: the claim has to survive
+        // the input row no longer holding the command.
+        h.note_slash_command();
+        h.set_menu(true, false);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        // Escaped: back to normal, and the next menu is Claude's.
+        h.set_menu(false, false);
+        h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
     }
 
     #[test]
     fn a_chooser_claude_opened_is_attention() {
         let h = handle();
-        h.set_menu(true);
+        h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
     }
 
@@ -1143,7 +1169,7 @@ mod tests {
         h.note_activity(0b1000);
         std::thread::sleep(FRAME);
         h.note_activity(0b0100);
-        h.set_menu(true);
+        h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
     }
 
@@ -1273,7 +1299,7 @@ mod tests {
 
         // A prompt on screen still outranks the wait.
         h.set_waiting_agents(true);
-        h.set_menu(true);
+        h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
     }
 

@@ -1697,7 +1697,7 @@ fn reader_loop(
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
             // glyph in the *new* bytes (chunk-based like the web — instant, and a
             // stale star left on screen can't pin it to "working").
-            let (menu, scrolled, waiting, working, idle_box) = {
+            let (menu, scrolled, waiting, working, idle_box, slash_input) = {
                 let t = term.lock().unwrap();
                 (
                     t.visible_menu(),
@@ -1705,6 +1705,7 @@ fn reader_loop(
                     t.visible_waiting_agents(),
                     t.visible_working(),
                     t.claude_chrome(),
+                    t.input_row_is_slash(),
                 )
             };
             // Scrolled away, everything on screen is history: an approval box the user
@@ -1719,7 +1720,7 @@ fn reader_loop(
             if !scrolled {
                 claude.set_working_row(working, idle_box);
             }
-            claude.set_menu(menu);
+            claude.set_menu(menu, slash_input);
             claude.set_scrolled(scrolled);
             if prev_menu && !menu {
                 // A menu just LEFT the screen (answered or escaped). AskUserQuestion

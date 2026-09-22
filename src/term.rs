@@ -834,12 +834,15 @@ fn is_menu_row(row: &str) -> bool {
 /// first character must still look like a command, not prose that happens to start
 /// with a slash.
 fn row_is_slash_command(row: &str) -> bool {
-    let body = row.trim_start_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '│' | '|' | '>' | '\u{276f}')
-    });
+    // Claude draws the text inside a box, so strip the border and prompt marker from
+    // both ends: the row is `│ > /model        │`.
+    let edge = |c: char| c.is_whitespace() || matches!(c, '│' | '|' | '>' | '\u{276f}');
+    let body = row.trim_start_matches(edge).trim_end_matches(edge);
     let Some(rest) = body.strip_prefix('/') else { return false };
+    // A bare `/` counts: Claude lists its commands on that first keystroke, which is
+    // the moment the list appears and the earliest this has to be right.
+    let Some(first) = rest.chars().next() else { return true };
     // `/usr/bin/x` or `//` is a path or a comment, not a command.
-    let Some(first) = rest.chars().next() else { return false };
     first.is_ascii_alphabetic()
         && rest.chars().take_while(|c| !c.is_whitespace()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
 }
@@ -1035,6 +1038,10 @@ mod tests {
         assert!(slash("│ ❯ /config "));
         assert!(slash("  /agents"));
         assert!(slash("> /statusline setup"));
+        // The first keystroke, which is when Claude puts its command list up.
+        assert!(slash("> /"));
+        assert!(slash("│ > /   │"));
+        assert!(slash("> /mod"));
         assert!(!slash("> fix the bug in /src/main.rs"));
         assert!(!slash("> /usr/bin/env"));
         assert!(!slash("> //"));
