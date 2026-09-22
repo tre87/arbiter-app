@@ -19,9 +19,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
   workspace remembers its folder, width and expanded folders across a restart.
 - **A built-in editor.** Double-click a file in the explorer, or right-click and Open, and it
   opens in an editor with line numbers, syntax colouring by file type, undo and redo, cut,
-  copy, paste and select all, a tab per file and a right-click menu. A `.vue` file colours
-  its template, script and style blocks with the HTML, JavaScript and CSS grammars at once;
-  TOML is bundled too, which syntect does not ship. The editor takes the terminals' place
+  copy, paste and select all, a tab per file and a right-click menu. It opens at once
+  whatever the file's size, and the wheel scrolls it. A `.vue` file colours its template,
+  script and style blocks with the HTML, JavaScript and CSS grammars at once. The editor
+  takes the terminals' place
   while it shows and the explorer's toggle brings them back, so nothing typed into it can
   reach a terminal you cannot see. Open tabs are remembered per workspace, though a relaunch
   always opens on the terminals. A file changed by something else reloads by itself when you
@@ -33,17 +34,35 @@ history belongs to the prior Tauri/Vue web app it replaced.
   explorer's own watcher saw as a change, which ran it again: a loop once per debounce for
   as long as the pane was open. It cost 4.7% of a core on an idle repo; it is now 0.16%,
   the same as with the explorer closed.
-- **An open file no longer holds memory it is not using.** Tabs that are off screen and
-  unedited release their buffer and re-read on the way back, so memory follows the file
-  being looked at rather than the sum of everything open: six tabs including a 9,600 line
-  file went from 457 MB to 354 MB. Undo and redo are both bounded now (they were whole
-  document snapshots, with redo uncapped), and the line-number gutter, which costs a shaped
-  copy of every line, gives way above 5,000 lines.
-- **A second iced crate is forked.** `vendor/iced_widget` carries a one-line fix: iced
-  0.13's text editor hit-tests a click with the padding applied to swapped axes, so an
-  editor with uneven padding puts the caret nowhere near the pointer. The editor's line
-  numbers are drawn inside its own left padding, which is what lets a drag across them
-  keep selecting instead of stopping at the gutter's edge.
+- **The editor opens a file at once, and holds only what it is showing.** It used to lay the
+  whole document out so the line numbers beside it stayed in step, which meant opening a file
+  shaped every one of its lines three times over and ran the syntax parser across all of them,
+  in the frame the file was asked for. The editor is the viewport again and scrolls itself,
+  and the numbers are read from its own scroll each frame instead of being kept in step by
+  brute force, so nothing off screen is laid out at all. A 10,000 line file went from 262 ms
+  to 7 ms of blocked interface, and the 5,000 line ceiling on the line numbers is gone with
+  it. The text lands in a buffer the editor has already sized, which is where most of the
+  rest of the time went, and after the first file of a session that buffer is the one the
+  previous tab was using, so the text is there in the frame the editor appears in rather
+  than the one after. Tabs that are off screen and
+  unedited still release their buffer and re-read on the way back, and undo and redo are
+  both bounded (they were whole document snapshots, with redo uncapped).
+- **A second iced crate is forked.** `vendor/iced_widget` carries two changes. One is a
+  one-line fix: iced 0.13's text editor hit-tests a click with the padding applied to swapped
+  axes, so an editor with uneven padding puts the caret nowhere near the pointer. The
+  editor's line numbers are drawn inside its own left padding, which is what lets a drag
+  across them keep selecting instead of stopping at the gutter's edge. The other opens up the
+  editor behind a `Content`, so the line numbers can be drawn from the editor's own scroll
+  rather than from a copy kept beside it.
+- **Syntax colouring for the languages you actually open.** The grammars are bat's set now
+  (the `two-face` crate) rather than syntect's own, which shipped none of PowerShell,
+  TypeScript, SCSS, LESS, Svelte, F#, TOML, Vue, Dockerfile, Terraform, GraphQL, Kotlin,
+  Swift, Zig, Nix or INI. A `.ps1` file was plain text and had a PowerShell icon over it;
+  there is now a test that every extension the explorer draws a language icon for resolves to
+  a grammar. PowerShell itself is bundled separately (`assets/syntaxes`, MIT): it is one of
+  the two grammars bat has that only build against oniguruma, which Arbiter does not use
+  because it is C. The bundled Vue and TOML grammars are gone, since the set has both.
+  `.csproj`, `.props`, `.targets`, `.resx` and the rest of .NET's XML family colour as XML.
 - **A crash now leaves a note behind.** Panics are appended to `panic.log` in Arbiter's data
   folder with the build they came from. A release build on Windows has no console, and
   Windows Error Reporting does not record a Rust panic, so until now a crash took the window

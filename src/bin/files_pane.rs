@@ -56,18 +56,29 @@ const EDITOR_LINE_H: f32 = 20.0;
 const MONO_ADVANCE: f32 = 7.7;
 /// Gap between the line numbers and the first character of the line.
 const GUTTER_GAP: f32 = 10.0;
-/// Above this many lines the editor drops its gutter and scrolls itself, rather
-/// than being laid out in full. The whole-document layout is what keeps the
-/// gutter aligned, and it costs a shaping pass over every line.
-/// Above this the editor drops its gutter and goes back to scrolling itself.
+/// Above this many lines, a buffer is not carried over to the tab being opened.
 ///
-/// Laying the whole document out is what keeps the numbers in step with the
-/// text, and it costs cosmic-text a shaped copy of every line rather than only
-/// the visible ones. Measured at roughly 5 KB a line: 47 MB of the 197 MB a
-/// 9,600 line file takes. 5,000 lines caps that contribution near 25 MB and
-/// still covers all but the largest source files.
-const MAX_GUTTER_LINES: usize = 5_000;
-const EDITOR_SCROLL: &str = "editor-scroll";
+/// Putting a different file into a buffer means clearing it first, and
+/// cosmic-text's delete builds an undo record by pushing every removed line onto
+/// the FRONT of a vector, so it costs far more than the lines are worth: 8 ms at
+/// 2,500 lines, 48 ms at 10,500. Starting from an empty buffer instead costs one
+/// frame, and a frame is 16 ms. Below this the carry-over wins, above it the
+/// frame does.
+const CARRY_MAX_LINES: usize = 2_000;
+
+/// Lines pasted at a time when a whole file goes into the buffer.
+///
+/// cosmic-text inserts each pasted line into the buffer's line vector at the
+/// same index, so one paste of a whole file is quadratic in its length: a 10,000
+/// line file spent 191 ms there. Pasting in blocks keeps that quadratic term
+/// inside the block, and a block this large is still few enough that the
+/// re-shaping every paste triggers is paid a couple of dozen times rather than
+/// hundreds.
+const PASTE_LINES: usize = 512;
+
+/// The editor's own padding. The gutter is drawn from the same value, which is
+/// what puts the first number level with the first line.
+const EDITOR_PAD: f32 = 5.0;
 pub const PROMPT_INPUT: &str = "explorer-prompt-input";
 
 // ---------------------------------------------------------------------------
@@ -138,6 +149,9 @@ pub struct EditorTab {
     /// A watcher event arrived for a tab that was not on screen, so the disk
     /// check waits until it is activated.
     pending_check: bool,
+    /// A read is in flight for this tab: its buffer is the empty one the widget
+    /// is being laid out with, and nothing else may touch it until it lands.
+    loading: bool,
     load_error: Option<String>,
 }
 
@@ -159,6 +173,7 @@ impl EditorTab {
             bom: false,
             missing: false,
             pending_check: false,
+            loading: false,
             load_error: None,
         }
     }
@@ -198,10 +213,6 @@ pub struct Editor {
     /// The tab that changed on disk while it had unsaved edits.
     reload_prompt: Option<usize>,
     doc_seq: u64,
-    /// Last known scroll offset and viewport height, so the caret can be kept in
-    /// view: a Shrink-height editor inside a scrollable never scrolls itself.
-    scroll_y: f32,
-    view_h: Option<f32>,
 }
 
 impl Editor {
@@ -317,6 +328,9 @@ pub enum Msg {
     EditorOpen(PathBuf),
     EditorToggle,
     EditorAction(text_editor::Action),
+    /// A tab whose buffer had to be laid out first is ready for its text: which
+    /// tab (its path and `doc`), where its caret goes, and the file.
+    Fill(PathBuf, u64, (usize, usize), ReadFile),
     TabSelect(usize),
     TabClose(usize),
     CloseDirtyAnswer(CloseAnswer),
@@ -332,7 +346,6 @@ pub enum Msg {
     Pasted(Option<String>),
     DeleteSelection,
     SelectAll,
-    Scrolled(scrollable::Viewport),
     SendToAgent,
     SendPick(usize),
     SendMove(i32),
@@ -441,6 +454,11 @@ pub fn set_enabled(state: &mut State, on: bool) {
 /// and the first file opened would otherwise wait for all of it.
 pub fn boot_tasks(state: &State) -> Vec<Task<Message>> {
     if state.settings.show_file_explorer {
+        // Under the open-latency diagnostic, wait for it: otherwise the first
+        // open races the warm-up and its number is really the grammar decode.
+        if ed::timing::enabled() {
+            let _ = highlight::syntaxes();
+        }
         highlight::warm();
     }
     boot_git_tasks(state)
@@ -801,6 +819,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             release_background_tabs(state);
         }
         Msg::EditorAction(action) => return editor_action(state, action),
+        Msg::Fill(path, doc, caret, read) => return finish_fill(state, path, doc, caret, read),
         Msg::TabSelect(i) => {
             let ed = &mut state.active_mut().editor;
             if i >= ed.tabs.len() {
@@ -855,11 +874,6 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
         Msg::SelectAll => {
             state.editor_menu = None;
             return editor_action(state, text_editor::Action::SelectAll);
-        }
-        Msg::Scrolled(v) => {
-            let ed = &mut state.active_mut().editor;
-            ed.scroll_y = v.absolute_offset().y;
-            ed.view_h = Some(v.bounds().height);
         }
         Msg::SendToAgent => return send_to_agent(state),
         Msg::SendMove(delta) => {
@@ -1148,6 +1162,10 @@ fn editor_fs_changed(state: &mut State, paths: &[PathBuf]) -> Task<Message> {
 
 fn open_file(state: &mut State, path: PathBuf) -> Task<Message> {
     let path = ex::normalize(&path);
+    ed::timing::open(
+        &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    );
+    highlight::warm();
     if let Some(i) = state.active().editor.index_of(&path) {
         state.active_mut().editor.active = Some(i);
         state.active_mut().editor.visible = true;
@@ -1155,67 +1173,227 @@ fn open_file(state: &mut State, path: PathBuf) -> Task<Message> {
         save_session(state);
         return Task::batch([task, iced::widget::focus_next()]);
     }
+    let read = match read_file(&path) {
+        Ok(read) => read,
+        Err(body) => {
+            state.notice = Some(Notice { title: "Cannot open this file".into(), body });
+            return Task::none();
+        }
+    };
+    let carried = take_spare_buffer(state, None);
     let mut tab = EditorTab::unloaded(path.clone());
-    if let Err(body) = load_into(&mut tab) {
-        state.notice = Some(Notice { title: "Cannot open this file".into(), body });
-        return Task::none();
-    }
-    highlight::warm();
-    let doc = state.active_mut().editor.next_doc();
-    tab.doc = doc;
-    let ed = &mut state.active_mut().editor;
-    ed.tabs.push(tab);
-    ed.active = Some(ed.tabs.len() - 1);
-    ed.visible = true;
-    ed.scroll_y = 0.0;
+    tab.doc = state.active_mut().editor.next_doc();
+    tab.content = Some(carried.unwrap_or_default());
+    let ws = state.active;
+    let pane = &mut state.active_mut().editor;
+    pane.tabs.push(tab);
+    let i = pane.tabs.len() - 1;
+    pane.active = Some(i);
+    pane.visible = true;
     release_background_tabs(state);
-    save_session(state);
-    Task::batch([
-        iced::widget::scrollable::scroll_to(
-            scrollable::Id::new(EDITOR_SCROLL),
-            scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
-        ),
-        iced::widget::focus_next(),
-    ])
+    Task::batch([fill_tab(state, ws, i, (0, 0), read), iced::widget::focus_next()])
 }
 
-/// Read a tab's file into a buffer. `Err` carries what to tell the user.
-fn load_into(tab: &mut EditorTab) -> Result<(), String> {
-    let meta = std::fs::metadata(&tab.path)
-        .map_err(|e| format!("{}: {e}", tab.path.display()))?;
+/// What one read brings back.
+#[derive(Clone)]
+pub struct ReadFile {
+    loaded: ed::Loaded,
+    disk: Option<ed::DiskStamp>,
+}
+
+// By hand so that debug-printing the message it travels in does not print the
+// whole file.
+impl std::fmt::Debug for ReadFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadFile").field("bytes", &self.loaded.text.len()).finish()
+    }
+}
+
+/// Read one file. `Err` carries what to tell the user.
+fn read_file(path: &Path) -> Result<ReadFile, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.len() > ed::MAX_FILE_BYTES {
         return Err(format!(
             "{} is {:.1} MiB. The editor opens files up to {} MiB; use Open in default app instead.",
-            tab.path.display(),
+            path.display(),
             meta.len() as f64 / (1024.0 * 1024.0),
             ed::MAX_FILE_BYTES / (1024 * 1024),
         ));
     }
-    let bytes = std::fs::read(&tab.path).map_err(|e| format!("{}: {e}", tab.path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    ed::timing::phase("read");
     let loaded = ed::load_bytes(&bytes).map_err(|e| e.message().to_string())?;
-    tab.saved_hash = ed::hash_text(&loaded.text);
-    tab.content = Some(text_editor::Content::with_text(&loaded.text));
-    tab.eol = loaded.eol;
-    tab.trailing_newline = loaded.trailing_newline;
-    tab.bom = loaded.bom;
-    tab.disk = ed::DiskStamp::read(&tab.path);
+    Ok(ReadFile { loaded, disk: ed::DiskStamp::read(path) })
+}
+
+/// Take a laid-out buffer off a tab other than `keep`, for the tab being opened
+/// to carry on with.
+///
+/// A fresh `Content` has a buffer with no height until the widget has been laid
+/// out once, and text pasted into a buffer with no height is laid out in full
+/// (see `set_text`). A buffer that has been on screen is sized to this very pane,
+/// so handing it on is what lets a file's text appear in the same frame the
+/// editor does rather than the frame after. The tab it comes from re-reads on the
+/// way back, which is what `release_background_tabs` would have done to it
+/// anyway. For the same reason, a tab holding anything that is not on disk
+/// keeps its buffer.
+fn take_spare_buffer(state: &mut State, keep: Option<usize>) -> Option<text_editor::Content> {
+    let pane = &mut state.active_mut().editor;
+    for (i, tab) in pane.tabs.iter_mut().enumerate() {
+        if Some(i) == keep || tab.dirty || tab.missing || tab.loading {
+            continue;
+        }
+        if !tab.undo.is_empty() || !tab.redo.is_empty() {
+            continue;
+        }
+        let carryable = tab
+            .content
+            .as_ref()
+            .is_some_and(|c| buffer_is_sized(c) && c.line_count() <= CARRY_MAX_LINES);
+        if carryable {
+            return tab.content.take();
+        }
+    }
+    None
+}
+
+/// Whether a buffer has been through a layout, and so knows its viewport.
+fn buffer_is_sized(content: &text_editor::Content) -> bool {
+    content.editor().buffer().size().1.is_some_and(|h| h > 0.0)
+}
+
+/// Put a file that has been read into its tab, now if the buffer is ready for it
+/// and on the next frame if it is not. `caret` is where the caret goes afterwards:
+/// a reload keeps its place, anything else starts at the top, since the buffer may
+/// have been carried over from another tab, whose caret it still holds.
+fn fill_tab(
+    state: &mut State,
+    ws: usize,
+    i: usize,
+    caret: (usize, usize),
+    read: ReadFile,
+) -> Task<Message> {
+    let Some(tab) = state.workspaces.get_mut(ws).and_then(|w| w.editor.tabs.get_mut(i)) else {
+        return Task::none();
+    };
+    let ready = tab.content.as_ref().is_some_and(buffer_is_sized);
+    if !ready {
+        // Nothing on screen to carry a buffer over from, so the empty one this
+        // tab was given has to be laid out once before the text goes in. One
+        // frame, and the editor is already up while it passes.
+        tab.loading = true;
+        let msg = Msg::Fill(tab.path.clone(), tab.doc, caret, read);
+        return Task::done(Message::Files(msg));
+    }
+    apply_read(tab, caret, read);
+    save_session(state);
+    Task::none()
+}
+
+/// The second half of a deferred fill: the buffer has been laid out by now.
+///
+/// The tab is found again by its path and `doc`, and only while it is still
+/// waiting. Its workspace is not held by index: closing an earlier workspace
+/// during the frame in between would shift it, and a same-path tab there could
+/// have its unsaved edits replaced. `doc` alone is only unique within one
+/// workspace, hence the path beside it.
+fn finish_fill(
+    state: &mut State,
+    path: PathBuf,
+    doc: u64,
+    caret: (usize, usize),
+    read: ReadFile,
+) -> Task<Message> {
+    let tab = state
+        .workspaces
+        .iter_mut()
+        .flat_map(|w| w.editor.tabs.iter_mut())
+        .find(|t| t.loading && t.doc == doc && t.path == path);
+    let Some(tab) = tab else { return Task::none() };
+    tab.loading = false;
+    apply_read(tab, caret, read);
+    save_session(state);
+    Task::none()
+}
+
+fn apply_read(tab: &mut EditorTab, caret: (usize, usize), read: ReadFile) {
+    if tab.content.is_none() {
+        tab.content = Some(text_editor::Content::new());
+    }
+    set_text(tab, &read.loaded.text);
+    ed::timing::phase("fill");
+    ed::timing::lines(tab.content.as_ref().map(|c| c.line_count()).unwrap_or(0));
+    place_caret(tab, caret);
+    tab.saved_hash = ed::hash_text(&read.loaded.text);
+    tab.eol = read.loaded.eol;
+    tab.trailing_newline = read.loaded.trailing_newline;
+    tab.bom = read.loaded.bom;
+    tab.disk = read.disk;
     tab.dirty = false;
     tab.missing = false;
     tab.load_error = None;
     tab.undo.clear();
     tab.redo.clear();
-    Ok(())
+}
+
+/// Replace a tab's buffer with `text`, in place.
+///
+/// Pasting over a select-all rather than building a fresh `Content`.
+/// `Content::with_text` makes a buffer with no height, so cosmic-text lays out
+/// every line of the file, and the first layout then throws all of it away when
+/// it applies the editor's own font. Measured on a 2,400 line file that was 40%
+/// of what an open cost. A buffer that knows its viewport shapes only the lines
+/// on screen.
+fn set_text(tab: &mut EditorTab, text: &str) {
+    let Some(c) = tab.content.as_mut() else { return };
+    c.perform(text_editor::Action::SelectAll);
+    let mut blocks = line_blocks(text, PASTE_LINES);
+    // The first paste replaces the selection; the rest land at the caret, which
+    // each one leaves at the end of the document.
+    let first = blocks.next().unwrap_or("");
+    c.perform(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(first.to_string()))));
+    for block in blocks {
+        c.perform(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+            block.to_string(),
+        ))));
+    }
+}
+
+/// `text` cut into runs of at most `lines` whole lines, each keeping its own
+/// line terminator. Empty for empty text.
+fn line_blocks(text: &str, lines: usize) -> impl Iterator<Item = &str> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= text.len() {
+            return None;
+        }
+        let mut end = start;
+        for _ in 0..lines {
+            match text[end..].find('\n') {
+                Some(i) => end += i + 1,
+                None => {
+                    end = text.len();
+                    break;
+                }
+            }
+            if end >= text.len() {
+                break;
+            }
+        }
+        let block = &text[start..end];
+        start = end;
+        Some(block)
+    })
 }
 
 /// Load the active tab if it has not been read yet, and check the disk if a
 /// watcher event arrived while it was off screen.
 /// Let go of the buffers of tabs that are not on screen.
 ///
-/// A tab's buffer is not just its text: the editor is laid out at its full
-/// height so the gutter can track it, which makes cosmic-text shape and keep
-/// every line rather than only the visible ones. That runs to a couple of
-/// hundred megabytes for a ten-thousand-line file, and it would otherwise be
-/// paid for every tab at once, for as long as the app is open.
+/// A tab's buffer is not just its text: cosmic-text keeps a line of its own for
+/// every line of the file, and the highlighter keeps a parsed copy of every line
+/// it has reached. That would otherwise be held for every tab at once, for as
+/// long as the app is open.
 ///
 /// Only untouched tabs are released: one with unsaved edits obviously cannot be
 /// re-read from disk, and one with an undo history would lose it, which is not
@@ -1230,7 +1408,7 @@ fn release_background_tabs(state: &mut State) {
         if Some(i) == active || t.content.is_none() {
             continue;
         }
-        if t.dirty || t.missing || !t.undo.is_empty() || !t.redo.is_empty() {
+        if t.dirty || t.missing || t.loading || !t.undo.is_empty() || !t.redo.is_empty() {
             continue;
         }
         t.content = None;
@@ -1245,26 +1423,37 @@ fn ensure_active_loaded(state: &mut State) -> Task<Message> {
         .editor
         .tabs
         .get(i)
-        .map(|t| t.content.is_none() && t.load_error.is_none())
+        .map(|t| t.content.is_none() && t.load_error.is_none() && !t.loading)
         .unwrap_or(false);
-    if needs_load {
-        let doc = state.active_mut().editor.next_doc();
-        if let Some(t) = state.active_mut().editor.tabs.get_mut(i) {
-            t.doc = doc;
-            if let Err(e) = load_into(t) {
-                t.load_error = Some(e);
-            }
-        }
-        highlight::warm();
-        return Task::none();
+    if !needs_load {
+        return check_disk(state, i);
     }
-    check_disk(state, i)
+    highlight::warm();
+    let Some(path) = state.active().editor.tabs.get(i).map(|t| t.path.clone()) else {
+        return Task::none();
+    };
+    let read = match read_file(&path) {
+        Ok(read) => read,
+        Err(body) => {
+            if let Some(t) = state.active_mut().editor.tabs.get_mut(i) {
+                t.load_error = Some(body);
+            }
+            return Task::none();
+        }
+    };
+    let carried = take_spare_buffer(state, Some(i));
+    let doc = state.active_mut().editor.next_doc();
+    let ws = state.active;
+    let Some(t) = state.active_mut().editor.tabs.get_mut(i) else { return Task::none() };
+    t.doc = doc;
+    t.content = Some(carried.unwrap_or_default());
+    fill_tab(state, ws, i, (0, 0), read)
 }
 
 /// Compare one tab with its file: reload silently when clean, ask when dirty.
 fn check_disk(state: &mut State, i: usize) -> Task<Message> {
     let Some(t) = state.active().editor.tabs.get(i) else { return Task::none() };
-    if t.content.is_none() {
+    if t.content.is_none() || t.loading {
         return Task::none();
     }
     let change = ed::check_disk(&t.path, t.disk);
@@ -1289,17 +1478,28 @@ fn check_disk(state: &mut State, i: usize) -> Task<Message> {
 }
 
 fn reload_tab(state: &mut State, i: usize) -> Task<Message> {
-    let doc = state.active_mut().editor.next_doc();
-    let Some(t) = state.active_mut().editor.tabs.get_mut(i) else { return Task::none() };
-    let caret = t.content.as_ref().map(|c| c.cursor_position()).unwrap_or((0, 0));
-    t.doc = doc;
-    if let Err(e) = load_into(t) {
-        t.load_error = Some(e);
-        t.content = None;
+    let Some(path) = state.active().editor.tabs.get(i).map(|t| t.path.clone()) else {
         return Task::none();
+    };
+    ed::timing::open(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    let read = match read_file(&path) {
+        Ok(read) => read,
+        Err(body) => {
+            if let Some(t) = state.active_mut().editor.tabs.get_mut(i) {
+                t.load_error = Some(body);
+                t.content = None;
+            }
+            return Task::none();
+        }
+    };
+    let doc = state.active_mut().editor.next_doc();
+    let ws = state.active;
+    let mut caret = (0, 0);
+    if let Some(t) = state.active_mut().editor.tabs.get_mut(i) {
+        t.doc = doc;
+        caret = t.content.as_ref().map(|c| c.cursor_position()).unwrap_or((0, 0));
     }
-    place_caret(t, caret);
-    follow_caret(state)
+    fill_tab(state, ws, i, caret, read)
 }
 
 /// Put the caret back at `(line, byte)` after the buffer was replaced. iced 0.13
@@ -1308,11 +1508,25 @@ fn reload_tab(state: &mut State, i: usize) -> Task<Message> {
 fn place_caret(tab: &mut EditorTab, (line, byte): (usize, usize)) {
     let Some(c) = tab.content.as_mut() else { return };
     c.perform(text_editor::Action::Move(text_editor::Motion::DocumentStart));
-    for _ in 0..line {
-        if c.cursor_position().0 >= line {
+    // Whole pages first: every step re-shapes around the caret, so walking a line
+    // at a time to line 9,000 shapes the file on the way past it.
+    loop {
+        let at = c.cursor_position().0;
+        c.perform(text_editor::Action::Move(text_editor::Motion::PageDown));
+        let now = c.cursor_position().0;
+        if now > line || now == at {
+            if now > line {
+                c.perform(text_editor::Action::Move(text_editor::Motion::PageUp));
+            }
             break;
         }
+    }
+    while c.cursor_position().0 < line {
+        let at = c.cursor_position();
         c.perform(text_editor::Action::Move(text_editor::Motion::Down));
+        if c.cursor_position() == at {
+            break;
+        }
     }
     // Right steps by grapheme, so walk to the recorded byte rather than
     // computing it. The guard is against a caret that cannot move any further,
@@ -1370,34 +1584,7 @@ fn editor_action(state: &mut State, action: text_editor::Action) -> Task<Message
             }
         }
     }
-    follow_caret(state)
-}
-
-/// Keep the caret on screen. The editor is laid out at its full height inside a
-/// scrollable, so it never scrolls itself and nothing else would.
-fn follow_caret(state: &mut State) -> Task<Message> {
-    let view_h = state.active().editor.view_h.unwrap_or_else(|| {
-        (state.main_size.height - 40.0 - 6.0 - HEADER_H - FOOTER_H - 4.0).max(EDITOR_LINE_H)
-    });
-    let scroll_y = state.active().editor.scroll_y;
-    let Some(tab) = state.active().editor.tab() else { return Task::none() };
-    let Some(c) = tab.content.as_ref() else { return Task::none() };
-    let line = c.cursor_position().0;
-    let top = 5.0 + line as f32 * EDITOR_LINE_H;
-    let margin = EDITOR_LINE_H * 3.0;
-    let target = if top < scroll_y + margin {
-        (top - margin).max(0.0)
-    } else if top + EDITOR_LINE_H > scroll_y + view_h - margin {
-        top + EDITOR_LINE_H + margin - view_h
-    } else {
-        return Task::none();
-    };
-    let target = target.max(0.0);
-    state.active_mut().editor.scroll_y = target;
-    scrollable::scroll_to(
-        scrollable::Id::new(EDITOR_SCROLL),
-        scrollable::AbsoluteOffset { x: 0.0, y: target },
-    )
+    Task::none()
 }
 
 fn undo_redo(state: &mut State, undo: bool) -> Task<Message> {
@@ -1416,10 +1603,10 @@ fn undo_redo(state: &mut State, undo: bool) -> Task<Message> {
         tab.undo.push(current);
     }
     tab.doc = doc;
-    tab.content = Some(text_editor::Content::with_text(&restore.text));
+    set_text(tab, &restore.text);
     place_caret(tab, restore.cursor);
     tab.dirty = ed::hash_text(&restore.text) != tab.saved_hash;
-    follow_caret(state)
+    Task::none()
 }
 
 /// Tab key: spaces to the next multiple of four, as one undo entry.
@@ -1819,80 +2006,73 @@ fn text_area<'a>(
     tab: &'a EditorTab,
     content: &'a text_editor::Content,
 ) -> Element<'a, Message> {
+    ed::timing::frame();
     let mono = iced::Font::with_name(highlight::MONO_FAMILY);
     let lh = iced::widget::text::LineHeight::Absolute(iced::Pixels(EDITOR_LINE_H));
     let count = content.line_count().max(1);
-    // Past this the whole-document layout below stops being affordable, so the
-    // editor goes back to scrolling itself and loses its gutter.
-    let paged = count > MAX_GUTTER_LINES;
     let digits = count.to_string().len();
     let gutter_w = (digits as f32 * MONO_ADVANCE + 8.0).ceil();
-    let numbers: String =
-        (1..=count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
-    // The numbers are drawn UNDER the editor, inside its left padding, rather
-    // than beside it. That way the editor's bounds cover them, so a drag that
-    // wanders over the numbers keeps extending the selection instead of
-    // stopping dead at a strip the pointer naturally crosses. Text captures no
-    // mouse events, so everything still reaches the editor.
-    //
-    // This needs the editor's padding to be asymmetric, which upstream iced
-    // 0.13 hit-tests wrongly (it applies the padding to swapped axes). That is
-    // the one line `vendor/iced_widget` exists to fix.
-    let gutter = container(
-        row![
-            text(numbers)
-                .font(mono)
-                .size(EDITOR_FONT_PX)
-                .line_height(lh)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .color(TXT_MUTED)
-                .align_x(iced::alignment::Horizontal::Right)
-                .width(Length::Fixed(gutter_w)),
-            horizontal_space(),
-        ]
-        .width(Length::Fill),
-    )
-    .padding(iced::Padding { top: 5.0, right: 0.0, bottom: 5.0, left: 0.0 });
+
+    // Where the editor has actually scrolled to, read from its own buffer. The
+    // numbers are derived from it every frame rather than tracked beside it, so
+    // the two columns cannot come apart. Before the first layout the buffer has
+    // no height yet; the window's own is an over-estimate, and drawing a few
+    // numbers too many costs nothing because the container clips them.
+    let (first, offset, visible, page_lines) = {
+        let editor = content.editor();
+        let buffer = editor.buffer();
+        let scroll = buffer.scroll();
+        let view_h = match buffer.size().1 {
+            Some(h) if h > 0.0 => h,
+            _ => state.main_size.height,
+        };
+        let (first, offset, visible) = ed::gutter_window(
+            scroll.line,
+            scroll.vertical,
+            view_h,
+            EDITOR_LINE_H,
+            content.line_count(),
+        );
+        (first, offset, visible, ((view_h / EDITOR_LINE_H) as usize).max(1))
+    };
+    let gutter = gutter::Gutter::new(
+        first,
+        visible,
+        EDITOR_PAD + offset,
+        gutter_w,
+        EDITOR_LINE_H,
+        EDITOR_FONT_PX,
+        mono,
+        TXT_MUTED,
+    );
 
     let modal_up = state.active().editor.modal_up() || modal_is_open(state);
-    let page_lines = state
-        .active()
-        .editor
-        .view_h
-        .map(|h| ((h / EDITOR_LINE_H) as usize).max(1))
-        .unwrap_or(20);
     let active = state.active().editor.active.unwrap_or(0);
 
     // A file past the cap is shown plain: the widget re-highlights from the
-    // edited line to the end of the document on every keystroke.
+    // edited line to the last visible one on every keystroke.
     let token = if count > highlight::MAX_HIGHLIGHT_LINES { "txt" } else { tab.lang.as_str() };
     let editor = text_editor(content)
         .font(mono)
         .size(EDITOR_FONT_PX)
         .line_height(lh)
-        // Left padding leaves room for the numbers drawn beneath, so the
-        // editor's own bounds still cover them and a drag across them keeps
-        // selecting.
-        // Room on the left for the numbers drawn beneath (see the gutter above).
+        // Room on the left for the numbers drawn beneath, so the editor's own
+        // bounds still cover them and a drag across them keeps selecting. This
+        // needs the editor's padding to be asymmetric, which upstream iced 0.13
+        // hit-tests wrongly (it applies the padding to swapped axes). That is one
+        // of the two things `vendor/iced_widget` exists to fix.
         .padding(iced::Padding {
-            top: 5.0,
-            right: 5.0,
-            bottom: 5.0,
-            left: if paged { 5.0 } else { gutter_w + GUTTER_GAP },
+            top: EDITOR_PAD,
+            right: EDITOR_PAD,
+            bottom: EDITOR_PAD,
+            left: gutter_w + GUTTER_GAP,
         })
         .wrapping(iced::widget::text::Wrapping::None)
-        // Laying the whole document out is what lets the gutter beside it stay
-        // in step: the editor then never scrolls itself, and the one scrollable
-        // moves both columns together. The height is stated rather than left to
-        // Shrink because a Shrink child of a scrollable is measured against an
-        // infinite limit, and the editor carries that infinity into its own
-        // arithmetic (a viewport of i32::MAX rows). Stating it keeps every
-        // number finite and equal to what the gutter was built from.
-        .height(if paged {
-            Length::Fill
-        } else {
-            Length::Fixed(count as f32 * EDITOR_LINE_H + 10.0)
-        })
+        // The editor is the viewport and scrolls itself, so cosmic-text shapes
+        // and iced highlights only the lines on screen. Laying the whole document
+        // out to keep a gutter beside it in step costs a shaping pass over every
+        // line of the file, three times over, in the frame that opens it.
+        .height(Length::Fill)
         .on_action(|a| Message::Files(Msg::EditorAction(a)))
         .key_binding(move |kp| key_binding(kp, modal_up, active, page_lines))
         .style(editor_style)
@@ -1902,15 +2082,10 @@ fn text_area<'a>(
         );
 
     let editor = mouse_area(editor).on_right_press(Message::Files(Msg::EditorMenuOpen));
-    if paged {
-        // No gutter to keep in step, so the editor scrolls itself.
-        return container(editor).width(Length::Fill).height(Length::Fill).into();
-    }
-    scrollable(iced::widget::stack![editor, gutter])
-        .id(scrollable::Id::new(EDITOR_SCROLL))
-        .on_scroll(|v| Message::Files(Msg::Scrolled(v)))
+    container(iced::widget::stack![editor, gutter])
         .width(Length::Fill)
         .height(Length::Fill)
+        .clip(true)
         .into()
 }
 

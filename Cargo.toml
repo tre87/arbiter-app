@@ -5,8 +5,9 @@ edition = "2021"
 publish = false
 description = "Cross-platform terminal application with Claude support"
 license = "MIT"
-# Don't auto-discover bins: src/bin/file_icons.rs and src/bin/editor_ui.rs are
-# *modules* of iced_shell (siblings of it), not binaries. List the real bins here.
+# Don't auto-discover bins: src/bin/file_icons.rs, src/bin/files_pane.rs and
+# src/bin/gutter.rs are *modules* of iced_shell (siblings of it), not binaries.
+# List the real bins here.
 autobins = false
 
 [[bin]]
@@ -100,20 +101,25 @@ tiny-skia = "0.11"
 # `trash_path`. Cross-platform (Finder Trash / Recycle Bin / freedesktop).
 trash = "5"
 # Editor syntax highlighting. Taken directly rather than through iced's
-# `highlighter` feature: that wraps a private SyntaxSet we cannot add Vue to, and
-# its default features build oniguruma (C). `regex-fancy` keeps the build pure Rust,
-# and `yaml-load` is what lets us add `assets/syntaxes/Vue.sublime-syntax`.
+# `highlighter` feature: that wraps a private SyntaxSet and its default features
+# build oniguruma (C). `regex-fancy` keeps the build pure Rust.
 syntect = { version = "5", default-features = false, features = [
     "parsing",
-    "default-syntaxes",
     "default-themes",
-    "yaml-load",
     "regex-fancy",
-    # Cache the built syntax set to the data dir: linking the bundled grammars
-    # together with our own costs ~130ms, loading the dump back ~6ms.
+    # `yaml-load` is what lets us add `assets/syntaxes/PowerShell.sublime-syntax`.
+    "yaml-load",
+    # Cache the linked set to the data dir: adding a grammar forces syntect to
+    # re-link all 200 of them, which costs far more than loading a dump back.
     "dump-create",
     "dump-load",
 ] }
+# The grammars themselves: bat's set rather than syntect's, which ships no
+# TypeScript, SCSS, LESS, Svelte, F#, TOML or Vue at all. `syntect-fancy` picks
+# the same pure-Rust regex engine as above; the two grammars bat has that only
+# build against oniguruma (PowerShell and JavaScript (Babel)) are not in it, so
+# PowerShell is bundled separately from a `.sublime-syntax` that is.
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 # One-shot delays inside iced Tasks (a notification card's timeout). iced's executor is
 # already this runtime (its `tokio` feature), so nothing new is compiled.
 tokio = { version = "1", features = ["time"] }

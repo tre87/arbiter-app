@@ -42,6 +42,8 @@ mod usage_helper;
 mod file_icons;
 /// The file explorer pane and the editor it opens files into.
 mod files_pane;
+/// The editor's line-number gutter, drawn from the editor's own scroll.
+mod gutter;
 
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).

@@ -2,10 +2,13 @@
 //! `Highlighter` trait.
 //!
 //! syntect is used directly rather than through iced's `highlighter` feature,
-//! which wraps a private `SyntaxSet` we could not add Vue to and whose default
-//! features build oniguruma. The set here is syntect's own bundle plus the
-//! grammars in `assets/syntaxes`, so a `.vue` file colours its template,
-//! script and style blocks with the HTML, JavaScript and CSS grammars.
+//! which wraps a private `SyntaxSet` and whose default features build oniguruma.
+//! The grammars are bat's set (`two-face`) rather than syntect's own, which
+//! ships no PowerShell, TypeScript, SCSS, LESS, Svelte, F#, TOML or Vue.
+//!
+//! Those grammars carry their own licences. The ones that require
+//! acknowledgement are written to `assets/syntaxes/SYNTAXES-LICENSES.md` by
+//! `tests::syntax_licences_are_written_out`; re-run it after a `two-face` bump.
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -18,36 +21,34 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 pub const MONO_FAMILY: &str = "Cascadia Mono";
 
 /// Files longer than this are shown without colouring: the widget re-highlights
-/// from the edited line to the end of the document on every keystroke, and past
-/// this length that stops being free even with the line cache below.
+/// from the edited line to the last visible line on every keystroke, and past
+/// this length the first scroll into fresh territory stops being free.
 pub const MAX_HIGHLIGHT_LINES: usize = 20_000;
-
-/// Grammars syntect does not bundle, as `(name, source)`. Vue is the one the
-/// user asked for; TOML is missing from the default set and this is a Rust
-/// project, so `Cargo.toml` would otherwise open uncoloured.
-const EXTRA_SYNTAXES: [(&str, &str); 2] = [
-    ("Vue", include_str!("../assets/syntaxes/Vue.sublime-syntax")),
-    ("TOML", include_str!("../assets/syntaxes/TOML.sublime-syntax")),
-];
 
 /// Dark theme closest to the app's own chrome. Foregrounds read well on #121212.
 const THEME_NAME: &str = "base16-ocean.dark";
+
+/// Grammars bat has that `two-face` can only build against oniguruma, so its
+/// pure-Rust set leaves them out. PowerShell is the one that matters here; the
+/// other, JavaScript (Babel), only adds JSX tags over plain JavaScript, which
+/// `lang_for_path` falls back to.
+const EXTRA_SYNTAXES: [(&str, &str); 1] =
+    [("PowerShell", include_str!("../assets/syntaxes/PowerShell.sublime-syntax"))];
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Theme> = OnceLock::new();
 
 /// Bumped when `link_syntaxes` changes in a way a cached dump would not reflect.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
-/// syntect's bundled grammars plus our own, linked together.
+/// bat's grammars plus our own, linked together.
 ///
-/// Adding any grammar forces syntect to re-link the whole set, which costs far
-/// more than loading its pre-linked default dump did. So the result is cached as
-/// a dump of our own, keyed by the grammars that went into it.
+/// Newline mode is syntect's own advice: the no-newline variants are rewritten
+/// regexes that are unreliable for a grammar it did not ship itself. Adding any
+/// grammar forces syntect to re-link the whole set, which costs far more than
+/// loading the pre-linked one did, so the result is cached as a dump of our own.
 fn link_syntaxes() -> SyntaxSet {
-    // Newline mode: syntect's own advice, and the no-newline variants are
-    // rewritten regexes that are unreliable for a grammar it did not ship.
-    let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+    let mut builder = two_face::syntax::extra_newlines().into_builder();
     for (name, source) in EXTRA_SYNTAXES {
         match syntect::parsing::SyntaxDefinition::load_from_str(source, true, Some(name)) {
             Ok(syntax) => builder.add(syntax),
@@ -112,7 +113,7 @@ pub fn theme() -> &'static Theme {
     })
 }
 
-/// Build the syntax set off the UI thread, once.
+/// Link the syntax set off the UI thread, once.
 ///
 /// Call this as early as the explorer is known to be in use, not when a file is
 /// opened: the first `Syntax::new` blocks on the same initialisation, so warming
@@ -307,17 +308,63 @@ mod tests {
         h.highlight_line(line).map(|(_, hl)| hl.color).collect()
     }
 
+    /// Writes `assets/syntaxes/SYNTAXES-LICENSES.md` from the bundled grammars.
+    /// Ignored because it writes to the tree: run it after a `two-face` bump with
+    /// `cargo test --lib syntax_licences -- --ignored`.
     #[test]
-    fn the_bundled_vue_grammar_loads() {
-        assert!(syntaxes().find_syntax_by_extension("vue").is_some());
+    #[ignore]
+    fn syntax_licences_are_written_out() {
+        let mut md = String::from(
+            "# Bundled syntax definitions\n\n\
+             The editor's grammars come from the `two-face` crate, which embeds the set \n\
+             bat ships. The licences below are the ones that require acknowledgement; \n\
+             the full listing is at <https://codeberg.org/CosmicHarper/two-face>.\n\n\
+             Generated by `highlight::tests::syntax_licences_are_written_out`.\n\n",
+        );
+        for license in two_face::acknowledgement::listing().for_syntaxes() {
+            license.write_md(&mut md);
+            md.push_str("\n\n");
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/syntaxes/SYNTAXES-LICENSES.md");
+        std::fs::write(&path, md).expect("write the licence listing");
     }
 
     #[test]
+    fn the_vue_and_toml_grammars_come_from_the_bundled_set() {
+        assert!(syntaxes().find_syntax_by_extension("vue").is_some());
+        assert!(syntaxes().find_syntax_by_extension("toml").is_some());
+    }
+
+    /// Every extension the explorer draws a language icon for must colour as that
+    /// language. The list is `file_icons::for_path`'s, minus the ones whose icon
+    /// says "not text" (images, archives, media, pdf, certificates, databases) and
+    /// minus `txt`, which IS plain text. A `.ps1` with a PowerShell icon and no
+    /// PowerShell colouring is what this test exists to stop coming back.
+    #[test]
     fn the_languages_the_icons_promise_all_resolve() {
         let set = syntaxes();
-        for token in ["rs", "js", "css", "html", "json", "md", "py", "toml", "yaml", "sh", "vue", "properties"] {
-            assert!(set.find_syntax_by_token(token).is_some(), "no syntax for {token}");
-        }
+        let plain = set.find_syntax_plain_text();
+        let promised = [
+            "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "html", "htm", "css",
+            "scss", "sass", "less", "py", "pyi", "pyw", "rs", "go", "java", "c", "h", "cpp", "cc",
+            "cxx", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "lua", "hs", "f90", "f95", "r",
+            "md", "mdx", "json", "jsonc", "json5", "xml", "xsl", "xslt", "svg", "yml", "yaml",
+            "toml", "ini", "conf", "cfg", "env", "sh", "bash", "zsh", "fish", "bat", "cmd", "ps1",
+            "sql",
+        ];
+        let missing: Vec<&str> = promised
+            .iter()
+            .copied()
+            .filter(|ext| {
+                let token = crate::editor::lang_for_path(std::path::Path::new(&format!("x.{ext}")));
+                match set.find_syntax_by_token(&token) {
+                    Some(syntax) => syntax.name == plain.name,
+                    None => true,
+                }
+            })
+            .collect();
+        assert!(missing.is_empty(), "icons promise a language with no grammar: {missing:?}");
     }
 
     #[test]
@@ -365,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn a_powershell_script_is_coloured() {
+        let mut h = Syntax::new(&settings("ps1"));
+        let doc = [
+            "<# a comment block #>",
+            "param([string]$Name = 'world')",
+            "function Get-Greeting {",
+            "    Write-Output \"Hello, $Name!\"",
+            "}",
+            "Get-ChildItem -Path . | Where-Object { $_.Length -gt 0 }",
+        ];
+        let mut distinct = std::collections::HashSet::new();
+        for line in doc {
+            for c in colours(&mut h, line).into_iter().flatten() {
+                distinct.insert(format!("{c:?}"));
+            }
+        }
+        // Plain text would give one colour for the whole script.
+        assert!(distinct.len() > 3, "powershell highlighting produced {} colours", distinct.len());
+    }
+
+    #[test]
     fn rust_keywords_and_strings_get_different_colours() {
         let mut h = Syntax::new(&settings("rs"));
         let spans = colours(&mut h, "let s = \"text\";");
@@ -393,3 +461,4 @@ mod tests {
         assert_eq!(h.parsed, 201, "cache did not converge after one changed line");
     }
 }
+

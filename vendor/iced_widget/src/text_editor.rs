@@ -333,6 +333,16 @@ where
         }))
     }
 
+    /// Returns the [`Editor`] behind this [`Content`].
+    ///
+    /// ARBITER: a gutter drawn beside the editor has to follow the editor's own
+    /// scroll, which is reachable from the concrete editor but not from here.
+    ///
+    /// [`Editor`]: text::Editor
+    pub fn editor(&self) -> std::cell::Ref<'_, R::Editor> {
+        std::cell::Ref::map(self.0.borrow(), |internal| &internal.editor)
+    }
+
     /// Performs an [`Action`] on the [`Content`].
     pub fn perform(&mut self, action: Action) {
         let internal = self.0.get_mut();

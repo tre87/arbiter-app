@@ -1,15 +1,15 @@
 //! Pure logic behind the built-in editor: loading and saving a text file
 //! faithfully, the undo history iced 0.13's `text_editor` does not provide, and
 //! the "Send to Agent" message. No iced types, so it is all unit-testable; the
-//! widgets live in `src/bin/editor_ui.rs`.
+//! widgets live in `src/bin/files_pane.rs` and `src/bin/gutter.rs`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Largest file the editor opens. Above this the Shrink-height layout shapes
-/// more text than a frame can afford, so the file goes to the OS handler instead.
+/// Largest file the editor opens. Above this the undo history, which holds whole
+/// document copies, is the binding cost; the file goes to the OS handler instead.
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Bytes inspected for a NUL before calling a file binary.
@@ -194,9 +194,8 @@ pub fn check_disk(path: &Path, stamp: Option<DiskStamp>) -> DiskChange {
     }
 }
 
-/// The syntax token for a path: syntect resolves most languages straight from
-/// the extension. The aliases cover languages its bundled set lacks, so a
-/// TypeScript file colours as JavaScript rather than as plain text.
+/// The syntax token for a path: the grammar set resolves most languages straight
+/// from the extension, and these are the ones it cannot.
 pub fn lang_for_path(path: &Path) -> String {
     let ext = path
         .extension()
@@ -204,15 +203,57 @@ pub fn lang_for_path(path: &Path) -> String {
         .unwrap_or_default();
     match ext.as_str() {
         "" => "txt".to_string(),
-        "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" => "js".to_string(),
-        "yml" => "yaml".to_string(),
+        // .NET carries most of its project files as XML under names no grammar
+        // claims. `.xaml` itself the XML grammar does claim.
+        "axaml" | "csproj" | "vbproj" | "fsproj" | "props" | "targets" | "nuspec" | "resx"
+        | "vsixmanifest" | "plist" | "xsl" => "xml".to_string(),
+        "jsonc" | "json5" => "json".to_string(),
+        "mts" | "cts" => "ts".to_string(),
+        // No JSX grammar in the bundled set: plain JavaScript colours everything
+        // but the tags, which is what it did before there was one.
+        "jsx" | "mjs" | "cjs" => "js".to_string(),
+        "mdx" => "md".to_string(),
         "htm" => "html".to_string(),
-        "zsh" | "bash" | "fish" => "sh".to_string(),
-        // syntect has no INI grammar; Java Properties is the same key=value
-        // shape with `#` comments, which is most of the colouring these get.
-        "ini" | "conf" | "cfg" | "env" => "properties".to_string(),
+        "yml" => "yaml".to_string(),
+        "zsh" => "sh".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Which line numbers a gutter beside the editor has to draw, taken from the
+/// editor's own scroll rather than tracked alongside it.
+///
+/// `scroll_line` and `vertical` are cosmic-text's scroll as the buffer holds it
+/// RIGHT NOW, which is not where it will end up: `Editor::perform` applies a
+/// wheel notch as a raw `vertical += lines * line_h` and leaves it there, and the
+/// buffer only settles it during the next layout, after the frame this gutter is
+/// built for. Mid-document the two agree by accident (line 0 at -80px draws the
+/// same as line 4 at 0). At either end they do not, which showed as numbers that
+/// scrolled in a file the text could not scroll, so the same clamp cosmic-text is
+/// about to apply is applied here: never above the first line, never past the
+/// last screenful. It is a clamp on a value read fresh every frame, not a copy of
+/// the scroll kept alongside it, and it holds because every line is exactly
+/// `line_h` tall (an absolute line height, and no wrapping).
+///
+/// Returns the first line (0-based), the y its top sits at relative to the top of
+/// the text area (never positive), and how many lines to draw, including a last
+/// one the viewport only half shows.
+pub fn gutter_window(
+    scroll_line: usize,
+    vertical: f32,
+    view_h: f32,
+    line_h: f32,
+    line_count: usize,
+) -> (usize, f32, usize) {
+    if line_h <= 0.0 || view_h <= 0.0 || line_count == 0 {
+        return (0, 0.0, 0);
+    }
+    let furthest = (line_count as f32 * line_h - view_h).max(0.0);
+    let scrolled = (scroll_line as f32 * line_h + vertical).clamp(0.0, furthest);
+    let first = (scrolled / line_h) as usize;
+    let offset = scrolled - first as f32 * line_h;
+    let count = ((view_h + offset) / line_h).ceil() as usize;
+    (first, -offset, count.min(line_count - first.min(line_count)))
 }
 
 /// The language tag on the fenced block sent to an agent: the extension as
@@ -550,13 +591,152 @@ mod tests {
     }
 
     #[test]
+    fn the_gutter_window_follows_the_editors_scroll() {
+        // Whole-line scroll: 30 lines of a 20px grid fill a 600px viewport.
+        assert_eq!(gutter_window(0, 0.0, 600.0, 20.0, 1000), (0, 0.0, 30));
+        assert_eq!(gutter_window(100, 0.0, 600.0, 20.0, 1000), (100, 0.0, 30));
+
+        // A viewport that is not a whole number of lines, scrolled part way into
+        // its first line: both edges are half shown, so 32 numbers are needed.
+        assert_eq!(gutter_window(100, 5.0, 605.0, 20.0, 1000), (100, -5.0, 31));
+
+        // The end of the document never numbers past the last line: the furthest
+        // the editor will settle at is the last screenful, line 970 of 1000.
+        assert_eq!(gutter_window(970, 0.0, 600.0, 20.0, 1000), (970, 0.0, 30));
+        assert_eq!(gutter_window(980, 0.0, 600.0, 20.0, 1000), (970, 0.0, 30));
+        assert_eq!(gutter_window(1000, 0.0, 600.0, 20.0, 1000), (970, 0.0, 30));
+
+        // A wheel notch past the end is refused, as the editor will refuse it.
+        assert_eq!(gutter_window(970, 80.0, 600.0, 20.0, 1000), (970, 0.0, 30));
+
+        // A file shorter than the viewport cannot scroll at all, however far the
+        // raw scroll has been pushed. This is the bug the clamp exists for.
+        assert_eq!(gutter_window(0, 80.0, 600.0, 20.0, 10), (0, 0.0, 10));
+        assert_eq!(gutter_window(4, 0.0, 600.0, 20.0, 10), (0, 0.0, 10));
+
+        // Scrolling up past the first line is refused the same way.
+        assert_eq!(gutter_window(4, -80.0, 600.0, 20.0, 1000), (0, 0.0, 30));
+        assert_eq!(gutter_window(0, -40.0, 600.0, 20.0, 1000), (0, 0.0, 30));
+
+        // Degenerate sizes ask for nothing rather than panicking.
+        assert_eq!(gutter_window(0, 0.0, 0.0, 20.0, 1000).2, 0);
+        assert_eq!(gutter_window(0, 0.0, 600.0, 0.0, 1000).2, 0);
+        assert_eq!(gutter_window(0, 0.0, 600.0, 20.0, 0).2, 0);
+    }
+
+    #[test]
     fn language_tokens_and_fence_tags_come_from_the_extension() {
         assert_eq!(lang_for_path(Path::new("Foo.VUE")), "vue");
         assert_eq!(lang_for_path(Path::new("x.rs")), "rs");
-        assert_eq!(lang_for_path(Path::new("x.ts")), "js");
+        assert_eq!(lang_for_path(Path::new("x.ps1")), "ps1");
+        assert_eq!(lang_for_path(Path::new("x.ts")), "ts");
+        assert_eq!(lang_for_path(Path::new("x.cts")), "ts");
+        assert_eq!(lang_for_path(Path::new("Arbiter.csproj")), "xml");
+        // `.xaml` needs no alias: the XML grammar claims the extension itself.
+        assert_eq!(lang_for_path(Path::new("MainWindow.xaml")), "xaml");
+        assert_eq!(lang_for_path(Path::new("tsconfig.jsonc")), "json");
         assert_eq!(lang_for_path(Path::new("x.yml")), "yaml");
         assert_eq!(lang_for_path(Path::new("Makefile")), "txt");
         assert_eq!(fence_tag(Path::new("a/b/App.vue")), "vue");
         assert_eq!(fence_tag(Path::new("Makefile")), "");
+    }
+}
+
+/// Open-latency diagnostic, gated on `ARBITER_TIME_OPEN`. Off, every call costs
+/// one relaxed atomic load. On, one line per opened file goes to stderr with the
+/// phases we control and the wall time to the frame that has paid for the
+/// layout and the first highlighting pass.
+pub mod timing {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("ARBITER_TIME_OPEN").is_some())
+    }
+
+    struct Open {
+        at: Instant,
+        last: Instant,
+        name: String,
+        lines: usize,
+        phases: Vec<(&'static str, f32)>,
+        frames: u32,
+        filled: bool,
+    }
+
+    static PENDING: Mutex<Option<Open>> = Mutex::new(None);
+
+    pub fn open(name: &str) {
+        if !enabled() {
+            return;
+        }
+        let now = Instant::now();
+        *PENDING.lock().unwrap() = Some(Open {
+            at: now,
+            last: now,
+            name: name.to_string(),
+            lines: 0,
+            phases: Vec::new(),
+            frames: 0,
+            filled: false,
+        });
+    }
+
+    pub fn phase(label: &'static str) {
+        if !enabled() {
+            return;
+        }
+        if let Some(o) = PENDING.lock().unwrap().as_mut() {
+            let now = Instant::now();
+            o.phases.push((label, (now - o.last).as_secs_f32() * 1000.0));
+            o.last = now;
+        }
+    }
+
+    pub fn lines(n: usize) {
+        if !enabled() {
+            return;
+        }
+        if let Some(o) = PENDING.lock().unwrap().as_mut() {
+            o.lines = n;
+            o.filled = true;
+        }
+    }
+
+    /// Called once per editor frame. The first frame only builds the widget
+    /// tree; the layout and the first highlight are paid for after `view`
+    /// returns, so the second frame is the earliest one that has seen the file.
+    pub fn frame() {
+        if !enabled() {
+            return;
+        }
+        let mut guard = PENDING.lock().unwrap();
+        let Some(o) = guard.as_mut() else { return };
+        o.frames += 1;
+        if o.frames == 1 {
+            let now = Instant::now();
+            o.phases.push(("to-frame", (now - o.last).as_secs_f32() * 1000.0));
+            o.last = now;
+        }
+        // The frame that has the text is the one worth reporting: with a buffer
+        // carried over from the tab being left that is the first, and without one
+        // it is the second.
+        if !o.filled {
+            return;
+        }
+        let total = (Instant::now() - o.at).as_secs_f32() * 1000.0;
+        let phases: Vec<String> =
+            o.phases.iter().map(|(l, ms)| format!("{l} {ms:.1}")).collect();
+        eprintln!(
+            "arbiter: open {} ({} lines) {} | visible {:.1} ms over {} frames",
+            o.name,
+            o.lines,
+            phases.join(" "),
+            total,
+            o.frames
+        );
+        *guard = None;
     }
 }

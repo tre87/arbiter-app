@@ -28,10 +28,11 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   (`git::file_status`, 4.7% of a core on an idle repo). Measure idle CPU after touching
   anything a watcher triggers.
 - **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`:
-  `iced_winit` (inactive notification windows) and `iced_widget` (the text editor
-  hit-tests with the padding on swapped axes, which the editor's line-number gutter
-  depends on; see `vendor/iced_widget/ARBITER-FORK.md`). An iced upgrade means
-  re-copying both from the registry and re-applying their diffs.
+  `iced_winit` (inactive notification windows) and `iced_widget` (two changes: the text
+  editor hit-tests with the padding on swapped axes, and `Content` does not expose the
+  editor whose scroll the line-number gutter is drawn from; see
+  `vendor/iced_widget/ARBITER-FORK.md`). An iced upgrade means re-copying both from the
+  registry and re-applying their diffs.
 - **Verify UI changes with a debug build**, not just `--release`. iced states several
   layout contracts as `debug_assert!`, which release compiles out: a release build runs
   a mis-specified layout silently where `cargo run` panics at once. A panic goes to
@@ -147,6 +148,39 @@ a row resize (shifts the whole layout for a frame; a column does not).
   `ClaudeHandle::set_waiting_agents` holds `Working` while it shows. The off edge stamps a
   fresh activity TTL so the resumed turn's first frames have time to pair up; Escape during
   the wait ends it the same way, one TTL later, with a "Claude finished" card.
+
+## The editor is the viewport, and the gutter follows it (2026-09-22)
+
+`text_editor` is `Length::Fill` and scrolls itself, so cosmic-text shapes and iced
+highlights only the lines on screen. The line numbers are a small widget
+(`src/bin/gutter.rs`) stacked over it inside its own left padding, drawn from
+`content.editor().buffer().scroll()` every frame, never from a copy kept alongside it,
+which is what the earlier whole-document layout was avoiding by brute force, and what made
+an open cost a shaping pass over every line of the file, three times over. Consequences
+worth knowing:
+
+- **The scroll in the buffer is not where the editor will settle.** `Editor::perform` applies
+  a wheel notch as a raw `scroll.vertical += lines * line_h` and does NOT re-shape, so the
+  value `view` reads is unclamped; the buffer only settles it at the next layout, after the
+  frame has been built. Mid-document the two draw the same picture, which is why this looked
+  right at first: at either end they do not, and the numbers scrolled in files the text could
+  not scroll. `editor::gutter_window` applies the same clamp cosmic-text is about to apply.
+  Anything else reading that scroll needs to do likewise.
+- **Never build a `Content` with `with_text` for a file.** It makes a buffer with no height,
+  so cosmic-text lays out the whole document, and the first layout throws all of it away when
+  it applies the editor's font: 2.8 s of a 6.9 s open (debug, 2,400 lines). A file is pasted
+  into a buffer the widget has already sized (`set_text`).
+- **A buffer that has been on screen is carried to the tab being opened**
+  (`take_spare_buffer`), because it is already sized: that is what puts a file's text in the
+  same frame the editor appears in rather than the frame after. Only the first open of a
+  session has nothing to carry, and it fills one frame later (`Msg::Fill`).
+- **Both of cosmic-text's bulk edits are quadratic in the document**, for the same reason
+  each time: a per-line push onto the front of a vector.
+  - Insert: paste in blocks (`PASTE_LINES`): 191 ms for 10,000 lines against 6.5 ms.
+  - Delete: no way around it from outside, so a buffer over `CARRY_MAX_LINES` is not carried
+    over at all (48 ms to clear 10,500 lines, against the 16 ms frame it would save).
+- `ARBITER_TIME_OPEN=1` prints the phases of every open and reload to stderr, and the number
+  of frames before the text was on screen.
 
 ## Terminal renderer — known limitation (intentional)
 
