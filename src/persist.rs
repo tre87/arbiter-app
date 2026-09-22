@@ -244,6 +244,19 @@ pub struct Settings {
     /// it.
     #[serde(default)]
     pub show_agents_office: bool,
+    /// Keep the Agents Office above other windows. Off by default, unlike the
+    /// overview: the overview is a panel you consult, this is a picture you leave in
+    /// a corner, and a picture that sits on top of your work is in the way.
+    #[serde(default)]
+    pub office_topmost: bool,
+    /// Draw the workspace and terminal name under each desk. On by default; off
+    /// gives the room back as art.
+    #[serde(default = "default_true")]
+    pub office_show_names: bool,
+    /// Which sky, as an index into `agents_office::Weather::ALL`. Clear by default,
+    /// which is also the only one of the six that is a still picture on its own.
+    #[serde(default)]
+    pub office_weather: usize,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -361,6 +374,9 @@ impl Default for Settings {
             split_keeps_cwd: true,
             show_file_explorer: false,
             show_agents_office: false,
+            office_topmost: false,
+            office_show_names: true,
+            office_weather: 0,
         }
     }
 }

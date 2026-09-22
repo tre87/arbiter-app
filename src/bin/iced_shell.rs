@@ -155,6 +155,16 @@ struct State {
     office_rev: u64,
     /// Seconds since the office opened, the room's animation clock.
     office_t: f32,
+    /// Pointer inside the office window, which is when its one piece of chrome
+    /// shows. The window is the art the rest of the time.
+    office_hover: bool,
+    /// The gear's dropdown, while open.
+    office_menu: bool,
+    /// Hold the room on one frame. Transient, not a setting: it is an escape hatch,
+    /// not a preference.
+    office_frozen: bool,
+    /// The desk the pointer is over, drawn as the room's floor marker.
+    office_hovered: Option<usize>,
     /// Whether the main window is focused — drives the Windows caption-button
     /// glyph colour (white when active, dimmed when not), like native controls.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -785,6 +795,20 @@ enum Message {
     OfficeDeskClicked(String),
     /// The room's own 12fps clock, live only while a turn is in flight.
     OfficeTick,
+    /// The pointer entered or left the office window; its chrome follows.
+    OfficeHover(bool),
+    /// Open or close the gear's dropdown.
+    OfficeMenu(bool),
+    /// The pointer entered or left a desk. Exit carries the slot so that leaving one
+    /// desk for the next cannot clear the arrival, whichever order they arrive in.
+    OfficeDeskEnter(usize),
+    OfficeDeskExit(usize),
+    /// Toolbar: keep the office above other windows, draw the nameplates, pick a sky,
+    /// hold the frame.
+    OfficeTopmost(bool),
+    OfficeShowNames(bool),
+    OfficeWeather(usize),
+    OfficeFreeze(bool),
     /// Raise a notification card, and its sound, as Settings allow; `target` is the
     /// session id of the terminal it is about, which a click on the card goes to.
     Notify { title: String, body: String, target: Option<u64> },
@@ -1475,8 +1499,12 @@ fn office_sync(state: &mut State) -> bool {
         labels: vec![(String::new(), String::new()); state.office_seats.len()],
         ..agents_office::Scene::default()
     };
-    scene.weather = state.office_scene.weather;
-    scene.show_names = state.office_scene.show_names;
+    scene.weather = agents_office::Weather::ALL
+        [state.settings.office_weather.min(agents_office::Weather::ALL.len() - 1)];
+    scene.show_names = state.settings.office_show_names;
+    // The floor marker follows the pointer, so you can tell which desk you are about
+    // to click without it having to light up in a colour the room has reserved.
+    scene.selected = state.office_hovered.filter(|i| *i < scene.desks.len());
     for (i, seat) in state.office_seats.iter().enumerate() {
         let Some(s) = seat else { continue };
         if let Some((_, desk, ws, pane)) = live.iter().find(|(h, ..)| *h == s.id) {
@@ -1485,7 +1513,10 @@ fn office_sync(state: &mut State) -> bool {
         }
     }
     let changed = scene.desks != state.office_scene.desks
-        || scene.labels != state.office_scene.labels;
+        || scene.labels != state.office_scene.labels
+        || scene.selected != state.office_scene.selected
+        || scene.weather != state.office_scene.weather
+        || scene.show_names != state.office_scene.show_names;
     state.office_scene = scene;
     changed
 }
@@ -1521,8 +1552,11 @@ fn office_view(state: &State) -> Element<'_, Message> {
             .into(),
         None => Space::new(Length::Fixed(iw), Length::Fixed(ih)).into(),
     };
-    let drag: Element<Message> =
-        mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragOffice).into();
+    let drag: Element<Message> = mouse_area(Space::new(Length::Fill, Length::Fill))
+        .on_press(Message::DragOffice)
+        .on_enter(Message::OfficeHover(true))
+        .on_exit(Message::OfficeHover(false))
+        .into();
 
     // Hit targets over the occupied desks only, built from the same constants the
     // painter uses so the two cannot drift apart. A free desk is left transparent so
@@ -1543,6 +1577,8 @@ fn office_view(state: &State) -> Element<'_, Message> {
                 Some(seat) => Element::from(
                     mouse_area(cell)
                         .on_press(Message::OfficeDeskClicked(seat.id.clone()))
+                        .on_enter(Message::OfficeDeskEnter(i))
+                        .on_exit(Message::OfficeDeskExit(i))
                         .interaction(iced::mouse::Interaction::Pointer),
                 ),
                 None => cell.into(),
@@ -1561,14 +1597,141 @@ fn office_view(state: &State) -> Element<'_, Message> {
             ..Default::default()
         });
 
+    let chrome = office_chrome(state);
     #[cfg(target_os = "windows")]
     {
-        stack![stage, resize_overlay()].into()
+        stack![stage, chrome, resize_overlay()].into()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        stage.into()
+        stack![stage, chrome].into()
     }
+}
+
+/// The office's only chrome: a gear in the top-right corner, over the strip of
+/// ceiling right of the last window that no desk ever occupies, and the menu it
+/// opens. Present while the pointer is in the window or the menu is up, absent
+/// otherwise, and switched rather than faded, because a fade is a clock.
+fn office_chrome(state: &State) -> Element<'_, Message> {
+    // Always there, because a control nobody can find is a control nobody has, but
+    // faint until the pointer is in the window so it stays out of the picture.
+    let lit = state.office_hover || state.office_menu;
+    let ink = if lit { TXT_SECONDARY } else { iced::Color::from_rgba8(0x8a, 0x94, 0x9e, 0.45) };
+    let gear = button(cmdi(mdi_path::COG, 13.0, ink))
+        .padding([4, 6])
+        .on_press(Message::OfficeMenu(!state.office_menu))
+        .style(move |_: &iced::Theme, s: button::Status| button::Style {
+            background: Some(iced::Background::Color(match (lit, s) {
+                (_, button::Status::Hovered | button::Status::Pressed) => {
+                    iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.12)
+                }
+                (true, _) => iced::Color::from_rgba8(0x0d, 0x12, 0x18, 0.65),
+                (false, _) => iced::Color::TRANSPARENT,
+            })),
+            border: iced::Border {
+                radius: 4.0.into(),
+                width: if lit { 1.0 } else { 0.0 },
+                color: iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.10),
+            },
+            ..Default::default()
+        });
+
+    let mut col = column![gear].spacing(6).align_x(iced::alignment::Horizontal::Right);
+    if state.office_menu {
+        col = col.push(office_menu(state));
+    }
+    container(col)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Top)
+        .padding(8)
+        .into()
+}
+
+/// The gear's dropdown. Everything the room can be told, and the only way to shut
+/// the window from inside it.
+fn office_menu(state: &State) -> Element<'_, Message> {
+    let check = |on: bool| if on { "✓" } else { " " };
+    let item = |label: String, msg: Message| {
+        button(text(label).size(12))
+            .width(Length::Fill)
+            .padding([5, 8])
+            .on_press(msg)
+            .style(|_: &iced::Theme, s: button::Status| button::Style {
+                text_color: TXT_SECONDARY,
+                background: Some(iced::Background::Color(match s {
+                    button::Status::Hovered | button::Status::Pressed => {
+                        iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.08)
+                    }
+                    _ => iced::Color::TRANSPARENT,
+                })),
+                ..Default::default()
+            })
+    };
+
+    let mut col = column![
+        item(
+            format!("{} Always on top", check(state.settings.office_topmost)),
+            Message::OfficeTopmost(!state.settings.office_topmost),
+        ),
+        item(
+            format!("{} Show names", check(state.settings.office_show_names)),
+            Message::OfficeShowNames(!state.settings.office_show_names),
+        ),
+        item(
+            format!("{} Freeze motion", check(state.office_frozen)),
+            Message::OfficeFreeze(!state.office_frozen),
+        ),
+        container(Space::new(Length::Fill, Length::Fixed(1.0))).style(|_: &iced::Theme| {
+            container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba8(
+                    0xff, 0xff, 0xff, 0.08,
+                ))),
+                ..Default::default()
+            }
+        }),
+    ]
+    .spacing(1);
+
+    for (i, w) in agents_office::Weather::ALL.iter().enumerate() {
+        let picked = state.settings.office_weather == i;
+        // Rain and snow are the only decoration with moving parts, and they move
+        // only while some desk is working, so the mark is a description and not a
+        // warning.
+        let label = if w.moves() {
+            format!("{} {} ·", check(picked), w.label())
+        } else {
+            format!("{} {}", check(picked), w.label())
+        };
+        col = col.push(item(label, Message::OfficeWeather(i)));
+    }
+    col = col.push(
+        container(Space::new(Length::Fill, Length::Fixed(1.0))).style(|_: &iced::Theme| {
+            container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba8(
+                    0xff, 0xff, 0xff, 0.08,
+                ))),
+                ..Default::default()
+            }
+        }),
+    );
+    // The window has no titlebar, so this is the only way to close it from inside.
+    col = col.push(item("  Close".to_string(), Message::ToggleAgentsOffice));
+
+    container(col)
+        .width(Length::Fixed(150.0))
+        .padding(4)
+        .style(|_: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x16, 0x1b, 0x22))),
+            border: iced::Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.12),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Window settings for the overview popout at a (saved) size + optional position.
@@ -1617,9 +1780,11 @@ fn office_min_size() -> iced::Size {
 
 /// Window settings for the Agents Office popout. Borderless like the overview, but
 /// with nothing drawn in it except the room: no titlebar, no caption buttons.
-fn office_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window::Settings {
+fn office_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
     settings.min_size = Some(office_min_size());
+    settings.level =
+        if topmost { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
     if let Some(p) = pos {
         settings.position = iced::window::Position::Specific(p);
     }
@@ -1638,8 +1803,12 @@ fn office_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window::
 
 /// Open the Agents Office at its saved geometry, with the same post-open `move_to`
 /// the overview needs (see `open_overview`).
-fn open_office(size: iced::Size, pos: Option<iced::Point>) -> (iced::window::Id, Task<Message>) {
-    let (id, open) = iced::window::open(office_settings(size, pos));
+fn open_office(
+    size: iced::Size,
+    pos: Option<iced::Point>,
+    topmost: bool,
+) -> (iced::window::Id, Task<Message>) {
+    let (id, open) = iced::window::open(office_settings(size, pos, topmost));
     let mut task = open.map(|_| Message::Noop);
     if let Some(p) = pos {
         task = Task::batch([task, iced::window::move_to(id, p)]);
@@ -2954,6 +3123,43 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             // The phase and nothing else; `office_refresh` below draws the frame.
             state.office_t += OFFICE_FRAME_MS as f32 / 1000.0;
         }
+        Message::OfficeHover(on) => {
+            state.office_hover = on;
+            if !on {
+                state.office_hovered = None;
+                // The menu stays put when the pointer leaves: reaching for it is how
+                // you get to it, and having it vanish on the way would be maddening.
+            }
+        }
+        Message::OfficeMenu(open) => state.office_menu = open,
+        Message::OfficeDeskEnter(i) => state.office_hovered = Some(i),
+        Message::OfficeDeskExit(i) => {
+            // Only if this desk is still the one we think the pointer is on: moving
+            // to the next desk can deliver its enter before this exit.
+            if state.office_hovered == Some(i) {
+                state.office_hovered = None;
+            }
+        }
+        Message::OfficeTopmost(v) => {
+            state.settings.office_topmost = v;
+            save_session(state);
+            if let Some(id) = state.office_window {
+                return iced::window::change_level(
+                    id,
+                    if v { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal },
+                );
+            }
+        }
+        Message::OfficeShowNames(v) => {
+            state.settings.office_show_names = v;
+            save_session(state);
+        }
+        Message::OfficeWeather(i) => {
+            state.settings.office_weather = i.min(agents_office::Weather::ALL.len() - 1);
+            state.office_menu = false;
+            save_session(state);
+        }
+        Message::OfficeFreeze(v) => state.office_frozen = v,
         Message::ToggleAgentsOffice => {
             if !state.settings.show_agents_office {
                 return Task::none();
@@ -2962,7 +3168,8 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 save_session(state); // persist "office closed"
                 return iced::window::close(id);
             }
-            let (id, task) = open_office(state.office_size, state.office_pos);
+            let (id, task) =
+                open_office(state.office_size, state.office_pos, state.settings.office_topmost);
             state.office_window = Some(id);
             save_session(state); // persist "office open"
             return task;
@@ -8734,7 +8941,10 @@ fn subscription(state: &State) -> Subscription<Message> {
     // It can only ever run inside a window where `needs_fast_tick` is already true,
     // since a working desk requires a pane whose Claude is working, so it adds no
     // frames the app was not drawing anyway.
-    let office = if state.office_window.is_some() && state.office_scene.animates() {
+    let office = if state.office_window.is_some()
+        && !state.office_frozen
+        && state.office_scene.animates()
+    {
         iced::time::every(Duration::from_millis(OFFICE_FRAME_MS)).map(|_| Message::OfficeTick)
     } else {
         Subscription::none()
@@ -9859,7 +10069,8 @@ fn main() -> iced::Result {
             // from when it was enabled must not reopen it for someone who has since
             // turned it off and has no button to close it with.
             let office_window = if office_was_open && saved_settings.show_agents_office {
-                let (of_id, of_task) = open_office(office_size, office_pos);
+                let (of_id, of_task) =
+                    open_office(office_size, office_pos, saved_settings.office_topmost);
                 tasks.push(of_task.chain(iced::window::gain_focus(main_id)));
                 Some(of_id)
             } else {
@@ -9895,6 +10106,10 @@ fn main() -> iced::Result {
                 office_key: None,
                 office_rev: 0,
                 office_t: 0.0,
+                office_hover: false,
+                office_menu: false,
+                office_frozen: false,
+                office_hovered: None,
                 main_focused: true,
                 wheel_nudge: 0,
                 main_maximized: false,

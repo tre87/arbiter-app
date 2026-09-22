@@ -141,7 +141,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
   is what you drag it by. Turning the setting off closes it, so it can never be left with
   no way to dismiss it. Its clock runs at 12fps and only while some agent is mid-turn,
   inside a window where the app was already drawing, so an open office over a quiet room
-  costs nothing at all.
+  costs nothing at all. A gear in the top corner, faint until the pointer is in the window,
+  opens the only menu it has: always on top (off by default, since this is a picture you
+  leave in a corner rather than a panel you consult), show names, freeze motion, the six
+  skies, and Close, which is the only way to shut the window from inside it. The desk under
+  the pointer takes the floor marker, so you can see which agent you are about to click
+  without anything having to light up in a colour the room has reserved.
 
 ### Fixed
 - **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,
