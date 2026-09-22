@@ -552,6 +552,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
                     }
                     e.watcher = None;
                     state.active_mut().editor.visible = false;
+                    release_background_tabs(state);
                     save_session(state);
                 }
             }
@@ -565,6 +566,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             // armed would make the terminals vanish again the moment the pane
             // came back. Closing the pane means "show me the terminals".
             state.active_mut().editor.visible = false;
+            release_background_tabs(state);
             save_session(state);
         }
         Msg::PickFolder => {
@@ -775,6 +777,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
                 let task = ensure_active_loaded(state);
                 return Task::batch([task, iced::widget::focus_next()]);
             }
+            release_background_tabs(state);
         }
         Msg::EditorAction(action) => return editor_action(state, action),
         Msg::TabSelect(i) => {
@@ -1197,8 +1200,11 @@ fn load_into(tab: &mut EditorTab) -> Result<(), String> {
 /// re-read from disk, and one with an undo history would lose it, which is not
 /// a trade to make silently. They reload on the way back in, the same lazy path
 /// a restored session already uses.
+/// While the editor is hidden nothing is on screen, so even the active tab's
+/// buffer is dead weight until it comes back.
 fn release_background_tabs(state: &mut State) {
-    let active = state.active().editor.active;
+    let visible = state.active().editor.visible;
+    let active = state.active().editor.active.filter(|_| visible);
     for (i, t) in state.active_mut().editor.tabs.iter_mut().enumerate() {
         if Some(i) == active || t.content.is_none() {
             continue;
@@ -1551,6 +1557,7 @@ fn pane_where(d: &PaneData) -> String {
 fn deliver(state: &mut State, pane: pane_grid::Pane, text: String) -> Task<Message> {
     paste_into(state.active_mut(), pane, &text);
     state.active_mut().editor.visible = false;
+    release_background_tabs(state);
     super::update(state, Message::Focus(pane))
 }
 
