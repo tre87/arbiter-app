@@ -148,6 +148,10 @@ const SHADOW_DY: i32 = 3;
 const CONE: [(i32, i32, i32, f32); 3] = [(14, 0, 10, 0.11), (19, 10, 14, 0.08), (24, 24, 16, 0.05)];
 /// Daylight through the clerestory on a sunny day.
 const SUNLIGHT: Rgba = rgb(0xf2, 0xe8, 0xc6);
+/// The moon on a clear night. Cool, and a step under [`PAPER`]: it is the
+/// brightest thing outside and must still lose to anything lit inside.
+const MOON: Rgba = rgb(0xc0, 0xc8, 0xd4);
+const MOON_SEA: Rgba = rgb(0x9a, 0xa4, 0xb2);
 
 /// The app's `TXT_MUTED`. A blue-grey that carries the house colour into the
 /// furniture (light fixtures, window frames, distant city) without going
@@ -934,12 +938,46 @@ fn window(b: &mut Buf, x: i32, y: i32, w: i32, h: i32, weather: Weather, t: f32,
                 let sy = y + 2 + (hash(seed, i + 40) % (h as u32 / 2)) as i32;
                 b.fill(sx, sy, 1, 1, PAPER.alpha(0.5));
             }
+            // The moon sits in one pane only, the way the sun does, so the three
+            // windows read as three views of one sky rather than three copies of
+            // a poster. It takes the right sixth and the sun takes the left, so
+            // flipping between the two skies moves the light across the window
+            // instead of swapping one disc for another in the same hole. Both
+            // clear the mullions, which sit at the thirds. Cool and a step under
+            // PAPER: the moon is the brightest thing outside, and it still must
+            // not be the brightest thing in the room.
+            if seed == 1 {
+                let (mx, my) = (x + 5 * w / 6, y + 9);
+                b.fill_checker(mx - 6, my - 6, 13, 13, MOON.alpha(0.12));
+                b.fill(mx - 2, my - 4, 5, 9, MOON);
+                b.fill(mx - 3, my - 3, 7, 7, MOON);
+                // Two seas, which is the whole difference between a moon and a
+                // lamp at this size.
+                b.fill(mx - 1, my - 1, 2, 2, MOON_SEA);
+                b.fill(mx + 1, my + 1, 1, 1, MOON_SEA);
+            }
+            // A couple of thin clouds drifting nowhere, so a clear night is a
+            // sky rather than a backdrop.
+            for i in 0..2i64 {
+                let cy = y + 6 + (hash(seed, i + 17) % (h as u32 / 2)) as i32;
+                let cw = 16 + (hash(seed, i + 19) % 18) as i32;
+                let cx = x + (hash(seed, i + 23) % (w as u32 - 18)) as i32;
+                b.fill(cx, cy, cw.min(x + w - cx), 2, STEEL.alpha(0.12));
+                b.fill(
+                    cx + 3,
+                    cy - 1,
+                    (cw - 7).max(3).min(x + w - cx - 3),
+                    1,
+                    STEEL.alpha(0.08),
+                );
+            }
         }
         Weather::Sunny => {
             // The sun sits in one pane only, so the three windows read as three
-            // views of one sky rather than three copies of a poster.
+            // views of one sky rather than three copies of a poster, and in the
+            // left sixth of it, opposite the moon.
             if seed == 1 {
-                let (dx, dy) = (x + w / 2 + 14, y + 8);
+                let (dx, dy) = (x + w / 6, y + 8);
                 b.fill_checker(dx - 6, dy - 6, 13, 13, SUNLIGHT.alpha(0.3));
                 b.fill(dx - 2, dy - 3, 5, 9, SUNLIGHT);
                 b.fill(dx - 3, dy - 2, 7, 7, SUNLIGHT);
