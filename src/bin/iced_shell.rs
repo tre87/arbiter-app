@@ -1439,6 +1439,16 @@ fn office_refresh(state: &mut State) {
     if state.office_window.is_none() {
         // A frame is a couple of megabytes; a closed window holds none.
         state.office_frame = None;
+        // Nor does it hold anything that belongs to having the window on screen.
+        // Closing from the menu's own Close item would otherwise leave the menu
+        // open, waiting to greet whoever opened the office next; and the pointer
+        // gets no chance to leave a window that has gone, so its hover would stick.
+        // Cleared here rather than at each of the three ways to close, because this
+        // runs after every message and so cannot be the one that was forgotten.
+        state.office_menu = false;
+        state.office_hover = false;
+        state.office_hovered = None;
+        state.office_frozen = false;
         return;
     }
     let changed = office_sync(state);
