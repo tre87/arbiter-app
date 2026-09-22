@@ -8,6 +8,54 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **A file explorer beside the terminals.** Settings, General, "Show the file explorer" (off
+  by default) puts a folder button in the titlebar and on Ctrl+Shift+F. The first press in a
+  workspace asks for a folder, the way Open Folder does in VS Code; after that the button
+  shows and hides the pane. It hugs the left edge, stays out of Ctrl+Shift+E, and is dragged
+  to any width. The tree brings back the file-type icons, chevrons, git colours and
+  right-click menu of the explorer retired with project workspaces, with a folder now
+  carrying the strongest git state beneath it, and with New file, New folder, Copy path and
+  Copy relative path added. A file watcher keeps it current without polling, and each
+  workspace remembers its folder, width and expanded folders across a restart.
+- **A built-in editor.** Double-click a file in the explorer, or right-click and Open, and it
+  opens in an editor with line numbers, syntax colouring by file type, undo and redo, cut,
+  copy, paste and select all, a tab per file and a right-click menu. A `.vue` file colours
+  its template, script and style blocks with the HTML, JavaScript and CSS grammars at once;
+  TOML is bundled too, which syntect does not ship. The editor takes the terminals' place
+  while it shows and the explorer's toggle brings them back, so nothing typed into it can
+  reach a terminal you cannot see. Open tabs are remembered per workspace, though a relaunch
+  always opens on the terminals. A file changed by something else reloads by itself when you
+  have no unsaved edits, and asks first when you do, checked when you switch to its tab and
+  when the watcher reports it. Ctrl+S saves, Ctrl+W closes a tab, and quitting with unsaved
+  work always asks, whatever the quit setting says.
+- **The explorer no longer keeps a repo busy at idle.** Its per-file `git status` was the
+  one status read without `--no-optional-locks`, so it refreshed `.git/index`, which the
+  explorer's own watcher saw as a change, which ran it again: a loop once per debounce for
+  as long as the pane was open. It cost 4.7% of a core on an idle repo; it is now 0.16%,
+  the same as with the explorer closed.
+- **An open file no longer holds memory it is not using.** Tabs that are off screen and
+  unedited release their buffer and re-read on the way back, so memory follows the file
+  being looked at rather than the sum of everything open: six tabs including a 9,600 line
+  file went from 457 MB to 354 MB. Undo and redo are both bounded now (they were whole
+  document snapshots, with redo uncapped), and the line-number gutter, which costs a shaped
+  copy of every line, gives way above 5,000 lines.
+- **A second iced crate is forked.** `vendor/iced_widget` carries a one-line fix: iced
+  0.13's text editor hit-tests a click with the padding applied to swapped axes, so an
+  editor with uneven padding puts the caret nowhere near the pointer. The editor's line
+  numbers are drawn inside its own left padding, which is what lets a drag across them
+  keep selecting instead of stopping at the gutter's edge.
+- **A crash now leaves a note behind.** Panics are appended to `panic.log` in Arbiter's data
+  folder with the build they came from. A release build on Windows has no console, and
+  Windows Error Reporting does not record a Rust panic, so until now a crash took the window
+  down leaving nothing at all to read. `ARBITER_OPEN_FILE` opens files in the editor at
+  startup, so a fault can be reproduced without driving the UI by hand.
+- **Send to Agent.** Select text in the editor and the top item of its right-click menu sends
+  it to the Claude running in that workspace, as a fenced block carrying the file's full path
+  and line numbers, with the cursor left two lines below it ready for your question. One
+  Claude gets it directly; with several, a short list asks which, and with none the same list
+  offers every terminal in the workspace. Arrows and Enter or a click choose, Escape cancels.
+  Sending hides the editor and focuses the terminal it went to.
+
 - **Ops Floor, stage 1: a pixel-art room where one desk is one pane** (`src/floor.rs`).
   Groundwork only — nothing is wired to a `Session` yet. `floor-demo` is a standalone
   harness with fake desks and test buttons (`cargo run --bin floor-demo
@@ -49,6 +97,102 @@ history belongs to the prior Tauri/Vue web app it replaced.
   sky is a single image that needs no clock at all. Precipitation is the one piece of
   decoration that does cost a clock, which `Weather::moves` makes explicit rather than
   hiding.
+
+### Fixed
+- **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,
+  `/config` or any other slash command raised a "Claude needs your input" card. Claude
+  lists its commands on the first `/`, and that list carries the footer a real prompt
+  carries, which no hook distinguishes. The pane now reads its own input box, so the list
+  is quiet as you type and so is the chooser Enter opens. A command that sets Claude
+  working, like `/init`, still reports whatever that turn asks for.
+- **Scrolling back over a plan no longer raises cards.** The scan that finds a prompt read
+  the whole screen, so an approval box scrolled back into view looked like a live one, and
+  every pass over it raised another card. A prompt only counts at the live bottom, within
+  the rows Claude draws its input box in, and a footer now has to look like a footer
+  rather than merely contain one of its phrases.
+- **"Claude finished" now means Claude finished.** The turn end was inferred from two
+  seconds of silence in the spinner animation, so anything that interrupted it for that
+  long raised a card: dragging the explorer edge or a split divider, toggling the editor,
+  switching workspace, a frozen status row after scrolling, a narrow pane wrapping a
+  status line. A turn end is now the event that ends it, either Claude's Stop hook or its
+  working row giving way to its input box, and nothing else can invent one. Claude's
+  status row is also read directly, so a row that has frozen or a read that has stalled no
+  longer decays into "finished".
+- **Waiting for background agents survives scrolling.** Scrolling up during the wait ended
+  the hold added in 1.5.1 and raised a card about two seconds later.
+- **The usage refresh keeps the numbers on screen.** Clicking refresh flashed "Usage
+  unavailable": it reloaded the whole claude.ai page, and a failure during that cold load
+  was parsed into a state that discarded every meter. A refresh now asks the live page to
+  refetch, which is far quicker, and falls back to a reload only if that goes unanswered.
+  Figures that fail to refresh stay on screen instead of being replaced by a warning, and
+  the arrow turns while a refresh you asked for is in flight. An automatic refresh still
+  draws nothing at all.
+
+## [1.5.1] - 2026-09-21
+
+### Added
+- **A split opens where you are.** A terminal opened by a split starts in the directory of
+  the terminal you split, on Windows and macOS alike (Settings, General, "Split into the
+  same directory"; on by default). A terminal inside `ssh` hands on the local directory it
+  left from.
+- **Ctrl+Shift+P shows a test notification** about the focused terminal, cards enabled or
+  not, so a card can be looked at and the chime heard without waiting for Claude.
+
+### Fixed
+- **Waiting for background agents no longer reads as idle.** While Claude's status row says
+  "Waiting for N background agents to finish" the pane stays working and no "Claude
+  finished" card is raised. Claude's turn is over by every other sign (the spinner stands
+  still and the Stop hook has fired), yet it resumes on its own when the agents report.
+- **A notification card no longer takes the keyboard on macOS.** iced shows every window it
+  opens through winit's `set_visible`, which on macOS is `makeKeyAndOrderFront` whatever
+  the window's inactive flag said, so the card became the key window and the terminal
+  stopped receiving keystrokes. The vendored runtime now lets such a window be shown by its
+  creation, where winit honours the flag.
+- **A card's text and bell are centred vertically.** The row hugged the top padding and
+  left the slack below.
+- **Memory no longer grows with the panes you have closed.** Every terminal keeps a GPU
+  renderer (its glyph atlases, some 6 MB) in a store the app never pruned, so a pane closed
+  or reconnected left its renderer behind for the life of the app. A two-day session held
+  30 of them for 18 panes. A dropped session now retires its id and the store frees the
+  renderer on the next frame; the Claude monitor thread each closed pane also left blocked
+  ends with it.
+- **A frame is rebuilt only when something on it changed.** Output in any pane re-walked
+  every visible terminal's grid and re-uploaded its whole instance buffer, at 60 fps while
+  Claude worked, for panes whose contents were identical frame to frame. The terminal now
+  carries a generation the renderer compares before doing either. The same traffic drove
+  the GPU upload heaps from 100 MB to over 300 MB in two days; they now see a fraction of it.
+- **A new glyph uploads its own atlas slot, not the whole atlas.** Each first appearance of
+  a character re-sent the 1 MB mono atlas or the 4 MB colour atlas; now only its rectangle
+  goes up. The renderers also share the bundled font bytes instead of each holding a copy.
+- **A full glyph atlas starts over instead of indexing past its end.** Enough distinct
+  glyphs in one pane (thousands; CJK or icon-heavy output over weeks) would have panicked
+  the renderer. The atlas now flushes and the glyphs in use re-rasterise.
+- **Output bursts no longer spawn a thread each.** The held redraw, the frozen frame and the
+  hidden cursor's grace each started a thread per event, eight or more a second under
+  Claude output. One deadline thread now serves them all, parked with no timer while
+  nothing is armed.
+- **Scrollback is capped while Claude owns a pane.** Claude takes the wheel there (mouse
+  reporting), so the pane's history is unreachable, yet Claude's redraws filled it to the
+  configured 5000 lines, some 25 MB per pane. It is held at 1000 lines for the duration
+  and returns to the setting when Claude leaves.
+- **Only one graphics backend loads on Windows.** iced let wgpu initialise every backend it
+  was built with, DX12 and OpenGL beside the Vulkan it drew with, tens of MB of driver for
+  nothing. The app now probes for a Vulkan adapter before starting and asks for Vulkan
+  alone. A machine without one gets DX12 and a notice saying so: DX12 draws an unmaximised
+  window soft, because DXGI stretches the frame to the window and winit's borderless-shadow
+  hack leaves the client rect one row taller than the window shows, so the frame is squeezed
+  by a pixel. A DX12-only build was tried first and had every window that way.
+  `WGPU_BACKEND` set by hand still wins.
+- **`exit` closes the terminal.** A shell that ends with exit code 0 (`exit`, Ctrl+D)
+  closes its pane as Ctrl+Shift+W would; the last pane of a workspace closes the
+  workspace, unless it is the only one. A shell that dies otherwise keeps its screen and
+  offers Reconnect, as before. Detected by a per-session exit watcher, since ConPTY gives
+  the reader no EOF when the child ends.
+
+### Added
+- **`ARBITER_MEM_DIAG=1`** logs every allocation of 8 MiB or more with a backtrace, and a
+  summary of the live large blocks once a minute, to `<temp>/arbiter-mem-diag.log`. Off,
+  it costs one atomic load per allocation.
 
 ## [1.5.0] — 2026-09-18
 

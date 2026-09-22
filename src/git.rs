@@ -210,9 +210,17 @@ pub fn worktree_prune(repo_root: &str) -> Result<(), String> {
 /// Per-file git status for `worktree_path` (or `repo_root`): relative path →
 /// one of modified/added/deleted/renamed/untracked/conflicted. From
 /// `git status --porcelain=v1 -uall`.
+///
+/// `--no-optional-locks` for the same reason `repo_info` uses it, and here it is
+/// load-bearing: a plain `git status` refreshes `.git/index`, the file explorer
+/// watches its root recursively, and `.git/index` is a change its filter passes.
+/// Without this the status would trigger the watch that triggered the status,
+/// once per debounce, forever.
 pub fn file_status(worktree_path: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let Some(text) = git(worktree_path, &["status", "--porcelain=v1", "-uall"]) else {
+    let Some(text) =
+        git(worktree_path, &["--no-optional-locks", "status", "--porcelain=v1", "-uall"])
+    else {
         return map;
     };
     for line in text.lines() {

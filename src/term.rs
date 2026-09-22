@@ -130,6 +130,11 @@ impl EventListener for Responder {
 /// every `Session::spawn`/`VtTerm::new` call site; existing grids keep their size.
 pub static SCROLLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(5000);
 
+/// Scrollback kept while Claude owns a pane (see the reader loop in `session.rs`): its
+/// wheel goes to Claude, so Arbiter's history is unreachable there and only holds redraw
+/// churn. Enough to keep the shell's recent output around Claude's launch.
+pub const CLAUDE_SCROLLBACK: usize = 1000;
+
 #[derive(Clone, Copy)]
 struct Size {
     cols: usize,
@@ -165,6 +170,11 @@ pub struct VtTerm {
     /// PTY replies the term produced (query responses), drained by the reader loop
     /// and written back to the PTY. Shared with the `Responder` event sink.
     responses: Arc<Mutex<Vec<u8>>>,
+    /// Bumped by every change that can alter what a frame shows: output, resize, scroll,
+    /// selection, search, history depth. The renderer skips rebuilding a frame whose
+    /// generation it already drew (see `gpu::TermGpu::prepare`), so a mutating method
+    /// that forgets to bump it leaves a stale frame until the next change.
+    generation: u64,
 }
 
 impl VtTerm {
@@ -186,10 +196,25 @@ impl VtTerm {
             hidden_since: None,
             last_scroll: None,
             responses,
+            generation: 0,
         }
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Change how many lines of history the primary screen keeps. Shrinking drops the
+    /// oldest lines and frees their rows; growing only raises the cap.
+    pub fn set_history(&mut self, lines: usize) {
+        let mut config = Config::default();
+        config.scrolling_history = lines;
+        self.term.set_options(config);
+        self.generation += 1;
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.generation += 1;
         self.parser.advance(&mut self.term, bytes);
         if self.term.mode().contains(TermMode::SHOW_CURSOR) {
             let p = self.term.grid().cursor.point;
@@ -212,6 +237,7 @@ impl VtTerm {
     /// empty/invalid query clears the search. Case-insensitive unless the query has
     /// an uppercase letter (alacritty's smart-case).
     pub fn set_search(&mut self, query: &str) {
+        self.generation += 1;
         if query.is_empty() {
             self.search = None;
             return;
@@ -237,6 +263,7 @@ impl VtTerm {
 
     /// Move to the next (or previous) match, wrapping, and scroll it into view.
     pub fn search_jump(&mut self, forward: bool) {
+        self.generation += 1;
         let len = self.search.as_ref().map_or(0, |s| s.matches.len());
         if len == 0 {
             return;
@@ -249,6 +276,7 @@ impl VtTerm {
     }
 
     pub fn clear_search(&mut self) {
+        self.generation += 1;
         self.search = None;
     }
 
@@ -290,6 +318,7 @@ impl VtTerm {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.generation += 1;
         self.term.resize(Size { cols, rows });
     }
 
@@ -297,6 +326,7 @@ impl VtTerm {
     /// clamped to the history. The next `for_each_cell` renders the new view.
     /// Records the scroll time so the scroll indicator shows then fades.
     pub fn scroll(&mut self, lines: i32) {
+        self.generation += 1;
         self.term.scroll_display(Scroll::Delta(lines));
         self.last_scroll = Some(std::time::Instant::now());
     }
@@ -304,6 +334,7 @@ impl VtTerm {
     /// Jump back to the live bottom (display offset 0). Does NOT mark a user
     /// scroll, so typing/jump-to-bottom never flashes the scroll indicator.
     pub fn scroll_to_bottom(&mut self) {
+        self.generation += 1;
         self.term.scroll_display(Scroll::Bottom);
     }
 
@@ -329,6 +360,7 @@ impl VtTerm {
     /// right half (which edge the selection snaps to). `kind` sets the
     /// granularity (single/double/triple click → char/word/line).
     pub fn start_selection(&mut self, row: usize, col: usize, right: bool, kind: SelectKind) {
+        self.generation += 1;
         let point = Point::new(self.abs_line(row), Column(col));
         let side = if right { Side::Right } else { Side::Left };
         let ty = match kind {
@@ -341,6 +373,7 @@ impl VtTerm {
 
     /// Extend the active selection to a visible (row, col).
     pub fn update_selection(&mut self, row: usize, col: usize, right: bool) {
+        self.generation += 1;
         let point = Point::new(self.abs_line(row), Column(col));
         let side = if right { Side::Right } else { Side::Left };
         if let Some(sel) = self.term.selection.as_mut() {
@@ -349,6 +382,9 @@ impl VtTerm {
     }
 
     pub fn clear_selection(&mut self) {
+        if self.term.selection.is_some() {
+            self.generation += 1;
+        }
         self.term.selection = None;
     }
 
@@ -359,6 +395,7 @@ impl VtTerm {
     /// Select the entire buffer (scrollback + visible screen) — the terminal
     /// context menu's "Select All".
     pub fn select_all(&mut self) {
+        self.generation += 1;
         let history = self.term.grid().history_size() as i32;
         let cols = self.term.grid().columns();
         let lines = self.term.screen_lines() as i32;
@@ -372,6 +409,7 @@ impl VtTerm {
     /// Buffer". Leaves the cursor where it is (the running program owns it).
     pub fn clear(&mut self) {
         use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        self.generation += 1;
         self.term.clear_screen(ClearMode::All);
         self.term.grid_mut().clear_history();
         self.term.scroll_display(Scroll::Bottom);
@@ -422,9 +460,15 @@ impl VtTerm {
     /// Working is NOT detected here — it's keyed off the live byte stream (see
     /// `session.rs`), so a spinner star left on screen can't pin it to "working".
     pub fn visible_menu(&self) -> bool {
-        // The exact markers the web used (AskUserQuestion / plan-mode menus).
-        const MENU: &[&str] = &["to navigate", "Esc to cancel", "Would you like to proceed"];
-        self.screen_contains(MENU)
+        self.rows_from_bottom(MENU_ROWS, is_menu_row)
+    }
+
+    /// True while Claude's status row says it is working: a spinner glyph, then text
+    /// ending in the interrupt hint. Level-triggered, unlike the spinner-frame stream,
+    /// so it reads correctly when the row is FROZEN (the text is still there) and when
+    /// a read stalls — neither of which says the turn ended.
+    pub fn visible_working(&self) -> bool {
+        self.any_visible_row(is_working_row)
     }
 
     /// True while Claude's fullscreen UI is scrolled away from its live bottom: it then
@@ -434,20 +478,41 @@ impl VtTerm {
         self.screen_contains(&["(ctrl+End)"])
     }
 
+    /// True while Claude's status row reads "✳ Waiting for N background agents to finish":
+    /// its turn is over by every other sign (the spinner stands still, the Stop hook has
+    /// fired), yet it picks the work up by itself when the agents report, so the pane is
+    /// not idle. The row is told from the same words in the transcript by its shape: a
+    /// spinner glyph, a space, the phrase; Claude's prose starts with a bullet or an indent.
+    pub fn visible_waiting_agents(&self) -> bool {
+        self.any_visible_row(is_waiting_agents_row)
+    }
+
     /// Whether any of the last 40 visible rows contains one of `needles`.
     fn screen_contains(&self, needles: &[&str]) -> bool {
+        self.any_visible_row(|row| needles.iter().any(|m| row.contains(m)))
+    }
+
+    /// Whether `matches` holds for the text of any of the last 40 visible rows.
+    fn any_visible_row(&self, matches: impl Fn(&str) -> bool) -> bool {
+        self.rows_from_bottom(40, matches)
+    }
+
+    /// Whether `matches` holds for any of the last `n` visible rows. A narrow window
+    /// is how a LIVE element is told from the same words sitting in the transcript:
+    /// Claude anchors its input box and menus to the bottom of the screen.
+    fn rows_from_bottom(&self, n: usize, matches: impl Fn(&str) -> bool) -> bool {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
         let mut buf = String::with_capacity(cols);
-        for row in rows.saturating_sub(40)..rows {
+        for row in rows.saturating_sub(n)..rows {
             buf.clear();
             let line = &grid[Line(row as i32 - off)];
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if needles.iter().any(|m| buf.contains(m)) {
+            if matches(&buf) {
                 return true;
             }
         }
@@ -530,6 +595,14 @@ impl VtTerm {
             buf.push(line[Column(col)].c);
         }
         buf.trim_end().to_string()
+    }
+
+    /// Whether the row the cursor is on is a slash command in Claude's input box.
+    /// Read at Enter, this says the user is about to open a chooser themselves
+    /// (`/model`, `/config`), which no hook reports and which must not read as Claude
+    /// asking for something.
+    pub fn input_row_is_slash(&self) -> bool {
+        row_is_slash_command(&self.cursor_row_text())
     }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
@@ -707,6 +780,73 @@ fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
 }
 
+/// Rows from the bottom that a LIVE menu can occupy. Claude anchors its input box and
+/// its choosers to the bottom of the screen, so a marker further up is transcript: an
+/// old approval box scrolled back into view, or prose quoting the words. Scanning the
+/// whole screen for them raised a card every time the user scrolled past one.
+const MENU_ROWS: usize = 12;
+
+/// The text after a spinner glyph at the start of `row`, if the row is one of Claude's
+/// status rows. The glyph is one of the spinner's frames (Claude's ✢✳✶✻✽ range, or its
+/// `·` frame) followed by a space, which no transcript line begins with.
+fn status_row_text(row: &str) -> Option<&str> {
+    let trimmed = row.trim_start();
+    let mut chars = trimmed.chars();
+    let glyph = chars.next()?;
+    let is_frame = matches!(glyph as u32, 0x2722..=0x273F) || glyph == '·';
+    if !is_frame || chars.next() != Some(' ') {
+        return None;
+    }
+    Some(chars.as_str())
+}
+
+/// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
+/// row (see `VtTerm::visible_waiting_agents`).
+fn is_waiting_agents_row(row: &str) -> bool {
+    let Some(rest) = status_row_text(row) else { return false };
+    rest.starts_with("Waiting for ") && rest.contains(" background agent") && rest.contains(" to finish")
+}
+
+/// Whether a screen row is Claude's working status row: a spinner frame and a line
+/// carrying the interrupt hint ("✻ Thinking… (esc to interrupt)"). The shape is what
+/// separates it from prose containing the same words, including Arbiter's own source
+/// shown in a diff.
+fn is_working_row(row: &str) -> bool {
+    status_row_text(row).is_some_and(|rest| rest.contains("esc to interrupt"))
+}
+
+/// Whether a row is the footer of a live chooser. Claude draws the same hint under
+/// AskUserQuestion, plan-mode approval and its own slash-command menus.
+fn is_menu_row(row: &str) -> bool {
+    if row.contains("Would you like to proceed") {
+        return true;
+    }
+    // Claude's footer reads "↑/↓ to navigate · Enter to select · Esc to cancel". Any
+    // ONE of those fragments also turns up in ordinary prose ("explains how to
+    // navigate the tree"), which is how scrolling a transcript used to raise a card,
+    // so a footer has to carry at least two of them.
+    const HINTS: &[&str] = &["to navigate", "to select", "Esc to cancel", "Enter to"];
+    HINTS.iter().filter(|h| row.contains(**h)).count() >= 2
+}
+
+/// Whether a rendered input row holds a slash command. Claude's box draws a border and
+/// a prompt marker before the text, so those are stripped first; everything after the
+/// first character must still look like a command, not prose that happens to start
+/// with a slash.
+fn row_is_slash_command(row: &str) -> bool {
+    // Claude draws the text inside a box, so strip the border and prompt marker from
+    // both ends: the row is `│ > /model        │`.
+    let edge = |c: char| c.is_whitespace() || matches!(c, '│' | '|' | '>' | '\u{276f}');
+    let body = row.trim_start_matches(edge).trim_end_matches(edge);
+    let Some(rest) = body.strip_prefix('/') else { return false };
+    // A bare `/` counts: Claude lists its commands on that first keystroke, which is
+    // the moment the list appears and the earliest this has to be right.
+    let Some(first) = rest.chars().next() else { return true };
+    // `/usr/bin/x` or `//` is a path or a comment, not a command.
+    first.is_ascii_alphabetic()
+        && rest.chars().take_while(|c| !c.is_whitespace()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+}
+
 /// http(s):// scheme length at `t[i]` (8 for `https://`, 7 for `http://`), else
 /// `None`.
 fn url_scheme_len(t: &[char], i: usize) -> Option<usize> {
@@ -860,9 +1000,127 @@ mod tests {
         assert!(matches("http://").is_empty()); // scheme with no body
     }
 
+    // Claude's working row, against the same words as they appear in a transcript —
+    // including Arbiter's own source, which contains the phrase in these very tests.
+    #[test]
+    fn the_working_row_is_known_by_its_shape() {
+        use super::is_working_row as row;
+        assert!(row("✻ Thinking… (esc to interrupt)"));
+        assert!(row("· Brewing… (esc to interrupt · ctrl+t to hide todos)"));
+        assert!(row("✳ Waiting for 2 background agents to finish · esc to interrupt   "));
+        // Prose, quoted text and source: same words, no status-row shape.
+        assert!(!row("  the hint reads (esc to interrupt) while it works"));
+        assert!(!row("● Ran tool, esc to interrupt was shown"));
+        assert!(!row("+    assert!(row(\"✻ Thinking… (esc to interrupt)\"));"));
+        assert!(!row("✻ Brewed for 7s"));
+        assert!(!row(""));
+    }
+
+    // A live chooser's footer, against an approval box sitting in the transcript.
+    #[test]
+    fn a_menu_footer_is_matched_by_its_words() {
+        use super::is_menu_row as row;
+        assert!(row("  ↑/↓ to navigate · Enter to select · Esc to cancel"));
+        assert!(row("Would you like to proceed?"));
+        assert!(row("  ↑/↓ to navigate · Esc to cancel"));
+        // One stray fragment is prose, which is what used to raise a card on every
+        // pass while scrolling back over a plan.
+        assert!(!row("  the plan explains how to navigate the tree"));
+        assert!(!row("  press Esc to cancel, it said, and I did"));
+        assert!(!row(""));
+    }
+
+    // Telling a slash command in Claude's input box from an ordinary prompt.
+    #[test]
+    fn a_slash_command_is_told_from_a_prompt() {
+        use super::row_is_slash_command as slash;
+        assert!(slash("> /model"));
+        assert!(slash("│ ❯ /config "));
+        assert!(slash("  /agents"));
+        assert!(slash("> /statusline setup"));
+        // The first keystroke, which is when Claude puts its command list up.
+        assert!(slash("> /"));
+        assert!(slash("│ > /   │"));
+        assert!(slash("> /mod"));
+        assert!(!slash("> fix the bug in /src/main.rs"));
+        assert!(!slash("> /usr/bin/env"));
+        assert!(!slash("> //"));
+        assert!(!slash("> how do I use /model?"));
+        assert!(!slash("> "));
+        assert!(!slash(""));
+    }
+
+    // The status row while Claude waits on agents it launched, against the same words
+    // where Claude writes them in its transcript.
+    #[test]
+    fn the_waiting_for_agents_row_is_known_by_its_shape() {
+        use super::is_waiting_agents_row as row;
+        assert!(row("✳ Waiting for 3 background agents to finish"));
+        assert!(row("· Waiting for 1 background agent to finish"));
+        assert!(row("✻ Waiting for 2 background agents to finish · esc to interrupt   "));
+        assert!(!row("● Waiting for 3 background agents to finish."));
+        assert!(!row("  Waiting for 3 background agents to finish"));
+        assert!(!row("✳ Waiting for API response"));
+        assert!(!row("✳ Brewed for 7s"));
+        assert!(!row(""));
+    }
+
     /// Scrolling (wheel or drag auto-scroll) while a selection drag is active must
     /// keep extending the marked region: scroll the view, then re-extend to the same
     /// screen row — the selection should grow to cover the lines scrolled into view.
+    // Every change the renderer must draw moves the generation; the renderer relies on
+    // this to skip frames whose inputs are unchanged.
+    #[test]
+    fn generation_moves_with_every_visible_change() {
+        let mut t = super::VtTerm::new(20, 4);
+        let mut last = t.generation();
+        let mut step = |t: &mut super::VtTerm, what: &str| {
+            assert!(t.generation() > last, "{what} did not bump the generation");
+            last = t.generation();
+        };
+        t.feed(b"hello\r\n");
+        step(&mut t, "feed");
+        t.resize(30, 5);
+        step(&mut t, "resize");
+        t.scroll(1);
+        step(&mut t, "scroll");
+        t.scroll_to_bottom();
+        step(&mut t, "scroll_to_bottom");
+        t.start_selection(0, 0, false, super::SelectKind::Simple);
+        step(&mut t, "start_selection");
+        t.update_selection(0, 3, true);
+        step(&mut t, "update_selection");
+        t.clear_selection();
+        step(&mut t, "clear_selection");
+        t.set_search("hell");
+        step(&mut t, "set_search");
+        t.clear_search();
+        step(&mut t, "clear_search");
+        t.set_history(100);
+        step(&mut t, "set_history");
+        t.clear();
+        step(&mut t, "clear");
+    }
+
+    // Shrinking the history drops the oldest lines and reports the smaller size; growing
+    // it back gives capacity, not content.
+    #[test]
+    fn history_shrinks_and_regrows_on_demand() {
+        let mut t = super::VtTerm::new(10, 2);
+        for i in 0..60 {
+            t.feed(format!("L{i:02}\r\n").as_bytes());
+        }
+        assert!(t.scroll_state().1 >= 50, "lines scrolled into history");
+        t.set_history(20);
+        assert_eq!(t.scroll_state().1, 20);
+        t.set_history(5000);
+        assert_eq!(t.scroll_state().1, 20, "growing the cap does not bring lines back");
+        for i in 0..30 {
+            t.feed(format!("M{i:02}\r\n").as_bytes());
+        }
+        assert_eq!(t.scroll_state().1, 50);
+    }
+
     #[test]
     fn selection_extends_while_scrolling() {
         use super::{SelectKind, VtTerm};

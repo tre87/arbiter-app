@@ -502,6 +502,20 @@ where
                                 let target =
                                     settings.platform_specific.target.clone();
 
+                                // VENDORED ADDITION: on macOS a window asked to open
+                                // without focus (`NEXT_WINDOW_INACTIVE`) is shown by
+                                // its creation, where winit uses `orderFront`. The
+                                // hidden-then-shown route below ends in winit's
+                                // `set_visible(true)`, which on macOS is
+                                // `makeKeyAndOrderFront` and takes the key window
+                                // from the app's main window whatever the flag said.
+                                // Windows keeps the flag in its window state, so its
+                                // later show is already `SW_SHOWNOACTIVATE`.
+                                let inactive = conversion::NEXT_WINDOW_INACTIVE
+                                    .load(std::sync::atomic::Ordering::SeqCst);
+                                let shown_at_creation =
+                                    cfg!(target_os = "macos") && inactive && visible;
+
                                 let window_attributes =
                                     conversion::window_attributes(
                                         settings,
@@ -509,8 +523,12 @@ where
                                         monitor
                                             .or(event_loop.primary_monitor()),
                                         self.id.clone(),
-                                    )
-                                    .with_visible(false);
+                                    );
+                                let window_attributes = if shown_at_creation {
+                                    window_attributes
+                                } else {
+                                    window_attributes.with_visible(false)
+                                };
 
                                 #[cfg(target_arch = "wasm32")]
                                 let window_attributes = {
@@ -585,7 +603,8 @@ where
                                         id,
                                         window,
                                         exit_on_close_request,
-                                        make_visible: visible,
+                                        make_visible: visible
+                                            && !shown_at_creation,
                                         on_open,
                                     },
                                 );

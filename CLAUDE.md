@@ -22,6 +22,21 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   vice-versa — they're separate (CoreText vs DirectWrite) and easy to regress.
 - **No polling.** Every live signal must be event-driven (file watchers / PTY reader
   callbacks); web parity depends on it.
+- **Every `git` read reached from a watcher needs `--no-optional-locks`.** A plain
+  `git status` refreshes `.git/index`, and a watcher over the working tree sees that as a
+  change and runs the status again, forever. The explorer shipped that loop once
+  (`git::file_status`, 4.7% of a core on an idle repo). Measure idle CPU after touching
+  anything a watcher triggers.
+- **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`:
+  `iced_winit` (inactive notification windows) and `iced_widget` (the text editor
+  hit-tests with the padding on swapped axes, which the editor's line-number gutter
+  depends on; see `vendor/iced_widget/ARBITER-FORK.md`). An iced upgrade means
+  re-copying both from the registry and re-applying their diffs.
+- **Verify UI changes with a debug build**, not just `--release`. iced states several
+  layout contracts as `debug_assert!`, which release compiles out: a release build runs
+  a mis-specified layout silently where `cargo run` panics at once. A panic goes to
+  `panic.log` in the data dir, and `ARBITER_OPEN_FILE` opens files in the editor at
+  startup so a fault reproduces without driving the UI by hand.
 
 ## Remote Claude resume — how the session id is known
 
@@ -115,6 +130,24 @@ Claude fixes the issue. Rejected: scrolling
 Arbiter's own scrollback instead (the transcript is not in it under the fullscreen UI) and
 a row resize (shifts the whole layout for a frame; a column does not).
 
+## Notification cards and what counts as a turn end (2026-09-21)
+
+- **A card must never take the keyboard.** Each card is its own iced window opened with
+  the fork's `NEXT_WINDOW_INACTIVE`. On Windows the flag lives in winit's window state, so
+  iced's hidden-then-`set_visible(true)` route shows it `SW_SHOWNOACTIVATE`; on macOS
+  `set_visible(true)` is `makeKeyAndOrderFront` and stole the key window from the main
+  one, so the fork (`vendor/iced_winit/src/program.rs`) creates such a window visible and
+  lets winit's creation `orderFront` it. Ctrl+Shift+P raises a test card
+  (`Message::TestNotification`), Settings or not.
+- **"Waiting for N background agents to finish" is not idle.** It is Claude's
+  `turn_duration` line: the turn is over (Stop hook fired, spinner still), yet Claude
+  resumes by itself when the agents report. The reader scans the visible rows for the row's
+  shape (`VtTerm::visible_waiting_agents`, `term::is_waiting_agents_row`: a spinner glyph,
+  a space, the phrase; prose starts with a bullet or an indent) and
+  `ClaudeHandle::set_waiting_agents` holds `Working` while it shows. The off edge stamps a
+  fresh activity TTL so the resumed turn's first frames have time to pair up; Escape during
+  the wait ends it the same way, one TTL later, with a "Claude finished" card.
+
 ## Terminal renderer — known limitation (intentional)
 
 The GPU renderer draws **one opaque quad per cell**, so a glyph cannot overflow its cell
@@ -151,3 +184,44 @@ without painting over (erasing) the neighbour. Consequences, both intentional / 
   rest are stretched to the cell on each axis (`gpu::stretch_to_box`): a segment edge with a
   gap above or below shows as a notch, and uniform fitting of the bundled font's glyphs left
   one. They never take a second cell either (`raster::is_icon` excludes them).
+
+## Memory: what is bounded, what is pooled, and how to look (2026-09-20)
+
+A two-day, 18-pane run was taken apart with a region census (VirtualQueryEx by allocation
+base, then reading the contents of the largest blocks) and isolated instances driven from
+crafted `session.json` files. Findings that shape the code:
+
+- **Per-pane renderers are freed via a retire list.** `Renderers` lives in iced's shader
+  storage, reachable only from `TermPrimitive::prepare`; a dropped `Session` pushes its id to
+  `session::RETIRED` and the next frame removes the entry. Every pane ever drawn used to
+  keep its 5 MB of atlas copies forever (30 renderers for 18 panes).
+- **One deadline thread** (`session::schedule`) replaces spawn-per-event for the redraw
+  hold, the frozen frame, the cursor grace and the resize nudge. It parks on a condvar with
+  no timeout while nothing is armed, so it is still event-driven under the no-polling rule.
+- **A frame is rebuilt only when `VtTerm::generation` (plus cursor, background, canvas)
+  changed** (`gpu::FrameKey`). Every `&mut self` method on `VtTerm` that can alter the
+  picture must bump the generation; `term::tests::generation_moves_with_every_visible_change`
+  pins the list. Atlas uploads are per dirty rectangle, and a full atlas flushes.
+- **Scrollback while Claude owns a pane is `term::CLAUDE_SCROLLBACK`** (the reader loop
+  switches it on the `claude_running || on_screen` edge). Blank pre-allocated alacritty rows
+  were the bulk of the Rust heap: rows are allocated 1000 at a time as history grows.
+- **The 16 MiB zero-filled heap blocks** seen in the long run (13 to 14 of them, appearing
+  under sustained 60 fps rendering, occasionally recycled) are not produced by any Rust
+  allocation site in this tree or its dependencies, and `ARBITER_MEM_DIAG` saw none in
+  isolated runs. The best-fitting owner is the NVIDIA in-game overlay's capture hook
+  (`nvspcap64.dll` was loaded in the process). Disable the overlay to test.
+- **Windows asks wgpu for Vulkan alone, after a probe** (`gpu::windows_backend`, set as
+  `WGPU_BACKEND` in `main`). Pinning DX12 to save the Vulkan and OpenGL driver DLLs drew
+  every unmaximised window blurry (2026-09-21): wgpu-hal creates the DXGI swapchain with
+  `DXGI_SCALING_STRETCH`, and winit's `undecorated_shadow` hack (`WM_NCCALCSIZE`:
+  `top += 1; bottom += 1`) makes the client rect one row taller than the window shows, so
+  DWM squeezed the frame by a pixel: edges crisp at the top, half a pixel soft mid-window,
+  the phase drifting one pixel over the height. Confirmed by measuring the user's
+  screenshot, not by theory. A maximised window takes winit's other `WM_NCCALCSIZE` branch
+  and is unaffected. Vulkan presents 1:1. Only a machine with no Vulkan adapter gets DX12,
+  with a message box saying so; `VK_DRIVER_FILES=<nonexistent>` forces that path for a test.
+- **Do not attach process-memory readers, ETW heap tracing or keystroke automation to a
+  running Arbiter from a shell descended from it.** Defender's behaviour classifier
+  attributed exactly that to `arbiter.exe` (Trojan:Win32/Bearfoos.A!ml) and killed the
+  app. Use `ARBITER_MEM_DIAG`, `Get-Process` counters, or an elevated console you open
+  yourself.

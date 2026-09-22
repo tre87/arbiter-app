@@ -1,12 +1,12 @@
 [package]
 name = "arbiter-native"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 publish = false
 description = "Cross-platform terminal application with Claude support"
 license = "MIT"
-# Don't auto-discover bins: src/bin/file_icons.rs is a *module* of iced_shell
-# (sibling of the crate root), not a binary. List the real bins explicitly.
+# Don't auto-discover bins: src/bin/file_icons.rs and src/bin/editor_ui.rs are
+# *modules* of iced_shell (siblings of it), not binaries. List the real bins here.
 autobins = false
 
 [[bin]]
@@ -99,6 +99,21 @@ tiny-skia = "0.11"
 # File-explorer "Delete" moves to the OS trash (recoverable), like the web app's
 # `trash_path`. Cross-platform (Finder Trash / Recycle Bin / freedesktop).
 trash = "5"
+# Editor syntax highlighting. Taken directly rather than through iced's
+# `highlighter` feature: that wraps a private SyntaxSet we cannot add Vue to, and
+# its default features build oniguruma (C). `regex-fancy` keeps the build pure Rust,
+# and `yaml-load` is what lets us add `assets/syntaxes/Vue.sublime-syntax`.
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "default-themes",
+    "yaml-load",
+    "regex-fancy",
+    # Cache the built syntax set to the data dir: linking the bundled grammars
+    # together with our own costs ~130ms, loading the dump back ~6ms.
+    "dump-create",
+    "dump-load",
+] }
 # One-shot delays inside iced Tasks (a notification card's timeout). iced's executor is
 # already this runtime (its `tokio` feature), so nothing new is compiled.
 tokio = { version = "1", features = ["time"] }
@@ -152,6 +167,11 @@ block2 = "0.5"
 # in the terminal. Windows/Linux conversion is unchanged. See vendor/iced_winit.
 [patch.crates-io]
 iced_winit = { path = "vendor/iced_winit" }
+# One-line fix: iced 0.13's text editor hit-tests with the padding applied to
+# swapped axes, so an editor with asymmetric padding puts every click in the
+# wrong place. The editor's line numbers live in its left padding, which makes
+# it asymmetric. See vendor/iced_widget/ARBITER-FORK.md.
+iced_widget = { path = "vendor/iced_widget" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

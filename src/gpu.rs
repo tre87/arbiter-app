@@ -152,6 +152,54 @@ struct Glyph {
     cells: u32,
 }
 
+/// Everything a frame depends on besides the atlas: the grid's generation, the cursor
+/// (its visibility changes on a timer, not a grid mutation), the background setting, and
+/// the canvas size. `prepare` rebuilds only when this differs from the last frame drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FrameKey {
+    generation: u64,
+    cursor: (usize, usize, bool),
+    bg: [u32; 3],
+    canvas: (u32, u32),
+}
+
+/// Windows: the one wgpu backend to ask for (`WGPU_BACKEND`), decided before iced starts.
+/// Vulkan, which wgpu's own adapter order always chose here, wherever a Vulkan adapter
+/// exists; iced would otherwise initialise DX12 and OpenGL beside it, tens of MB of driver
+/// for nothing. DX12 only where none does, so the app still opens, with a notice: DX12 draws
+/// an unmaximised window soft (DXGI stretches the frame to the window, and winit's
+/// borderless-shadow hack leaves the client rect one row taller than the window shows).
+/// The probe enumerates adapters synchronously; the instance is dropped again at once.
+#[cfg(windows)]
+pub fn windows_backend() -> &'static str {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..Default::default()
+    });
+    if !instance.enumerate_adapters(wgpu::Backends::VULKAN).is_empty() {
+        return "vulkan";
+    }
+    warn_no_vulkan();
+    "dx12"
+}
+
+// On its own thread so the window opens behind it rather than after it.
+#[cfg(windows)]
+fn warn_no_vulkan() {
+    std::thread::spawn(|| {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+        let text = HSTRING::from(
+            "Arbiter found no Vulkan graphics driver and is running on DirectX 12.\n\n\
+             Text renders soft while the window is not maximised. Installing the graphics \
+             card's current driver brings Vulkan back.",
+        );
+        let caption = HSTRING::from("Arbiter");
+        unsafe { MessageBoxW(HWND::default(), &text, &caption, MB_OK | MB_ICONWARNING) };
+    });
+}
+
 /// Surface-agnostic renderer: pipeline + glyph atlas + instance buffer.
 pub struct TermGpu {
     pipeline: wgpu::RenderPipeline,
@@ -165,9 +213,8 @@ pub struct TermGpu {
     /// its writers are untouched, so normal text rendering is unaffected.
     color_atlas_tex: wgpu::Texture,
 
-    font_name: String,
-    regular: (Vec<u8>, u32),
-    bold_face: Option<(Vec<u8>, u32)>,
+    /// Shared with every other pane's renderer: the font bytes are read, never owned here.
+    spec: Arc<crate::font::FontSpec>,
     em_px: f32,
     scale: f32,
     /// Font size (points) this renderer was built with — compared against
@@ -185,8 +232,14 @@ pub struct TermGpu {
     next_slot: u32,
     color_next: u32,
     per_row: u32,
-    atlas_dirty: bool,
-    color_dirty: bool,
+    /// Atlas regions (x, y, w, h) drawn since the last upload; each goes up on its own,
+    /// not the whole 1 MB or 4 MB texture. A whole-atlas entry means a fresh or flushed atlas.
+    dirty: Vec<[u32; 4]>,
+    color_dirty: Vec<[u32; 4]>,
+    /// Set when an atlas was flushed while a frame was being built: every slot resolved
+    /// before the flush is stale, so `prepare` builds the frame once more.
+    flushed: bool,
+    last_frame: Option<FrameKey>,
 
     scratch: Vec<f32>,
     count: u32,
@@ -222,7 +275,7 @@ impl TermGpu {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        spec: &crate::font::FontSpec,
+        spec: Arc<crate::font::FontSpec>,
         scale: f32,
     ) -> Self {
         // Glyph atlas (CPU). ab_glyph is used only for metrics (cell size +
@@ -400,13 +453,45 @@ impl TermGpu {
 
         Self {
             pipeline, quad_vb, inst_vb, inst_cap, uniform_buf, bind_group, atlas_tex, color_atlas_tex,
-            font_name: spec.name.clone(), regular: spec.regular.clone(), bold_face: spec.bold.clone(),
+            spec,
             em_px, scale, built_pts, cell_w, cell_h, baseline,
             is_srgb: format.is_srgb(),
             atlas_cpu, color_atlas_cpu, glyphs: HashMap::new(), next_slot: 2, color_next: 0,
-            per_row, atlas_dirty: true, color_dirty: true,
+            per_row,
+            dirty: vec![[0, 0, ATLAS, ATLAS]],
+            color_dirty: vec![[0, 0, ATLAS, ATLAS]],
+            flushed: false,
+            last_frame: None,
             scratch: Vec::new(), count: 0, prepared_at: None,
         }
+    }
+
+    /// Slots in an atlas: whole rows of whole cells.
+    fn capacity(&self) -> u32 {
+        self.per_row * (ATLAS / self.cell_h).max(1)
+    }
+
+    /// The mono atlas is full: start it over. Every mono glyph rasterises again the next
+    /// time it is drawn, and the frame under construction is rebuilt (see `prepare`) so
+    /// no instance keeps pointing at a recycled slot. Rare (thousands of distinct glyphs
+    /// in one pane) and cheap next to the alternative, which was indexing past the atlas.
+    fn flush_mono(&mut self) {
+        self.glyphs.retain(|_, g| g.color);
+        self.atlas_cpu.fill(0);
+        fill_slot(&mut self.atlas_cpu, SLOT_SOLID, self.per_row, self.cell_w, self.cell_h, 255);
+        self.next_slot = 2;
+        self.dirty.clear();
+        self.dirty.push([0, 0, ATLAS, ATLAS]);
+        self.flushed = true;
+    }
+
+    fn flush_color(&mut self) {
+        self.glyphs.retain(|_, g| !g.color);
+        self.color_atlas_cpu.fill(0);
+        self.color_next = 0;
+        self.color_dirty.clear();
+        self.color_dirty.push([0, 0, ATLAS, ATLAS]);
+        self.flushed = true;
     }
 
     /// The display scale this renderer was built for. The host rebuilds the
@@ -437,6 +522,9 @@ impl TermGpu {
         if col + cells > self.per_row {
             self.color_next += self.per_row - col; // skip the row's tail
         }
+        if self.color_next + cells > self.capacity() {
+            self.flush_color();
+        }
         let slot = self.color_next;
         self.color_next += cells;
         slot
@@ -448,6 +536,9 @@ impl TermGpu {
         let col = self.next_slot % self.per_row;
         if col + cells > self.per_row {
             self.next_slot += self.per_row - col; // skip the row's tail
+        }
+        if self.next_slot + cells > self.capacity() {
+            self.flush_mono();
         }
         let slot = self.next_slot;
         self.next_slot += cells;
@@ -466,7 +557,11 @@ impl TermGpu {
             return g;
         }
         let cp = ch as u32;
-        // The next free mono slot (only consumed if we actually draw a mono glyph).
+        // The next free mono slot (only consumed if we actually draw a mono glyph), with
+        // room made for it first.
+        if self.next_slot + 1 > self.capacity() {
+            self.flush_mono();
+        }
         let mslot = self.next_slot;
         let ox = (mslot % self.per_row) * self.cell_w;
         let oy = (mslot / self.per_row) * self.cell_h;
@@ -480,23 +575,23 @@ impl TermGpu {
             || draw_powerline_glyph(&mut self.atlas_cpu, cp, ox, oy, self.cell_w, self.cell_h)
         {
             self.next_slot += 1;
-            self.atlas_dirty = true;
+            self.dirty.push([ox, oy, self.cell_w, self.cell_h]);
             let g = Glyph { slot: mslot, color: false, cells: 1 };
             self.glyphs.insert((ch, bold, icon2), g);
             return g;
         }
         // Pick the bold face when we carry one (swash path); otherwise pass the
         // regular bytes and let the rasteriser synthesise bold (CoreText).
-        let (data, index) = match (bold, &self.bold_face) {
+        let (data, index) = match (bold, &self.spec.bold) {
             (true, Some(b)) => (b.0.as_slice(), b.1),
-            _ => (self.regular.0.as_slice(), self.regular.1),
+            _ => (self.spec.regular.0.as_slice(), self.spec.regular.1),
         };
         // Also hand over the bold-face bytes regardless of weight: the DirectWrite
         // path loads them into a real bold IDWriteFontFace so bold renders the bundled
         // bold (not a synthesised faux-bold). Other platforms ignore this.
-        let bold_data = self.bold_face.as_ref().map(|(b, _)| b.as_slice());
+        let bold_data = self.spec.bold.as_ref().map(|(b, _)| b.as_slice());
         let raster = crate::raster::rasterize(
-            &self.font_name, data, index, bold_data, self.em_px, ch, bold, wide_hint, icon2,
+            &self.spec.name, data, index, bold_data, self.em_px, ch, bold, wide_hint, icon2,
         );
         // Diagnostic: ARBITER_GLYPH_DEBUG logs how non-ASCII symbols (e.g. ✻ U+273B,
         // ⏵ U+23F5) rasterise — mono vs colour, size + bearing vs the cell, and the
@@ -530,7 +625,7 @@ impl TermGpu {
                 blit_color(
                     &mut self.color_atlas_cpu, &bmp, self.baseline, cells * self.cell_w, self.cell_h, cox, coy,
                 );
-                self.color_dirty = true;
+                self.color_dirty.push([cox, coy, cells * self.cell_w, self.cell_h]);
                 Glyph { slot, color: true, cells }
             }
             Some(bmp) if icon2 => {
@@ -544,7 +639,7 @@ impl TermGpu {
                 let ox = (slot % self.per_row) * self.cell_w;
                 let oy = (slot / self.per_row) * self.cell_h;
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, 2 * self.cell_w, self.cell_h, ox, oy);
-                self.atlas_dirty = true;
+                self.dirty.push([ox, oy, 2 * self.cell_w, self.cell_h]);
                 Glyph { slot, color: false, cells: 2 }
             }
             Some(bmp) => {
@@ -557,7 +652,7 @@ impl TermGpu {
                 };
                 blit_glyph(&mut self.atlas_cpu, &bmp, self.baseline, self.cell_w, self.cell_h, ox, oy);
                 self.next_slot += 1;
-                self.atlas_dirty = true;
+                self.dirty.push([ox, oy, self.cell_w, self.cell_h]);
                 Glyph { slot: mslot, color: false, cells: 1 }
             }
             // No glyph anywhere → blank (don't consume the mono slot).
@@ -580,6 +675,18 @@ impl TermGpu {
         let ch = self.cell_h as f32;
         let default_bg = term.default_bg();
         let (cur_row, cur_col, cur_vis) = term.cursor();
+        // Nothing that reaches the screen has changed since the last frame built here:
+        // keep the instance buffer as it is. Any output in any pane used to re-walk every
+        // visible grid and re-upload it, at 60 fps while Claude worked.
+        let key = FrameKey {
+            generation: term.generation(),
+            cursor: (cur_row, cur_col, cur_vis),
+            bg: default_bg.map(f32::to_bits),
+            canvas: (canvas_w, canvas_h),
+        };
+        if self.last_frame == Some(key) {
+            return;
+        }
 
         // Selection highlight bg (VS Code blue, matches the web's #264f78).
         const SEL_BG: [f32; 3] = [0x26 as f32 / 255.0, 0x4f as f32 / 255.0, 0x78 as f32 / 255.0];
@@ -634,20 +741,29 @@ impl TermGpu {
             }
         }
 
-        self.scratch.clear();
-        for (i, (row, col, c, fg, bg, bold, wide)) in cells.iter().enumerate() {
-            if mode[i] == 2 {
-                continue;
+        // Built twice at most: an atlas flush mid-frame (see `flush_mono`) invalidates the
+        // slots resolved before it, and the second pass resolves them all afresh.
+        for _attempt in 0..2 {
+            self.scratch.clear();
+            self.flushed = false;
+            for (i, (row, col, c, fg, bg, bold, wide)) in cells.iter().enumerate() {
+                if mode[i] == 2 {
+                    continue;
+                }
+                let g = self.slot_for(*c, *bold, *wide, mode[i] == 1);
+                let (u, v) = self.uv(g.slot);
+                let kind = if g.color { 1.0 } else { 0.0 };
+                self.scratch.extend_from_slice(&[
+                    *col as f32 * cw, *row as f32 * ch, u, v,
+                    fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
+                    kind, g.cells as f32,
+                ]);
             }
-            let g = self.slot_for(*c, *bold, *wide, mode[i] == 1);
-            let (u, v) = self.uv(g.slot);
-            let kind = if g.color { 1.0 } else { 0.0 };
-            self.scratch.extend_from_slice(&[
-                *col as f32 * cw, *row as f32 * ch, u, v,
-                fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
-                kind, g.cells as f32,
-            ]);
+            if !self.flushed {
+                break;
+            }
         }
+        self.flushed = false;
         if cur_vis {
             let (u, v) = self.uv(SLOT_SOLID);
             let cur = [0.8f32, 0.8, 0.85]; // #ccccd9 block, matches the web cursor
@@ -660,33 +776,44 @@ impl TermGpu {
         self.count = (self.scratch.len() / 12) as u32;
         self.prepared_at = Some(Instant::now());
 
-        if self.atlas_dirty {
+        // Upload the regions drawn since the last frame, each from its place in the CPU
+        // copy: the data slice is the whole atlas and the layout's offset and row pitch
+        // address the rectangle, so no repacking is needed. `write_texture` does not
+        // require aligned row pitches (only buffer-to-texture copies do), and ours are
+        // whole atlas rows anyway.
+        for [x, y, w, h] in self.dirty.drain(..) {
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.atlas_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &self.atlas_cpu,
-                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(ATLAS), rows_per_image: Some(ATLAS) },
-                wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+                wgpu::ImageDataLayout {
+                    offset: (y * ATLAS + x) as u64,
+                    bytes_per_row: Some(ATLAS),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-            self.atlas_dirty = false;
         }
-        if self.color_dirty {
+        for [x, y, w, h] in self.color_dirty.drain(..) {
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.color_atlas_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &self.color_atlas_cpu,
-                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(ATLAS * 4), rows_per_image: Some(ATLAS) },
-                wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+                wgpu::ImageDataLayout {
+                    offset: ((y * ATLAS + x) * 4) as u64,
+                    bytes_per_row: Some(ATLAS * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-            self.color_dirty = false;
         }
 
         if self.count as u64 > self.inst_cap {
@@ -711,6 +838,7 @@ impl TermGpu {
             gamma_blend: if cfg!(target_os = "windows") { 1.0 } else { 0.0 },
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
+        self.last_frame = Some(key);
     }
 
     /// Draw into a pass. The caller owns the pass + viewport/scissor.
@@ -767,7 +895,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let gpu = TermGpu::new(&device, format, spec, scale);
+        let gpu = TermGpu::new(&device, format, Arc::new(spec.clone()), scale);
         Self { surface, device, queue, config, gpu }
     }
 
