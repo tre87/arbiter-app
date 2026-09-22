@@ -125,6 +125,95 @@ pub fn primary_work_area() -> Option<WorkArea> {
     None
 }
 
+/// The work area of the display `p` falls on, or the primary one when it falls on
+/// none. For putting a window somewhere on the screen it is already on, rather than
+/// dragging it back to the main display to do it.
+///
+/// Each monitor is converted to the same logical space the caller's point is in,
+/// which is exact while the displays share a scale factor and close enough when they
+/// do not: the answer only has to pick the right monitor.
+#[cfg(windows)]
+pub fn work_area_at(p: (f32, f32)) -> Option<WorkArea> {
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    unsafe extern "system" fn cb(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        let out = &mut *(data.0 as *mut Vec<WorkArea>);
+        let mut info =
+            MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut info).as_bool() {
+            let (mut dx, mut dy) = (96u32, 96u32);
+            let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+            let s = dx.max(1) as f32 / 96.0;
+            let w = info.rcWork;
+            out.push(WorkArea {
+                left: w.left as f32 / s,
+                top: w.top as f32 / s,
+                right: w.right as f32 / s,
+                bottom: w.bottom as f32 / s,
+            });
+        }
+        BOOL(1)
+    }
+
+    let mut found: Vec<WorkArea> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(cb),
+            LPARAM(&mut found as *mut Vec<WorkArea> as isize),
+        );
+    }
+    found
+        .iter()
+        .find(|a| p.0 >= a.left && p.0 < a.right && p.1 >= a.top && p.1 < a.bottom)
+        .copied()
+        .or_else(primary_work_area)
+}
+
+#[cfg(target_os = "macos")]
+pub fn work_area_at(p: (f32, f32)) -> Option<WorkArea> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    use objc2_foundation::NSRect;
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![screens, count];
+        if count == 0 {
+            return None;
+        }
+        // Every screen's y is flipped against the FIRST screen's height, because that
+        // is the one whose top left is the desktop's origin in winit's space.
+        let primary: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        let root: NSRect = msg_send![primary, frame];
+        for i in 0..count {
+            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            let v: NSRect = msg_send![screen, visibleFrame];
+            let area = WorkArea {
+                left: v.origin.x as f32,
+                top: (root.size.height - v.origin.y - v.size.height) as f32,
+                right: (v.origin.x + v.size.width) as f32,
+                bottom: (root.size.height - v.origin.y) as f32,
+            };
+            if p.0 >= area.left && p.0 < area.right && p.1 >= area.top && p.1 < area.bottom {
+                return Some(area);
+            }
+        }
+    }
+    primary_work_area()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn work_area_at(_p: (f32, f32)) -> Option<WorkArea> {
+    None
+}
+
 /// Whether the desktop is in a state to show a card: not a full-screen game or video, a
 /// presentation, or another fullscreen app. Windows' own rule for its toasts, asked the
 /// same way. Elsewhere always true: a macOS fullscreen app has its own Space, which a
@@ -154,6 +243,63 @@ pub fn restore_if_minimized(hwnd: isize) {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
+    }
+}
+
+/// Stop the desktop offering to resize a window when it is dragged against a screen
+/// edge. Wanted by a window whose size is its own business: the Agents Office is a
+/// picture at a whole-number zoom, and half a screen is not one of those.
+///
+/// Windows drives Aero Snap off the maximize box, so taking that one style bit away
+/// disables snapping while leaving the window freely resizable by its edges.
+#[cfg(windows)]
+pub fn disable_snap(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_MAXIMIZEBOX,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style == 0 {
+            return;
+        }
+        let stripped = style & !(WS_MAXIMIZEBOX.0 as isize);
+        if stripped != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// macOS tiles a window dragged to an edge unless it says not to, which is what
+/// `NSWindowCollectionBehaviorDisallowsTiling` is for. Takes the `NSView` iced hands
+/// out, and asks it for its window.
+#[cfg(target_os = "macos")]
+pub fn disable_snap_view(ns_view: *mut std::ffi::c_void) {
+    use objc2::{msg_send, runtime::AnyObject};
+    /// `NSWindowCollectionBehaviorDisallowsTiling`, which AppKit defines as 1 << 12.
+    const DISALLOWS_TILING: usize = 1 << 12;
+    if ns_view.is_null() {
+        return;
+    }
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let window: *mut AnyObject = msg_send![view, window];
+        if window.is_null() {
+            return;
+        }
+        let behavior: usize = msg_send![window, collectionBehavior];
+        let _: () = msg_send![window, setCollectionBehavior: behavior | DISALLOWS_TILING];
     }
 }
 

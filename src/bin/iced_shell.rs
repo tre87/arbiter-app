@@ -114,6 +114,16 @@ impl Workspace {
     }
 }
 
+/// Which section of the Agents Office menu is folded open. One at a time, because
+/// the sky is seven entries and the position is nine, and a menu carrying all of
+/// them is taller than the window it is drawn in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OfficeFold {
+    None,
+    Position,
+    Sky,
+}
+
 struct State {
     workspaces: Vec<Workspace>,
     active: usize,
@@ -160,6 +170,8 @@ struct State {
     office_hover: bool,
     /// The gear's dropdown, while open.
     office_menu: bool,
+    /// Which of the menu's sections is folded open.
+    office_fold: OfficeFold,
     /// Hold the room on one frame. Transient, not a setting: it is an escape hatch,
     /// not a preference.
     office_frozen: bool,
@@ -809,6 +821,10 @@ enum Message {
     OfficeShowNames(bool),
     OfficeWeather(usize),
     OfficeWeatherAuto(bool),
+    /// Fold the menu open on one of its sections, or back to the list.
+    OfficeFold(OfficeFold),
+    /// Put the window in one of nine places on the primary screen.
+    OfficeMoveTo(usize),
     OfficeFreeze(bool),
     /// Raise a notification card, and its sound, as Settings allow; `target` is the
     /// session id of the terminal it is about, which a click on the card goes to.
@@ -1446,6 +1462,7 @@ fn office_refresh(state: &mut State) {
         // Cleared here rather than at each of the three ways to close, because this
         // runs after every message and so cannot be the one that was forgotten.
         state.office_menu = false;
+        state.office_fold = OfficeFold::None;
         state.office_hover = false;
         state.office_hovered = None;
         state.office_frozen = false;
@@ -1677,8 +1694,42 @@ fn office_chrome(state: &State) -> Element<'_, Message> {
     stack![catcher, panel].into()
 }
 
+/// Put the office in one of the nine places on the primary screen. `i` is the cell
+/// of a 3x3 grid, read the way it is drawn: 0 is top left, 4 is the middle, 8 is
+/// bottom right. Flush to the work area, so "left" means against the edge and not
+/// near it.
+fn office_spot(i: usize, size: iced::Size, at: Option<iced::Point>) -> Option<iced::Point> {
+    // The screen the window is already on, so "top right" does not mean dragging it
+    // back to the main display first.
+    let a = match at {
+        Some(p) => arbiter_native::notify::work_area_at((
+            p.x + size.width / 2.0,
+            p.y + size.height / 2.0,
+        )),
+        None => arbiter_native::notify::primary_work_area(),
+    }?;
+    let x = match i % 3 {
+        0 => a.left,
+        1 => a.left + ((a.right - a.left) - size.width) / 2.0,
+        _ => a.right - size.width,
+    };
+    let y = match i / 3 {
+        0 => a.top,
+        1 => a.top + ((a.bottom - a.top) - size.height) / 2.0,
+        _ => a.bottom - size.height,
+    };
+    // A window larger than the work area would otherwise be placed off the top or
+    // left, where its own chrome becomes unreachable.
+    Some(iced::Point::new(x.max(a.left), y.max(a.top)))
+}
+
 /// The gear's dropdown. Everything the room can be told, and the only way to shut
 /// the window from inside it.
+///
+/// It folds rather than growing: the sky is seven entries and the position is nine,
+/// and a menu with all of them at once is taller than the window it belongs to,
+/// which at the minimum size is one row of desks. Opening a section replaces the
+/// list instead of extending it, so the menu can never outgrow the room.
 fn office_menu(state: &State) -> Element<'_, Message> {
     let check = |on: bool| if on { "✓" } else { " " };
     let item = |label: String, msg: Message| {
@@ -1698,19 +1749,7 @@ fn office_menu(state: &State) -> Element<'_, Message> {
             })
     };
 
-    let mut col = column![
-        item(
-            format!("{} Always on top", check(state.settings.office_topmost)),
-            Message::OfficeTopmost(!state.settings.office_topmost),
-        ),
-        item(
-            format!("{} Show names", check(state.settings.office_show_names)),
-            Message::OfficeShowNames(!state.settings.office_show_names),
-        ),
-        item(
-            format!("{} Freeze motion", check(state.office_frozen)),
-            Message::OfficeFreeze(!state.office_frozen),
-        ),
+    let rule = || {
         container(Space::new(Length::Fill, Length::Fixed(1.0))).style(|_: &iced::Theme| {
             container::Style {
                 background: Some(iced::Background::Color(iced::Color::from_rgba8(
@@ -1718,28 +1757,93 @@ fn office_menu(state: &State) -> Element<'_, Message> {
                 ))),
                 ..Default::default()
             }
-        }),
-    ]
-    .spacing(1);
-
+        })
+    };
     let auto = state.settings.office_weather_auto;
-    col = col.push(item(format!("{} Auto", check(auto)), Message::OfficeWeatherAuto(true)));
-    for (i, w) in agents_office::Weather::ALL.iter().enumerate() {
-        let picked = !auto && state.settings.office_weather == i;
-        col = col.push(item(format!("{} {}", check(picked), w.title()), Message::OfficeWeather(i)));
-    }
-    col = col.push(
-        container(Space::new(Length::Fill, Length::Fixed(1.0))).style(|_: &iced::Theme| {
-            container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba8(
-                    0xff, 0xff, 0xff, 0.08,
-                ))),
-                ..Default::default()
+    let sky = if auto {
+        "Auto".to_string()
+    } else {
+        agents_office::Weather::ALL
+            [state.settings.office_weather.min(agents_office::Weather::ALL.len() - 1)]
+        .title()
+        .to_string()
+    };
+
+    let col = match state.office_fold {
+        // The sky, and Auto, which drifts it on the room's own clock.
+        OfficeFold::Sky => {
+            let mut c = column![
+                item("‹ Sky".to_string(), Message::OfficeFold(OfficeFold::None)),
+                rule(),
+            ]
+            .spacing(1);
+            c = c.push(item(format!("{} Auto", check(auto)), Message::OfficeWeatherAuto(true)));
+            for (i, w) in agents_office::Weather::ALL.iter().enumerate() {
+                let picked = !auto && state.settings.office_weather == i;
+                c = c.push(item(
+                    format!("{} {}", check(picked), w.title()),
+                    Message::OfficeWeather(i),
+                ));
             }
-        }),
-    );
-    // The window has no titlebar, so this is the only way to close it from inside.
-    col = col.push(item("  Close".to_string(), Message::ToggleAgentsOffice));
+            c
+        }
+        // Nine cells laid out the way the screen is, so the one you want is where
+        // you would point at it.
+        OfficeFold::Position => {
+            let mut c = column![
+                item("‹ Position".to_string(), Message::OfficeFold(OfficeFold::None)),
+                rule(),
+            ]
+            .spacing(1);
+            for r in 0..3 {
+                let mut band = row![].spacing(3);
+                for q in 0..3 {
+                    let i = r * 3 + q;
+                    band = band.push(
+                        button(Space::new(Length::Fill, Length::Fixed(24.0)))
+                            .width(Length::Fill)
+                            .on_press(Message::OfficeMoveTo(i))
+                            .style(|_: &iced::Theme, s: button::Status| button::Style {
+                                background: Some(iced::Background::Color(match s {
+                                    button::Status::Hovered | button::Status::Pressed => {
+                                        iced::Color::from_rgba8(0x33, 0x99, 0xff, 0.35)
+                                    }
+                                    _ => iced::Color::from_rgba8(0xff, 0xff, 0xff, 0.06),
+                                })),
+                                border: iced::Border {
+                                    radius: 2.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                    );
+                }
+                c = c.push(container(band).padding([1, 6]));
+            }
+            c
+        }
+        OfficeFold::None => column![
+            item(
+                format!("{} Always on top", check(state.settings.office_topmost)),
+                Message::OfficeTopmost(!state.settings.office_topmost),
+            ),
+            item(
+                format!("{} Show names", check(state.settings.office_show_names)),
+                Message::OfficeShowNames(!state.settings.office_show_names),
+            ),
+            item(
+                format!("{} Freeze motion", check(state.office_frozen)),
+                Message::OfficeFreeze(!state.office_frozen),
+            ),
+            rule(),
+            item("  Position ›".to_string(), Message::OfficeFold(OfficeFold::Position)),
+            item(format!("  Sky: {sky} ›"), Message::OfficeFold(OfficeFold::Sky)),
+            rule(),
+            // The window has no titlebar, so this is the only way to close it.
+            item("  Close".to_string(), Message::ToggleAgentsOffice),
+        ]
+        .spacing(1),
+    };
 
     container(col)
         .width(Length::Fixed(146.0))
@@ -3189,6 +3293,18 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             save_session(state);
         }
         Message::OfficeFreeze(v) => state.office_frozen = v,
+        Message::OfficeFold(f) => state.office_fold = f,
+        Message::OfficeMoveTo(i) => {
+            state.office_menu = false;
+            state.office_fold = OfficeFold::None;
+            if let (Some(id), Some(p)) =
+                (state.office_window, office_spot(i, state.office_size, state.office_pos))
+            {
+                state.office_pos = Some(p);
+                save_session(state);
+                return iced::window::move_to(id, p);
+            }
+        }
         Message::ToggleAgentsOffice => {
             if !state.settings.show_agents_office {
                 return Task::none();
@@ -3347,7 +3463,9 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 #[cfg(not(target_os = "windows"))]
                 return Task::none();
             }
-            let known = id == state.main_window || state.overview_window == Some(id);
+            let known = id == state.main_window
+                || state.overview_window == Some(id)
+                || state.office_window == Some(id);
             if id == state.main_window {
                 if let Some(p) = pos.filter(|p| on_screen_ish(*p)) {
                     state.main_pos = Some(p);
@@ -3358,9 +3476,34 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                     state.overview_pos = Some(p);
                 }
                 state.overview_size = size;
+            } else if state.office_window == Some(id) {
+                if let Some(p) = pos.filter(|p| on_screen_ish(*p)) {
+                    state.office_pos = Some(p);
+                }
+                state.office_size = size;
             }
             if known {
                 save_session(state);
+            }
+            if state.office_window == Some(id) {
+                // The office is a picture at a whole-number zoom; half a screen is not
+                // one of those, so it opts out of the desktop's drag-to-edge tiling.
+                return iced::window::run_with_handle(id, |handle| {
+                    #[cfg(target_os = "windows")]
+                    if let iced::window::raw_window_handle::RawWindowHandle::Win32(h) =
+                        handle.as_raw()
+                    {
+                        arbiter_native::notify::disable_snap(h.hwnd.get());
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let iced::window::raw_window_handle::RawWindowHandle::AppKit(h) =
+                        handle.as_raw()
+                    {
+                        arbiter_native::notify::disable_snap_view(h.ns_view.as_ptr());
+                    }
+                    let _ = &handle;
+                })
+                .map(|_| Message::Noop);
             }
             if id == state.main_window {
                 // Launched from `cargo run` (no `.app` bundle) the app starts inactive, so
@@ -10137,6 +10280,7 @@ fn main() -> iced::Result {
                 office_t: 0.0,
                 office_hover: false,
                 office_menu: false,
+                office_fold: OfficeFold::None,
                 office_frozen: false,
                 office_hovered: None,
                 main_focused: true,

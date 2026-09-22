@@ -143,8 +143,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
   inside a window where the app was already drawing, so an open office over a quiet room
   costs nothing at all. A gear in the top corner, faint until the pointer is in the window,
   opens the only menu it has: always on top (off by default, since this is a picture you
-  leave in a corner rather than a panel you consult), show names, freeze motion, the sky,
-  and Close, which is the only way to shut the window from inside it. The sky is Auto by
+  leave in a corner rather than a panel you consult), show names, freeze motion, a position,
+  the sky, and Close, which is the only way to shut the window from inside it. The menu
+  folds rather than growing, one section at a time, because the sky is seven entries and the
+  position nine and a menu carrying both is taller than the window at its smallest. Position
+  is nine cells laid out the way the screen is, and it uses the screen the window is already
+  on rather than dragging it back to the main display. The desktop is also told not to tile
+  the window when it is dragged against an edge: a room drawn at a whole-number zoom has no
+  use for half a screen, and it stays freely resizable by its edges. The sky is Auto by
   default, drifting on the room's own clock, which is to say it changes through working
   time and holds still when the room goes quiet: a decoration can never be the reason a
   frame is drawn. Pick any of the six by hand and that turns Auto off. The desk under
