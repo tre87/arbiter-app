@@ -117,6 +117,12 @@ const POT_DK: Rgba = rgb(0x45, 0x3a, 0x2f);
 /// meaning exactly one thing.
 const LAMP_WARM: Rgba = rgb(0xc8, 0xb7, 0x9a);
 
+/// Nameplate ink. The pane name is what gets read, the workspace above it is
+/// context, so it sits a long way back. Neither is as bright as [`PAPER`]: a row
+/// of labels must not become the brightest thing on the floor.
+const PLATE: Rgba = rgb(0xa8, 0xb2, 0xbd);
+const PLATE_DIM: Rgba = rgb(0x74, 0x82, 0x92);
+
 /// Cool white off the ceiling fixtures. Blue-grey like the fixtures themselves
 /// ([`STEEL`]), so a lit wall never drifts warm and toward the amber.
 const CEIL_LIGHT: Rgba = rgb(0xb4, 0xc0, 0xcc);
@@ -169,6 +175,172 @@ pub const ATTENTION: Rgba = rgb(0xe5, 0xa0, 0x3c);
 pub const DONE: Rgba = rgb(0x22, 0xc5, 0x5e);
 const SCREEN_OFF: Rgba = rgb(0x39, 0x44, 0x52);
 
+// ------------------------------------------------------------------- font ---
+// A face drawn at the room's own resolution, so a nameplate is part of the
+// picture rather than UI text laid over it. Anti-aliased text on pixel art reads
+// as two pictures at two resolutions, which is the one thing that cannot be
+// fixed by choosing a nicer font.
+//
+// Three columns and five rows above the baseline, plus one row under it so
+// descenders are real rather than clipped. Mixed case throughout: the workspace
+// line is a folder name and shouting it is not what a nameplate does.
+
+/// The glyph cell: six columns by thirteen rows, eleven above the baseline and
+/// two under it for descenders. Ascent is what governs how big a letter looks,
+/// not cell height: 5x8 and 6x9 share an ascent of seven and draw identically
+/// sized letters, which is why stepping between them changed nothing. The face carries its own side bearing inside those
+/// six columns, which is why the advance is the cell width rather than one more.
+const GLYPH_W: i32 = 6;
+const GLYPH_H: i32 = 13;
+const ADVANCE: i32 = 6;
+
+// Printable ASCII, 0x20 to 0x7e, indexed by `c as usize - 0x20`.
+const FONT: [[u8; GLYPH_H as usize]; 95] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // space
+    [0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00, 0x00], // !
+    [0x00, 0x00, 0x50, 0x50, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // "
+    [0x00, 0x00, 0x00, 0x50, 0x50, 0xf8, 0x50, 0xf8, 0x50, 0x50, 0x00, 0x00, 0x00], // #
+    [0x00, 0x00, 0x20, 0x78, 0xa0, 0xa0, 0x70, 0x28, 0x28, 0xf0, 0x20, 0x00, 0x00], // $
+    [0x00, 0x00, 0x48, 0xa8, 0x50, 0x10, 0x20, 0x40, 0x50, 0xa8, 0x90, 0x00, 0x00], // %
+    [0x00, 0x00, 0x00, 0x40, 0xa0, 0xa0, 0x40, 0xa0, 0x98, 0x90, 0x68, 0x00, 0x00], // &
+    [0x00, 0x00, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // '
+    [0x00, 0x10, 0x20, 0x20, 0x40, 0x40, 0x40, 0x40, 0x40, 0x20, 0x20, 0x10, 0x00], // (
+    [0x00, 0x40, 0x20, 0x20, 0x10, 0x10, 0x10, 0x10, 0x10, 0x20, 0x20, 0x40, 0x00], // )
+    [0x00, 0x00, 0x20, 0xa8, 0x70, 0xa8, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // *
+    [0x00, 0x00, 0x00, 0x00, 0x20, 0x20, 0xf8, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00], // +
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x20, 0x40, 0x00], // ,
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // -
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x70, 0x20, 0x00], // .
+    [0x00, 0x00, 0x08, 0x08, 0x10, 0x10, 0x20, 0x40, 0x40, 0x80, 0x80, 0x00, 0x00], // /
+    [0x00, 0x00, 0x20, 0x50, 0x88, 0x88, 0x88, 0x88, 0x88, 0x50, 0x20, 0x00, 0x00], // 0
+    [0x00, 0x00, 0x20, 0x60, 0xa0, 0x20, 0x20, 0x20, 0x20, 0x20, 0xf8, 0x00, 0x00], // 1
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x08, 0x10, 0x20, 0x40, 0x80, 0xf8, 0x00, 0x00], // 2
+    [0x00, 0x00, 0xf8, 0x08, 0x10, 0x20, 0x70, 0x08, 0x08, 0x88, 0x70, 0x00, 0x00], // 3
+    [0x00, 0x00, 0x10, 0x10, 0x30, 0x50, 0x50, 0x90, 0xf8, 0x10, 0x10, 0x00, 0x00], // 4
+    [0x00, 0x00, 0xf8, 0x80, 0x80, 0xb0, 0xc8, 0x08, 0x08, 0x88, 0x70, 0x00, 0x00], // 5
+    [0x00, 0x00, 0x70, 0x88, 0x80, 0x80, 0xf0, 0x88, 0x88, 0x88, 0x70, 0x00, 0x00], // 6
+    [0x00, 0x00, 0xf8, 0x08, 0x10, 0x10, 0x20, 0x20, 0x40, 0x40, 0x40, 0x00, 0x00], // 7
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x70, 0x88, 0x88, 0x88, 0x70, 0x00, 0x00], // 8
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x78, 0x08, 0x08, 0x88, 0x70, 0x00, 0x00], // 9
+    [0x00, 0x00, 0x00, 0x00, 0x20, 0x70, 0x20, 0x00, 0x00, 0x20, 0x70, 0x20, 0x00], // :
+    [0x00, 0x00, 0x00, 0x00, 0x20, 0x70, 0x20, 0x00, 0x00, 0x30, 0x20, 0x40, 0x00], // ;
+    [0x00, 0x00, 0x08, 0x10, 0x20, 0x40, 0x80, 0x40, 0x20, 0x10, 0x08, 0x00, 0x00], // <
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00], // =
+    [0x00, 0x00, 0x80, 0x40, 0x20, 0x10, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00, 0x00], // >
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x08, 0x10, 0x20, 0x20, 0x00, 0x20, 0x00, 0x00], // ?
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x98, 0xa8, 0xa8, 0xb0, 0x80, 0x78, 0x00, 0x00], // @
+    [0x00, 0x00, 0x20, 0x50, 0x88, 0x88, 0x88, 0xf8, 0x88, 0x88, 0x88, 0x00, 0x00], // A
+    [0x00, 0x00, 0xf0, 0x48, 0x48, 0x48, 0x70, 0x48, 0x48, 0x48, 0xf0, 0x00, 0x00], // B
+    [0x00, 0x00, 0x70, 0x88, 0x80, 0x80, 0x80, 0x80, 0x80, 0x88, 0x70, 0x00, 0x00], // C
+    [0x00, 0x00, 0xf0, 0x48, 0x48, 0x48, 0x48, 0x48, 0x48, 0x48, 0xf0, 0x00, 0x00], // D
+    [0x00, 0x00, 0xf8, 0x80, 0x80, 0x80, 0xf0, 0x80, 0x80, 0x80, 0xf8, 0x00, 0x00], // E
+    [0x00, 0x00, 0xf8, 0x80, 0x80, 0x80, 0xf0, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00], // F
+    [0x00, 0x00, 0x70, 0x88, 0x80, 0x80, 0x80, 0x98, 0x88, 0x88, 0x70, 0x00, 0x00], // G
+    [0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0xf8, 0x88, 0x88, 0x88, 0x88, 0x00, 0x00], // H
+    [0x00, 0x00, 0x70, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00, 0x00], // I
+    [0x00, 0x00, 0x38, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x90, 0x60, 0x00, 0x00], // J
+    [0x00, 0x00, 0x88, 0x88, 0x90, 0xa0, 0xc0, 0xa0, 0x90, 0x88, 0x88, 0x00, 0x00], // K
+    [0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xf8, 0x00, 0x00], // L
+    [0x00, 0x00, 0x88, 0x88, 0xd8, 0xa8, 0xa8, 0x88, 0x88, 0x88, 0x88, 0x00, 0x00], // M
+    [0x00, 0x00, 0x88, 0xc8, 0xc8, 0xa8, 0xa8, 0x98, 0x98, 0x88, 0x88, 0x00, 0x00], // N
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00, 0x00], // O
+    [0x00, 0x00, 0xf0, 0x88, 0x88, 0x88, 0xf0, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00], // P
+    [0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0xa8, 0x70, 0x08, 0x00], // Q
+    [0x00, 0x00, 0xf0, 0x88, 0x88, 0x88, 0xf0, 0xa0, 0x90, 0x88, 0x88, 0x00, 0x00], // R
+    [0x00, 0x00, 0x70, 0x88, 0x80, 0x80, 0x70, 0x08, 0x08, 0x88, 0x70, 0x00, 0x00], // S
+    [0x00, 0x00, 0xf8, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00], // T
+    [0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00, 0x00], // U
+    [0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0x50, 0x50, 0x50, 0x20, 0x20, 0x00, 0x00], // V
+    [0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0xa8, 0xa8, 0xa8, 0xa8, 0x50, 0x00, 0x00], // W
+    [0x00, 0x00, 0x88, 0x88, 0x50, 0x50, 0x20, 0x50, 0x50, 0x88, 0x88, 0x00, 0x00], // X
+    [0x00, 0x00, 0x88, 0x88, 0x50, 0x50, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00], // Y
+    [0x00, 0x00, 0xf8, 0x08, 0x10, 0x10, 0x20, 0x40, 0x40, 0x80, 0xf8, 0x00, 0x00], // Z
+    [0x00, 0x70, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x70, 0x00], // [
+    [0x00, 0x00, 0x80, 0x80, 0x40, 0x40, 0x20, 0x10, 0x10, 0x08, 0x08, 0x00, 0x00], // \
+    [0x00, 0x70, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x70, 0x00], // ]
+    [0x00, 0x00, 0x20, 0x50, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ^
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00], // _
+    [0x00, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // `
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x08, 0x78, 0x88, 0x98, 0x68, 0x00, 0x00], // a
+    [0x00, 0x00, 0x80, 0x80, 0x80, 0xf0, 0x88, 0x88, 0x88, 0x88, 0xf0, 0x00, 0x00], // b
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x88, 0x80, 0x80, 0x88, 0x70, 0x00, 0x00], // c
+    [0x00, 0x00, 0x08, 0x08, 0x08, 0x78, 0x88, 0x88, 0x88, 0x88, 0x78, 0x00, 0x00], // d
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x88, 0xf8, 0x80, 0x88, 0x70, 0x00, 0x00], // e
+    [0x00, 0x00, 0x30, 0x48, 0x40, 0x40, 0xf0, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00], // f
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x78, 0x08, 0x88, 0x70], // g
+    [0x00, 0x00, 0x80, 0x80, 0x80, 0xb0, 0xc8, 0x88, 0x88, 0x88, 0x88, 0x00, 0x00], // h
+    [0x00, 0x00, 0x00, 0x20, 0x00, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00, 0x00], // i
+    [0x00, 0x00, 0x00, 0x10, 0x00, 0x30, 0x10, 0x10, 0x10, 0x10, 0x90, 0x90, 0x60], // j
+    [0x00, 0x00, 0x80, 0x80, 0x80, 0x90, 0xa0, 0xc0, 0xa0, 0x90, 0x88, 0x00, 0x00], // k
+    [0x00, 0x00, 0x60, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00, 0x00], // l
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0xd0, 0xa8, 0xa8, 0xa8, 0xa8, 0x88, 0x00, 0x00], // m
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0xb0, 0xc8, 0x88, 0x88, 0x88, 0x88, 0x00, 0x00], // n
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00, 0x00], // o
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x88, 0x88, 0x88, 0xf0, 0x80, 0x80, 0x80], // p
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x88, 0x88, 0x88, 0x78, 0x08, 0x08, 0x08], // q
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0xb0, 0xc8, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00], // r
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x88, 0x60, 0x10, 0x88, 0x70, 0x00, 0x00], // s
+    [0x00, 0x00, 0x00, 0x40, 0x40, 0xf0, 0x40, 0x40, 0x40, 0x48, 0x30, 0x00, 0x00], // t
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0x98, 0x68, 0x00, 0x00], // u
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x88, 0x50, 0x50, 0x20, 0x00, 0x00], // v
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0xa8, 0xa8, 0xa8, 0x50, 0x00, 0x00], // w
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x50, 0x20, 0x20, 0x50, 0x88, 0x00, 0x00], // x
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x88, 0x98, 0x68, 0x08, 0x88, 0x70], // y
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x10, 0x20, 0x40, 0x80, 0xf8, 0x00, 0x00], // z
+    [0x00, 0x18, 0x20, 0x20, 0x20, 0x20, 0xc0, 0x20, 0x20, 0x20, 0x20, 0x18, 0x00], // {
+    [0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00], // |
+    [0x00, 0xc0, 0x20, 0x20, 0x20, 0x20, 0x18, 0x20, 0x20, 0x20, 0x20, 0xc0, 0x00], // }
+    [0x00, 0x00, 0x48, 0xa8, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ~
+];
+
+/// U+2026 HORIZONTAL ELLIPSIS, the truncation mark.
+const GLYPH_ELLIPSIS: [u8; GLYPH_H as usize] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa8, 0x00, 0x00];
+
+/// Width of `s` in pixels, without the trailing gap.
+fn text_width(s: &str) -> i32 {
+    match s.chars().count() as i32 {
+        0 => 0,
+        n => n * ADVANCE - 1,
+    }
+}
+
+/// The bitmap for one character. Anything outside printable ASCII draws blank
+/// rather than a tofu box: a pane name is not worth a row of error glyphs.
+fn glyph(c: char) -> [u8; GLYPH_H as usize] {
+    match c {
+        '…' => GLYPH_ELLIPSIS,
+        ' '..='~' => FONT[c as usize - 0x20],
+        _ => [0; GLYPH_H as usize],
+    }
+}
+
+/// Draw `s` with its top-left at `(x, y)`.
+fn draw_text(b: &mut Buf, x: i32, y: i32, s: &str, c: Rgba) {
+    let mut pen = x;
+    for ch in s.chars() {
+        for (row, bits) in glyph(ch).iter().enumerate() {
+            for col in 0..GLYPH_W {
+                if bits & (0x80 >> col) != 0 {
+                    b.fill(pen + col, y + row as i32, 1, 1, c);
+                }
+            }
+        }
+        pen += ADVANCE;
+    }
+}
+
+/// Trim to `max` glyphs, ending in an ellipsis when it does not fit.
+fn fit(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    match max {
+        0 => String::new(),
+        1 => "…".into(),
+        _ => s.chars().take(max - 1).collect::<String>() + "…",
+    }
+}
+
 // ----------------------------------------------------------------- layout ---
 
 /// Desks per row. Five is what fits before a face stops being legible.
@@ -181,8 +353,15 @@ pub const W: i32 = COLS as i32 * SLOT_W;
 /// them. Drawn once at the top however many rows there are, which is why the
 /// weather costs the same at one desk and at twenty.
 pub const CEIL_H: i32 = 46;
-/// One row of desks: wall above, desk, floor strip below.
-pub const ROW_H: i32 = 92;
+/// The floor strip at the foot of each row: the bit of floor the desks stand on,
+/// and where the nameplate goes. Two lines of the face come to 27 pixels, and the
+/// strip has to hold that at the smallest zoom the room is shown at, which is
+/// double: 14 by 2 is 28. Everything above the strip is untouched by this, so
+/// every `*_Y` constant in a workstation still means what it meant.
+pub const STRIP_H: i32 = 14;
+/// One row of desks: wall above, desk, floor strip below. The 82 is the wall plus
+/// its trim, which is fixed; only the strip under it varies.
+pub const ROW_H: i32 = 82 + STRIP_H;
 /// The near floor, drawn once at the bottom: the walkway in front of the last
 /// row of desks, and where a passing colleague will go in stage 3. Shallow on
 /// purpose — a deep empty band under the desks reads as a missing wall.
@@ -399,6 +578,11 @@ impl Desk {
 #[derive(Clone, Debug)]
 pub struct Scene {
     pub desks: Vec<Desk>,
+    /// The nameplate under each desk: the workspace, then the pane. Kept the same
+    /// length as `desks`; a free desk carries empty strings and draws nothing.
+    pub labels: Vec<(String, String)>,
+    /// Draw the nameplates. Off gives the room back as pure art.
+    pub show_names: bool,
     pub selected: Option<usize>,
     pub weather: Weather,
 }
@@ -407,6 +591,8 @@ impl Default for Scene {
     fn default() -> Self {
         Scene {
             desks: vec![Desk::Empty; COLS],
+            labels: vec![(String::new(), String::new()); COLS],
+            show_names: true,
             selected: None,
             weather: Weather::default(),
         }
@@ -417,15 +603,24 @@ impl Scene {
     /// Fill the first free desk, opening a new row if every desk is taken.
     /// Returns the slot used.
     pub fn spawn(&mut self, state: Desk) -> usize {
+        self.spawn_named(state, "", "")
+    }
+
+    /// Fill the first free desk and put a name on it, opening a new row if every
+    /// desk is taken. Returns the slot used.
+    pub fn spawn_named(&mut self, state: Desk, workspace: &str, pane: &str) -> usize {
         let i = match self.desks.iter().position(|d| *d == Desk::Empty) {
             Some(i) => i,
             None => {
                 let i = self.desks.len();
                 self.desks.extend(std::iter::repeat(Desk::Empty).take(COLS));
+                self.labels
+                    .resize(self.desks.len(), (String::new(), String::new()));
                 i
             }
         };
         self.desks[i] = state;
+        self.labels[i] = (workspace.to_string(), pane.to_string());
         i
     }
 
@@ -434,6 +629,7 @@ impl Scene {
     pub fn remove_last(&mut self) {
         if let Some(i) = self.desks.iter().rposition(|d| *d != Desk::Empty) {
             self.desks[i] = Desk::Empty;
+            self.labels[i] = (String::new(), String::new());
         }
         while self.desks.len() > COLS
             && self.desks[self.desks.len() - COLS..]
@@ -441,6 +637,7 @@ impl Scene {
                 .all(|d| *d == Desk::Empty)
         {
             self.desks.truncate(self.desks.len() - COLS);
+            self.labels.truncate(self.desks.len());
             if self.selected.is_some_and(|s| s >= self.desks.len()) {
                 self.selected = None;
             }
@@ -517,6 +714,31 @@ impl Buf {
         }
     }
 
+    /// Nearest-neighbour enlargement by a whole number, which is the only kind
+    /// this room allows: a fractional one gives unevenly sized pixels, and that
+    /// is the single thing that instantly reads as sloppy.
+    fn upscaled(&self, k: i32) -> Buf {
+        if k <= 1 {
+            return Buf {
+                w: self.w,
+                h: self.h,
+                px: self.px.clone(),
+            };
+        }
+        let (w, h) = (self.w * k, self.h * k);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            let src_row = ((y / k) * self.w * 4) as usize;
+            let dst_row = (y * w * 4) as usize;
+            for x in 0..w {
+                let s = src_row + ((x / k) * 4) as usize;
+                let d = dst_row + (x * 4) as usize;
+                px[d..d + 4].copy_from_slice(&self.px[s..s + 4]);
+            }
+        }
+        Buf { w, h, px }
+    }
+
     /// Checkerboard fill, for the outer edge of a light pool. Dithering is the
     /// only texture this room has: a flat alpha band over a flat wall ends in a
     /// visible rectangle, which reads as a box rather than as light. The pattern
@@ -553,6 +775,55 @@ pub fn render(scene: &Scene, t: f32) -> Buf {
     b
 }
 
+/// The room at `scale` times its logical size, with the nameplates drawn on top
+/// **after** the enlargement, at the face's own 4x6.
+///
+/// That ordering is the whole point. Drawn into the room and enlarged with it, a
+/// glyph is `scale` times bigger too: at 3x the 4x6 face reads as a 24-pixel one,
+/// which is enormous next to the desk it labels, and no smaller face fixes it
+/// because the multiplier applies to that one as well. Drawn afterwards, a plate
+/// is six pixels tall whatever the window is doing, so zooming the room gets you
+/// more room rather than bigger writing, which is what a label on a picture
+/// should do.
+///
+/// Still pixels in the same buffer rather than text stacked over it, and still
+/// rasterised here rather than by an OS text engine, so a plate is the same
+/// pixels on Windows and macOS.
+pub fn render_at(scene: &Scene, t: f32, scale: i32) -> Buf {
+    let art = render(scene, t);
+    let scale = scale.max(1);
+    let mut b = art.upscaled(scale);
+    if !scene.show_names {
+        return b;
+    }
+    for (i, desk) in scene.desks.iter().enumerate() {
+        if *desk == Desk::Empty {
+            continue;
+        }
+        let Some((ws, pane)) = scene.labels.get(i).map(|(w, p)| (w.as_str(), p.as_str())) else {
+            continue;
+        };
+        let (cx, r) = slot_origin(i);
+        // Centred on the slot and sat in the floor strip, workspace over pane:
+        // the pane name is the one being looked for, and the lower line is where
+        // the eye lands first.
+        let budget = (SLOT_W * scale / ADVANCE - 2).max(4) as usize;
+        let ws = fit(ws, budget);
+        let pane = fit(pane, budget);
+        let mid = cx * scale;
+        let top = (r + ROW_H - STRIP_H) * scale + (STRIP_H * scale - (GLYPH_H * 2 + 1)) / 2;
+        draw_text(&mut b, mid - text_width(&ws) / 2, top, &ws, PLATE_DIM);
+        draw_text(
+            &mut b,
+            mid - text_width(&pane) / 2,
+            top + GLYPH_H + 1,
+            &pane,
+            PLATE,
+        );
+    }
+    b
+}
+
 fn room(b: &mut Buf, scene: &Scene, t: f32) {
     let (w, h) = (b.w, b.h);
     let n = scene.desks.len();
@@ -562,17 +833,18 @@ fn room(b: &mut Buf, scene: &Scene, t: f32) {
     // One band per row: wall, then the floor strip the desks stand on.
     for r in 0..rows(n) {
         let top = CEIL_H + r * ROW_H;
-        b.fill(0, top, w, ROW_H - 12, WALL);
+        let wall_h = ROW_H - STRIP_H - 2;
+        b.fill(0, top, w, wall_h, WALL);
         let mut x = 0;
         while x < w {
-            b.fill(x, top, 1, ROW_H - 12, WALL_SEAM);
+            b.fill(x, top, 1, wall_h, WALL_SEAM);
             x += 38;
         }
         // A little light at the top of every row, so rows two and three read as
         // more of the same room rather than as separate strips.
         b.fill(0, top, w, 6, STEEL.alpha(0.05));
-        b.fill(0, top + ROW_H - 12, w, 2, TRIM);
-        b.fill(0, top + ROW_H - 10, w, 10, FLOOR);
+        b.fill(0, top + wall_h, w, 2, TRIM);
+        b.fill(0, top + ROW_H - STRIP_H, w, STRIP_H, FLOOR);
     }
 
     // The near floor. It continues the last row's floor toward the viewer, so
@@ -1002,7 +1274,7 @@ fn light_and_shadow(b: &mut Buf, cx: i32, r: i32, d: Desk, lean: i32, t: f32) {
 
         // The same light off the floor strip in front of the desk, dithered and a
         // step dimmer. This is what turns the strip from a band into a floor.
-        let fy = r + ROW_H - 10;
+        let fy = r + ROW_H - STRIP_H;
         b.fill_checker(cx - 4, fy, 36, 10, g.alpha(b0));
         b.fill(cx + 4, fy, 22, 4, g.alpha(b0 * 0.7));
     }
@@ -1135,52 +1407,6 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         }
         b.fill(cx - 26 + lean, r + SHOULDER_Y, 13, 1, CEIL_LIGHT.alpha(0.25));
 
-        // Arms. This is where the work variety lives: every pose below means
-        // exactly Working, so none may introduce a colour or a motion the other
-        // states do not already have.
-        match (d, job) {
-            (Desk::Working, Some(Task::Typing)) | (Desk::Running, _) => {
-                let k = (frame % 2) as i32;
-                b.fill(cx - 16, r + 46, 10, 4, shirt);
-                b.fill(cx - 7, r + 48 + k, 8, 3, SKIN);
-                b.fill(cx - 16, r + 51, 9, 4, shirt);
-                b.fill(cx - 8, r + 52 - k, 8, 3, SKIN);
-            }
-            // Hands in the lap, head in close.
-            (Desk::Working, Some(Task::Reading)) => {
-                b.fill(cx - 17, r + 48, 8, 4, shirt);
-                b.fill(cx - 13, r + 52, 6, 4, SKIN);
-            }
-            // One hand on the keys, the other writing. The pen is the only thing
-            // that moves, at a third the rate of typing.
-            (Desk::Working, Some(Task::Noting)) => {
-                let k = ((frame / 3) % 3) as i32;
-                b.fill(cx - 16, r + 46, 10, 4, shirt);
-                b.fill(cx - 7, r + 49, 8, 3, SKIN);
-                b.fill(cx - 17, r + 52, 7, 4, shirt);
-                b.fill(cx - 11 + k, r + 54, 4, 3, SKIN);
-            }
-            // Back in the chair, hand to chin.
-            (Desk::Working, Some(Task::Pondering)) => {
-                b.fill(cx - 17 + lean, r + 47, 4, 10, shirt);
-                b.fill(cx - 18 + lean, r + 41, 4, 7, SKIN);
-            }
-            // Mug up, which is why there is no mug on the desk this phase.
-            (Desk::Working, Some(Task::Sipping)) => {
-                b.fill(cx - 17, r + 45, 4, 11, shirt);
-                b.fill(cx - 18, r + 41, 5, 5, SKIN);
-                b.fill(cx - 19, r + 38, 5, 5, CERAMIC);
-            }
-            // Hands off the keyboard: the agent has stopped and is waiting.
-            (Desk::Attention, _) => {
-                b.fill(cx - 16, r + 48, 7, 4, shirt);
-                b.fill(cx - 10, r + 42, 4, 11, SKIN);
-            }
-            _ => {
-                b.fill(cx - 16 + lean, r + 49, 9, 4, shirt);
-                b.fill(cx - 8 + lean, r + 52, 6, 3, SKIN);
-            }
-        }
     }
 
     // Desk: a cantilever top with its pedestal on the far side, so the near side
@@ -1226,6 +1452,63 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     b.fill(cx - 8, r + KB_Y, 15, 4, METAL_DK);
     b.fill(cx - 7, r + KB_Y + 1, 13, 2, rgb(0x32, 0x3a, 0x42));
 
+    // Arms, drawn last of the figure because a hand is ON the keyboard and the
+    // desk, not behind them. Drawn with the body they used to sit with, the
+    // keyboard painted over every hand that reached it and a desk that was not
+    // being typed at looked like somebody sitting there with no arms.
+    //
+    // This is also where the work variety lives: every pose below means exactly
+    // Working, so none may introduce a colour or a motion the other states do not
+    // already have.
+    if occupied {
+        match (d, job) {
+            (Desk::Working, Some(Task::Typing)) | (Desk::Running, _) => {
+                let k = (frame % 2) as i32;
+                b.fill(cx - 16, r + 46, 12, 4, shirt);
+                b.fill(cx - 5, r + 48 + k, 5, 3, SKIN);
+                b.fill(cx - 16, r + 51, 11, 4, shirt);
+                b.fill(cx - 6, r + 52 - k, 5, 3, SKIN);
+            }
+            // Hands down, head in close, reading what came back.
+            (Desk::Working, Some(Task::Reading)) => {
+                b.fill(cx - 17, r + 48, 9, 4, shirt);
+                b.fill(cx - 9, r + 52, 5, 3, SKIN);
+            }
+            // One hand on the keys, the other writing. The pen is the only thing
+            // that moves, at a third the rate of typing.
+            (Desk::Working, Some(Task::Noting)) => {
+                let k = ((frame / 3) % 3) as i32;
+                b.fill(cx - 16, r + 46, 12, 4, shirt);
+                b.fill(cx - 5, r + 49, 5, 3, SKIN);
+                b.fill(cx - 17, r + 52, 8, 4, shirt);
+                b.fill(cx - 10 + k, r + 54, 4, 3, SKIN);
+            }
+            // Back in the chair, hand to chin.
+            (Desk::Working, Some(Task::Pondering)) => {
+                b.fill(cx - 17 + lean, r + 47, 4, 10, shirt);
+                b.fill(cx - 18 + lean, r + 41, 4, 7, SKIN);
+            }
+            // Mug up, which is why there is no mug on the desk this phase.
+            (Desk::Working, Some(Task::Sipping)) => {
+                b.fill(cx - 17, r + 45, 4, 11, shirt);
+                b.fill(cx - 18, r + 41, 5, 5, SKIN);
+                b.fill(cx - 19, r + 38, 5, 5, CERAMIC);
+            }
+            // Hands off the keys and resting short of them: the agent has stopped
+            // and is waiting on you. It was a raised forearm, which at this size
+            // was a pale vertical bar rather than an arm.
+            (Desk::Attention, _) => {
+                b.fill(cx - 17, r + 47, 10, 4, shirt);
+                b.fill(cx - 8, r + 50, 5, 3, SKIN);
+            }
+            // Idle, ready, done: one hand still resting on the keyboard.
+            _ => {
+                b.fill(cx - 16 + lean, r + 48, 11, 4, shirt);
+                b.fill(cx - 6 + lean, r + 51, 5, 3, SKIN);
+            }
+        }
+    }
+
     if occupied {
         // Every desk keeps a plant; which one is fixed by slot.
         desk_plant(
@@ -1240,7 +1523,9 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         // can because Working and Done never happen at the same desk at once.
         if d == Desk::Working && job != Some(Task::Sipping) {
             b.fill(cx + 9, r + DESK_Y - 6, 5, 6, CERAMIC);
-            b.fill(cx + 14, r + DESK_Y - 5, 2, 3, CERAMIC);
+            // Handle on the near side, toward the figure. It sat on the far side,
+            // which put it out of the hand that has to reach for it.
+            b.fill(cx + 7, r + DESK_Y - 5, 2, 3, CERAMIC);
             b.fill(cx + 9, r + DESK_Y - 6, 5, 1, rgb(0xa5, 0xac, 0xb4));
         }
         if d == Desk::Done {
@@ -1280,22 +1565,37 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     // Selection is a floor marker, not a flashing outline: it must not compete
     // with the attention signal, and it may not borrow a reserved colour.
     if selected {
-        let fy = r + ROW_H - 12;
+        let fy = r + ROW_H - STRIP_H - 2;
         b.fill(cx - 34, fy, SLOT_W - 8, 1, PAPER.alpha(0.7));
         b.fill(cx - 34, fy, 1, 4, PAPER.alpha(0.7));
         b.fill(cx + 33, fy, 1, 4, PAPER.alpha(0.7));
-        b.fill(cx - 34, r + 10, SLOT_W - 8, ROW_H - 22, PAPER.alpha(0.03));
+        b.fill(cx - 34, r + 10, SLOT_W - 8, ROW_H - STRIP_H - 12, PAPER.alpha(0.03));
     }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Plausible `(workspace, pane)` pairs, so a dump shows the plates at the
+    /// lengths they will really have rather than at "Desk 1".
+    const NAMES: [(&str, &str); 8] = [
+        ("arbiter-app", "Claude"),
+        ("arbiter-app", "Claude 2"),
+        ("dev-webapp", "Powershell"),
+        ("tren.dk", "SSH [Mac Mini]"),
+        ("ha-dashboard", "Claude"),
+        ("ytdownloader", "Git"),
+        ("zyre-ui", "Terminal 1"),
+        ("claude-stats", "Claude 2"),
+    ];
+
     fn scene(states: &[Desk]) -> Scene {
         let mut s = Scene::default();
-        for d in states {
-            s.spawn(*d);
+        for (i, d) in states.iter().enumerate() {
+            let (ws, pane) = NAMES[i % NAMES.len()];
+            s.spawn_named(*d, ws, pane);
         }
         s
     }
@@ -1550,28 +1850,15 @@ mod tests {
         }
     }
 
-    /// Nearest-neighbour upscale for the dumps below. One row of desks is 380px
-    /// wide, which is too small to judge anything by; whole numbers only, for the
-    /// same reason the room itself is only ever blitted at one.
+    /// The scale the dumps render at. Three is where the room is legible on screen
+    /// and the nameplates are at their native size beside it.
     const ZOOM: i32 = 3;
-
-    fn upscaled(b: &Buf) -> (u32, u32, Vec<u8>) {
-        let (w, h) = (b.w * ZOOM, b.h * ZOOM);
-        let mut px = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let s = (((y / ZOOM) * b.w + x / ZOOM) * 4) as usize;
-                let d = ((y * w + x) * 4) as usize;
-                px[d..d + 4].copy_from_slice(&b.px[s..s + 4]);
-            }
-        }
-        (w as u32, h as u32, px)
-    }
 
     /// Write a frame where something can open it. The buffer is opaque, so its
     /// straight RGBA and tiny-skia's premultiplied RGBA are the same bytes.
     fn save(b: &Buf, name: &str) -> std::path::PathBuf {
-        let (w, h, px) = upscaled(b);
+        let (w, h) = (b.w as u32, b.h as u32);
+        let px = b.px.clone();
         let dir = std::env::temp_dir().join("ops-floor");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{name}.png"));
@@ -1601,7 +1888,7 @@ mod tests {
             Desk::Working,
         ]);
         room.selected = Some(1);
-        save(&render(&room, 0.5), "01-room");
+        save(&render_at(&room, 0.5, ZOOM), "01-room");
 
         // Every state the room can be in, in `Desk` order, so none of them can
         // be judged only by the company it keeps.
@@ -1613,7 +1900,7 @@ mod tests {
             Desk::Attention,
             Desk::Done,
         ]);
-        save(&render(&states, 0.5), "02-states");
+        save(&render_at(&states, 0.5, ZOOM), "02-states");
 
         // The five work poses at once. Which task a desk is doing is a function
         // of its slot and the time, so the way to see all five together is to go
@@ -1630,13 +1917,13 @@ mod tests {
             })
             .unwrap();
         println!("poses at t={t}: {tasks:?}");
-        save(&render(&busy, t), "03-poses");
+        save(&render_at(&busy, t, ZOOM), "03-poses");
 
         // One sky each. The weather is scene-wide, so it cannot share a frame.
         for w in Weather::ALL {
             let mut s = room.clone();
             s.weather = w;
-            save(&render(&s, 1.7), &format!("04-sky-{}", w.label()));
+            save(&render_at(&s, 1.7, ZOOM), &format!("04-sky-{}", w.label()));
         }
     }
 
@@ -1662,6 +1949,6 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);
-        save(&render(&s, t), "dump");
+        save(&render_at(&s, t, ZOOM), "dump");
     }
 }

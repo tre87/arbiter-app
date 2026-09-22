@@ -19,14 +19,41 @@ use arbiter_native::floor::{self, Desk, Scene, Weather};
 use iced::widget::{
     button, column, container, horizontal_space, image, mouse_area, row, stack, text, Space,
 };
+
 use iced::{Alignment, Element, Length, Size, Subscription};
+
+/// Fake `(workspace, pane)` pairs, one per slot up to the planned cap of twenty,
+/// so the nameplates are judged against realistic lengths rather than against
+/// "Desk 1". Workspaces run two to four desks, the way they actually do.
+const NAMES: [(&str, &str); 20] = [
+    ("arbiter-app", "Claude"),
+    ("arbiter-app", "Claude 2"),
+    ("arbiter-app", "Git"),
+    ("dev-webapp", "Claude"),
+    ("dev-webapp", "Powershell"),
+    ("tren.dk", "Claude"),
+    ("tren.dk", "SSH [Mac Mini]"),
+    ("tren.dk", "Claude 2"),
+    ("ha-dashboard", "Claude"),
+    ("ha-dashboard", "Terminal 1"),
+    ("ytdownloader", "Claude"),
+    ("ytdownloader", "Claude 2"),
+    ("ytdownloader", "Git"),
+    ("zyre-ui", "Claude"),
+    ("zyre-ui", "SSH [build-box]"),
+    ("claude-stats", "Claude"),
+    ("claude-stats", "Powershell"),
+    ("travelpack", "Claude"),
+    ("travelpack", "Claude 2"),
+    ("travelpack", "Terminal 1"),
+];
 
 /// Wall-clock step per tick. ~30fps, the chunky end of the range, because
 /// mechanical motion reads as a machine and smooth motion reads as a cartoon.
 const TICK: Duration = Duration::from_millis(33);
 
 /// Window size the harness opens at.
-const WINDOW: Size = Size::new(1000.0, 720.0);
+const WINDOW: Size = Size::new(1280.0, 820.0);
 /// Space the header, the button rows and the padding take, so the room's scale
 /// is a pure function of the window size. `iced::widget::responsive` would
 /// measure this instead, but it lives behind iced's `lazy` feature and that
@@ -48,6 +75,8 @@ enum Msg {
     /// Step the sky by hand, which also drops out of auto.
     CycleWeather,
     ToggleAutoWeather,
+    /// Nameplates on and off, so the room can be judged both ways.
+    ToggleNames,
     Resized(Size),
 }
 
@@ -58,6 +87,8 @@ struct Demo {
     /// Let the sky drift on its own. On by default, because the point of the
     /// window is that you look up and it has changed without you asking.
     auto_weather: bool,
+
+
     window: Size,
 }
 
@@ -66,15 +97,19 @@ impl Default for Demo {
         // Opens in a realistic working state rather than an empty room: three
         // agents, one of them blocked, which is the case the whole design is for.
         let mut scene = Scene::default();
-        scene.spawn(Desk::Working);
-        scene.spawn(Desk::Attention);
-        scene.spawn(Desk::Done);
-        scene.spawn(Desk::Idle);
+        for (i, d) in [Desk::Working, Desk::Attention, Desk::Done, Desk::Idle]
+            .into_iter()
+            .enumerate()
+        {
+            let (ws, pane) = NAMES[i];
+            scene.spawn_named(d, ws, pane);
+        }
         Demo {
             scene,
             t: 0.0,
             frozen: false,
             auto_weather: true,
+
             window: WINDOW,
         }
     }
@@ -96,12 +131,16 @@ impl Demo {
                 self.scene.selected = Some(i);
             }
             Msg::Spawn(d) => {
-                let i = self.scene.spawn(d);
+                let n = self.scene.occupied();
+                let (ws, pane) = NAMES[n % NAMES.len()];
+                let i = self.scene.spawn_named(d, ws, pane);
                 self.scene.selected = Some(i);
             }
             Msg::SpawnRow => {
                 for _ in 0..floor::COLS {
-                    self.scene.spawn(Desk::Working);
+                    let n = self.scene.occupied();
+                    let (ws, pane) = NAMES[n % NAMES.len()];
+                    self.scene.spawn_named(Desk::Working, ws, pane);
                 }
             }
             Msg::RemoveLast => self.scene.remove_last(),
@@ -125,6 +164,7 @@ impl Demo {
                     self.scene.weather = Weather::drifting(self.t);
                 }
             }
+            Msg::ToggleNames => self.scene.show_names = !self.scene.show_names,
             Msg::Resized(size) => self.window = size,
         }
     }
@@ -192,7 +232,9 @@ impl Demo {
         let (lw, lh) = self.scene.size();
         let (iw, ih) = (lw as f32 * k, lh as f32 * k);
 
-        let buf = floor::render(&self.scene, self.t);
+        // The room is enlarged inside `render_at`, not by the image widget, so the
+        // nameplates can be drawn after the enlargement at their own size.
+        let buf = floor::render_at(&self.scene, self.t, k as i32);
         let pixels = image::Handle::from_rgba(buf.w as u32, buf.h as u32, buf.px);
         let room = image(pixels)
             .width(iw)
@@ -283,6 +325,14 @@ impl Demo {
                     "Auto: off"
                 },
                 Msg::ToggleAutoWeather
+            ),
+            chip(
+                if self.scene.show_names {
+                    "Names: on"
+                } else {
+                    "Names: off"
+                },
+                Msg::ToggleNames
             ),
             horizontal_space(),
             text(format!(

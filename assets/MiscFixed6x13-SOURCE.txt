@@ -1,0 +1,20 @@
+Misc-Fixed 6x13, the source of the nameplate face in src/floor.rs.
+
+  FONT      -Misc-Fixed-Medium-R-Normal--13-120-75-75-C-60-ISO10646-1
+  COPYRIGHT "Public domain font.  Share and enjoy."
+
+Part of the X.Org misc-misc bitmap fonts, maintained by Markus Kuhn. Taken from
+https://gitlab.freedesktop.org/xorg/font/misc-misc (6x13.bdf).
+
+This file is kept for provenance only. It is not read at build or run time: the
+printable-ASCII glyphs are compiled into the `FONT` table in src/floor.rs, so
+the room needs no font file and no text engine, and a nameplate rasterises to
+exactly the same pixels on Windows and macOS. Regenerate that table from this
+file if the face ever needs extending past printable ASCII.
+
+Pick a sibling size by ASCENT, not by the name: the name is the cell, and cells
+grow for descenders too. 5x8 and 6x9 both have an ascent of 7 and draw letters
+of identical height. The set runs 4x6 (ascent 5), 5x8 and 6x9 (7), 6x10 (8),
+6x12 (10), 6x13 and 7x13 (11), 9x15 (12). Changing size means GLYPH_W, GLYPH_H,
+ADVANCE, the table, and STRIP_H, which must hold two lines plus a gap at the
+smallest zoom the room is drawn at.

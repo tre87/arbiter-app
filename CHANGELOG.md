@@ -108,7 +108,18 @@ history belongs to the prior Tauri/Vue web app it replaced.
   the near one, since two layers is all the parallax a still picture needs; the walkway is
   the darkest plane, being nearest the viewer and farthest from every lamp; and each desk
   keeps a shelf, a pinboard or a bare wall, fixed by slot, a third of them bare so the
-  rest do not read as wallpaper.
+  rest do not read as wallpaper. Every occupied desk carries a nameplate on the floor in
+  front of it, the workspace set back over the pane name, drawn into the picture with a
+  bundled public-domain bitmap face (Misc-Fixed 6x13, `assets/MiscFixed6x13.bdf`) whose
+  printable-ASCII glyphs are compiled into a table: no font file is loaded and no text
+  engine runs, so a plate rasterises to the same pixels on Windows and macOS by
+  construction. `render_at` enlarges the room first and draws the plates after, at the
+  face's own size, so a label stays a fixed height and zooming the window gets you more
+  room rather than bigger writing. `Scene::show_names` turns them off and gives the room
+  back as pure art. The figures' arms are drawn after the keyboard, because a hand is on
+  the keyboard rather than behind it: drawn with the body they used to sit with, the
+  keyboard painted over every hand that reached it, so a desk nobody was typing at looked
+  like somebody sitting there with no arms.
 
 ### Fixed
 - **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,
