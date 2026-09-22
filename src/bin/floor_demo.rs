@@ -84,11 +84,10 @@ struct Demo {
     scene: Scene,
     t: f32,
     frozen: bool,
-    /// Let the sky drift on its own. On by default, because the point of the
-    /// window is that you look up and it has changed without you asking.
+    /// Let the sky drift on its own. Off, and out of the product: the sky is a
+    /// function of `t`, so drifting it needs a clock for a decoration nobody
+    /// asked for. Kept in the harness only to preview the six skies quickly.
     auto_weather: bool,
-
-
     window: Size,
 }
 
@@ -108,8 +107,7 @@ impl Default for Demo {
             scene,
             t: 0.0,
             frozen: false,
-            auto_weather: true,
-
+            auto_weather: false,
             window: WINDOW,
         }
     }
@@ -174,9 +172,9 @@ impl Demo {
     /// display sit beside the app's no-polling rule without lying about it.
     fn subscription(&self) -> Subscription<Msg> {
         let resize = iced::window::resize_events().map(|(_id, size)| Msg::Resized(size));
-        // Auto weather needs the clock too, since the sky is a function of `t`.
-        // In the real app the weather would come from a slow timer or a feed, not
-        // from the render clock, so a quiet room could still cost nothing.
+        // A turn in flight is the only thing that earns a clock. Auto weather is
+        // the harness's own exception, since drifting the sky is a function of `t`;
+        // the product has no such option, for exactly that reason.
         if self.frozen || !(self.scene.animates() || self.auto_weather) {
             resize
         } else {

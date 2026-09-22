@@ -559,8 +559,13 @@ impl Desk {
     }
 
     /// Whether this desk needs a clock. Only two states move.
+    /// Whether this desk needs a clock. A turn in flight is the only state that
+    /// does. `Attention` deliberately does not: an agent can sit on a permission
+    /// prompt for hours, and the app made the same call for the status dot when
+    /// true idle landed in 1.0.11, turning it from pulsing to solid so a session
+    /// parked at a prompt could not pin the UI at 60fps.
     fn animates(self) -> bool {
-        matches!(self, Desk::Working | Desk::Attention)
+        matches!(self, Desk::Working)
     }
 
     /// Short label for a readout. Not drawn in the room: no text in the art.
@@ -659,11 +664,16 @@ impl Scene {
     /// Whether anything in the room moves. When this is false the caller must
     /// stop its timer: a still room costs nothing, which is what lets an ambient
     /// display sit beside the app's no-polling rule without lying about it.
-    /// Note that precipitation counts, so a rainy sky keeps the clock alive even
-    /// over a room full of idle agents. That is the price of the window, and it
-    /// is why [`Weather::moves`] exists rather than being assumed.
+    ///
+    /// A turn in flight is the only thing that earns a clock. The weather
+    /// deliberately does not: rain and snow animate as a side effect of a clock
+    /// some desk had already justified, and stop where they are when the last
+    /// turn ends. A still picture of rain is what rain looks like in a still
+    /// picture, and the alternative, clearing the sky when the agents go quiet,
+    /// would make the weather encode agent state, which is the one thing it may
+    /// never do.
     pub fn animates(&self) -> bool {
-        self.weather.moves() || self.desks.iter().any(|d| d.animates())
+        self.desks.iter().any(|d| d.animates())
     }
 
     pub fn size(&self) -> (i32, i32) {
@@ -1301,9 +1311,11 @@ fn light_and_shadow(b: &mut Buf, cx: i32, r: i32, d: Desk, lean: i32, t: f32) {
         // An attention state that floods the desk spends the whole loudness
         // budget in one place. Only the two live states breathe, so a quiet room
         // stays a still image.
+        // Only a turn in flight breathes. Everything else is a fixed value, so a
+        // room with nothing running is a single image.
         let b0 = match d {
             Desk::Working => 0.10 + 0.02 * (t * 1.6).sin(),
-            Desk::Attention => 0.07 + 0.03 * (t * 1.9).sin(),
+            Desk::Attention => 0.085,
             _ => 0.04,
         };
         b.fill_checker(cx - 18, r + 14, 50, 44, g.alpha(b0 * 0.55));
@@ -1589,10 +1601,11 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         b.fill(cx + 11, r + 2, 12, 1, METAL);
         b.fill(cx + 16, r + 9, 2, 3, METAL_DK);
         if lit {
-            // Breathing at about a third of a hertz: findable from across the
-            // room, and never fast enough to pull an eye off something else.
-            let pulse = 0.72 + 0.28 * (t * 2.2).sin();
-            b.fill(cx + 12, r + 4, 10, 4, ATTENTION.alpha(pulse));
+            // Lit, and steady. It used to breathe, which was one of two states in
+            // the room that could hold a clock open; an agent can wait on a
+            // permission prompt for hours, so that was a pulse with no end to it.
+            // The colour was always what caught the eye.
+            b.fill(cx + 12, r + 4, 10, 4, ATTENTION);
             b.fill(cx + 12, r + 4, 10, 1, ATTENTION);
         } else {
             b.fill(cx + 12, r + 4, 10, 4, rgb(0x2b, 0x33, 0x3d));
@@ -1775,24 +1788,33 @@ mod tests {
     fn a_quiet_room_needs_no_clock() {
         assert!(!scene(&[Desk::Idle, Desk::Ready, Desk::Done]).animates());
         assert!(scene(&[Desk::Idle, Desk::Working]).animates());
-        assert!(scene(&[Desk::Attention]).animates());
         assert!(
             !Scene::default().animates(),
             "an empty room under a clear sky is a still image"
         );
 
-        // Precipitation is the one bit of decoration that costs a clock, which is
-        // a deliberate trade and must stay visible in the type.
+        // A blocked agent does not earn a clock. It can sit on a prompt for hours,
+        // and the andon says what it needs to say by being lit.
+        assert!(
+            !scene(&[Desk::Attention, Desk::Ready]).animates(),
+            "a blocked agent must not hold a clock open"
+        );
+
+        // Neither does the sky, under any weather. Rain and snow move only as a
+        // side effect of a clock some desk had already justified; over a quiet
+        // room they stop where they are.
         for w in Weather::ALL {
-            let mut s = Scene::default();
-            s.weather = w;
-            assert_eq!(
-                s.animates(),
-                w.moves(),
-                "{} disagreed with Weather::moves",
-                w.label()
-            );
+            let mut quiet = scene(&[Desk::Attention, Desk::Ready, Desk::Done]);
+            quiet.weather = w;
+            assert!(!quiet.animates(), "{} asked for a clock", w.label());
+
+            let mut busy = scene(&[Desk::Working]);
+            busy.weather = w;
+            assert!(busy.animates(), "a turn in flight needs a clock under any sky");
         }
+
+        // `Weather::moves` still says truthfully which skies have moving parts; it
+        // just no longer decides whether a clock runs.
         assert!(Weather::Rain.moves() && Weather::Snow.moves());
         assert!(!Weather::Clear.moves() && !Weather::Cloudy.moves() && !Weather::Fog.moves());
     }
