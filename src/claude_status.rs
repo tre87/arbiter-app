@@ -681,9 +681,6 @@ impl ClaudeHandle {
     pub fn note_activity(&self, glyphs: u64) {
         let now = now_ms();
         self.last_star_ms.store(now, Ordering::Relaxed);
-        // Claude is doing something, so the last slash command is spent: a chooser
-        // raised later in this turn is Claude's, not the user's (`/init` and friends).
-        self.slash_submit_ms.store(0, Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
         // A spinner frame inside the post-Stop window is the turn's FINAL redraw —
         // ignore it so it can't revive "working" after Stop already ended the turn.
@@ -722,6 +719,12 @@ impl ClaudeHandle {
         {
             self.activity_ms.store(now, Ordering::Relaxed);
             self.hook_attention.store(false, Ordering::Relaxed);
+            // Claude has genuinely started a turn, so the last slash command is spent:
+            // whatever it puts up now is its own (`/init` asking to write a file).
+            // Cleared here, in the branch that ENTERS working, rather than on every
+            // frame: a lone star in a repaint does not pair and so must not count,
+            // and clearing on any frame at all made the latch easy to lose.
+            self.slash_submit_ms.store(0, Ordering::Relaxed);
         }
     }
 
@@ -766,8 +769,21 @@ impl ClaudeHandle {
             let submitted = self.slash_submit_ms.load(Ordering::Relaxed);
             let just_submitted =
                 submitted != 0 && now_ms().saturating_sub(submitted) < SLASH_MENU_WINDOW_MS;
-            if slash_input || just_submitted {
+            let mine = slash_input || just_submitted;
+            if mine {
                 self.menu_user_opened.store(true, Ordering::Relaxed);
+            }
+            if !was && crate::claude_shim::debug_enabled() {
+                crate::claude_shim::debug_log(&format!(
+                    "menu on: slash_input={slash_input} just_submitted={just_submitted} \
+                     submitted_ms_ago={} hook_attention={} -> user_opened={mine}",
+                    if submitted == 0 {
+                        -1
+                    } else {
+                        now_ms().saturating_sub(submitted) as i64
+                    },
+                    self.hook_attention.load(Ordering::Relaxed),
+                ));
             }
         } else if was {
             self.menu_user_opened.store(false, Ordering::Relaxed);
@@ -778,7 +794,15 @@ impl ClaudeHandle {
     }
 
     /// UI: the user submitted a slash command in this pane (see `slash_submit_ms`).
+    ///
+    /// Recorded only while Claude is not mid-turn. A command typed at an idle prompt
+    /// opens a chooser that belongs to the user; one typed while Claude is working
+    /// (or `/init`, which sets it working) is followed by prompts that are Claude's,
+    /// and those must still be reported.
     pub fn note_slash_command(&self) {
+        if self.lifecycle() == Lifecycle::Working {
+            return;
+        }
         self.slash_submit_ms.store(now_ms(), Ordering::Relaxed);
     }
 

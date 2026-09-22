@@ -65,8 +65,14 @@ pub const HOOKS_SUBDIR: &str = "claude-hooks";
 /// unbounded — the statusLine fires on every render). The temp dir is shared
 /// down the shell→claude→subcommand chain, so all steps land in one findable
 /// file even though the subcommands' stderr is invisible.
+/// Whether `ARBITER_CLAUDE_DEBUG` is set, for callers that would otherwise pay to
+/// build a message that `debug_log` throws away.
+pub fn debug_enabled() -> bool {
+    std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some()
+}
+
 pub fn debug_log(msg: &str) {
-    if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_none() {
+    if !debug_enabled() {
         return;
     }
     let ts = std::time::SystemTime::now()
