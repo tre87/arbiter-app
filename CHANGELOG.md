@@ -96,7 +96,19 @@ history belongs to the prior Tauri/Vue web app it replaced.
   so any frame reproduces), and only real activity animates — a quiet room under a still
   sky is a single image that needs no clock at all. Precipitation is the one piece of
   decoration that does cost a clock, which `Weather::moves` makes explicit rather than
-  hiding.
+  hiding. Light is structural rather than ambient: the room is dark, and what you see you
+  see because a particular lamp lit it. A ceiling fixture throws a cone down the wall
+  behind each occupied desk and stays dark over a free one, the desk lamp pools on the
+  desktop, the screen throws its state colour onto the face turned toward it and onto the
+  floor in front of the desk, and every object casts one shadow, at one weight, from one
+  key light, which is what glues a figure to a wall and a desk to a floor. The drama is
+  all value contrast, so no new hue arrives to compete: the azure and the amber are still
+  the only saturated things in the room, and each is now also the brightest thing in its
+  own pool of light. None of it moves. The clerestory gets a second, hazier skyline behind
+  the near one, since two layers is all the parallax a still picture needs; the walkway is
+  the darkest plane, being nearest the viewer and farthest from every lamp; and each desk
+  keeps a shelf, a pinboard or a bare wall, fixed by slot, a third of them bare so the
+  rest do not read as wallpaper.
 
 ### Fixed
 - **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,

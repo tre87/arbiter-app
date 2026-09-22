@@ -83,11 +83,15 @@ fn hashf(a: i64, b: i64) -> f32 {
 
 const GROUND: Rgba = rgb(0x0d, 0x12, 0x18);
 const CEIL: Rgba = rgb(0x10, 0x16, 0x1d);
-const WALL: Rgba = rgb(0x19, 0x20, 0x29);
-const WALL_SEAM: Rgba = rgb(0x13, 0x1a, 0x22);
+// The wall and the floor are the dark things the lamps land on, so both sit one
+// step below where they would if they were lit flat. TRIM is unchanged and now
+// stands two steps over the wall instead of one, which is what an edge needs to
+// read at 3x.
+const WALL: Rgba = rgb(0x15, 0x1b, 0x23);
+const WALL_SEAM: Rgba = rgb(0x10, 0x16, 0x1d);
 const TRIM: Rgba = rgb(0x2a, 0x34, 0x40);
-const FLOOR: Rgba = rgb(0x14, 0x1b, 0x23);
-const FLOOR_LINE: Rgba = rgb(0x1d, 0x26, 0x30);
+const FLOOR: Rgba = rgb(0x11, 0x17, 0x1e);
+const FLOOR_LINE: Rgba = rgb(0x1a, 0x22, 0x2b);
 const METAL: Rgba = rgb(0x38, 0x42, 0x4e);
 const METAL_DK: Rgba = rgb(0x25, 0x2d, 0x37);
 const METAL_LT: Rgba = rgb(0x51, 0x5d, 0x6c);
@@ -112,6 +116,30 @@ const POT_DK: Rgba = rgb(0x45, 0x3a, 0x2f);
 /// this size reads as [`ATTENTION`], and the whole room depends on that colour
 /// meaning exactly one thing.
 const LAMP_WARM: Rgba = rgb(0xc8, 0xb7, 0x9a);
+
+/// Cool white off the ceiling fixtures. Blue-grey like the fixtures themselves
+/// ([`STEEL`]), so a lit wall never drifts warm and toward the amber.
+const CEIL_LIGHT: Rgba = rgb(0xb4, 0xc0, 0xcc);
+
+/// Every cast shadow. One weight for all of them: a shadow darker under one
+/// object than under another reads as a second light source, and this room has
+/// one key light, the desk lamp.
+const SHADE: Rgba = Rgba(0, 0, 0, 0.24);
+
+/// Where the key light throws things. The desk lamp hangs above and to the right
+/// of the figure, so everything casts down and to the left. Three is one grid
+/// step in this art: less vanishes into the outline, more detaches the shadow
+/// from what cast it.
+const SHADOW_DX: i32 = -3;
+const SHADOW_DY: i32 = 3;
+
+/// The ceiling cone as bands down the wall: half-width, top, height, alpha. It
+/// starts at the fixture's 28 and widens ten per step, each step a shade dimmer,
+/// and stops at the desktop, where the desk lamp takes over. Stepped rather than
+/// ramped: banding is honest at this resolution. 58 wide at the foot in a 76-wide
+/// slot leaves 18 dark pixels between neighbours, so cones never merge into one
+/// lit wall.
+const CONE: [(i32, i32, i32, f32); 3] = [(14, 0, 10, 0.11), (19, 10, 14, 0.08), (24, 24, 16, 0.05)];
 /// Daylight through the clerestory on a sunny day.
 const SUNLIGHT: Rgba = rgb(0xf2, 0xe8, 0xc6);
 
@@ -529,7 +557,7 @@ fn room(b: &mut Buf, scene: &Scene, t: f32) {
     let (w, h) = (b.w, b.h);
     let n = scene.desks.len();
     b.fill(0, 0, w, h, GROUND);
-    clerestory(b, scene.weather, t);
+    clerestory(b, scene, t);
 
     // One band per row: wall, then the floor strip the desks stand on.
     for r in 0..rows(n) {
@@ -552,11 +580,17 @@ fn room(b: &mut Buf, scene: &Scene, t: f32) {
     // to be here read as an empty tiled void rather than as a walkway, and the
     // plants standing on it read as a garden centre. Both are gone. A cable
     // trunk runs along the base, which is what an open-plan floor actually has.
+    // The walkway is nearest the viewer and farthest from every lamp, so it is
+    // the dark plane: near dark, mid lit, far dark, windows dimmer still. The
+    // joint is FLOOR_LINE rather than TRIM so the last row's strip and the
+    // walkway read as one floor with a seam in it instead of a step.
     let fy = h - FORE_H;
     b.fill(0, fy, w, FORE_H, FLOOR);
-    b.fill(0, fy, w, 1, TRIM);
+    b.fill(0, fy, w, 1, FLOOR_LINE);
     b.fill(0, fy + 1, w, 2, FLOOR_LINE.alpha(0.5));
     b.fill(0, fy + 8, w, 1, FLOOR_LINE.alpha(0.35));
+    // Two values of darkening toward the base is a gradient at this size.
+    b.fill(0, h - 11, w, 6, Rgba(0, 0, 0, 0.10));
     b.fill(0, h - 5, w, 4, rgb(0x1a, 0x21, 0x2a));
     b.fill(0, h - 5, w, 1, TRIM);
     let mut x = 6;
@@ -576,18 +610,28 @@ fn room(b: &mut Buf, scene: &Scene, t: f32) {
 
 /// The top band: three windows onto the weather, with the ceiling lights slung
 /// under them. Drawn once however many rows the room has.
-fn clerestory(b: &mut Buf, weather: Weather, t: f32) {
+///
+/// Takes the whole scene, not just the sky, because a fixture is only lit over an
+/// occupied desk: it is the top of that desk's cone, and the two have to agree.
+fn clerestory(b: &mut Buf, scene: &Scene, t: f32) {
     b.fill(0, 0, W, CEIL_H, CEIL);
     for i in 0..3 {
-        window(b, 26 + i * 118, 6, 92, 30, weather, t, i as i64);
+        window(b, 26 + i * 118, 6, 92, 30, scene.weather, t, i as i64);
     }
-    // Sill under the glass, then the light fixtures.
+    // Sill under the glass, with its own shadow so it stands off the wall, then
+    // the light fixtures.
     b.fill(0, 36, W, 2, TRIM);
+    b.fill(0, 38, W, 2, SHADE);
     b.fill(0, CEIL_H - 3, W, 2, TRIM);
     for c in 0..COLS {
         let cx = c as i32 * SLOT_W + SLOT_W / 2;
         b.fill(cx - 14, 40, 28, 2, STEEL.alpha(0.8));
-        b.fill(cx - 16, 42, 32, 4, STEEL.alpha(0.06));
+        // A lit underside only where somebody is sitting. The row-0 cone starts
+        // at CEIL_H at this same 28 width, so fixture and cone read as one light.
+        if scene.desks.get(c).is_some_and(|d| *d != Desk::Empty) {
+            b.fill(cx - 13, 42, 26, 1, CEIL_LIGHT.alpha(0.55));
+            b.fill(cx - 16, 43, 32, 3, CEIL_LIGHT.alpha(0.10));
+        }
     }
 }
 
@@ -682,7 +726,26 @@ fn window(b: &mut Buf, x: i32, y: i32, w: i32, h: i32, weather: Weather, t: f32,
         }
     }
 
-    // Distant city along the bottom of the glass, then the mullions over it all.
+    // Distant city along the bottom of the glass, in two layers, because two is
+    // all the parallax a still picture needs. The far one is at half alpha, so it
+    // takes on whatever haze the sky has: under Sunny it comes out as a pale
+    // silhouette, which is what distance looks like in daylight.
+    for i in 0..6i64 {
+        let bw = 8 + (hash(seed, i + 51) % 8) as i32;
+        let bh = 8 + (hash(seed, i + 53) % 10) as i32;
+        let bx = x + i as i32 * w / 6 + (hash(seed, i + 55) % 5) as i32;
+        b.fill(
+            bx,
+            y + h - bh,
+            bw.min(x + w - bx),
+            bh,
+            rgb(0x10, 0x16, 0x1e).alpha(0.45),
+        );
+        if hash(seed, i + 57) % 4 == 0 {
+            b.fill(bx + 3, y + h - bh + 3, 1, 1, STEEL.alpha(0.35));
+        }
+    }
+    // Then the near blocks over it, and the mullions over it all.
     for i in 0..9 {
         let bw = 6 + (hash(seed, i + 21) % 10) as i32;
         let bh = 4 + (hash(seed, i + 23) % 9) as i32;
@@ -790,7 +853,7 @@ fn screen(b: &mut Buf, sx: i32, sy: i32, sw: i32, sh: i32, d: Desk, t: f32, seed
         Desk::Idle => b.fill(sx + 2, sy + 4, 3, 2, METAL_LT.alpha(0.5)),
         Desk::Attention => {
             // A choice waiting on you: two options, the first one under the
-            // cursor. Static — the paddle above the monitor does the moving.
+            // cursor. Static: the andon over the desk does the moving.
             out_lines(b, sx + 2, sy + 3, sw - 8, 2, body, 3);
             b.fill(sx + 2, sy + 12, sw - 4, 4, g);
             b.fill(sx + 2, sy + 18, sw - 4, 3, g.alpha(0.35));
@@ -873,6 +936,106 @@ const FLOOR_Y: i32 = 80;
 const MON_TOP: i32 = 20;
 const MON_BOT: i32 = 49;
 
+/// Something on the wall behind a desk, fixed by slot the way the plant is.
+///
+/// Variant 0 is deliberately nothing: a third of the desks keep a bare wall, which
+/// is what stops the other two thirds reading as wallpaper. No new colour, and
+/// nothing here is drawn in a shirt colour, so a desk's clutter can never be
+/// mistaken for its occupant.
+fn wall_item(b: &mut Buf, cx: i32, r: i32, variant: u32, seed: i64) {
+    match variant {
+        // A shelf of spines, left of the andon and clear of the head.
+        1 => {
+            b.fill(cx - 37, r + 16, 16, 1, DESK_LT);
+            b.fill(cx - 37, r + 17, 1, 2, METAL_DK);
+            for k in 0..3i64 {
+                let h = 5 + (hash(seed, k) % 4) as i32;
+                let c = [POT, METAL_LT, PLANT_DK][k as usize];
+                b.fill(cx - 35 + k as i32 * 3, r + 16 - h, 2, h, c);
+            }
+        }
+        // A pinboard with two notes on it.
+        2 => {
+            b.fill(cx - 37, r + 9, 15, 11, POT_DK);
+            b.fill(cx - 37, r + 9, 15, 1, POT);
+            b.fill(cx - 35, r + 11, 4, 5, PAPER.alpha(0.5));
+            b.fill(cx - 29, r + 12, 5, 4, PAPER.alpha(0.4));
+        }
+        _ => {}
+    }
+}
+
+/// Everything that lights or shades one workstation, painted onto bare wall and
+/// floor before any furniture goes down. Far to near: the ceiling cone, the
+/// screen's pool over it, the floor bounce, then the shadows, so a shadow darkens
+/// lit wall rather than being lit over.
+///
+/// `lean` is the figure's upper-body lean, so the head's shadow follows the head.
+fn light_and_shadow(b: &mut Buf, cx: i32, r: i32, d: Desk, lean: i32, t: f32) {
+    let occupied = d != Desk::Empty;
+    // The chair x, exactly as the chair itself is placed: pushed in when free.
+    let ch = cx - 31 + if occupied { 0 } else { 13 };
+
+    if occupied {
+        for (half, top, h, a) in CONE {
+            b.fill(cx - half, r + top, half * 2, h, CEIL_LIGHT.alpha(a));
+        }
+        b.fill_checker(cx - 29, r + 40, 58, DESK_Y - 40, CEIL_LIGHT.alpha(0.06));
+        // A brighter core under the fixture is what makes three bands read as one
+        // beam rather than as three lighter wallpapers.
+        b.fill(cx - 6, r, 12, 30, CEIL_LIGHT.alpha(0.04));
+    }
+
+    if let Some(g) = d.glow() {
+        // Small on purpose: the glow says which state, the andon says "act now".
+        // An attention state that floods the desk spends the whole loudness
+        // budget in one place. Only the two live states breathe, so a quiet room
+        // stays a still image.
+        let b0 = match d {
+            Desk::Working => 0.10 + 0.02 * (t * 1.6).sin(),
+            Desk::Attention => 0.07 + 0.03 * (t * 1.9).sin(),
+            _ => 0.04,
+        };
+        b.fill_checker(cx - 18, r + 14, 50, 44, g.alpha(b0 * 0.55));
+        b.fill(cx - 8, r + 18, 38, 36, g.alpha(b0 * 0.7));
+        b.fill(cx, r + 20, 28, 30, g.alpha(b0));
+
+        // The same light off the floor strip in front of the desk, dithered and a
+        // step dimmer. This is what turns the strip from a band into a floor.
+        let fy = r + ROW_H - 10;
+        b.fill_checker(cx - 4, fy, 36, 10, g.alpha(b0));
+        b.fill(cx + 4, fy, 22, 4, g.alpha(b0 * 0.7));
+    }
+
+    // Each shadow is the object's whole silhouette, offset. The object is drawn
+    // over it afterwards and covers most of it; what survives is a three-pixel rim
+    // along its lower-left, and that rim is the entire depth cue.
+    b.fill(
+        cx + 3 + SHADOW_DX,
+        r + MON_TOP + SHADOW_DY,
+        26,
+        MON_BOT - MON_TOP,
+        SHADE,
+    );
+    // Under the desktop, not offset in y: the dark under a slab, which also closes
+    // the one-row gap of bare wall between the desktop and the thigh.
+    b.fill(cx - 16 + SHADOW_DX, r + DESK_Y + 5, 52, 3, SHADE);
+    if occupied {
+        b.fill(
+            cx - 25 + lean + SHADOW_DX,
+            r + HAIR_Y + SHADOW_DY,
+            10,
+            HIP_Y - HAIR_Y,
+            SHADE,
+        );
+    }
+    b.fill(ch + SHADOW_DX, r + 40 + lean + SHADOW_DY, 5, SEAT_Y - 40, SHADE);
+
+    // Contact shadow under the chair, at the weight the desk already uses, so the
+    // two stand on the same floor.
+    b.fill(ch - 1, r + FLOOR_Y, 22, 2, Rgba(0, 0, 0, 0.3));
+}
+
 /// One workstation. Everything is positioned from the slot's centre `cx` and the
 /// row band top `r`, so a desk is identical wherever it lands.
 fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
@@ -889,8 +1052,8 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     );
     let glow = d.glow();
     let occupied = d != Desk::Empty;
-    // 12fps sprite cadence: smooth motion reads as an animation, chunky motion
-    // reads as a machine.
+    // Chunky on purpose (SPRITE_FPS): smooth motion reads as an animation, chunky
+    // motion reads as a machine.
     let frame = (t * SPRITE_FPS) as i64;
     let job = (d == Desk::Working).then(|| task(i, t));
     // Idle, done and pondering slump back into the chair. Posture is a free
@@ -900,19 +1063,11 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         matches!(d, Desk::Idle | Desk::Done | Desk::Ready) || job == Some(Task::Pondering),
     ) - i32::from(job == Some(Task::Reading) || job == Some(Task::Noting));
 
-    // Light spill. Small on purpose: the glow says which state, the paddle says
-    // "act now". An attention state that floods the desk spends the whole
-    // loudness budget in one place.
-    if let Some(g) = glow {
-        let b0 = match d {
-            Desk::Working => 0.10 + 0.02 * (t * 1.6).sin(),
-            Desk::Attention => 0.07 + 0.03 * (t * 1.9).sin(),
-            _ => 0.04,
-        };
-        b.fill_checker(cx - 18, r + 14, 50, 44, g.alpha(b0 * 0.55));
-        b.fill(cx - 8, r + 18, 38, 36, g.alpha(b0 * 0.7));
-        b.fill(cx, r + 20, 28, 30, g.alpha(b0));
+    // Wall clutter goes down before the light, so the cone falls across it.
+    if occupied {
+        wall_item(b, cx, r, hash(i as i64, 0x5e) % 3, i as i64 * 11 + 5);
     }
+    light_and_shadow(b, cx, r, d, lean, t);
 
     // Task chair, drawn behind the figure. An unoccupied one is pushed in under
     // the desk, which is how a free desk reads as free rather than as somebody
@@ -967,6 +1122,18 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         b.fill(cx - 12, r + KNEE_Y, 1, shin, trews_lit);
         b.fill(cx - 13, r + FLOOR_Y - 3, 10, 3, rgb(0x1b, 0x1f, 0x25));
         b.fill(cx - 13, r + FLOOR_Y - 3, 10, 1, rgb(0x2b, 0x31, 0x39));
+
+        // Rim light. A one-pixel column that does more than its size: the screen
+        // lights the face turned toward it, so an idle figure takes a grey rim
+        // from SCREEN_OFF and a working one an azure rim, and that is the figure
+        // lit by its own screen. It is per state and identical across the five
+        // tasks, so it stays a state rather than becoming a pose. Not on the
+        // torso, where the desktop and the arms cover the front column in every
+        // pose and it comes out as stray pixels.
+        if let Some(g) = glow {
+            b.fill(cx - 17 + lean, r + HEAD_Y + 4, 1, 6, g.alpha(0.45));
+        }
+        b.fill(cx - 26 + lean, r + SHOULDER_Y, 13, 1, CEIL_LIGHT.alpha(0.25));
 
         // Arms. This is where the work variety lives: every pose below means
         // exactly Working, so none may introduce a colour or a motion the other
@@ -1044,8 +1211,15 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
         b.fill(cx + 7, r + MON_TOP - 7, 18, 3, METAL);
         b.fill(cx + 7, r + MON_TOP - 7, 18, 1, METAL_LT);
         b.fill(cx + 8, r + MON_TOP - 4, 16, 1, LAMP_WARM.alpha(0.9));
-        b.fill_checker(cx + 4, r + KB_Y - 4, 24, 8, LAMP_WARM.alpha(0.1));
-        b.fill(cx + 7, r + KB_Y, 18, 4, LAMP_WARM.alpha(0.07));
+        // Dithering is for the open edge of a pool, where a flat alpha band would
+        // end in a visible rectangle. Above the desk it earns that; on the desktop
+        // it does not, because the pool's edge is the desk edge, and a checker at
+        // this alpha reads as a woven mat rather than as light.
+        b.fill_checker(cx + 4, r + KB_Y - 4, 24, 8, LAMP_WARM.alpha(0.13));
+        b.fill(cx + 7, r + KB_Y, 18, 4, LAMP_WARM.alpha(0.12));
+        // Reach the near end of the desktop, so the desk has a lit surface rather
+        // than a lit stripe and the mug sits in the light.
+        b.fill(cx - 14, r + DESK_Y, 20, 3, LAMP_WARM.alpha(0.07));
     }
 
     // Keyboard.
@@ -1376,9 +1550,99 @@ mod tests {
         }
     }
 
-    /// Eyeball the room without launching a GUI. Writes the raw buffer so a
-    /// one-liner can turn it into an image:
-    /// `cargo test --lib floor::tests::dump -- --ignored --nocapture`
+    /// Nearest-neighbour upscale for the dumps below. One row of desks is 380px
+    /// wide, which is too small to judge anything by; whole numbers only, for the
+    /// same reason the room itself is only ever blitted at one.
+    const ZOOM: i32 = 3;
+
+    fn upscaled(b: &Buf) -> (u32, u32, Vec<u8>) {
+        let (w, h) = (b.w * ZOOM, b.h * ZOOM);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let s = (((y / ZOOM) * b.w + x / ZOOM) * 4) as usize;
+                let d = ((y * w + x) * 4) as usize;
+                px[d..d + 4].copy_from_slice(&b.px[s..s + 4]);
+            }
+        }
+        (w as u32, h as u32, px)
+    }
+
+    /// Write a frame where something can open it. The buffer is opaque, so its
+    /// straight RGBA and tiny-skia's premultiplied RGBA are the same bytes.
+    fn save(b: &Buf, name: &str) -> std::path::PathBuf {
+        let (w, h, px) = upscaled(b);
+        let dir = std::env::temp_dir().join("ops-floor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.png"));
+        tiny_skia::Pixmap::from_vec(px, tiny_skia::IntSize::from_wh(w, h).unwrap())
+            .unwrap()
+            .save_png(&path)
+            .unwrap();
+        println!("{}", path.display());
+        path
+    }
+
+    /// Every frame a redesign has to answer for, in one directory:
+    /// `cargo test --lib floor::tests::sheet -- --ignored --nocapture`
+    ///
+    /// The point is to spend one look rather than ten. Judging pixel art means
+    /// seeing it, and every correction this room has had so far came from an eye
+    /// on a frame rather than from reading the code that drew it.
+    #[test]
+    #[ignore = "writes PNGs; run it when you want to look at the room"]
+    fn sheet() {
+        // The case the whole design is for: a floor mid-shift, one agent blocked.
+        let mut room = scene(&[
+            Desk::Working,
+            Desk::Attention,
+            Desk::Working,
+            Desk::Done,
+            Desk::Working,
+        ]);
+        room.selected = Some(1);
+        save(&render(&room, 0.5), "01-room");
+
+        // Every state the room can be in, in `Desk` order, so none of them can
+        // be judged only by the company it keeps.
+        let states = scene(&[
+            Desk::Idle,
+            Desk::Running,
+            Desk::Ready,
+            Desk::Working,
+            Desk::Attention,
+            Desk::Done,
+        ]);
+        save(&render(&states, 0.5), "02-states");
+
+        // The five work poses at once. Which task a desk is doing is a function
+        // of its slot and the time, so the way to see all five together is to go
+        // looking for the moment they happen to coincide.
+        let busy = scene(&[Desk::Working; COLS]);
+        let (t, tasks) = (0..8000)
+            .map(|step| {
+                let t = step as f32 * 0.37;
+                let seen: Vec<Task> = (0..COLS).map(|i| task(i, t)).collect();
+                (t, seen)
+            })
+            .max_by_key(|(_, seen)| {
+                seen.iter().collect::<std::collections::HashSet<_>>().len()
+            })
+            .unwrap();
+        println!("poses at t={t}: {tasks:?}");
+        save(&render(&busy, t), "03-poses");
+
+        // One sky each. The weather is scene-wide, so it cannot share a frame.
+        for w in Weather::ALL {
+            let mut s = room.clone();
+            s.weather = w;
+            save(&render(&s, 1.7), &format!("04-sky-{}", w.label()));
+        }
+    }
+
+    /// One frame, on demand, for looking at a particular sky or a particular
+    /// point in an animation:
+    /// `FLOOR_WEATHER=snow FLOOR_T=3.25 cargo test --lib floor::tests::dump -- --ignored --nocapture`
     #[test]
     #[ignore = "writes a file; run it when you want to look at the room"]
     fn dump() {
@@ -1398,9 +1662,6 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);
-        let b = render(&s, t);
-        let path = std::env::temp_dir().join(format!("ops-floor-{}x{}.rgba", b.w, b.h));
-        std::fs::write(&path, &b.px).unwrap();
-        println!("{}", path.display());
+        save(&render(&s, t), "dump");
     }
 }
