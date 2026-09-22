@@ -2199,6 +2199,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                     // Backup install point (in case Opened fired before the delegate
                     // was ready); idempotent with the WindowOpened call.
                     trafficlights::install_quit_hook();
+                    windows_menu::sync();
                 }
             }
             // The 120s usage auto-refresh poll runs on a background thread now (see
@@ -3322,6 +3323,8 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             return task;
         }
         Message::WindowClosed(id) => {
+            #[cfg(target_os = "macos")]
+            windows_menu::sync();
             if id == state.main_window {
                 // Capture the final layout (incl. each terminal's current cwd) on exit.
                 save_session(state);
@@ -3453,6 +3456,8 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::WindowOpened(id, pos, size) => {
+            #[cfg(target_os = "macos")]
+            windows_menu::sync();
             if state.toasts.iter().any(|t| t.window == Some(id)) {
                 // A click on a card must not move the keyboard focus to it.
                 #[cfg(target_os = "windows")]
@@ -7038,6 +7043,9 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
 /// taking focus (the fork's `NEXT_WINDOW_INACTIVE`). On Windows the window is opaque and
 /// DWM shadows and rounds it; on macOS it is transparent and the card draws its own
 /// rounded corners (see `toast_theme`).
+/// The card windows' title. The macOS Window menu keeps them out of its list by it.
+const TOAST_TITLE: &str = "Arbiter · Notification";
+
 fn open_toast_window(pos: Option<iced::Point>) -> (iced::window::Id, Task<Message>) {
     let mut settings = iced::window::Settings {
         size: iced::Size::new(TOAST_W, TOAST_H),
@@ -8148,6 +8156,104 @@ mod trafficlights {
             r.origin.x = INSET_X + (i as f64) * space;
             let _: () = msg_send![btn, setFrameOrigin: r.origin];
         }
+    }
+}
+
+/// The macOS Window menu, and the list of windows it keeps.
+///
+/// winit's default menu bar has only the app menu, and AppKit keeps its list of an
+/// app's windows through the menu handed to `setWindowsMenu:`. With none set, the
+/// Dock's right-click menu listed no windows at all, and there was no Window menu to
+/// pick one from either. Titled windows join the list by themselves once the menu
+/// exists; a borderless one (the Agents Office) never does, so every window is added
+/// here by hand, and the notification cards are kept out of it.
+#[cfg(target_os = "macos")]
+mod windows_menu {
+    use objc2::{class, msg_send, runtime::AnyObject, sel};
+    use objc2_foundation::NSString;
+
+    /// Bring the menu into being if it is not there yet, and list every window that
+    /// should be in it. Cheap enough to call on every window opening and closing.
+    pub fn sync() {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            if !ensure_menu(app) {
+                return;
+            }
+            let windows: *mut AnyObject = msg_send![app, windows];
+            if windows.is_null() {
+                return;
+            }
+            let count: usize = msg_send![windows, count];
+            for i in 0..count {
+                let window: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                let title: *mut AnyObject = msg_send![window, title];
+                if title.is_null() {
+                    continue;
+                }
+                let name = (*(title as *mut NSString)).to_string();
+                if name == super::TOAST_TITLE {
+                    let _: () = msg_send![window, setExcludedFromWindowsMenu: true];
+                    continue;
+                }
+                let visible: bool = msg_send![window, isVisible];
+                if !visible || name.is_empty() {
+                    continue;
+                }
+                // Adds the item, or retitles the one already there.
+                let _: () = msg_send![app, addWindowsItem: window, title: title, filename: false];
+            }
+        }
+    }
+
+    /// False until AppKit has built the main menu, which happens at launch.
+    unsafe fn ensure_menu(app: *mut AnyObject) -> bool {
+        let existing: *mut AnyObject = msg_send![app, windowsMenu];
+        if !existing.is_null() {
+            return true;
+        }
+        let main_menu: *mut AnyObject = msg_send![app, mainMenu];
+        if main_menu.is_null() {
+            return false;
+        }
+        let title = NSString::from_str("Window");
+        let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let menu: *mut AnyObject = msg_send![menu, initWithTitle: &*title];
+        add_item(menu, "Minimize", Some(sel!(performMiniaturize:)), "m");
+        add_item(menu, "Zoom", Some(sel!(performZoom:)), "");
+        let separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: separator];
+        add_item(menu, "Bring All to Front", Some(sel!(arrangeInFront:)), "");
+
+        let holder: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let empty = NSString::from_str("");
+        let holder: *mut AnyObject = msg_send![
+            holder,
+            initWithTitle: &*title,
+            action: None::<objc2::runtime::Sel>,
+            keyEquivalent: &*empty
+        ];
+        let _: () = msg_send![holder, setSubmenu: menu];
+        let _: () = msg_send![main_menu, addItem: holder];
+        let _: () = msg_send![app, setWindowsMenu: menu];
+        true
+    }
+
+    unsafe fn add_item(
+        menu: *mut AnyObject,
+        title: &str,
+        action: Option<objc2::runtime::Sel>,
+        key: &str,
+    ) {
+        let title = NSString::from_str(title);
+        let key = NSString::from_str(key);
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject =
+            msg_send![item, initWithTitle: &*title, action: action, keyEquivalent: &*key];
+        let _: () = msg_send![menu, addItem: item];
     }
 }
 
@@ -10097,9 +10203,9 @@ fn main() -> iced::Result {
             // Borderless, but it still has a taskbar entry and an Alt+Tab label.
             "Arbiter · Agents Office".to_string()
         } else if state.toasts.iter().any(|t| t.window == Some(id)) {
-            "Arbiter · Notification".to_string()
+            TOAST_TITLE.to_string()
         } else {
-            "Arbiter native".to_string()
+            "Arbiter".to_string()
         }
     };
 

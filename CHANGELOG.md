@@ -8,6 +8,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **macOS: a Window menu, and the Dock lists your windows.** Right-clicking Arbiter in the
+  Dock showed no windows, because winit's menu bar has no Window menu and AppKit keeps an
+  app's window list through that menu. There is one now, with Minimize (Cmd+M), Zoom and
+  Bring All to Front, and the main window, the Overview and the Agents Office all appear in
+  it and in the Dock menu. The Agents Office is borderless, which macOS never lists on its
+  own, so each window is added explicitly; notification cards are kept out. The main
+  window is titled "Arbiter" there, and in the Windows taskbar and Alt+Tab, rather than
+  "Arbiter native", a leftover from the move off the web app.
 - **A file explorer beside the terminals.** Settings, General, "Show the file explorer" (off
   by default) puts a folder button in the titlebar and on Ctrl+Shift+F. The first press in a
   workspace asks for a folder, the way Open Folder does in VS Code; after that the button
