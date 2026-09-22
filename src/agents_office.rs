@@ -453,6 +453,8 @@ impl Weather {
         matches!(self, Weather::Rain | Weather::Snow)
     }
 
+    /// The machine name: dump filenames, and the `AGENTS_OFFICE_WEATHER` env knob.
+    /// Anything a person reads wants [`Weather::title`] instead.
     pub fn label(self) -> &'static str {
         match self {
             Weather::Clear => "clear",
@@ -461,6 +463,18 @@ impl Weather {
             Weather::Rain => "rain",
             Weather::Snow => "snow",
             Weather::Fog => "fog",
+        }
+    }
+
+    /// The name as it is shown to somebody choosing a sky.
+    pub fn title(self) -> &'static str {
+        match self {
+            Weather::Clear => "Clear",
+            Weather::Sunny => "Sunny",
+            Weather::Cloudy => "Cloudy",
+            Weather::Rain => "Rain",
+            Weather::Snow => "Snow",
+            Weather::Fog => "Fog",
         }
     }
 

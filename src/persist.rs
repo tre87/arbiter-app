@@ -253,10 +253,16 @@ pub struct Settings {
     /// gives the room back as art.
     #[serde(default = "default_true")]
     pub office_show_names: bool,
-    /// Which sky, as an index into `agents_office::Weather::ALL`. Clear by default,
-    /// which is also the only one of the six that is a still picture on its own.
+    /// Which sky, as an index into `agents_office::Weather::ALL`. Only consulted when
+    /// `office_weather_auto` is off.
     #[serde(default)]
     pub office_weather: usize,
+    /// Let the sky drift on its own. On by default, and free: it drifts on the
+    /// room's own clock, which only runs while some agent is working, so the weather
+    /// changes through working time and holds still when the room goes quiet. It can
+    /// never be the reason a frame is drawn.
+    #[serde(default = "default_true")]
+    pub office_weather_auto: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -377,6 +383,7 @@ impl Default for Settings {
             office_topmost: false,
             office_show_names: true,
             office_weather: 0,
+            office_weather_auto: true,
         }
     }
 }

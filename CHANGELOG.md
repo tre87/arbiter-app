@@ -143,8 +143,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
   inside a window where the app was already drawing, so an open office over a quiet room
   costs nothing at all. A gear in the top corner, faint until the pointer is in the window,
   opens the only menu it has: always on top (off by default, since this is a picture you
-  leave in a corner rather than a panel you consult), show names, freeze motion, the six
-  skies, and Close, which is the only way to shut the window from inside it. The desk under
+  leave in a corner rather than a panel you consult), show names, freeze motion, the sky,
+  and Close, which is the only way to shut the window from inside it. The sky is Auto by
+  default, drifting on the room's own clock, which is to say it changes through working
+  time and holds still when the room goes quiet: a decoration can never be the reason a
+  frame is drawn. Pick any of the six by hand and that turns Auto off. The desk under
   the pointer takes the floor marker, so you can see which agent you are about to click
   without anything having to light up in a colour the room has reserved.
 

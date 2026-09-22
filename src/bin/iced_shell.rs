@@ -808,6 +808,7 @@ enum Message {
     OfficeTopmost(bool),
     OfficeShowNames(bool),
     OfficeWeather(usize),
+    OfficeWeatherAuto(bool),
     OfficeFreeze(bool),
     /// Raise a notification card, and its sound, as Settings allow; `target` is the
     /// session id of the terminal it is about, which a click on the card goes to.
@@ -1499,8 +1500,15 @@ fn office_sync(state: &mut State) -> bool {
         labels: vec![(String::new(), String::new()); state.office_seats.len()],
         ..agents_office::Scene::default()
     };
-    scene.weather = agents_office::Weather::ALL
-        [state.settings.office_weather.min(agents_office::Weather::ALL.len() - 1)];
+    // Auto drifts the sky on the room's own clock, which only runs while some agent
+    // is working. So the weather changes through working time and holds wherever it
+    // was when the room goes quiet, and it can never be the reason a frame is drawn.
+    scene.weather = if state.settings.office_weather_auto {
+        agents_office::Weather::drifting(state.office_t)
+    } else {
+        agents_office::Weather::ALL
+            [state.settings.office_weather.min(agents_office::Weather::ALL.len() - 1)]
+    };
     scene.show_names = state.settings.office_show_names;
     // The floor marker follows the pointer, so you can tell which desk you are about
     // to click without it having to light up in a colour the room has reserved.
@@ -1636,17 +1644,27 @@ fn office_chrome(state: &State) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    let mut col = column![gear].spacing(6).align_x(iced::alignment::Horizontal::Right);
+    let mut col = column![gear].spacing(4).align_x(iced::alignment::Horizontal::Right);
     if state.office_menu {
         col = col.push(office_menu(state));
     }
-    container(col)
+    let panel = container(col)
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(iced::alignment::Horizontal::Right)
         .align_y(iced::alignment::Vertical::Top)
-        .padding(8)
-        .into()
+        .padding(6);
+    if !state.office_menu {
+        return panel.into();
+    }
+    // With the menu up, a press anywhere else dismisses it. The catcher sits under
+    // the gear and the menu, so their own presses still reach them, and over the
+    // room, so that first press only closes the menu rather than also dragging the
+    // window or jumping to a desk.
+    let catcher: Element<Message> = mouse_area(Space::new(Length::Fill, Length::Fill))
+        .on_press(Message::OfficeMenu(false))
+        .into();
+    stack![catcher, panel].into()
 }
 
 /// The gear's dropdown. Everything the room can be told, and the only way to shut
@@ -1654,9 +1672,9 @@ fn office_chrome(state: &State) -> Element<'_, Message> {
 fn office_menu(state: &State) -> Element<'_, Message> {
     let check = |on: bool| if on { "✓" } else { " " };
     let item = |label: String, msg: Message| {
-        button(text(label).size(12))
+        button(text(label).size(11))
             .width(Length::Fill)
-            .padding([5, 8])
+            .padding([3, 7])
             .on_press(msg)
             .style(|_: &iced::Theme, s: button::Status| button::Style {
                 text_color: TXT_SECONDARY,
@@ -1694,17 +1712,11 @@ fn office_menu(state: &State) -> Element<'_, Message> {
     ]
     .spacing(1);
 
+    let auto = state.settings.office_weather_auto;
+    col = col.push(item(format!("{} Auto", check(auto)), Message::OfficeWeatherAuto(true)));
     for (i, w) in agents_office::Weather::ALL.iter().enumerate() {
-        let picked = state.settings.office_weather == i;
-        // Rain and snow are the only decoration with moving parts, and they move
-        // only while some desk is working, so the mark is a description and not a
-        // warning.
-        let label = if w.moves() {
-            format!("{} {} ·", check(picked), w.label())
-        } else {
-            format!("{} {}", check(picked), w.label())
-        };
-        col = col.push(item(label, Message::OfficeWeather(i)));
+        let picked = !auto && state.settings.office_weather == i;
+        col = col.push(item(format!("{} {}", check(picked), w.title()), Message::OfficeWeather(i)));
     }
     col = col.push(
         container(Space::new(Length::Fill, Length::Fixed(1.0))).style(|_: &iced::Theme| {
@@ -1720,8 +1732,8 @@ fn office_menu(state: &State) -> Element<'_, Message> {
     col = col.push(item("  Close".to_string(), Message::ToggleAgentsOffice));
 
     container(col)
-        .width(Length::Fixed(150.0))
-        .padding(4)
+        .width(Length::Fixed(146.0))
+        .padding(3)
         .style(|_: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x16, 0x1b, 0x22))),
             border: iced::Border {
@@ -3156,6 +3168,13 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::OfficeWeather(i) => {
             state.settings.office_weather = i.min(agents_office::Weather::ALL.len() - 1);
+            // Picking a sky by hand is also how you leave Auto.
+            state.settings.office_weather_auto = false;
+            state.office_menu = false;
+            save_session(state);
+        }
+        Message::OfficeWeatherAuto(v) => {
+            state.settings.office_weather_auto = v;
             state.office_menu = false;
             save_session(state);
         }
