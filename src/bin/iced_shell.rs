@@ -21,10 +21,11 @@ use portable_pty::PtySize;
 use iced::widget::shader::{self, wgpu};
 use iced::widget::{
     button, column, container, horizontal_space, mouse_area, pane_grid, pick_list, row, scrollable,
-    shader as shader_widget, svg, text, text_input, toggler, Space,
+    shader as shader_widget, stack, svg, text, text_input, toggler, Space,
 };
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
+use arbiter_native::agents_office;
 use arbiter_native::claude_status::Lifecycle;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Secret, Session, SharedMaster, SharedTerm};
@@ -123,12 +124,37 @@ struct State {
     main_window: iced::window::Id,
     /// The popout overview window, while open.
     overview_window: Option<iced::window::Id>,
+    /// The popout Agents Office window, while open. A sibling of the overview rather
+    /// than a mode of it: the overview lists every terminal, this shows only agents,
+    /// and both are meant to be up at once.
+    office_window: Option<iced::window::Id>,
     /// Live geometry of each window (tracked from move/resize events) so it can be
     /// persisted and restored. Positions are `None` until the WM reports one.
     main_size: iced::Size,
     main_pos: Option<iced::Point>,
     overview_size: iced::Size,
     overview_pos: Option<iced::Point>,
+    office_size: iced::Size,
+    office_pos: Option<iced::Point>,
+    /// Slot -> the agent sitting at it, as `PaneData.history_id`, for the life of
+    /// that pane. Never reordered: a desk that moved would cost the room the only
+    /// advantage it has over the overview's list, which is that you learn where
+    /// things are. `history_id` rather than `Session::id()` because a session is
+    /// re-minted on reconnect and on a shell switch, and the desk must not move for
+    /// either.
+    office_seats: Vec<Option<agents_office::Seat>>,
+    /// The room as last built from the panes, and the frame drawn from it. Built in
+    /// `update`, not in `view`: `view` takes `&State` so it cannot cache, and a frame
+    /// is a couple of megabytes, which is not a thing to rebuild on every PTY wake.
+    /// Same bargain as `gpu::FrameKey` for the terminals.
+    office_scene: agents_office::Scene,
+    office_frame: Option<iced::widget::image::Handle>,
+    /// What `office_frame` was drawn for: scene revision, animation phase, zoom.
+    office_key: Option<(u64, u32, i32)>,
+    /// Bumped whenever `office_sync` finds something the room draws has moved.
+    office_rev: u64,
+    /// Seconds since the office opened, the room's animation clock.
+    office_t: f32,
     /// Whether the main window is focused — drives the Windows caption-button
     /// glyph colour (white when active, dimmed when not), like native controls.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -748,6 +774,17 @@ enum Message {
     WolAdd,
     WolRemove(usize),
     ToggleWolButton(bool),
+    /// The Settings switch for the Agents Office. Distinct from `ToggleAgentsOffice`,
+    /// which opens and closes its window.
+    ToggleAgentsOfficeSetting(bool),
+    /// Open the Agents Office window, or close it if it is already up.
+    ToggleAgentsOffice,
+    /// Drag the Agents Office window by its art.
+    DragOffice,
+    /// A desk was clicked; the payload is that agent's `history_id`.
+    OfficeDeskClicked(String),
+    /// The room's own 12fps clock, live only while a turn is in flight.
+    OfficeTick,
     /// Raise a notification card, and its sound, as Settings allow; `target` is the
     /// session id of the terminal it is about, which a click on the card goes to.
     Notify { title: String, body: String, target: Option<u64> },
@@ -1350,6 +1387,190 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
     }
 }
 
+/// How long a desk is held for an agent that has stopped running.
+///
+/// `reconnect_pane` and `SwitchShell` both keep the pane's `history_id` and then
+/// assign over `data.session`, which drops the old `Session` and its `ClaudeHandle`.
+/// So `claude_running()` reads false for the whole respawn, which for an ssh
+/// reconnect replaying its startup command is seconds. Freeing the desk on that
+/// edge would move the agent to whatever slot happened to be free when Claude came
+/// back, which is the founding rule broken silently and invisibly.
+///
+/// The hold needs no timer: an expired reservation is invisible (its desk already
+/// draws empty) until some new agent asks for a seat, and that is a message.
+const OFFICE_SEAT_HOLD_MS: u64 = 20_000;
+
+/// The room's own clock, 12fps. The fastest thing in the art is `SPRITE_FPS` at 7
+/// and the spinner steps 3 times a second, so 12 resolves everything it does.
+const OFFICE_FRAME_MS: u64 = 83;
+
+/// Bring the room in line with the panes, and redraw it if anything it shows moved.
+///
+/// Every pane with Claude running gets a desk, across every workspace; nothing else
+/// does. A seat is taken for the life of that pane and released once Claude has been
+/// gone longer than [`OFFICE_SEAT_HOLD_MS`], so quitting Claude frees the desk while
+/// the pane carries on as a shell, and a reconnect keeps it.
+fn office_refresh(state: &mut State) {
+    if state.office_window.is_none() {
+        // A frame is a couple of megabytes; a closed window holds none.
+        state.office_frame = None;
+        return;
+    }
+    let changed = office_sync(state);
+    let key = (state.office_rev, state.office_t.to_bits(), office_zoom(state));
+    if !changed && state.office_key == Some(key) {
+        return;
+    }
+    if changed {
+        state.office_rev += 1;
+    }
+    state.office_key = Some((state.office_rev, state.office_t.to_bits(), office_zoom(state)));
+    office_render(state);
+}
+
+/// Whole-number zoom for the room in the window it has.
+fn office_zoom(state: &State) -> i32 {
+    let (lw, lh) = state.office_scene.size();
+    (state.office_size.width / lw as f32)
+        .min(state.office_size.height / lh as f32)
+        .floor()
+        .max(1.0) as i32
+}
+
+/// Reseat and re-derive the room. Returns whether anything it draws changed.
+fn office_sync(state: &mut State) -> bool {
+    use agents_office::Desk;
+    // Who is running, in workspace then pane order, which is the order seats are
+    // handed out in and therefore the order desks fill.
+    let live: Vec<(String, Desk, String, String)> = state
+        .workspaces
+        .iter()
+        .flat_map(|ws| {
+            ws.panes.iter().filter_map(move |(_, d)| {
+                if !d.session.claude_running() {
+                    return None;
+                }
+                let lc = d.session.claude_status().lifecycle;
+                let desk = match pane_dot(true, lc, false) {
+                    Dot::Working => Desk::Working,
+                    Dot::Attention => Desk::Attention,
+                    _ => Desk::Ready,
+                };
+                Some((d.history_id.clone(), desk, ws.name.clone(), d.name.clone()))
+            })
+        })
+        .collect();
+
+    let ids: Vec<&str> = live.iter().map(|(h, ..)| h.as_str()).collect();
+    agents_office::reseat(
+        &mut state.office_seats,
+        &ids,
+        now_ms(),
+        OFFICE_SEAT_HOLD_MS,
+        OFFICE_MAX_ROWS,
+    );
+
+    let mut scene = agents_office::Scene {
+        desks: vec![Desk::Empty; state.office_seats.len()],
+        labels: vec![(String::new(), String::new()); state.office_seats.len()],
+        ..agents_office::Scene::default()
+    };
+    scene.weather = state.office_scene.weather;
+    scene.show_names = state.office_scene.show_names;
+    for (i, seat) in state.office_seats.iter().enumerate() {
+        let Some(s) = seat else { continue };
+        if let Some((_, desk, ws, pane)) = live.iter().find(|(h, ..)| *h == s.id) {
+            scene.desks[i] = *desk;
+            scene.labels[i] = (ws.clone(), pane.clone());
+        }
+    }
+    let changed = scene.desks != state.office_scene.desks
+        || scene.labels != state.office_scene.labels;
+    state.office_scene = scene;
+    changed
+}
+
+/// Draw the room into `office_frame` at the whole-number scale the window allows.
+fn office_render(state: &mut State) {
+    let (lw, lh) = state.office_scene.size();
+    let k = (state.office_size.width / lw as f32)
+        .min(state.office_size.height / lh as f32)
+        .floor()
+        .max(1.0) as i32;
+    let buf = agents_office::render_at(&state.office_scene, state.office_t, k);
+    state.office_frame =
+        Some(iced::widget::image::Handle::from_rgba(buf.w as u32, buf.h as u32, buf.px));
+}
+
+/// The Agents Office window: the room, and nothing else. The art is the drag
+/// region, with an occupied desk the only thing that takes a click instead.
+fn office_view(state: &State) -> Element<'_, Message> {
+    let (lw, lh) = state.office_scene.size();
+    let k = (state.office_size.width / lw as f32)
+        .min(state.office_size.height / lh as f32)
+        .floor()
+        .max(1.0);
+    let (iw, ih) = (lw as f32 * k, lh as f32 * k);
+
+    let room: Element<Message> = match &state.office_frame {
+        Some(h) => iced::widget::image(h.clone())
+            .width(iw)
+            .height(ih)
+            .content_fit(iced::ContentFit::Fill)
+            .filter_method(iced::widget::image::FilterMethod::Nearest)
+            .into(),
+        None => Space::new(Length::Fixed(iw), Length::Fixed(ih)).into(),
+    };
+    let drag: Element<Message> =
+        mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragOffice).into();
+
+    // Hit targets over the occupied desks only, built from the same constants the
+    // painter uses so the two cannot drift apart. A free desk is left transparent so
+    // the drag underneath it still works.
+    let mut grid = column![Space::new(
+        Length::Fill,
+        Length::Fixed(agents_office::CEIL_H as f32 * k)
+    )];
+    for r in 0..agents_office::rows(state.office_seats.len()) {
+        let mut band = row![];
+        for c in 0..agents_office::COLS {
+            let i = r as usize * agents_office::COLS + c;
+            let cell = Space::new(
+                Length::Fixed(agents_office::SLOT_W as f32 * k),
+                Length::Fixed(agents_office::ROW_H as f32 * k),
+            );
+            band = band.push(match state.office_seats.get(i).and_then(|s| s.as_ref()) {
+                Some(seat) => Element::from(
+                    mouse_area(cell)
+                        .on_press(Message::OfficeDeskClicked(seat.id.clone()))
+                        .interaction(iced::mouse::Interaction::Pointer),
+                ),
+                None => cell.into(),
+            });
+        }
+        grid = grid.push(band);
+    }
+
+    let stage = container(stack![room, drag, grid].width(iw).height(ih))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(|_: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(0x0d, 0x12, 0x18))),
+            ..Default::default()
+        });
+
+    #[cfg(target_os = "windows")]
+    {
+        stack![stage, resize_overlay()].into()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        stage.into()
+    }
+}
+
 /// Window settings for the overview popout at a (saved) size + optional position.
 /// Overview popout minimum size.
 const OVERVIEW_MIN_W: f32 = 200.0;
@@ -1378,6 +1599,53 @@ const WHEEL_FROZEN_MS: u64 = 800;
 /// layout, then the real one, 120 ms apart). The pane's frame is kept this long so neither
 /// repaint shows; the first frame after it waits for the output to settle.
 const WHEEL_NUDGE_HOLD_MS: u64 = 300;
+
+/// The Agents Office opens at, and never shrinks below, twice the room's logical
+/// size. The nameplates are drawn at the display's resolution into a floor strip
+/// measured against that zoom, so below it a plate does not fit.
+const OFFICE_SCALE: i32 = 2;
+/// Rows of desks the room will grow to before an agent has to wait for a seat.
+/// Four rows of five is twenty, which is past the point where anyone is reading
+/// faces; the overview stays the complete list.
+const OFFICE_MAX_ROWS: usize = 4;
+fn office_min_size() -> iced::Size {
+    iced::Size::new(
+        (agents_office::W * OFFICE_SCALE) as f32,
+        (agents_office::height(agents_office::COLS) * OFFICE_SCALE) as f32,
+    )
+}
+
+/// Window settings for the Agents Office popout. Borderless like the overview, but
+/// with nothing drawn in it except the room: no titlebar, no caption buttons.
+fn office_settings(size: iced::Size, pos: Option<iced::Point>) -> iced::window::Settings {
+    let mut settings = iced::window::Settings { size, ..Default::default() };
+    settings.min_size = Some(office_min_size());
+    if let Some(p) = pos {
+        settings.position = iced::window::Position::Specific(p);
+    }
+    // Undecorated on BOTH platforms, which is where this parts company with the
+    // overview. The overview keeps a transparent macOS titlebar so the native
+    // traffic lights stay usable in its left pad, but iced 0.13 offers no way to
+    // hide those, and three of them sitting on the ceiling of the room is not the
+    // window this is meant to be.
+    settings.decorations = false;
+    #[cfg(target_os = "windows")]
+    {
+        settings.platform_specific.undecorated_shadow = true;
+    }
+    settings
+}
+
+/// Open the Agents Office at its saved geometry, with the same post-open `move_to`
+/// the overview needs (see `open_overview`).
+fn open_office(size: iced::Size, pos: Option<iced::Point>) -> (iced::window::Id, Task<Message>) {
+    let (id, open) = iced::window::open(office_settings(size, pos));
+    let mut task = open.map(|_| Message::Noop);
+    if let Some(p) = pos {
+        task = Task::batch([task, iced::window::move_to(id, p)]);
+    }
+    (id, task)
+}
 
 fn overview_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
     let mut settings = iced::window::Settings { size, ..Default::default() };
@@ -1471,6 +1739,8 @@ fn save_session(state: &State) {
         main_window: Some(saved_window(state.main_size, state.main_pos)),
         overview_window: Some(saved_window(state.overview_size, state.overview_pos)),
         overview_visible: state.overview_window.is_some(),
+        office_window: Some(saved_window(state.office_size, state.office_pos)),
+        office_visible: state.office_window.is_some(),
         usage_org: state.usage_org.clone(),
         settings: state.settings.clone(),
         workspaces: state
@@ -1574,7 +1844,19 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
     false
 }
 
+/// Every message, then bring the office in line with whatever it changed.
+///
+/// A wrapper rather than a tail call inside `update_app`, because most of its arms
+/// return early; and rather than work in `view`, because `view` takes `&State` and
+/// iced rebuilds every window's tree on every message. Costs one `is_none()` when
+/// the office is closed.
 fn update(state: &mut State, message: Message) -> Task<Message> {
+    let task = update_app(state, message);
+    office_refresh(state);
+    task
+}
+
+fn update_app(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Files(m) => return files_pane::update(state, m),
         // A no-op: processing any message makes iced redraw, which is the whole point
@@ -2558,6 +2840,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.settings.show_wol_button = v;
             save_session(state);
         }
+        Message::ToggleAgentsOfficeSetting(v) => {
+            state.settings.show_agents_office = v;
+            save_session(state);
+            // Turning it off takes away the button and the chord, so an open window
+            // would be left with no way to dismiss it.
+            if !v {
+                if let Some(id) = state.office_window.take() {
+                    save_session(state);
+                    return iced::window::close(id);
+                }
+            }
+        }
         Message::Notify { title, body, target } => {
             if !state.settings.notifications {
                 return Task::none();
@@ -2636,6 +2930,43 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             save_session(state); // persist "overview open"
             return task;
         }
+        Message::DragOffice => {
+            // macOS: the manual drag follows the key window, which the press made
+            // the office. Same call as DragWindow and DragOverview.
+            #[cfg(target_os = "macos")]
+            trafficlights::begin_drag();
+            #[cfg(not(target_os = "macos"))]
+            if let Some(id) = state.office_window {
+                return iced::window::drag(id);
+            }
+        }
+        Message::OfficeDeskClicked(history_id) => {
+            // Slot -> history_id -> pane, never through `Session::id()`: a respawned
+            // session has a new id and the desk must not chase it.
+            let found = state.workspaces.iter().enumerate().find_map(|(wi, ws)| {
+                ws.panes.iter().find(|(_, d)| d.history_id == history_id).map(|(p, _)| (wi, *p))
+            });
+            if let Some((wi, pane)) = found {
+                return update_app(state, Message::JumpTo(wi, pane));
+            }
+        }
+        Message::OfficeTick => {
+            // The phase and nothing else; `office_refresh` below draws the frame.
+            state.office_t += OFFICE_FRAME_MS as f32 / 1000.0;
+        }
+        Message::ToggleAgentsOffice => {
+            if !state.settings.show_agents_office {
+                return Task::none();
+            }
+            if let Some(id) = state.office_window.take() {
+                save_session(state); // persist "office closed"
+                return iced::window::close(id);
+            }
+            let (id, task) = open_office(state.office_size, state.office_pos);
+            state.office_window = Some(id);
+            save_session(state); // persist "office open"
+            return task;
+        }
         Message::WindowClosed(id) => {
             if id == state.main_window {
                 // Capture the final layout (incl. each terminal's current cwd) on exit.
@@ -2645,6 +2976,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.overview_window == Some(id) {
                 state.overview_window = None;
                 save_session(state); // persist "overview closed" (e.g. via its own close button)
+            }
+            if state.office_window == Some(id) {
+                state.office_window = None;
+                save_session(state); // persist "office closed" (e.g. via Alt+F4)
             }
             // A card whose window went away on its own (ours are removed before closing).
             if let Some(i) = state.toasts.iter().position(|t| t.window == Some(id)) {
@@ -2656,11 +2991,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Ignore the minimized/off-screen sentinel so we don't persist (and
             // later restore to) an invisible position. Keep the last real one.
             if on_screen_ish(p) {
-                let known = id == state.main_window || state.overview_window == Some(id);
+                let known = id == state.main_window
+                    || state.overview_window == Some(id)
+                    || state.office_window == Some(id);
                 if id == state.main_window {
                     state.main_pos = Some(p);
                 } else if state.overview_window == Some(id) {
                     state.overview_pos = Some(p);
+                } else if state.office_window == Some(id) {
+                    state.office_pos = Some(p);
                 }
                 // Persist geometry as it changes, so it survives any exit path.
                 if known {
@@ -2695,15 +3034,39 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     iced::Size::new(s.width.max(OVERVIEW_MIN_W), s.height.max(OVERVIEW_MIN_H)),
                 );
             }
+            // The office is borderless too, so it needs the same clamp.
+            let is_office = state.office_window == Some(id);
+            let office_min = office_min_size();
+            if is_office
+                && s.width > 50.0
+                && s.height > 20.0
+                && (s.width < office_min.width || s.height < office_min.height)
+            {
+                return iced::window::resize(
+                    id,
+                    iced::Size::new(
+                        s.width.max(office_min.width),
+                        s.height.max(office_min.height),
+                    ),
+                );
+            }
             // Track + save real sizes; skip the degenerate minimized size (main uses a
             // 100x100 floor, the overview its own 100x40 minimum).
-            let (min_w, min_h) = if is_overview { (OVERVIEW_MIN_W, OVERVIEW_MIN_H) } else { (100.0, 100.0) };
+            let (min_w, min_h) = if is_overview {
+                (OVERVIEW_MIN_W, OVERVIEW_MIN_H)
+            } else if is_office {
+                (office_min.width, office_min.height)
+            } else {
+                (100.0, 100.0)
+            };
             if s.width >= min_w && s.height >= min_h {
-                let known = id == state.main_window || is_overview;
+                let known = id == state.main_window || is_overview || is_office;
                 if id == state.main_window {
                     state.main_size = s;
                 } else if is_overview {
                     state.overview_size = s;
+                } else if is_office {
+                    state.office_size = s;
                 }
                 if known {
                     save_session(state);
@@ -2867,7 +3230,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 if state.workspaces[ws].panes.get(pane).is_some() {
                     state.workspaces[ws].focus = pane;
                 }
-                return iced::window::gain_focus(state.main_window);
+                // Bring the window out of the taskbar, not just to the front: both
+                // callers (an overview row, an office desk) are reached from a
+                // popout that is perfectly usable while the main window is
+                // minimized, where a bare `gain_focus` does nothing visible. Same
+                // dance `ToastClick` does for the same reason.
+                #[cfg(target_os = "macos")]
+                trafficlights::activate_app();
+                let main = state.main_window;
+                #[cfg(target_os = "windows")]
+                let restore = iced::window::run_with_handle(main, |handle| {
+                    if let iced::window::raw_window_handle::RawWindowHandle::Win32(h) =
+                        handle.as_raw()
+                    {
+                        arbiter_native::notify::restore_if_minimized(h.hwnd.get());
+                    }
+                })
+                .map(|_| Message::Noop);
+                #[cfg(not(target_os = "windows"))]
+                let restore = Task::none();
+                return restore.chain(iced::window::gain_focus(main));
             }
         }
         Message::Copy(allow_interrupt) => {
@@ -2987,6 +3369,8 @@ fn split(ws: &mut Workspace, axis: pane_grid::Axis, cwd: Option<String>) {
 fn view(state: &State, window: iced::window::Id) -> Element<'_, Message> {
     if Some(window) == state.overview_window {
         overview_view(state)
+    } else if Some(window) == state.office_window {
+        office_view(state)
     } else if let Some(t) = state.toasts.iter().find(|t| t.window == Some(window)) {
         toast_window_view(t)
     } else {
@@ -3838,6 +4222,14 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     Message::ToggleOverviewTopmost,
                 ),
                 Space::with_height(Length::Fixed(8.0)),
+                settings_section("Agents Office"),
+                settings_toggle(
+                    "Show the Agents Office",
+                    Some("Experimental. One desk per running agent."),
+                    state.settings.show_agents_office,
+                    Message::ToggleAgentsOfficeSetting,
+                ),
+                Space::with_height(Length::Fixed(8.0)),
                 settings_section("Terminal"),
                 settings_number_row(
                     "Scrollback lines",
@@ -4095,7 +4487,7 @@ fn kbd_combo(keys: &str) -> Element<'static, Message> {
 /// The keyboard-shortcuts cheat sheet — a centred card listing every binding
 /// (Ctrl on all platforms, like the web).
 fn shortcuts_dialog_view() -> Element<'static, Message> {
-    const ROWS: [(&str, &str); 17] = [
+    const ROWS: [(&str, &str); 18] = [
         ("New workspace", "Ctrl + Shift + T"),
         ("Next workspace", "Ctrl + Tab"),
         ("Previous workspace", "Ctrl + Shift + Tab"),
@@ -4113,6 +4505,7 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
         ("Wake a machine (Wake on LAN)", "Ctrl + Shift + M"),
         ("Show a test notification", "Ctrl + Shift + P"),
         ("Toggle the file explorer", "Ctrl + Shift + F"),
+        ("Toggle the Agents Office", "Ctrl + Shift + G"),
     ];
     let mut list = column![].spacing(0);
     for (i, (action, keys)) in ROWS.iter().enumerate() {
@@ -5762,6 +6155,7 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let actions_w = (if state.settings.show_terminal_buttons { 216.0 } else { 104.0 })
         + (if state.settings.show_wol_button { 34.0 } else { 0.0 })
         + (if state.settings.show_file_explorer { 34.0 } else { 0.0 })
+        + (if state.settings.show_agents_office { 34.0 } else { 0.0 })
         + caption_w;
     let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
@@ -5861,6 +6255,17 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     }
     actions = actions
         .push(action_icon_btn(mdi_path::VIEW_DASHBOARD, Message::ToggleOverview, state.overview_window.is_some()));
+    // The Agents Office, beside the overview it is a sibling of, and deliberately to
+    // the LEFT of the Wake button: `wol_menu_view` anchors its dropdown with a fixed
+    // estimate of the buttons to that button's right, which anything inserted there
+    // would silently shift.
+    if state.settings.show_agents_office {
+        actions = actions.push(action_icon_btn(
+            mdi_path::DESK,
+            Message::ToggleAgentsOffice,
+            state.office_window.is_some(),
+        ));
+    }
     // Wake-on-LAN, right of the overview button, only when switched on in Settings.
     if state.settings.show_wol_button {
         actions = actions.push(action_icon_btn(mdi_path::ACCESS_POINT, Message::ToggleWolMenu, state.wol_menu.is_some()));
@@ -6878,6 +7283,8 @@ mod mdi_path {
     pub const CLOSE: &str = "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z";
     pub const REFRESH: &str = "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z";
     pub const VIEW_DASHBOARD: &str = "M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z";
+    // The Agents Office, whose room is a row of these.
+    pub const DESK: &str = "M3 6H21C21.55 6 22 6.45 22 7C22 7.55 21.55 8 21 8V19H19V17H15V19H13V8H5V19H3V8C2.45 8 2 7.55 2 7C2 6.45 2.45 6 3 6M16 10.5V11H18V10.5C18 10.22 17.78 10 17.5 10H16.5C16.22 10 16 10.22 16 10.5M16 14.5V15H18V14.5C18 14.22 17.78 14 17.5 14H16.5C16.22 14 16 14.22 16 14.5Z";
     pub const COG: &str = "M12,8A4,4 0 0,1 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12A4,4 0 0,1 12,8M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10M10,22C9.75,22 9.54,21.82 9.5,21.58L9.13,18.93C8.5,18.68 7.96,18.34 7.44,17.94L4.95,18.95C4.73,19.03 4.46,18.95 4.34,18.73L2.34,15.27C2.21,15.05 2.27,14.78 2.46,14.63L4.57,12.97L4.5,12L4.57,11L2.46,9.37C2.27,9.22 2.21,8.95 2.34,8.73L4.34,5.27C4.46,5.05 4.73,4.96 4.95,5.05L7.44,6.05C7.96,5.66 8.5,5.32 9.13,5.07L9.5,2.42C9.54,2.18 9.75,2 10,2H14C14.25,2 14.46,2.18 14.5,2.42L14.87,5.07C15.5,5.32 16.04,5.66 16.56,6.05L19.05,5.05C19.27,4.96 19.54,5.05 19.66,5.27L21.66,8.73C21.79,8.95 21.73,9.22 21.54,9.37L19.43,11L19.5,12L19.43,13L21.54,14.63C21.73,14.78 21.79,15.05 21.66,15.27L19.66,18.73C19.54,18.95 19.27,19.04 19.05,18.95L16.56,17.95C16.04,18.34 15.5,18.68 14.87,18.93L14.5,21.58C14.46,21.82 14.25,22 14,22H10M11.25,4L10.88,6.61C9.68,6.86 8.62,7.5 7.85,8.39L5.44,7.35L4.69,8.65L6.8,10.2C6.4,11.37 6.4,12.64 6.8,13.8L4.68,15.36L5.43,16.66L7.86,15.62C8.63,16.5 9.68,17.14 10.87,17.38L11.24,20H12.76L13.13,17.39C14.32,17.14 15.37,16.5 16.14,15.62L18.57,16.66L19.32,15.36L17.2,13.81C17.6,12.64 17.6,11.37 17.2,10.2L19.31,8.65L18.56,7.35L16.15,8.39C15.38,7.5 14.32,6.86 13.12,6.62L12.75,4H11.25Z";
     pub const ARROW_RIGHT: &str = "M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z";
     // Terminal context menu: copy / paste / select-all / clear-buffer.
@@ -8321,6 +8728,17 @@ fn subscription(state: &State) -> Subscription<Message> {
     } else {
         Subscription::none()
     };
+    // The room's own clock, and only while it is both open and showing a turn in
+    // flight. `Scene::animates()` is "is any desk working", so a closed office, a
+    // room of idle agents, one blocked on a prompt, and a rainy sky all cost nothing.
+    // It can only ever run inside a window where `needs_fast_tick` is already true,
+    // since a working desk requires a pane whose Claude is working, so it adds no
+    // frames the app was not drawing anyway.
+    let office = if state.office_window.is_some() && state.office_scene.animates() {
+        iced::time::every(Duration::from_millis(OFFICE_FRAME_MS)).map(|_| Message::OfficeTick)
+    } else {
+        Subscription::none()
+    };
     // Only the main window's keys drive the terminal (not the overview window),
     // and not when a widget already consumed the key — e.g. a focused text input
     // (Settings, rename) else the typed text leaks into the terminal.
@@ -8400,6 +8818,7 @@ fn subscription(state: &State) -> Subscription<Message> {
     });
     let base = Subscription::batch([
         tick,
+        office,
         keys,
         closes,
         geom,
@@ -8564,6 +8983,9 @@ fn handle_key(event: iced::Event) -> Option<Message> {
                     Some('p') => return Some(Message::TestNotification),
                     // F for folder. Plain Ctrl+F stays the terminal find bar.
                     Some('f') => return Some(Message::Files(files_pane::Msg::Toggle)),
+                    // Ctrl+G is BEL, which nobody sends on purpose, so taking the
+                    // shifted alias costs a terminal program nothing.
+                    Some('g') => return Some(Message::ToggleAgentsOffice),
                     _ => {} // c/v fall through to copy/paste below
                 }
             }
@@ -9287,6 +9709,9 @@ fn main() -> iced::Result {
     let title = |state: &State, id: iced::window::Id| {
         if state.overview_window == Some(id) {
             "Arbiter · Overview".to_string()
+        } else if state.office_window == Some(id) {
+            // Borderless, but it still has a taskbar entry and an Alt+Tab label.
+            "Arbiter · Agents Office".to_string()
         } else if state.toasts.iter().any(|t| t.window == Some(id)) {
             "Arbiter · Notification".to_string()
         } else {
@@ -9314,6 +9739,8 @@ fn main() -> iced::Result {
             let main_geom = saved.as_ref().and_then(|s| s.main_window);
             let overview_geom = saved.as_ref().and_then(|s| s.overview_window);
             let overview_was_open = saved.as_ref().map(|s| s.overview_visible).unwrap_or(false);
+            let office_geom = saved.as_ref().and_then(|s| s.office_window);
+            let office_was_open = saved.as_ref().map(|s| s.office_visible).unwrap_or(false);
             let saved_usage_org = saved.as_ref().and_then(|s| s.usage_org.clone());
             let saved_settings = saved.as_ref().map(|s| s.settings.clone()).unwrap_or_default();
             // Apply the saved scrollback before any terminal spawns so restored
@@ -9421,6 +9848,23 @@ fn main() -> iced::Result {
             } else {
                 None
             };
+
+            let office_min = office_min_size();
+            let office_size = office_geom
+                .map(|g| iced::Size::new(g.width, g.height))
+                .filter(|s| s.width >= office_min.width && s.height >= office_min.height)
+                .unwrap_or(office_min);
+            let office_pos = office_geom.and_then(point);
+            // Reopen the Agents Office too, and only while its setting is on: a save
+            // from when it was enabled must not reopen it for someone who has since
+            // turned it off and has no button to close it with.
+            let office_window = if office_was_open && saved_settings.show_agents_office {
+                let (of_id, of_task) = open_office(office_size, office_pos);
+                tasks.push(of_task.chain(iced::window::gain_focus(main_id)));
+                Some(of_id)
+            } else {
+                None
+            };
             // Learn the real display scale so the logo is rasterized 1:1 for it.
             tasks.push(iced::window::get_scale_factor(main_id).map(Message::ScaleChanged));
 
@@ -9442,6 +9886,15 @@ fn main() -> iced::Result {
                 main_pos: main_geom.and_then(point),
                 overview_size,
                 overview_pos,
+                office_window,
+                office_size,
+                office_pos,
+                office_seats: vec![None; agents_office::COLS],
+                office_scene: agents_office::Scene::default(),
+                office_frame: None,
+                office_key: None,
+                office_rev: 0,
+                office_t: 0.0,
                 main_focused: true,
                 wheel_nudge: 0,
                 main_maximized: false,

@@ -681,6 +681,76 @@ impl Scene {
     }
 }
 
+// ------------------------------------------------------------------ seats ---
+
+/// One desk's reservation: which agent sits there, and since when it has been gone.
+///
+/// The agent is named by the app's stable per-pane id, never by a session id: a
+/// session is re-minted when a pane reconnects or switches shell, and the desk must
+/// not move for either.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Seat {
+    pub id: String,
+    /// `Some(t)` since the sync first found this agent gone, `None` while it runs.
+    pub vacated_ms: Option<u64>,
+}
+
+/// Hand out desks, and take them back.
+///
+/// `live` is every agent currently running, in the order desks should fill.
+/// Reservations outlive a short absence by `hold_ms`, because a pane that
+/// reconnects or switches shell stops running Claude for seconds while its session
+/// is replaced; releasing the desk on that edge would re-seat the agent wherever
+/// happened to be free when it came back, which is [the founding
+/// rule](self#rules) broken invisibly.
+///
+/// Seats are never reordered and never stolen. Past `max_rows` an agent simply
+/// waits: there is no pagination, because state in an ambient display defeats the
+/// glance, and no preemption, because a desk that moves costs more than a desk that
+/// is missing.
+pub fn reseat(
+    seats: &mut Vec<Option<Seat>>,
+    live: &[&str],
+    now_ms: u64,
+    hold_ms: u64,
+    max_rows: usize,
+) {
+    for slot in seats.iter_mut() {
+        let Some(seat) = slot else { continue };
+        if live.contains(&seat.id.as_str()) {
+            seat.vacated_ms = None;
+        } else {
+            match seat.vacated_ms {
+                Some(at) if now_ms.saturating_sub(at) >= hold_ms => *slot = None,
+                Some(_) => {}
+                None => seat.vacated_ms = Some(now_ms),
+            }
+        }
+    }
+    for id in live {
+        if seats.iter().flatten().any(|s| s.id == *id) {
+            continue;
+        }
+        let seat = Seat { id: (*id).to_string(), vacated_ms: None };
+        match seats.iter().position(|s| s.is_none()) {
+            Some(i) => seats[i] = Some(seat),
+            None if seats.len() < COLS * max_rows => {
+                let base = seats.len();
+                seats.resize(base + COLS, None);
+                seats[base] = Some(seat);
+            }
+            None => break,
+        }
+    }
+    // Give back trailing empty rows so the room shrinks, keeping one row always.
+    while seats.len() > COLS && seats[seats.len() - COLS..].iter().all(|s| s.is_none()) {
+        seats.truncate(seats.len() - COLS);
+    }
+    if seats.len() < COLS {
+        seats.resize(COLS, None);
+    }
+}
+
 // ----------------------------------------------------------------- canvas ---
 
 /// An opaque RGBA buffer that only knows how to fill rectangles.
@@ -1711,6 +1781,60 @@ mod tests {
         }
         assert_eq!(s.desks.len(), COLS, "the first row is never removed");
         assert_eq!(s.occupied(), 0);
+    }
+
+    /// The founding rule, as seating: an agent keeps its desk for as long as it is
+    /// there, and across the gap while its pane respawns.
+    #[test]
+    fn a_seat_is_kept_through_a_respawn_and_freed_after_it() {
+        let mut seats = vec![None; COLS];
+        reseat(&mut seats, &["a", "b", "c"], 0, 20_000, 4);
+        assert_eq!(seats[1].as_ref().unwrap().id, "b");
+
+        // `b`'s pane reconnects: its session is replaced, so it stops running for a
+        // few seconds. Its desk must be waiting when it comes back.
+        reseat(&mut seats, &["a", "c"], 1_000, 20_000, 4);
+        assert_eq!(seats[1].as_ref().unwrap().id, "b", "freed mid-respawn");
+        reseat(&mut seats, &["a", "b", "c"], 4_000, 20_000, 4);
+        assert_eq!(seats[1].as_ref().unwrap().id, "b");
+        assert_eq!(seats[1].as_ref().unwrap().vacated_ms, None, "still marked gone");
+
+        // Quitting Claude for good gives the desk back, once the hold lapses.
+        reseat(&mut seats, &["a", "c"], 10_000, 20_000, 4);
+        assert!(seats[1].is_some(), "released before the hold was up");
+        reseat(&mut seats, &["a", "c"], 31_000, 20_000, 4);
+        assert!(seats[1].is_none(), "never released");
+        // And the freed desk is the next one handed out, not a new one.
+        reseat(&mut seats, &["a", "c", "d"], 32_000, 20_000, 4);
+        assert_eq!(seats[1].as_ref().unwrap().id, "d");
+        assert_eq!(seats[0].as_ref().unwrap().id, "a", "a moved");
+        assert_eq!(seats[2].as_ref().unwrap().id, "c", "c moved");
+    }
+
+    #[test]
+    fn the_room_grows_by_a_row_and_stops_at_the_cap() {
+        let mut seats = vec![None; COLS];
+        let ids: Vec<String> = (0..23).map(|i| format!("a{i}")).collect();
+        let live: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+        reseat(&mut seats, &live[..5], 0, 20_000, 4);
+        assert_eq!(seats.len(), COLS, "five fit one row");
+        reseat(&mut seats, &live[..6], 0, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 2, "the sixth opens a row");
+
+        // Past the cap the extra agents wait rather than displacing anyone.
+        reseat(&mut seats, &live, 0, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 4);
+        assert_eq!(seats.iter().flatten().count(), 20);
+        assert!(!seats.iter().flatten().any(|s| s.id == "a20"), "seated past the cap");
+        assert_eq!(seats[0].as_ref().unwrap().id, "a0", "a desk moved to fit one in");
+
+        // Losing a row's worth gives the rows back, but only once the hold is up:
+        // the first pass marks them gone, a later one releases them.
+        reseat(&mut seats, &live[..6], 99_000, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 4, "shrank before the hold was up");
+        reseat(&mut seats, &live[..6], 130_000, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 2);
     }
 
     #[test]

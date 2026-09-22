@@ -57,10 +57,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
   Sending hides the editor and focuses the terminal it went to.
 
 - **Agents Office, stage 1: a pixel-art room where one desk is one agent** (`src/agents_office.rs`).
-  Groundwork only — nothing is wired to a `Session` yet. `agents-office-demo` is a standalone
-  harness with fake desks and test buttons (`cargo run --bin agents-office-demo
-  --no-default-features`) whose only job is to answer whether the room reads at a glance
-  before any of it is connected. The room is drawn, not imported: every pixel is a
+  The room itself, which the entry below wires to the running agents.
+  `agents-office-demo` is a standalone harness with fake desks and test buttons
+  (`cargo run --bin agents-office-demo --no-default-features`) that drives it without an
+  app around it, and is what every judgement about the art was made on.
+  The room is drawn, not imported: every pixel is a
   rectangle fill, so the feature adds no asset files, no atlas, no dependency, and touches
   neither the CoreText nor the DirectWrite glyph path. Desks fill five to a row and the
   sixth opens a second row below, so the room grows downward like floors of a building
@@ -126,6 +127,21 @@ history belongs to the prior Tauri/Vue web app it replaced.
   the keyboard rather than behind it: drawn with the body they used to sit with, the
   keyboard painted over every hand that reached it, so a desk nobody was typing at looked
   like somebody sitting there with no arms.
+
+- **The Agents Office, behind an experimental switch.** Settings, Display, "Show the Agents
+  Office" (off by default) puts a desk button in the titlebar and on Ctrl+Shift+G, which
+  open a popout room showing every agent that is running, across every workspace. One desk
+  is one agent; a pane without Claude in it has none, so quitting Claude frees its desk
+  while the pane carries on as a shell. A desk is held for its agent for the life of that
+  pane, keyed on the pane rather than the session so a reconnect or a shell switch comes
+  back to the same seat, and the room grows a row at a time to twenty. Click a desk to jump
+  to that terminal, which now also lifts the main window out of the taskbar if it was
+  minimised (the overview's rows and the notification cards behave the same way). The
+  window is the art and nothing else: no titlebar, no caption buttons, and the room itself
+  is what you drag it by. Turning the setting off closes it, so it can never be left with
+  no way to dismiss it. Its clock runs at 12fps and only while some agent is mid-turn,
+  inside a window where the app was already drawing, so an open office over a quiet room
+  costs nothing at all.
 
 ### Fixed
 - **A chooser you opened yourself is not Claude asking for something.** Typing `/model`,

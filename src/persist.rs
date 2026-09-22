@@ -238,6 +238,12 @@ pub struct Settings {
     /// who only wants terminals. Off hides an open explorer without forgetting it.
     #[serde(default)]
     pub show_file_explorer: bool,
+    /// Offer the Agents Office: a titlebar button and Ctrl+Shift+G opening a popout
+    /// room where one desk is one running agent. Off by default, and experimental:
+    /// turning it off closes the window, so nothing is left without a way to dismiss
+    /// it.
+    #[serde(default)]
+    pub show_agents_office: bool,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -354,6 +360,7 @@ impl Default for Settings {
             notify_finished: true,
             split_keeps_cwd: true,
             show_file_explorer: false,
+            show_agents_office: false,
         }
     }
 }
@@ -371,6 +378,12 @@ pub struct SavedState {
     /// Whether the overview popout was open at save time → reopen it on startup.
     #[serde(default)]
     pub overview_visible: bool,
+    /// Agents Office popout geometry; defaulted likewise.
+    #[serde(default)]
+    pub office_window: Option<SavedWindow>,
+    /// Whether the Agents Office was open at save time → reopen it on startup.
+    #[serde(default)]
+    pub office_visible: bool,
     /// Chosen claude.ai org uuid for the usage bars (so the picker isn't re-shown).
     #[serde(default)]
     pub usage_org: Option<String>,
@@ -419,6 +432,8 @@ mod tests {
             main_window: Some(SavedWindow { width: 1200.0, height: 800.0, x: Some(10.0), y: Some(20.0) }),
             overview_window: None,
             overview_visible: true,
+            office_window: None,
+            office_visible: false,
             usage_org: None,
             settings: Settings::default(),
             workspaces: vec![
@@ -566,6 +581,8 @@ mod tests {
         assert!(!s.settings.show_fable_usage);
         // The file explorer is opt-in, and a save from before it existed has none.
         assert!(!s.settings.show_file_explorer);
+        // So is the Agents Office.
+        assert!(!s.settings.show_agents_office);
         assert!(s.workspaces[0].explorer.is_none());
         assert!(s.workspaces[0].editor_tabs.is_empty());
         match &s.workspaces[0].layout {
