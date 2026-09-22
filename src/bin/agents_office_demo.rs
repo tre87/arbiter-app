@@ -1,11 +1,11 @@
-//! Stage-1 harness for the Ops Floor (`arbiter_native::floor`).
+//! Stage-1 harness for the Agents Office (`arbiter_native::agents_office`).
 //!
 //! Fake desks and test buttons. Nothing here touches a `Session`, a PTY or
 //! `pane_dot()`: the point is to find out whether the room reads at a glance
 //! before any of that is wired up. Run it with:
 //!
 //! ```text
-//! cargo run --bin floor-demo --no-default-features
+//! cargo run --bin agents-office-demo --no-default-features
 //! ```
 //!
 //! The scale readout in the footer is the thing to watch as desks are added.
@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use arbiter_native::floor::{self, Desk, Scene, Weather};
+use arbiter_native::agents_office::{self as office, Desk, Scene, Weather};
 use iced::widget::{
     button, column, container, horizontal_space, image, mouse_area, row, stack, text, Space,
 };
@@ -135,7 +135,7 @@ impl Demo {
                 self.scene.selected = Some(i);
             }
             Msg::SpawnRow => {
-                for _ in 0..floor::COLS {
+                for _ in 0..office::COLS {
                     let n = self.scene.occupied();
                     let (ws, pane) = NAMES[n % NAMES.len()];
                     self.scene.spawn_named(Desk::Working, ws, pane);
@@ -232,7 +232,7 @@ impl Demo {
 
         // The room is enlarged inside `render_at`, not by the image widget, so the
         // nameplates can be drawn after the enlargement at their own size.
-        let buf = floor::render_at(&self.scene, self.t, k as i32);
+        let buf = office::render_at(&self.scene, self.t, k as i32);
         let pixels = image::Handle::from_rgba(buf.w as u32, buf.h as u32, buf.px);
         let room = image(pixels)
             .width(iw)
@@ -244,16 +244,16 @@ impl Demo {
         // layout constants the painter uses so the two cannot drift apart.
         let mut grid = column![Space::new(
             Length::Fill,
-            Length::Fixed(floor::CEIL_H as f32 * k)
+            Length::Fixed(office::CEIL_H as f32 * k)
         )];
-        for r in 0..floor::rows(self.scene.desks.len()) {
+        for r in 0..office::rows(self.scene.desks.len()) {
             let mut band = row![];
-            for c in 0..floor::COLS {
-                let i = r as usize * floor::COLS + c;
+            for c in 0..office::COLS {
+                let i = r as usize * office::COLS + c;
                 band = band.push(
                     mouse_area(Space::new(
-                        Length::Fixed(floor::SLOT_W as f32 * k),
-                        Length::Fixed(floor::ROW_H as f32 * k),
+                        Length::Fixed(office::SLOT_W as f32 * k),
+                        Length::Fixed(office::ROW_H as f32 * k),
                     ))
                     .on_press(Msg::Click(i))
                     .interaction(iced::mouse::Interaction::Pointer),
@@ -335,7 +335,7 @@ impl Demo {
             horizontal_space(),
             text(format!(
                 "{lw}×{lh} logical · {} rows · {}x · {} · {clock}",
-                floor::rows(self.scene.desks.len()),
+                office::rows(self.scene.desks.len()),
                 self.scale() as i32,
                 self.scene.weather.label()
             ))
@@ -350,7 +350,7 @@ impl Demo {
 }
 
 fn main() -> iced::Result {
-    iced::application("Arbiter · Ops Floor (stage 1)", Demo::update, Demo::view)
+    iced::application("Arbiter · Agents Office (stage 1)", Demo::update, Demo::view)
         .subscription(Demo::subscription)
         .theme(|_| iced::Theme::Dark)
         .window_size(WINDOW)

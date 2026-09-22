@@ -1,7 +1,7 @@
-//! The Ops Floor: a pixel-art room where one desk is one pane.
+//! The Agents Office: a pixel-art room where one desk is one agent.
 //!
 //! Stage 1 — geometry and the state read. Nothing here is wired to a real
-//! `Session`; `floor_demo` drives it with fake desks. The module is a pure
+//! `Session`; `agents_office_demo` drives it with fake desks. The module is a pure
 //! function from a `Scene` to a straight-RGBA buffer, so it unit-tests without a
 //! GPU and can later feed either `iced::widget::image` or the wgpu quad pipeline.
 //!
@@ -1919,7 +1919,7 @@ mod tests {
     fn save(b: &Buf, name: &str) -> std::path::PathBuf {
         let (w, h) = (b.w as u32, b.h as u32);
         let px = b.px.clone();
-        let dir = std::env::temp_dir().join("ops-floor");
+        let dir = std::env::temp_dir().join("agents-office");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{name}.png"));
         tiny_skia::Pixmap::from_vec(px, tiny_skia::IntSize::from_wh(w, h).unwrap())
@@ -1931,7 +1931,7 @@ mod tests {
     }
 
     /// Every frame a redesign has to answer for, in one directory:
-    /// `cargo test --lib floor::tests::sheet -- --ignored --nocapture`
+    /// `cargo test --lib agents_office::tests::sheet -- --ignored --nocapture`
     ///
     /// The point is to spend one look rather than ten. Judging pixel art means
     /// seeing it, and every correction this room has had so far came from an eye
@@ -1989,7 +1989,7 @@ mod tests {
 
     /// One frame, on demand, for looking at a particular sky or a particular
     /// point in an animation:
-    /// `FLOOR_WEATHER=snow FLOOR_T=3.25 cargo test --lib floor::tests::dump -- --ignored --nocapture`
+    /// `AGENTS_OFFICE_WEATHER=snow AGENTS_OFFICE_T=3.25 cargo test --lib agents_office::tests::dump -- --ignored --nocapture`
     #[test]
     #[ignore = "writes a file; run it when you want to look at the room"]
     fn dump() {
@@ -2000,12 +2000,12 @@ mod tests {
         for d in [Desk::Attention, Desk::Done, Desk::Idle, Desk::Ready] {
             s.spawn(d);
         }
-        s.weather = std::env::var("FLOOR_WEATHER")
+        s.weather = std::env::var("AGENTS_OFFICE_WEATHER")
             .ok()
             .and_then(|v| Weather::ALL.into_iter().find(|w| w.label() == v))
             .unwrap_or(Weather::Rain);
         s.selected = Some(5);
-        let t = std::env::var("FLOOR_T")
+        let t = std::env::var("AGENTS_OFFICE_T")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);

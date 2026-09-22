@@ -2,13 +2,13 @@
 //! binary (`main.rs`) and the Iced shell binary (`bin/iced_shell.rs`).
 
 pub mod about;
+pub mod agents_office;
 pub mod attach;
 pub mod claude;
 pub mod claude_shim;
 pub mod claude_status;
 pub mod editor;
 pub mod explorer;
-pub mod floor;
 pub mod font;
 pub mod git;
 pub mod memdiag;

@@ -20,11 +20,11 @@ name = "arbiter"
 path = "src/bin/iced_shell.rs"
 
 [[bin]]
-# Stage-1 harness for the Ops Floor pixel room (src/floor.rs). Fake desks and
+# Stage-1 harness for the Agents Office pixel room (src/agents_office.rs). Fake desks and
 # test buttons only, nothing wired to a real Session. Builds fastest with
 # --no-default-features (skips the usage-helper webview).
-name = "floor-demo"
-path = "src/bin/floor_demo.rs"
+name = "agents-office-demo"
+path = "src/bin/agents_office_demo.rs"
 
 # Desktop bundling (cargo-packager): produces Arbiter.app/.dmg (macOS) and an
 # NSIS installer (Windows, which also installs the WebView2 runtime the usage

@@ -56,9 +56,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   offers every terminal in the workspace. Arrows and Enter or a click choose, Escape cancels.
   Sending hides the editor and focuses the terminal it went to.
 
-- **Ops Floor, stage 1: a pixel-art room where one desk is one pane** (`src/floor.rs`).
-  Groundwork only — nothing is wired to a `Session` yet. `floor-demo` is a standalone
-  harness with fake desks and test buttons (`cargo run --bin floor-demo
+- **Agents Office, stage 1: a pixel-art room where one desk is one agent** (`src/agents_office.rs`).
+  Groundwork only — nothing is wired to a `Session` yet. `agents-office-demo` is a standalone
+  harness with fake desks and test buttons (`cargo run --bin agents-office-demo
   --no-default-features`) whose only job is to answer whether the room reads at a glance
   before any of it is connected. The room is drawn, not imported: every pixel is a
   rectangle fill, so the feature adds no asset files, no atlas, no dependency, and touches
@@ -74,7 +74,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
   clerestory of windows across the top carries the weather — clear, cloudy, rain, snow,
   fog, and one daylight sky — drawn once however many rows the room has, so the sky costs
   the same at one desk and at twenty; a sunny day spills past the sill but stops above the
-  desks, because reading an agent's state must never depend on the weather. Monitors face
+  desks, because reading an agent's state must never depend on the weather. A clear night
+  has a moon and a couple of thin clouds, and the moon and the sun take opposite sixths of
+  the middle window, so changing sky moves the light across the glass rather than swapping
+  one disc for another in the same hole. Monitors face
   the camera while the figure beside them stays in profile, so the screen can carry the
   state it is best at: Claude's own spinner turning while a turn is in flight (out of phase
   per desk, so five agents are not five copies of one frame, and paced well below a
@@ -93,10 +96,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   band of tiles, which read as a missing wall. Four rules are enforced by tests rather than by intent: a desk never
   moves, the working and attention colours are painted by nothing but those two states
   (checked across every sky and every pose), nothing is random (variety comes from a hash,
-  so any frame reproduces), and only real activity animates — a quiet room under a still
-  sky is a single image that needs no clock at all. Precipitation is the one piece of
-  decoration that does cost a clock, which `Weather::moves` makes explicit rather than
-  hiding. Light is structural rather than ambient: the room is dark, and what you see you
+  so any frame reproduces), and only real activity animates — a turn in flight is the one
+  thing in the room that earns a clock, so a room of agents that are idle, or blocked and
+  waiting on you, is a single image costing nothing. The andon over a blocked desk is lit
+  and steady rather than breathing, because an agent can sit on a permission prompt for
+  hours; rain and snow move only as a side effect of a clock some desk had already
+  justified, and stop where they are when the last turn ends. Light is structural rather
+  than ambient: the room is dark, and what you see you
   see because a particular lamp lit it. A ceiling fixture throws a cone down the wall
   behind each occupied desk and stays dark over a free one, the desk lamp pools on the
   desktop, the screen throws its state colour onto the face turned toward it and onto the
