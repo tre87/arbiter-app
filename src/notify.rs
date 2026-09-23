@@ -125,6 +125,126 @@ pub fn primary_work_area() -> Option<WorkArea> {
     None
 }
 
+/// Every display's work area, for asking whether a saved window position is on any
+/// of them. On Windows each monitor is scaled by its own DPI, which is exact for the
+/// monitor a window sits on and close enough to answer yes or no; `work_area_at` is
+/// the one to use for picking a monitor. Empty where the desktop cannot say.
+#[cfg(windows)]
+pub fn work_areas() -> Vec<WorkArea> {
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    unsafe extern "system" fn cb(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        let out = &mut *(data.0 as *mut Vec<WorkArea>);
+        let mut info =
+            MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut info).as_bool() {
+            let (mut dx, mut dy) = (96u32, 96u32);
+            let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+            let s = dx.max(1) as f32 / 96.0;
+            let w = info.rcWork;
+            out.push(WorkArea {
+                left: w.left as f32 / s,
+                top: w.top as f32 / s,
+                right: w.right as f32 / s,
+                bottom: w.bottom as f32 / s,
+            });
+        }
+        BOOL(1)
+    }
+
+    let mut found: Vec<WorkArea> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(cb),
+            LPARAM(&mut found as *mut Vec<WorkArea> as isize),
+        );
+    }
+    found
+}
+
+#[cfg(target_os = "macos")]
+pub fn work_areas() -> Vec<WorkArea> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    use objc2_foundation::NSRect;
+    let mut out = Vec::new();
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return out;
+        }
+        let count: usize = msg_send![screens, count];
+        if count == 0 {
+            return out;
+        }
+        // Flipped against the first screen, as in `work_area_at`.
+        let primary: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        let root: NSRect = msg_send![primary, frame];
+        for i in 0..count {
+            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            let v: NSRect = msg_send![screen, visibleFrame];
+            out.push(WorkArea {
+                left: v.origin.x as f32,
+                top: (root.size.height - v.origin.y - v.size.height) as f32,
+                right: (v.origin.x + v.size.width) as f32,
+                bottom: (root.size.height - v.origin.y) as f32,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn work_areas() -> Vec<WorkArea> {
+    Vec::new()
+}
+
+/// How much of a window's top edge has to be on a display for it to count as on
+/// screen: enough of the title bar to grab and drag it back.
+const GRAB_W: f32 = 120.0;
+const GRAB_H: f32 = 24.0;
+
+/// Where a window saved at `pos` with `size` should open on the displays there are
+/// now. A window whose title bar is on some display keeps its place, shrunk to that
+/// display if it has grown too big for it. One whose title bar is on none (saved at
+/// home on a monitor that is not here at work) opens centred on the primary display,
+/// shrunk to fit it. One never placed (`pos` is `None`) is left to the window manager,
+/// shrunk to the primary display. With no displays known, nothing changes.
+pub fn place_on_screen(
+    size: (f32, f32),
+    pos: Option<(f32, f32)>,
+    areas: &[WorkArea],
+    primary: Option<WorkArea>,
+) -> ((f32, f32), Option<(f32, f32)>) {
+    let Some(primary) = primary.or_else(|| areas.first().copied()) else {
+        return (size, pos);
+    };
+    let fit = |a: &WorkArea| (size.0.min(a.right - a.left), size.1.min(a.bottom - a.top));
+    let Some((x, y)) = pos else { return (fit(&primary), None) };
+    let grabbable = |a: &&WorkArea| {
+        let w = (x + size.0).min(a.right) - x.max(a.left);
+        let h = (y + GRAB_H).min(a.bottom) - y.max(a.top);
+        w >= GRAB_W.min(size.0) && h >= GRAB_H
+    };
+    if let Some(a) = areas.iter().find(grabbable) {
+        return (fit(a), Some((x, y)));
+    }
+    (fit(&primary), Some(centred_in(fit(&primary), &primary)))
+}
+
+/// The top-left that centres a window of `size` in `a`.
+pub fn centred_in(size: (f32, f32), a: &WorkArea) -> (f32, f32) {
+    (
+        a.left + ((a.right - a.left) - size.0).max(0.0) / 2.0,
+        a.top + ((a.bottom - a.top) - size.1).max(0.0) / 2.0,
+    )
+}
+
 /// The work area of the display `p` falls on, or the primary one when it falls on
 /// none. For putting a window somewhere on the screen it is already on, rather than
 /// dragging it back to the main display to do it.
@@ -346,5 +466,49 @@ mod tests {
         assert_eq!(data_len, SOUND.len() - 44);
         let seconds = data_len as f32 / (le32(24) as f32 * 2.0);
         assert!(seconds < 2.0, "{seconds} s");
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{place_on_screen, WorkArea};
+
+    const LAPTOP: WorkArea = WorkArea { left: 0.0, top: 25.0, right: 1512.0, bottom: 982.0 };
+    const EXTERNAL: WorkArea = WorkArea { left: 1512.0, top: 0.0, right: 4072.0, bottom: 1440.0 };
+
+    #[test]
+    fn a_window_on_a_display_keeps_its_place() {
+        let got = place_on_screen((1200.0, 800.0), Some((1700.0, 100.0)), &[LAPTOP, EXTERNAL], Some(LAPTOP));
+        assert_eq!(got, ((1200.0, 800.0), Some((1700.0, 100.0))));
+    }
+
+    // Saved at home on the external monitor; at work only the laptop is there.
+    #[test]
+    fn a_window_saved_on_a_missing_display_opens_centred_on_the_primary() {
+        let ((w, h), pos) = place_on_screen((1800.0, 1200.0), Some((2000.0, 100.0)), &[LAPTOP], Some(LAPTOP));
+        assert_eq!((w, h), (1512.0, 957.0), "shrunk to the laptop");
+        assert_eq!(pos, Some((0.0, 25.0)));
+        let (_, pos) = place_on_screen((800.0, 600.0), Some((-3000.0, 50.0)), &[LAPTOP], Some(LAPTOP));
+        assert_eq!(pos, Some((356.0, 203.5)));
+    }
+
+    // Mostly off the edge is fine while enough of the title bar is left to grab.
+    #[test]
+    fn a_window_with_its_title_bar_in_reach_stays_put() {
+        let (_, pos) = place_on_screen((800.0, 600.0), Some((1300.0, 900.0)), &[LAPTOP], Some(LAPTOP));
+        assert_eq!(pos, Some((1300.0, 900.0)));
+        // A title bar above the top of the screen cannot be grabbed.
+        let (_, pos) = place_on_screen((800.0, 600.0), Some((100.0, -200.0)), &[LAPTOP], Some(LAPTOP));
+        assert_eq!(pos, Some((356.0, 203.5)));
+    }
+
+    #[test]
+    fn a_window_never_placed_is_left_to_the_window_manager() {
+        assert_eq!(place_on_screen((2000.0, 600.0), None, &[LAPTOP], Some(LAPTOP)), ((1512.0, 600.0), None));
+    }
+
+    #[test]
+    fn with_no_displays_known_nothing_changes() {
+        assert_eq!(place_on_screen((800.0, 600.0), Some((5.0, 6.0)), &[], None), ((800.0, 600.0), Some((5.0, 6.0))));
     }
 }

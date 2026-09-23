@@ -8,6 +8,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **Ctrl+Shift+H brings every window back to the main display.** The main window is
+  centred there, the Overview goes to its top left corner and the Agents Office to its
+  top right, each sized to fit. It works from any of Arbiter's windows, so the one the
+  keyboard reaches can be the one that was lost; reach it through the taskbar or the
+  Dock first. Listed in the keyboard shortcuts.
 - **Aborting background agents ends the working state.** A pane is held as working while
   "Waiting for N background agents to finish" shows, but stopping the agents leaves that
   line in the transcript, with "All background agents stopped" under it, and the pane
@@ -190,6 +195,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
   without anything having to light up in a colour the room has reserved.
 
 ### Fixed
+- **A window saved on a monitor that is not connected opens on one that is.** Quitting
+  at home with Arbiter on an external monitor and starting it at work put the window
+  where that monitor had been, out of reach. At startup each window's saved position is
+  checked against the displays there are now: one whose title bar is on none of them
+  opens centred on the primary display, and one too big for its display is shrunk to
+  fit. On macOS and Windows alike.
 - **A shell Claude left running in the background keeps the pane working.** A turn that
   ends with a background shell still going (`✻ Brewed for 14m 1s · done 11:40 PM · 1 shell
   still running`) looked finished: the spinner stopped, the dot went idle and "Claude

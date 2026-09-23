@@ -823,6 +823,8 @@ enum Message {
     ToggleAgentsOfficeSetting(bool),
     /// Open the Agents Office window, or close it if it is already up.
     ToggleAgentsOffice,
+    /// Bring every window back onto the primary display (Ctrl+Shift+H).
+    ResetWindows,
     /// Drag the Agents Office window by its art.
     DragOffice,
     /// A desk was clicked; the payload is that agent's `history_id`.
@@ -2145,6 +2147,59 @@ fn move_workspace(state: &mut State, from: usize, to: usize) {
 }
 
 /// Build a `SavedWindow` from a tracked size + optional position.
+/// A saved window's size and position checked against the displays there are now, so
+/// a window saved on a monitor that is not connected opens on the primary one
+/// (`notify::place_on_screen`).
+fn on_current_screens(size: iced::Size, pos: Option<iced::Point>) -> (iced::Size, Option<iced::Point>) {
+    use arbiter_native::notify;
+    let ((w, h), pos) = notify::place_on_screen(
+        (size.width, size.height),
+        pos.map(|p| (p.x, p.y)),
+        &notify::work_areas(),
+        notify::primary_work_area(),
+    );
+    (iced::Size::new(w, h), pos.map(|(x, y)| iced::Point::new(x, y)))
+}
+
+/// Every window onto the primary display, sized to fit it: the main window centred,
+/// the overview in the top left corner, the office in the top right. For a window a
+/// monitor change has left somewhere no display shows, and for whoever has lost one.
+fn reset_windows(state: &mut State) -> Task<Message> {
+    use arbiter_native::notify;
+    let Some(a) = notify::primary_work_area() else { return Task::none() };
+    let fit = |s: iced::Size| iced::Size::new(s.width.min(a.right - a.left), s.height.min(a.bottom - a.top));
+    let mut tasks = Vec::new();
+
+    let main = fit(state.main_size);
+    let (x, y) = notify::centred_in((main.width, main.height), &a);
+    state.main_size = main;
+    state.main_pos = Some(iced::Point::new(x, y));
+    let id = state.main_window;
+    tasks.push(
+        iced::window::minimize(id, false)
+            .chain(iced::window::maximize(id, false))
+            .chain(iced::window::resize(id, main))
+            .chain(iced::window::move_to(id, iced::Point::new(x, y)))
+            .chain(iced::window::gain_focus(id)),
+    );
+    if let Some(id) = state.overview_window {
+        let size = fit(state.overview_size);
+        let p = iced::Point::new(a.left, a.top);
+        state.overview_size = size;
+        state.overview_pos = Some(p);
+        tasks.push(iced::window::resize(id, size).chain(iced::window::move_to(id, p)));
+    }
+    if let Some(id) = state.office_window {
+        let size = fit(state.office_size);
+        let p = iced::Point::new((a.right - size.width).max(a.left), a.top);
+        state.office_size = size;
+        state.office_pos = Some(p);
+        tasks.push(iced::window::resize(id, size).chain(iced::window::move_to(id, p)));
+    }
+    save_session(state);
+    Task::batch(tasks)
+}
+
 fn saved_window(size: iced::Size, pos: Option<iced::Point>) -> persist::SavedWindow {
     persist::SavedWindow {
         width: size.width,
@@ -3444,6 +3499,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 return iced::window::move_to(id, p);
             }
         }
+        Message::ResetWindows => return reset_windows(state),
         Message::ToggleAgentsOffice => {
             if !state.settings.show_agents_office {
                 return Task::none();
@@ -5007,7 +5063,7 @@ fn kbd_combo(keys: &str) -> Element<'static, Message> {
 /// The keyboard-shortcuts cheat sheet — a centred card listing every binding
 /// (Ctrl on all platforms, like the web).
 fn shortcuts_dialog_view() -> Element<'static, Message> {
-    const ROWS: [(&str, &str); 18] = [
+    const ROWS: [(&str, &str); 19] = [
         ("New workspace", "Ctrl + Shift + T"),
         ("Next workspace", "Ctrl + Tab"),
         ("Previous workspace", "Ctrl + Shift + Tab"),
@@ -5026,6 +5082,7 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
         ("Show a test notification", "Ctrl + Shift + P"),
         ("Toggle the file explorer", "Ctrl + Shift + F"),
         ("Toggle the Agents Office", "Ctrl + Shift + G"),
+        ("Bring all windows to the main display", "Ctrl + Shift + H"),
     ];
     let mut list = column![].spacing(0);
     for (i, (action, keys)) in ROWS.iter().enumerate() {
@@ -9391,6 +9448,18 @@ fn subscription(state: &State) -> Subscription<Message> {
                 _ => {}
             }
         }
+        // The way back for a window left off every display: taken from any of the
+        // app's windows, since the one the keyboard reaches may be the lost one.
+        if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) = &event
+        {
+            if modifiers.control() && modifiers.shift() && !modifiers.logo() && c.eq_ignore_ascii_case("h") {
+                return Some(Message::ResetWindows);
+            }
+        }
         if MAIN_WINDOW.get().copied() != Some(id) {
             return None;
         }
@@ -10458,14 +10527,13 @@ fn main() -> iced::Result {
                 if g.width >= 200.0 && g.height >= 150.0 {
                     settings.size = iced::Size::new(g.width, g.height);
                 }
-                if let (Some(x), Some(y)) = (g.x, g.y) {
-                    let p = iced::Point::new(x, y);
-                    // Ignore a saved off-screen sentinel (older builds could persist
-                    // the -32000 minimized position) — let the WM place the window so
-                    // it can't open invisible. Heals an already-corrupted session.json.
-                    if on_screen_ish(p) {
-                        settings.position = iced::window::Position::Specific(p);
-                    }
+                // Ignore a saved off-screen sentinel (older builds could persist the
+                // -32000 minimized position). Heals an already-corrupted session.json.
+                let saved_pos = g.x.zip(g.y).map(|(x, y)| iced::Point::new(x, y)).filter(|p| on_screen_ish(*p));
+                let (size, pos) = on_current_screens(settings.size, saved_pos);
+                settings.size = size;
+                if let Some(p) = pos {
+                    settings.position = iced::window::Position::Specific(p);
                 }
             }
             let main_size = settings.size;
@@ -10487,7 +10555,8 @@ fn main() -> iced::Result {
                 .map(|g| iced::Size::new(g.width, g.height))
                 .filter(|s| s.width >= 100.0 && s.height >= 40.0)
                 .unwrap_or(iced::Size::new(720.0, 520.0));
-            let overview_pos = overview_geom.and_then(point);
+            let (overview_size, overview_pos) =
+                on_current_screens(overview_size, overview_geom.and_then(point));
 
             // Reopen the overview popout if it was open at quit (matches the web).
             let mut tasks = vec![open.map(|_| Message::Noop)];
@@ -10509,7 +10578,7 @@ fn main() -> iced::Result {
                 .map(|g| iced::Size::new(g.width, g.height))
                 .filter(|s| s.width >= office_min.width && s.height >= office_min.height)
                 .unwrap_or(office_min);
-            let office_pos = office_geom.and_then(point);
+            let (office_size, office_pos) = on_current_screens(office_size, office_geom.and_then(point));
             // Reopen the Agents Office too, and only while its setting is on: a save
             // from when it was enabled must not reopen it for someone who has since
             // turned it off and has no button to close it with.
