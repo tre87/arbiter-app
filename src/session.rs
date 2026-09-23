@@ -595,7 +595,7 @@ pub fn set_ui_waker(f: Box<dyn Fn() + Send + Sync>) {
 }
 
 /// Wake the UI to redraw, if a waker is registered.
-pub(crate) fn wake_ui() {
+pub fn wake_ui() {
     if let Some(f) = UI_WAKER.get() {
         f();
     }

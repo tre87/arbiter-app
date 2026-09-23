@@ -1011,6 +1011,10 @@ async fn run_instance<P, C>(
                                 window.raw.request_redraw();
                             }
                             window.occluded = *occ;
+                            // VENDORED: and tell the app (`OCCLUSION_HOOK`).
+                            if let Some(hook) = conversion::OCCLUSION_HOOK.get() {
+                                hook(id, *occ);
+                            }
                         }
 
                         if matches!(

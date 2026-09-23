@@ -28,7 +28,9 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   (`git::file_status`, 4.7% of a core on an idle repo). Measure idle CPU after touching
   anything a watcher triggers.
 - **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`:
-  `iced_winit` (inactive notification windows) and `iced_widget` (two changes: the text
+  `iced_winit` (inactive notification windows, no present while occluded, and
+  `conversion::OCCLUSION_HOOK`, which tells the app a window was hidden or shown
+  again: macOS only, winit reports no occlusion on Windows) and `iced_widget` (two changes: the text
   editor hit-tests with the padding on swapped axes, and `Content` does not expose the
   editor whose scroll the line-number gutter is drawn from; see
   `vendor/iced_widget/ARBITER-FORK.md`). An iced upgrade means re-copying both from the

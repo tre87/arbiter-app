@@ -181,6 +181,9 @@ struct State {
     office_scale: f32,
     /// Rows of desks the window was last sized for (`office_grow`).
     office_rows: i32,
+    /// The office window is minimised: Windows reports that as a resize to nothing,
+    /// and winit sends no occlusion there (see `window_hidden`).
+    office_minimized: bool,
     /// Pointer inside the office window, which is when its one piece of chrome
     /// shows. The window is the art the rest of the time.
     office_hover: bool,
@@ -1480,6 +1483,7 @@ fn office_refresh(state: &mut State) -> Task<Message> {
         state.office_key = None;
         state.office_plates_key = None;
         state.office_rows = 1;
+        state.office_minimized = false;
         // Nor does it hold anything that belongs to having the window on screen.
         // Closing from the menu's own Close item would otherwise leave the menu
         // open, waiting to greet whoever opened the office next; and the pointer
@@ -3550,6 +3554,9 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             };
             // Moving to a monitor of another DPI reaches us as a resize, so the scale
             // factor is asked again with every one.
+            if is_office {
+                state.office_minimized = s.width < 1.0 || s.height < 1.0;
+            }
             let office_scale = if is_office {
                 iced::window::get_scale_factor(id).map(Message::OfficeScale)
             } else {
@@ -9353,7 +9360,10 @@ fn subscription(state: &State) -> Subscription<Message> {
     // since a working desk requires a pane whose Claude is working. What it adds is
     // 12 updates a second, each drawing the room at 1x; the plates and the zoom are
     // not redrawn by a tick.
-    let office = if state.office_window.is_some()
+    let office_seen = state
+        .office_window
+        .is_some_and(|id| !window_hidden(id) && !state.office_minimized);
+    let office = if office_seen
         && !state.office_frozen
         && state.office_scene.animates()
     {
@@ -10281,6 +10291,28 @@ fn install_panic_log() {
     }));
 }
 
+/// Windows winit reports fully hidden (the fork's `OCCLUSION_HOOK`; macOS only).
+static OCCLUDED: std::sync::Mutex<Vec<iced::window::Id>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs on the event loop as winit reports the change. The wake makes iced run an
+/// update, after which it asks for the subscriptions again, which is what starts or
+/// stops a clock that reads `window_hidden`.
+fn on_occluded(id: iced::window::Id, occluded: bool) {
+    let mut hidden = OCCLUDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    hidden.retain(|w| *w != id);
+    if occluded {
+        hidden.push(id);
+    }
+    drop(hidden);
+    arbiter_native::session::wake_ui();
+}
+
+/// Whether a window cannot be seen: occluded (macOS), or minimised, which Windows
+/// reports as a resize to nothing and the office records as `office_minimized`.
+fn window_hidden(id: iced::window::Id) -> bool {
+    OCCLUDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&id)
+}
+
 fn main() -> iced::Result {
     // Re-spawned as the usage-helper webview process (same binary, own process).
     // Run the helper loop and never start the GUI (avoids recursive spawning).
@@ -10315,6 +10347,7 @@ fn main() -> iced::Result {
     }
 
     install_panic_log();
+    let _ = iced_winit::conversion::OCCLUSION_HOOK.set(on_occluded);
     arbiter_native::memdiag::start_summary_thread();
     // One graphics backend, chosen by a probe (see `gpu::windows_backend`). A WGPU_BACKEND
     // the user set themselves is respected.
@@ -10522,6 +10555,7 @@ fn main() -> iced::Result {
                 office_ticks: 0,
                 office_scale: 1.0,
                 office_rows: 1,
+                office_minimized: false,
                 office_hover: false,
                 office_menu: false,
                 office_fold: OfficeFold::None,

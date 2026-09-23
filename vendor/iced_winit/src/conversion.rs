@@ -17,6 +17,13 @@ use crate::core::{Event, Point, Size};
 pub static NEXT_WINDOW_INACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Arbiter's addition: called with a window's id whenever winit reports it occluded
+/// (`true`: fully hidden, minimised, on another Space) or visible again. iced has no
+/// event for it, and the app needs it to stop an animation nobody can see. macOS
+/// reports it; winit does not on Windows. Set once, before the first window opens.
+pub static OCCLUSION_HOOK: std::sync::OnceLock<fn(window::Id, bool)> =
+    std::sync::OnceLock::new();
+
 /// Converts some [`window::Settings`] into some `WindowAttributes` from `winit`.
 pub fn window_attributes(
     settings: window::Settings,
