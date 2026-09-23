@@ -2259,7 +2259,10 @@ fn key_binding(
     if modal_up || !matches!(kp.status, text_editor::Status::Focused) {
         return None;
     }
-    let (cmd, shift, alt) = (kp.modifiers.command(), kp.modifiers.shift(), kp.modifiers.alt());
+    // Ctrl on every platform, as the rest of the app's shortcuts are, and Cmd too on
+    // macOS, where iced's own bindings and every other editor expect it.
+    let cmd = kp.modifiers.command() || kp.modifiers.control();
+    let (shift, alt) = (kp.modifiers.shift(), kp.modifiers.alt());
     let files = |m: Msg| Some(Binding::Custom(Message::Files(m)));
     match kp.key.as_ref() {
         // Page motion is computed from the buffer height, which is unbounded
@@ -2281,7 +2284,11 @@ fn key_binding(
             // Closing a hidden terminal by accident would be unrecoverable, so
             // both spellings close the tab instead.
             "w" => files(Msg::TabClose(active)),
-            "c" | "x" | "v" | "a" => Binding::from_key_press(kp),
+            // Spelled out: iced's defaults answer to Cmd alone on macOS.
+            "c" => Some(Binding::Copy),
+            "x" => Some(Binding::Cut),
+            "v" => Some(Binding::Paste),
+            "a" => Some(Binding::SelectAll),
             // Ctrl+1..9 and the Ctrl+Shift chords stay with the app.
             d if d.chars().all(|ch| ch.is_ascii_digit()) => None,
             _ if shift => None,
