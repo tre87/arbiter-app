@@ -160,13 +160,27 @@ struct State {
     /// is a couple of megabytes, which is not a thing to rebuild on every PTY wake.
     /// Same bargain as `gpu::FrameKey` for the terminals.
     office_scene: agents_office::Scene,
+    /// The room at 1x; the image widget enlarges it by a whole number of physical
+    /// pixels (`office_fit`), so an animation frame costs the room's own size.
     office_frame: Option<iced::widget::image::Handle>,
-    /// What `office_frame` was drawn for: scene revision, animation phase, zoom.
-    office_key: Option<(u64, u32, i32)>,
+    /// What `office_frame` was drawn for: scene revision, animation tick.
+    office_key: Option<(u64, u64)>,
+    /// Each desk's nameplate, drawn at the zoom the room is shown at, by slot. Plates
+    /// do not animate, so they are redrawn only when the room or the zoom changes.
+    office_plates: Vec<Option<iced::widget::image::Handle>>,
+    /// What `office_plates` was drawn for: scene revision, physical zoom.
+    office_plates_key: Option<(u64, i32)>,
     /// Bumped whenever `office_sync` finds something the room draws has moved.
     office_rev: u64,
-    /// Seconds since the office opened, the room's animation clock.
-    office_t: f32,
+    /// Ticks of the room's animation clock since the app started (`office_t`). A
+    /// count rather than accumulated seconds: an f32 summed 12 times a second stops
+    /// advancing after a few weeks of working time.
+    office_ticks: u64,
+    /// The office window's scale factor, so the room's pixels land on whole physical
+    /// pixels at 125% and 150% too.
+    office_scale: f32,
+    /// Rows of desks the window was last sized for (`office_grow`).
+    office_rows: i32,
     /// Pointer inside the office window, which is when its one piece of chrome
     /// shows. The window is the art the rest of the time.
     office_hover: bool,
@@ -812,6 +826,8 @@ enum Message {
     OfficeDeskClicked(String),
     /// The room's own 12fps clock, live only while a turn is in flight.
     OfficeTick,
+    /// The office window's scale factor, asked for when it opens or resizes.
+    OfficeScale(f32),
     /// The pointer entered or left the office window; its chrome follows.
     OfficeHover(bool),
     /// Open or close the gear's dropdown.
@@ -1456,10 +1472,14 @@ const OFFICE_FRAME_MS: u64 = 83;
 /// does. A seat is taken for the life of that pane and released once Claude has been
 /// gone longer than [`OFFICE_SEAT_HOLD_MS`], so quitting Claude frees the desk while
 /// the pane carries on as a shell, and a reconnect keeps it.
-fn office_refresh(state: &mut State) {
+fn office_refresh(state: &mut State) -> Task<Message> {
     if state.office_window.is_none() {
-        // A frame is a couple of megabytes; a closed window holds none.
+        // A closed window holds no frame.
         state.office_frame = None;
+        state.office_plates.clear();
+        state.office_key = None;
+        state.office_plates_key = None;
+        state.office_rows = 1;
         // Nor does it hold anything that belongs to having the window on screen.
         // Closing from the menu's own Close item would otherwise leave the menu
         // open, waiting to greet whoever opened the office next; and the pointer
@@ -1471,27 +1491,97 @@ fn office_refresh(state: &mut State) {
         state.office_hover = false;
         state.office_hovered = None;
         state.office_frozen = false;
-        return;
+        return Task::none();
     }
-    let changed = office_sync(state);
-    let key = (state.office_rev, state.office_t.to_bits(), office_zoom(state));
-    if !changed && state.office_key == Some(key) {
-        return;
-    }
-    if changed {
+    if office_sync(state) {
         state.office_rev += 1;
     }
-    state.office_key = Some((state.office_rev, state.office_t.to_bits(), office_zoom(state)));
-    office_render(state);
+    let key = (state.office_rev, state.office_ticks);
+    if state.office_key != Some(key) {
+        state.office_key = Some(key);
+        let buf = agents_office::render(&state.office_scene, office_t(state));
+        state.office_frame =
+            Some(iced::widget::image::Handle::from_rgba(buf.w as u32, buf.h as u32, buf.px));
+    }
+    let (kp, _) = office_fit(state);
+    let plates_key = (state.office_rev, kp);
+    if state.office_plates_key != Some(plates_key) {
+        state.office_plates_key = Some(plates_key);
+        office_draw_plates(state, kp);
+    }
+    office_grow(state)
 }
 
-/// Whole-number zoom for the room in the window it has.
-fn office_zoom(state: &State) -> i32 {
+/// The animation clock in seconds. Wrapped at an hour so the f32 keeps its precision;
+/// the one discontinuity an hour of working time brings is a single frame.
+fn office_t(state: &State) -> f32 {
+    const WRAP: u64 = 3_600_000 / OFFICE_FRAME_MS;
+    (state.office_ticks % WRAP) as f32 * OFFICE_FRAME_MS as f32 / 1000.0
+}
+
+/// How the room fits the window: `(kp, unit)`, where `kp` is the whole number of
+/// physical pixels per room pixel and `unit` the same in logical pixels, which is
+/// what layout works in. `kp` is 0 when the window is too small even for 1x, and the
+/// room is then shrunk to fit with uneven pixels rather than cut off.
+fn office_fit(state: &State) -> (i32, f32) {
     let (lw, lh) = state.office_scene.size();
-    (state.office_size.width / lw as f32)
-        .min(state.office_size.height / lh as f32)
-        .floor()
-        .max(1.0) as i32
+    let (w, h) = (state.office_size.width, state.office_size.height);
+    let s = state.office_scale;
+    let kp = (w * s / lw as f32).min(h * s / lh as f32).floor() as i32;
+    if kp >= 1 {
+        (kp, kp as f32 / s)
+    } else {
+        (0, (w / lw as f32).min(h / lh as f32))
+    }
+}
+
+fn office_draw_plates(state: &mut State, kp: i32) {
+    let scene = &state.office_scene;
+    state.office_plates = scene
+        .desks
+        .iter()
+        .enumerate()
+        .map(|(i, desk)| {
+            if !scene.show_names || *desk == agents_office::Desk::Empty {
+                return None;
+            }
+            let (ws, pane) = scene.labels.get(i)?;
+            let b = agents_office::plate(ws, pane, kp)?;
+            Some(iced::widget::image::Handle::from_rgba(b.w as u32, b.h as u32, b.px))
+        })
+        .collect();
+}
+
+/// A new row of desks grows the window to show it at `OFFICE_SCALE`, as far as the
+/// screen allows; the minimum size is one row, and a room squeezed into it would draw
+/// at 1x, where the nameplates do not fit. Never shrinks the window: rows emptying out
+/// is not a reason to move what the user sized.
+fn office_grow(state: &mut State) -> Task<Message> {
+    let rows = agents_office::rows(state.office_seats.len());
+    let grew = rows > state.office_rows;
+    state.office_rows = rows;
+    let Some(id) = state.office_window else { return Task::none() };
+    if !grew {
+        return Task::none();
+    }
+    let (lw, lh) = state.office_scene.size();
+    let mut want = iced::Size::new(
+        state.office_size.width.max((lw * OFFICE_SCALE) as f32),
+        state.office_size.height.max((lh * OFFICE_SCALE) as f32),
+    );
+    if let Some(a) = state.office_pos.and_then(|p| {
+        arbiter_native::notify::work_area_at((
+            p.x + state.office_size.width / 2.0,
+            p.y + state.office_size.height / 2.0,
+        ))
+    }) {
+        want.width = want.width.min(a.right - a.left).max(state.office_size.width);
+        want.height = want.height.min(a.bottom - a.top).max(state.office_size.height);
+    }
+    if want == state.office_size {
+        return Task::none();
+    }
+    iced::window::resize(id, want)
 }
 
 /// Reseat and re-derive the room. Returns whether anything it draws changed.
@@ -1536,7 +1626,7 @@ fn office_sync(state: &mut State) -> bool {
     // is working. So the weather changes through working time and holds wherever it
     // was when the room goes quiet, and it can never be the reason a frame is drawn.
     scene.weather = if state.settings.office_weather_auto {
-        agents_office::Weather::drifting(state.office_t)
+        agents_office::Weather::drifting(office_t(state))
     } else {
         agents_office::Weather::ALL
             [state.settings.office_weather.min(agents_office::Weather::ALL.len() - 1)]
@@ -1561,26 +1651,11 @@ fn office_sync(state: &mut State) -> bool {
     changed
 }
 
-/// Draw the room into `office_frame` at the whole-number scale the window allows.
-fn office_render(state: &mut State) {
-    let (lw, lh) = state.office_scene.size();
-    let k = (state.office_size.width / lw as f32)
-        .min(state.office_size.height / lh as f32)
-        .floor()
-        .max(1.0) as i32;
-    let buf = agents_office::render_at(&state.office_scene, state.office_t, k);
-    state.office_frame =
-        Some(iced::widget::image::Handle::from_rgba(buf.w as u32, buf.h as u32, buf.px));
-}
-
 /// The Agents Office window: the room, and nothing else. The art is the drag
 /// region, with an occupied desk the only thing that takes a click instead.
 fn office_view(state: &State) -> Element<'_, Message> {
     let (lw, lh) = state.office_scene.size();
-    let k = (state.office_size.width / lw as f32)
-        .min(state.office_size.height / lh as f32)
-        .floor()
-        .max(1.0);
+    let (kp, k) = office_fit(state);
     let (iw, ih) = (lw as f32 * k, lh as f32 * k);
 
     let room: Element<Message> = match &state.office_frame {
@@ -1609,10 +1684,28 @@ fn office_view(state: &State) -> Element<'_, Message> {
         let mut band = row![];
         for c in 0..agents_office::COLS {
             let i = r as usize * agents_office::COLS + c;
-            let cell = Space::new(
-                Length::Fixed(agents_office::SLOT_W as f32 * k),
-                Length::Fixed(agents_office::ROW_H as f32 * k),
-            );
+            // The plate sits in the cell's floor strip, drawn at the physical zoom, so
+            // it lands 1:1 on the screen's pixels.
+            let plate = state.office_plates.get(i).and_then(|p| p.clone());
+            let cell: Element<Message> = match plate {
+                Some(h) => column![
+                    Space::new(
+                        Length::Fixed(agents_office::SLOT_W as f32 * k),
+                        Length::Fixed((agents_office::ROW_H - agents_office::STRIP_H) as f32 * k),
+                    ),
+                    iced::widget::image(h)
+                        .width(agents_office::SLOT_W as f32 * k)
+                        .height(agents_office::STRIP_H as f32 * k)
+                        .content_fit(iced::ContentFit::Fill)
+                        .filter_method(iced::widget::image::FilterMethod::Nearest),
+                ]
+                .into(),
+                None => Space::new(
+                    Length::Fixed(agents_office::SLOT_W as f32 * k),
+                    Length::Fixed(agents_office::ROW_H as f32 * k),
+                )
+                .into(),
+            };
             band = band.push(match state.office_seats.get(i).and_then(|s| s.as_ref()) {
                 Some(seat) => Element::from(
                     mouse_area(cell)
@@ -1627,11 +1720,15 @@ fn office_view(state: &State) -> Element<'_, Message> {
         grid = grid.push(band);
     }
 
+    // Centred on a whole physical pixel: half of an odd margin would put every room
+    // pixel on a boundary, where nearest sampling picks columns unevenly.
+    let s = state.office_scale;
+    let snap = |free: f32| if kp > 0 { ((free * s / 2.0).floor() / s).max(0.0) } else { (free / 2.0).max(0.0) };
+    let (left, top) = (snap(state.office_size.width - iw), snap(state.office_size.height - ih));
     let stage = container(stack![room, drag, grid].width(iw).height(ih))
         .width(Length::Fill)
         .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
+        .padding(iced::Padding { top, left, right: 0.0, bottom: 0.0 })
         .style(|_: &iced::Theme| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(0x0d, 0x12, 0x18))),
             ..Default::default()
@@ -1934,6 +2031,23 @@ fn office_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) ->
 
 /// Open the Agents Office at its saved geometry, with the same post-open `move_to`
 /// the overview needs (see `open_overview`).
+/// The office is a picture at a whole-number zoom; half a screen is not one of those,
+/// so it opts out of the desktop's drag-to-edge tiling.
+fn office_no_tiling(id: iced::window::Id) -> Task<Message> {
+    iced::window::run_with_handle(id, |handle| {
+        #[cfg(target_os = "windows")]
+        if let iced::window::raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+            arbiter_native::notify::disable_snap(h.hwnd.get());
+        }
+        #[cfg(target_os = "macos")]
+        if let iced::window::raw_window_handle::RawWindowHandle::AppKit(h) = handle.as_raw() {
+            arbiter_native::notify::disable_snap_view(h.ns_view.as_ptr());
+        }
+        let _ = &handle;
+    })
+    .map(|_| Message::Noop)
+}
+
 fn open_office(
     size: iced::Size,
     pos: Option<iced::Point>,
@@ -2152,8 +2266,8 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
 /// the office is closed.
 fn update(state: &mut State, message: Message) -> Task<Message> {
     let task = update_app(state, message);
-    office_refresh(state);
-    task
+    let office = office_refresh(state);
+    Task::batch([task, office])
 }
 
 fn update_app(state: &mut State, message: Message) -> Task<Message> {
@@ -3254,7 +3368,12 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::OfficeTick => {
             // The phase and nothing else; `office_refresh` below draws the frame.
-            state.office_t += OFFICE_FRAME_MS as f32 / 1000.0;
+            state.office_ticks += 1;
+        }
+        Message::OfficeScale(s) => {
+            if s > 0.0 {
+                state.office_scale = s;
+            }
         }
         Message::OfficeHover(on) => {
             state.office_hover = on;
@@ -3277,10 +3396,14 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             state.settings.office_topmost = v;
             save_session(state);
             if let Some(id) = state.office_window {
+                // winit rewrites the whole window style when the level changes, which
+                // puts back the maximize box `disable_snap` took away, and with it
+                // Aero Snap; so the tweak is applied again after.
                 return iced::window::change_level(
                     id,
                     if v { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal },
-                );
+                )
+                .chain(office_no_tiling(id));
             }
         }
         Message::OfficeShowNames(v) => {
@@ -3420,6 +3543,13 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             } else {
                 (100.0, 100.0)
             };
+            // Moving to a monitor of another DPI reaches us as a resize, so the scale
+            // factor is asked again with every one.
+            let office_scale = if is_office {
+                iced::window::get_scale_factor(id).map(Message::OfficeScale)
+            } else {
+                Task::none()
+            };
             if s.width >= min_w && s.height >= min_h {
                 let known = id == state.main_window || is_overview || is_office;
                 if id == state.main_window {
@@ -3458,6 +3588,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             if state.overview_window == Some(id) {
                 return iced::window::get_maximized(id).map(Message::SetOverviewMaximized);
             }
+            return office_scale;
         }
         Message::WindowOpened(id, pos, size) => {
             #[cfg(target_os = "macos")]
@@ -3497,24 +3628,10 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 save_session(state);
             }
             if state.office_window == Some(id) {
-                // The office is a picture at a whole-number zoom; half a screen is not
-                // one of those, so it opts out of the desktop's drag-to-edge tiling.
-                return iced::window::run_with_handle(id, |handle| {
-                    #[cfg(target_os = "windows")]
-                    if let iced::window::raw_window_handle::RawWindowHandle::Win32(h) =
-                        handle.as_raw()
-                    {
-                        arbiter_native::notify::disable_snap(h.hwnd.get());
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let iced::window::raw_window_handle::RawWindowHandle::AppKit(h) =
-                        handle.as_raw()
-                    {
-                        arbiter_native::notify::disable_snap_view(h.ns_view.as_ptr());
-                    }
-                    let _ = &handle;
-                })
-                .map(|_| Message::Noop);
+                return Task::batch([
+                    office_no_tiling(id),
+                    iced::window::get_scale_factor(id).map(Message::OfficeScale),
+                ]);
             }
             if id == state.main_window {
                 // Launched from `cargo run` (no `.app` bundle) the app starts inactive, so
@@ -9228,8 +9345,9 @@ fn subscription(state: &State) -> Subscription<Message> {
     // flight. `Scene::animates()` is "is any desk working", so a closed office, a
     // room of idle agents, one blocked on a prompt, and a rainy sky all cost nothing.
     // It can only ever run inside a window where `needs_fast_tick` is already true,
-    // since a working desk requires a pane whose Claude is working, so it adds no
-    // frames the app was not drawing anyway.
+    // since a working desk requires a pane whose Claude is working. What it adds is
+    // 12 updates a second, each drawing the room at 1x; the plates and the zoom are
+    // not redrawn by a tick.
     let office = if state.office_window.is_some()
         && !state.office_frozen
         && state.office_scene.animates()
@@ -10393,8 +10511,12 @@ fn main() -> iced::Result {
                 office_scene: agents_office::Scene::default(),
                 office_frame: None,
                 office_key: None,
+                office_plates: Vec::new(),
+                office_plates_key: None,
                 office_rev: 0,
-                office_t: 0.0,
+                office_ticks: 0,
+                office_scale: 1.0,
+                office_rows: 1,
                 office_hover: false,
                 office_menu: false,
                 office_fold: OfficeFold::None,
