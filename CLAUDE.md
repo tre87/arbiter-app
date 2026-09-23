@@ -27,7 +27,8 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   change and runs the status again, forever. The explorer shipped that loop once
   (`git::file_status`, 4.7% of a core on an idle repo). Measure idle CPU after touching
   anything a watcher triggers.
-- **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`:
+- **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`, and so is
+  `wgpu-hal` (the DX12 swapchain presents 1:1, see the graphics bullet under Memory):
   `iced_winit` (inactive notification windows, no present while occluded, and
   `conversion::OCCLUSION_HOOK`, which tells the app a window was hidden or shown
   again: macOS only, winit reports no occlusion on Windows) and `iced_widget` (two changes: the text
@@ -263,16 +264,21 @@ crafted `session.json` files. Findings that shape the code:
   allocation site in this tree or its dependencies, and `ARBITER_MEM_DIAG` saw none in
   isolated runs. The best-fitting owner is the NVIDIA in-game overlay's capture hook
   (`nvspcap64.dll` was loaded in the process). Disable the overlay to test.
-- **Windows asks wgpu for Vulkan alone, after a probe** (`gpu::windows_backend`, set as
-  `WGPU_BACKEND` in `main`). Pinning DX12 to save the Vulkan and OpenGL driver DLLs drew
-  every unmaximised window blurry (2026-09-21): wgpu-hal creates the DXGI swapchain with
-  `DXGI_SCALING_STRETCH`, and winit's `undecorated_shadow` hack (`WM_NCCALCSIZE`:
+- **Windows asks wgpu for DX12 alone, after a probe** (`gpu::windows_backend`, set as
+  `WGPU_BACKEND` in `main`; Settings, Display, Graphics names the one in use). Order: DX12
+  on a hardware adapter (WARP is always listed, so it does not count), then Vulkan, then
+  WARP with a message box. Vulkan was the default until 2026-09-23 and flickers every
+  textured thing on Intel graphics (Core Ultra 5 225U, latest driver); DX12 does not.
+  DX12 used to draw every unmaximised window blurry: wgpu-hal created the DXGI swapchain
+  with `DXGI_SCALING_STRETCH`, and winit's `undecorated_shadow` hack (`WM_NCCALCSIZE`:
   `top += 1; bottom += 1`) makes the client rect one row taller than the window shows, so
   DWM squeezed the frame by a pixel: edges crisp at the top, half a pixel soft mid-window,
   the phase drifting one pixel over the height. Confirmed by measuring the user's
-  screenshot, not by theory. A maximised window takes winit's other `WM_NCCALCSIZE` branch
-  and is unaffected. Vulkan presents 1:1. Only a machine with no Vulkan adapter gets DX12,
-  with a message box saying so; `VK_DRIVER_FILES=<nonexistent>` forces that path for a test.
+  screenshots (17 grey levels in a text crop under Vulkan, 199 under DX12, 17 again with the
+  shadow off), not by theory. A maximised window takes winit's other `WM_NCCALCSIZE` branch
+  and was unaffected. The fix is a third fork, `vendor/wgpu-hal` (`DXGI_SCALING_NONE` for a
+  window's swapchain, see its `ARBITER-FORK.md`): DWM presents 1:1 and clips the hidden row,
+  as Vulkan always did. Dropping the fork brings the blur back.
 - **Do not attach process-memory readers, ETW heap tracing or keystroke automation to a
   running Arbiter from a shell descended from it.** Defender's behaviour classifier
   attributed exactly that to `arbiter.exe` (Trojan:Win32/Bearfoos.A!ml) and killed the

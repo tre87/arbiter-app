@@ -4436,6 +4436,28 @@ fn settings_section(label: &str) -> Element<'static, Message> {
     .into()
 }
 
+// Set when WGPU_BACKEND was already in the environment at startup, so main did not probe.
+#[cfg(windows)]
+static BACKEND_FROM_USER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Read back from WGPU_BACKEND, which main always sets on Windows before iced creates its
+// wgpu instance, so it names the backend iced asked for.
+#[cfg(windows)]
+fn graphics_backend_label() -> String {
+    let raw = std::env::var("WGPU_BACKEND").unwrap_or_default();
+    let name = match raw.to_ascii_lowercase().as_str() {
+        "dx12" | "d3d12" => "DirectX 12",
+        "vulkan" | "vk" => "Vulkan",
+        _ => raw.as_str(),
+    };
+    let source = if BACKEND_FROM_USER.load(std::sync::atomic::Ordering::Relaxed) {
+        "set by WGPU_BACKEND"
+    } else {
+        "chosen by probe"
+    };
+    format!("Rendering with {name} ({source}).")
+}
+
 /// Small muted explanatory text under a section (web `.panel-hint`).
 fn settings_hint(s: &str) -> Element<'static, Message> {
     text(s.to_string()).size(12).color(TXT_MUTED).into()
@@ -4896,6 +4918,13 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     state.settings.hide_shell_button,
                     Message::ToggleHideShellButton,
                 ));
+            }
+            #[cfg(windows)]
+            {
+                col = col
+                    .push(Space::with_height(Length::Fixed(8.0)))
+                    .push(settings_section("Graphics"))
+                    .push(settings_hint(&graphics_backend_label()));
             }
             col
         }
@@ -10528,6 +10557,8 @@ fn main() -> iced::Result {
     #[cfg(windows)]
     if std::env::var_os("WGPU_BACKEND").is_none() {
         std::env::set_var("WGPU_BACKEND", arbiter_native::gpu::windows_backend());
+    } else {
+        BACKEND_FROM_USER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();

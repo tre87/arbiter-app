@@ -23,6 +23,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
   fits the room exactly at any display scale.
 
 ### Fixed
+- **Text no longer flickers on Intel graphics (Windows).** Every textured thing in the
+  window (terminal text, tab labels, icons) flickered on Intel integrated graphics, at
+  launch, after a menu opened and while the pointer moved. That was Intel's Vulkan
+  driver, so Arbiter now draws with DirectX 12 on Windows, falling back to Vulkan only
+  where no DirectX 12 hardware is found. DirectX 12 used to draw every window that was
+  not maximised slightly soft, which is why Vulkan was used before; that is fixed too, so
+  text is as sharp on DirectX 12 as it was on Vulkan. Settings, Display, Graphics shows
+  which one is in use. Setting `WGPU_BACKEND` still overrides the choice.
 - **A desk held for an agent that left is released on time.** An agent that stops keeps
   its desk for 20 seconds in case its pane is only reconnecting, but the release waited
   for the next thing to happen in the app, so an emptied row could stay until you

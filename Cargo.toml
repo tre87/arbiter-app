@@ -178,6 +178,10 @@ iced_winit = { path = "vendor/iced_winit" }
 # wrong place. The editor's line numbers live in its left padding, which makes
 # it asymmetric. See vendor/iced_widget/ARBITER-FORK.md.
 iced_widget = { path = "vendor/iced_widget" }
+# One-line fix: the DX12 swapchain for a window is created with DXGI_SCALING_NONE
+# instead of STRETCH, so an unmaximised borderless window is not drawn soft.
+# See vendor/wgpu-hal/ARBITER-FORK.md.
+wgpu-hal = { path = "vendor/wgpu-hal" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

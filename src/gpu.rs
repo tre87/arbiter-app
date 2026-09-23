@@ -164,36 +164,43 @@ struct FrameKey {
 }
 
 /// Windows: the one wgpu backend to ask for (`WGPU_BACKEND`), decided before iced starts.
-/// Vulkan, which wgpu's own adapter order always chose here, wherever a Vulkan adapter
-/// exists; iced would otherwise initialise DX12 and OpenGL beside it, tens of MB of driver
-/// for nothing. DX12 only where none does, so the app still opens, with a notice: DX12 draws
-/// an unmaximised window soft (DXGI stretches the frame to the window, and winit's
-/// borderless-shadow hack leaves the client rect one row taller than the window shows).
-/// The probe enumerates adapters synchronously; the instance is dropped again at once.
+/// Pinning one keeps iced from initialising all three (DX12, Vulkan, OpenGL), tens of MB
+/// of driver for nothing. DX12 first: it is Windows' own API, every driver has it, and
+/// Vulkan flickers on Intel graphics. It used to draw an unmaximised window soft; the
+/// vendored wgpu-hal presents 1:1 now (vendor/wgpu-hal/ARBITER-FORK.md). DX12 always lists
+/// WARP, the software rasteriser, so only a hardware adapter counts; Vulkan next, and with
+/// neither, WARP with a notice. The probe enumerates adapters synchronously and drops the
+/// instances again at once.
 #[cfg(windows)]
 pub fn windows_backend() -> &'static str {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..Default::default()
-    });
-    if !instance.enumerate_adapters(wgpu::Backends::VULKAN).is_empty() {
+    let has_hardware = |backends: wgpu::Backends| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
+        instance
+            .enumerate_adapters(backends)
+            .iter()
+            .any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+    };
+    if has_hardware(wgpu::Backends::DX12) {
+        return "dx12";
+    }
+    if has_hardware(wgpu::Backends::VULKAN) {
         return "vulkan";
     }
-    warn_no_vulkan();
+    warn_no_gpu();
     "dx12"
 }
 
 // On its own thread so the window opens behind it rather than after it.
 #[cfg(windows)]
-fn warn_no_vulkan() {
+fn warn_no_gpu() {
     std::thread::spawn(|| {
         use windows::core::HSTRING;
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
         let text = HSTRING::from(
-            "Arbiter found no Vulkan graphics driver and is running on DirectX 12.\n\n\
-             Text renders soft while the window is not maximised. Installing the graphics \
-             card's current driver brings Vulkan back.",
+            "Arbiter found no graphics driver for DirectX 12 or Vulkan and is drawing in \
+             software, which is slow.\n\n\
+             Installing the graphics card's current driver fixes this.",
         );
         let caption = HSTRING::from("Arbiter");
         unsafe { MessageBoxW(HWND::default(), &text, &caption, MB_OK | MB_ICONWARNING) };
