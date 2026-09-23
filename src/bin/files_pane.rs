@@ -35,6 +35,13 @@ const ROW_INDENT: f32 = 16.0;
 /// the chevrons beneath it.
 const ROW_PAD_X: f32 = 8.0;
 const TREE_PAD: f32 = 4.0;
+/// Height of one tree row: the button's 2 px padding either side of a 13 px line
+/// (16.9 px), rounded. Fixed, because only the rows in view are built and the ones
+/// above and below are stood in for by spacers of this pitch.
+const TREE_ROW_H: f32 = 21.0;
+/// Rows built beyond each edge of the view, so a wheel notch lands on rows that
+/// already exist rather than on a frame of spacer.
+const TREE_ROW_MARGIN: usize = 20;
 /// How long spinner detection is ignored after a layout change resizes the PTYs. The
 /// same 500 ms a window resize uses, and for the same reason.
 const REFLOW_SUPPRESS_MS: u64 = 500;
@@ -100,6 +107,10 @@ pub struct Explorer {
     /// Bumped whenever the root changes, so a git status that was already
     /// running for the old root is discarded when it arrives.
     git_epoch: u64,
+    /// The tree's scroll offset and visible height as the scrollable last reported
+    /// them, which pick the rows `view` builds. Zero height until the first report.
+    scroll_y: f32,
+    view_h: f32,
 }
 
 impl Explorer {
@@ -114,6 +125,8 @@ impl Explorer {
             last_click: None,
             watcher: None,
             git_epoch: 0,
+            scroll_y: 0.0,
+            view_h: 0.0,
         }
     }
 
@@ -356,6 +369,8 @@ pub enum Msg {
     EditorOpen(PathBuf),
     EditorToggle,
     EditorAction(text_editor::Action),
+    /// The tree scrolled or resized: offset and visible height.
+    TreeScrolled(f32, f32),
     /// The trash finished with these paths; the strings are the ones it refused.
     Deleted(Vec<PathBuf>, Vec<String>),
     /// A tab whose buffer had to be laid out first is ready for its text: which
@@ -879,6 +894,12 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             release_background_tabs(state);
         }
         Msg::EditorAction(action) => return editor_action(state, action),
+        Msg::TreeScrolled(y, h) => {
+            if let Some(e) = state.active_mut().explorer.as_mut() {
+                e.scroll_y = y;
+                e.view_h = h;
+            }
+        }
         Msg::Deleted(paths, failed) => return deleted(state, paths, failed),
         Msg::Fill(path, doc, caret, read) => return finish_fill(state, path, doc, caret, read),
         Msg::TabSelect(i) => {
@@ -1963,13 +1984,28 @@ pub fn pane_view<'a>(state: &'a State, e: &'a Explorer) -> Element<'a, Message> 
     // about is marked here instead; otherwise there is nothing saying which one
     // "Rename" would rename.
     let menu_on = state.explorer_menu.as_ref().and_then(|m| m.target.clone());
-    for (entry, depth) in e.rows() {
+    // Only the rows in view are built, with spacers standing in for the rest: the
+    // view is rebuilt on every message, 60 times a second while Claude works, and a
+    // widget per row cost 2.6 ms for 2,000 rows (release) before layout.
+    let all = e.rows();
+    let (first, last) = tree_window(all.len(), e.scroll_y, e.view_h);
+    if first > 0 {
+        rows = rows.push(Space::with_height(Length::Fixed(first as f32 * TREE_ROW_H)));
+    }
+    for (entry, depth) in &all[first..last] {
         let targeted = menu_on.as_deref() == Some(entry.path.as_path());
-        rows = rows.push(tree_row(e, &entry, depth, targeted));
+        rows = rows.push(tree_row(e, entry, *depth, targeted));
+    }
+    if last < all.len() {
+        rows = rows.push(Space::with_height(Length::Fixed((all.len() - last) as f32 * TREE_ROW_H)));
     }
     // The press falls through to here only when no row swallowed it, which is
     // how a click on the empty space below the tree clears the selection.
-    let body = mouse_area(scrollable(rows).width(Length::Fill).height(Length::Fill))
+    let tree = scrollable(rows)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_scroll(|v| Message::Files(Msg::TreeScrolled(v.absolute_offset().y, v.bounds().height)));
+    let body = mouse_area(tree)
         .on_press(Message::Files(Msg::ClearSelection))
         .on_right_press(Message::Files(Msg::MenuOpen(None)));
 
@@ -1982,6 +2018,18 @@ pub fn pane_view<'a>(state: &'a State, e: &'a Explorer) -> Element<'a, Message> 
             ..Default::default()
         })
         .into()
+}
+
+/// The rows `[first, last)` of `n` that the view builds for a tree scrolled to
+/// `scroll_y` with `view_h` of it visible, `TREE_ROW_MARGIN` either side. Before the
+/// scrollable has reported a height, a screenful is assumed.
+fn tree_window(n: usize, scroll_y: f32, view_h: f32) -> (usize, usize) {
+    let view_h = if view_h > 0.0 { view_h } else { 1600.0 };
+    let top = ((scroll_y - TREE_PAD).max(0.0) / TREE_ROW_H) as usize;
+    let shown = (view_h / TREE_ROW_H).ceil() as usize + 1;
+    let first = top.saturating_sub(TREE_ROW_MARGIN).min(n);
+    let last = (top + shown + TREE_ROW_MARGIN).min(n);
+    (first, last)
 }
 
 /// A 14 px icon button for the explorer header. `None` renders it greyed out.
@@ -2061,6 +2109,7 @@ fn tree_row<'a>(
     .align_y(iced::Center);
     let btn = button(content)
         .width(Length::Fill)
+        .height(Length::Fixed(TREE_ROW_H))
         .padding(iced::Padding { top: 2.0, right: ROW_PAD_X, bottom: 2.0, left: ROW_PAD_X })
         .on_press(Message::Files(Msg::Select(entry.path.clone(), entry.is_dir)))
         .style(move |_t: &iced::Theme, s| {
@@ -2717,6 +2766,22 @@ mod tests {
         // A window narrower than twice the minimum still yields the minimum,
         // rather than a pane too small to read.
         assert_eq!(clamp_width(200.0, 100.0), MIN_W);
+    }
+
+    #[test]
+    fn the_tree_builds_the_rows_in_view_and_a_margin() {
+        // Unscrolled: from the top, a view and a margin down.
+        let (f, l) = tree_window(1000, 0.0, 210.0);
+        assert_eq!(f, 0);
+        assert_eq!(l, 11 + TREE_ROW_MARGIN);
+        // Scrolled 500 rows down.
+        let (f, l) = tree_window(1000, TREE_PAD + 500.0 * TREE_ROW_H, 210.0);
+        assert_eq!(f, 500 - TREE_ROW_MARGIN);
+        assert_eq!(l, 500 + 11 + TREE_ROW_MARGIN);
+        // Near the end, and a tree shorter than the view.
+        assert_eq!(tree_window(1000, TREE_PAD + 995.0 * TREE_ROW_H, 210.0).1, 1000);
+        assert_eq!(tree_window(5, 0.0, 210.0), (0, 5));
+        assert_eq!(tree_window(0, 0.0, 210.0), (0, 0));
     }
 
     #[test]
