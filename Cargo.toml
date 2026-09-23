@@ -1,6 +1,6 @@
 [package]
 name = "arbiter-native"
-version = "1.5.1"
+version = "1.6.0"
 edition = "2021"
 publish = false
 description = "Cross-platform terminal application with Claude support"

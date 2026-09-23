@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-23
+
 ### Added
 - **Ctrl+Shift+H brings every window back to the main display.** The main window is
   centred there, the Overview goes to its top left corner and the Agents Office to its
