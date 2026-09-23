@@ -207,37 +207,54 @@ pub fn worktree_prune(repo_root: &str) -> Result<(), String> {
     git_checked(repo_root, &["worktree", "prune"]).map(|_| ())
 }
 
-/// Per-file git status for `worktree_path` (or `repo_root`): relative path →
-/// one of modified/added/deleted/renamed/untracked/conflicted. From
-/// `git status --porcelain=v1 -uall`.
+/// Per-file git status under `dir`: path relative to `dir` → one of
+/// modified/added/deleted/renamed/untracked/conflicted. From
+/// `git status --porcelain=v1 -z -uall -- .`.
+///
+/// Porcelain paths are relative to the repository's top level whatever the cwd,
+/// so they are rebased onto `dir` with `--show-prefix`; `dir` may be any folder
+/// inside the work tree. `-z` because without it git quotes and octal-escapes any
+/// name outside plain ASCII (`core.quotePath`), which then matches no file.
 ///
 /// `--no-optional-locks` for the same reason `repo_info` uses it, and here it is
 /// load-bearing: a plain `git status` refreshes `.git/index`, the file explorer
 /// watches its root recursively, and `.git/index` is a change its filter passes.
 /// Without this the status would trigger the watch that triggered the status,
 /// once per debounce, forever.
-pub fn file_status(worktree_path: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let Some(text) =
-        git(worktree_path, &["--no-optional-locks", "status", "--porcelain=v1", "-uall"])
-    else {
-        return map;
+pub fn file_status(dir: &str) -> HashMap<String, String> {
+    let Some(prefix) = git(dir, &["--no-optional-locks", "rev-parse", "--show-prefix"]) else {
+        return HashMap::new();
     };
-    for line in text.lines() {
-        if line.len() < 4 {
+    let Some(text) =
+        git(dir, &["--no-optional-locks", "status", "--porcelain=v1", "-z", "-uall", "--", "."])
+    else {
+        return HashMap::new();
+    };
+    parse_status_z(&text, prefix.trim_end_matches(['\n', '\r']))
+}
+
+/// Parses `git status --porcelain=v1 -z` output, keeping the entries under `prefix`
+/// (the repo-relative folder with its trailing `/`, empty for the top level) with
+/// that prefix removed.
+fn parse_status_z(text: &str, prefix: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut fields = text.split('\0');
+    while let Some(entry) = fields.next() {
+        if entry.len() < 4 {
             continue;
         }
-        let xy = &line[..2];
-        let path = line[3..].trim();
-        // Renames are "R  old -> new"; key by the new path.
-        let path = path.rsplit(" -> ").next().unwrap_or(path);
+        let xy = &entry[..2];
+        // A rename or copy is "XY new" followed by the old path as a field of its own.
+        if xy.starts_with('R') || xy.starts_with('C') {
+            fields.next();
+        }
+        let Some(path) = entry[3..].strip_prefix(prefix) else { continue };
         let status = match xy {
             "??" => "untracked",
             "UU" | "AA" | "DD" => "conflicted",
             _ if xy.starts_with('R') => "renamed",
             _ if xy.contains('D') => "deleted",
             _ if xy.starts_with('A') => "added",
-            _ if xy.contains('M') => "modified",
             _ => "modified",
         };
         map.insert(path.to_string(), status.to_string());
@@ -300,4 +317,24 @@ pub fn is_branch_merged(repo: &str, branch: &str, into: &str) -> bool {
         cmd.creation_flags(0x0800_0000);
     }
     cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_status_z;
+
+    #[test]
+    fn status_paths_are_rebased_onto_the_folder_asked_about() {
+        let raw = " M src/main.rs\0?? src/\u{e6}bler.rs\0R  src/new.rs\0src/old.rs\0 M README.md\0";
+        let top = parse_status_z(raw, "");
+        assert_eq!(top.get("src/main.rs").map(String::as_str), Some("modified"));
+        assert_eq!(top.get("README.md").map(String::as_str), Some("modified"));
+        let sub = parse_status_z(raw, "src/");
+        assert_eq!(sub.get("main.rs").map(String::as_str), Some("modified"));
+        assert_eq!(sub.get("\u{e6}bler.rs").map(String::as_str), Some("untracked"));
+        assert_eq!(sub.get("new.rs").map(String::as_str), Some("renamed"));
+        assert!(!sub.contains_key("old.rs"), "a rename's old path is not an entry");
+        assert!(!sub.keys().any(|k| k.contains("README")), "outside the folder");
+        assert_eq!(sub.len(), 3);
+    }
 }
