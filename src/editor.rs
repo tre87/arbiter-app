@@ -80,12 +80,24 @@ pub fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
 }
 
-/// Which line ending the file uses: the first one found wins, and a file with
-/// none at all is written back as LF.
+/// Which line ending the file uses. A mixed file takes the one most of its lines
+/// have, so a save rewrites as few lines as it can, and the first one found breaks
+/// a tie. A file with none at all is written back as LF.
 pub fn detect_eol(text: &str) -> Eol {
-    match text.find('\n') {
-        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => Eol::CrLf,
-        _ => Eol::Lf,
+    let bytes = text.as_bytes();
+    let (mut crlf, mut lf, mut first) = (0usize, 0usize, None);
+    for (i, _) in text.match_indices('\n') {
+        let eol = if i > 0 && bytes[i - 1] == b'\r' { Eol::CrLf } else { Eol::Lf };
+        match eol {
+            Eol::CrLf => crlf += 1,
+            Eol::Lf => lf += 1,
+        }
+        first.get_or_insert(eol);
+    }
+    match crlf.cmp(&lf) {
+        std::cmp::Ordering::Greater => Eol::CrLf,
+        std::cmp::Ordering::Less => Eol::Lf,
+        std::cmp::Ordering::Equal => first.unwrap_or(Eol::Lf),
     }
 }
 
@@ -155,6 +167,17 @@ pub fn buffer_lines(text: &str) -> Vec<String> {
         out.pop();
     }
     out
+}
+
+/// A fingerprint of a buffer's lines, for telling an edited buffer from the saved
+/// one. Streamed a line at a time, so asking after every keystroke copies nothing.
+pub fn hash_lines<L: std::ops::Deref<Target = str>>(lines: impl Iterator<Item = L>) -> u64 {
+    let mut h = DefaultHasher::new();
+    for line in lines {
+        h.write(line.as_bytes());
+        h.write_u8(b'\n');
+    }
+    h.finish()
 }
 
 pub fn hash_text(text: &str) -> u64 {
@@ -498,8 +521,10 @@ mod tests {
         assert_eq!(detect_eol("a\r\nb"), Eol::CrLf);
         assert_eq!(detect_eol("a\nb"), Eol::Lf);
         assert_eq!(detect_eol("no newline"), Eol::Lf);
-        // A mixed file follows its first ending.
+        // A mixed file follows most of its lines, and its first ending on a tie.
         assert_eq!(detect_eol("a\nb\r\nc"), Eol::Lf);
+        assert_eq!(detect_eol("a\r\nb\nc\r\nd"), Eol::CrLf);
+        assert_eq!(detect_eol("a\nb\r\nc\r\nd"), Eol::CrLf);
     }
 
     #[test]

@@ -25,6 +25,16 @@ pub const MONO_FAMILY: &str = "Cascadia Mono";
 /// this length the first scroll into fresh territory stops being free.
 pub const MAX_HIGHLIGHT_LINES: usize = 20_000;
 
+/// A line longer than this turns colouring off for the file. A minified bundle is
+/// one line of a megabyte or more, which passes the line cap, and syntect parses a
+/// line in one go on the UI thread.
+pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 5_000;
+
+/// Whether `text` holds a line over `MAX_HIGHLIGHT_LINE_BYTES`.
+pub fn has_long_line(text: &str) -> bool {
+    text.split('\n').any(|l| l.len() > MAX_HIGHLIGHT_LINE_BYTES)
+}
+
 /// Dark theme closest to the app's own chrome. Foregrounds read well on #121212.
 const THEME_NAME: &str = "base16-ocean.dark";
 

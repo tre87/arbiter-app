@@ -133,8 +133,19 @@ pub struct EditorTab {
     /// but reads nothing from disk while the terminals are up.
     content: Option<text_editor::Content>,
     lang: String,
-    /// Identifies this buffer to the highlighter; bumped on every replacement.
+    /// Identifies this buffer's fill; bumped on every replacement, so a read that
+    /// lands after another one was started is dropped.
     doc: u64,
+    /// Identifies the file to the highlighter, whose cache a change clears. Moves only
+    /// when the buffer takes on a different file: a reload or an undo puts back
+    /// mostly the same lines, and each cached line is checked against its text and
+    /// parse state before it is reused, so keeping the cache is safe and saves
+    /// re-parsing from the top down to the caret.
+    hl_doc: u64,
+    /// The buffer has held a line too long to colour (`highlight::has_long_line`).
+    /// Set when text arrives rather than measured in `view`; never cleared while the
+    /// tab lives, since a file with one such line is not one to colour anyway.
+    long_line: bool,
     dirty: bool,
     saved_hash: u64,
     undo: UndoStack,
@@ -163,6 +174,8 @@ impl EditorTab {
             content: None,
             lang,
             doc: 0,
+            hl_doc: 0,
+            long_line: false,
             dirty: false,
             saved_hash: 0,
             undo: UndoStack::default(),
@@ -193,11 +206,26 @@ impl EditorTab {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let c = self.content.as_ref();
-        Snapshot {
-            text: ed::to_buffer_text(&self.lines()),
-            cursor: c.map(|c| c.cursor_position()).unwrap_or((0, 0)),
+        snapshot_of(self.content.as_ref())
+    }
+
+    /// `ed::hash_lines` of the buffer, which `saved_hash` is compared with.
+    fn content_hash(&self) -> u64 {
+        match &self.content {
+            Some(c) => ed::hash_lines(c.lines()),
+            None => ed::hash_lines(std::iter::empty::<&str>()),
         }
+    }
+}
+
+/// Free of `EditorTab` so an undo entry can be taken from the content alone, while
+/// the tab's undo stack is borrowed for the `begin` that decides whether it is needed.
+fn snapshot_of(content: Option<&text_editor::Content>) -> Snapshot {
+    let lines: Vec<String> =
+        content.map(|c| c.lines().map(|l| l.to_string()).collect()).unwrap_or_default();
+    Snapshot {
+        text: ed::to_buffer_text(&lines),
+        cursor: content.map(|c| c.cursor_position()).unwrap_or((0, 0)),
     }
 }
 
@@ -860,7 +888,6 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             return iced::clipboard::read().map(|t| Message::Files(Msg::Pasted(t)));
         }
         Msg::Pasted(Some(t)) if !t.is_empty() => {
-            let t = t.replace("\r\n", "\n");
             return editor_action(
                 state,
                 text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(t))),
@@ -1206,6 +1233,7 @@ fn open_file(state: &mut State, path: PathBuf) -> Task<Message> {
     let carried = take_spare_buffer(state, None);
     let mut tab = EditorTab::unloaded(path.clone());
     tab.doc = state.active_mut().editor.next_doc();
+    tab.hl_doc = tab.doc;
     tab.content = Some(carried.unwrap_or_default());
     let ws = state.active;
     let pane = &mut state.active_mut().editor;
@@ -1344,10 +1372,11 @@ fn apply_read(tab: &mut EditorTab, caret: (usize, usize), read: ReadFile) {
         tab.content = Some(text_editor::Content::new());
     }
     set_text(tab, &read.loaded.text);
+    tab.long_line = highlight::has_long_line(&read.loaded.text);
     ed::timing::phase("fill");
     ed::timing::lines(tab.content.as_ref().map(|c| c.line_count()).unwrap_or(0));
     place_caret(tab, caret);
-    tab.saved_hash = ed::hash_text(&ed::to_buffer_text(&tab.lines()));
+    tab.saved_hash = tab.content_hash();
     tab.eol = read.loaded.eol;
     tab.trailing_newline = read.loaded.trailing_newline;
     tab.bom = read.loaded.bom;
@@ -1475,6 +1504,7 @@ fn ensure_active_loaded(state: &mut State) -> Task<Message> {
     let ws = state.active;
     let Some(t) = state.active_mut().editor.tabs.get_mut(i) else { return Task::none() };
     t.doc = doc;
+    t.hl_doc = doc;
     t.content = Some(carried.unwrap_or_default());
     fill_tab(state, ws, i, (0, 0), read)
 }
@@ -1578,6 +1608,17 @@ fn place_caret(tab: &mut EditorTab, (line, byte): (usize, usize)) {
 
 fn editor_action(state: &mut State, action: text_editor::Action) -> Task<Message> {
     let now = now_ms();
+    // The buffer works in LF throughout (`ed::load_bytes`), and a Windows clipboard
+    // holds CRLF: pasted as is, every line kept a stray `\r` that the display, the
+    // modified check and Send to Agent all carried. Ctrl+V reaches here as a key
+    // binding and the menu's Paste as a message, so both are caught here.
+    let action = match action {
+        text_editor::Action::Edit(text_editor::Edit::Paste(t)) if t.contains('\r') => {
+            let t = t.replace("\r\n", "\n").replace('\r', "\n");
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(t)))
+        }
+        other => other,
+    };
     let Some(tab) = state.active_mut().editor.tab_mut() else { return Task::none() };
     if tab.content.is_none() {
         return Task::none();
@@ -1594,15 +1635,19 @@ fn editor_action(state: &mut State, action: text_editor::Action) -> Task<Message
     };
     match kind {
         Some(kind) => {
-            let before = tab.snapshot();
-            if tab.undo.begin(kind, now, || before) {
+            // Only an edit that opens a new undo entry copies the document; a key
+            // joining the current run does not.
+            if let text_editor::Action::Edit(text_editor::Edit::Paste(pasted)) = &action {
+                tab.long_line |= highlight::has_long_line(pasted);
+            }
+            let content = tab.content.as_ref();
+            if tab.undo.begin(kind, now, || snapshot_of(content)) {
                 tab.redo.clear();
             }
             if let Some(c) = tab.content.as_mut() {
                 c.perform(action);
             }
-            let text = ed::to_buffer_text(&tab.lines());
-            tab.dirty = ed::hash_text(&text) != tab.saved_hash;
+            tab.dirty = tab.content_hash() != tab.saved_hash;
         }
         None => {
             // A move, click or selection ends the run, so the next keystroke
@@ -1633,8 +1678,9 @@ fn undo_redo(state: &mut State, undo: bool) -> Task<Message> {
     }
     tab.doc = doc;
     set_text(tab, &restore.text);
+    tab.long_line |= highlight::has_long_line(&restore.text);
     place_caret(tab, restore.cursor);
-    tab.dirty = ed::hash_text(&restore.text) != tab.saved_hash;
+    tab.dirty = tab.content_hash() != tab.saved_hash;
     Task::none()
 }
 
@@ -1673,7 +1719,7 @@ fn save_tab(state: &mut State) -> Task<Message> {
     let bytes = ed::serialize(lines.clone(), tab.eol, tab.trailing_newline, tab.bom);
     match std::fs::write(&tab.path, &bytes) {
         Ok(()) => {
-            tab.saved_hash = ed::hash_text(&ed::to_buffer_text(&lines));
+            tab.saved_hash = ed::hash_lines(lines.iter().map(String::as_str));
             tab.dirty = false;
             tab.missing = false;
             tab.disk = ed::DiskStamp::read(&tab.path);
@@ -2087,8 +2133,13 @@ fn text_area<'a>(
     let active = state.active().editor.active.unwrap_or(0);
 
     // A file past the cap is shown plain: the widget re-highlights from the
-    // edited line to the last visible one on every keystroke.
-    let token = if count > highlight::MAX_HIGHLIGHT_LINES { "txt" } else { tab.lang.as_str() };
+    // edited line to the last visible one on every keystroke. So is one with a
+    // line too long to parse in a frame.
+    let token = if count > highlight::MAX_HIGHLIGHT_LINES || tab.long_line {
+        "txt"
+    } else {
+        tab.lang.as_str()
+    };
     let editor = text_editor(content)
         .font(mono)
         .size(EDITOR_FONT_PX)
@@ -2114,7 +2165,7 @@ fn text_area<'a>(
         .key_binding(move |kp| key_binding(kp, modal_up, active, page_lines))
         .style(editor_style)
         .highlight_with::<highlight::Syntax>(
-            highlight::Settings { token: token.to_string(), doc: tab.doc },
+            highlight::Settings { token: token.to_string(), doc: tab.hl_doc },
             highlight::format,
         );
 
@@ -2650,6 +2701,21 @@ mod tests {
             assert_eq!(tab.lines(), ed::buffer_lines(&loaded.text), "lines of {original:?}");
             let back = ed::serialize(tab.lines(), loaded.eol, loaded.trailing_newline, loaded.bom);
             assert_eq!(back, original.as_bytes(), "round trip of {original:?}");
+        }
+    }
+
+    // Typing a character and deleting it again leaves the buffer as saved.
+    #[test]
+    fn a_reverted_edit_is_not_modified() {
+        for original in ["a\nb\n", "a\nb", "a\n\n"] {
+            let mut tab = tab_with(original);
+            tab.saved_hash = tab.content_hash();
+            let c = tab.content.as_mut().unwrap();
+            c.perform(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+            assert_ne!(tab.content_hash(), tab.saved_hash, "{original:?} edited");
+            let c = tab.content.as_mut().unwrap();
+            c.perform(text_editor::Action::Edit(text_editor::Edit::Backspace));
+            assert_eq!(tab.content_hash(), tab.saved_hash, "{original:?} reverted");
         }
     }
 
