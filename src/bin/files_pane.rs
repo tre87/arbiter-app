@@ -1012,7 +1012,8 @@ fn prompt_commit(state: &mut State) -> Task<Message> {
         PromptKind::NewFile(d) | PromptKind::NewFolder(d) => (d.clone(), None),
     };
     let target = ex::normalize(&dir.join(&name));
-    if target.exists() && Some(&target) != old.as_ref() {
+    let case_only = old.as_ref().is_some_and(|old| is_same_entry(old, &target));
+    if target.exists() && Some(&target) != old.as_ref() && !case_only {
         if let Some(p) = state.explorer_prompt.as_mut() {
             p.error = Some("Something with that name is already here.".into());
         }
@@ -1052,15 +1053,16 @@ fn prompt_commit(state: &mut State) -> Task<Message> {
         e.anchor = Some(target.clone());
         task = git_task(e.root.clone(), e.git_epoch);
     }
-    // A renamed file that is open should follow its new name.
+    // An open file follows its new name, and so does every open file inside a
+    // renamed folder; left behind, a tab reads as deleted and cannot be saved.
     if let Some(old) = &old {
         for ws in &mut state.workspaces {
             for t in &mut ws.editor.tabs {
-                if t.path == *old {
-                    t.path = target.clone();
-                    t.lang = ed::lang_for_path(&target);
-                    t.disk = ed::DiskStamp::read(&target);
-                }
+                let Ok(rest) = t.path.strip_prefix(old) else { continue };
+                let path = if rest.as_os_str().is_empty() { target.clone() } else { target.join(rest) };
+                t.lang = ed::lang_for_path(&path);
+                t.disk = ed::DiskStamp::read(&path);
+                t.path = path;
             }
         }
     }
@@ -1070,6 +1072,27 @@ fn prompt_commit(state: &mut State) -> Task<Message> {
         return Task::batch([task, open]);
     }
     task
+}
+
+/// Whether `target` names the same file as `old`, which on a case-insensitive file
+/// system is what a rename that only changes case looks like: `target.exists()` is
+/// true, yet nothing would be overwritten.
+fn is_same_entry(old: &Path, target: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(old), std::fs::symlink_metadata(target)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    // NTFS is case-insensitive, and std has no stable file identity on Windows.
+    #[cfg(not(unix))]
+    {
+        old.parent() == target.parent()
+            && old.file_name().map(|n| n.to_string_lossy().to_lowercase())
+                == target.file_name().map(|n| n.to_string_lossy().to_lowercase())
+    }
 }
 
 fn delete_confirm(state: &mut State) -> Task<Message> {
@@ -1634,8 +1657,16 @@ fn indent(state: &mut State) -> Task<Message> {
 
 fn save_tab(state: &mut State) -> Task<Message> {
     state.editor_menu = None;
+    let active = state.active().editor.active;
     let Some(tab) = state.active_mut().editor.tab_mut() else { return Task::none() };
     if tab.content.is_none() {
+        return Task::none();
+    }
+    // Written since it was read, and the watcher's debounce has not reported it yet:
+    // ask, as the watcher would have, rather than overwrite it unseen. "Keep mine"
+    // takes the new version as the baseline, so saving again then goes through.
+    if ed::check_disk(&tab.path, tab.disk) == DiskChange::Changed {
+        state.active_mut().editor.reload_prompt = active;
         return Task::none();
     }
     let lines = tab.lines();
@@ -2585,6 +2616,23 @@ mod tests {
             expanded: Vec::new(),
         };
         assert!(from_saved(&saved, 1600.0, false).is_none());
+    }
+
+    #[test]
+    fn a_rename_that_only_changes_case_is_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("arbiter-case-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lower = dir.join("readme.md");
+        let other = dir.join("other.md");
+        std::fs::write(&lower, "x").unwrap();
+        std::fs::write(&other, "y").unwrap();
+        let upper = dir.join("README.md");
+        // True only where the file system folds case (macOS, Windows by default).
+        if upper.exists() {
+            assert!(is_same_entry(&lower, &upper));
+        }
+        assert!(!is_same_entry(&lower, &other));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tab_with(text: &str) -> EditorTab {
