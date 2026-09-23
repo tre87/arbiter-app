@@ -856,7 +856,7 @@ fn working_row_in(rows: &[String]) -> bool {
 fn waiting_in(rows: &[String]) -> bool {
     let waiting = |row: &str| is_waiting_agents_row(row) || is_background_shell_row(row);
     let start = rows.len().saturating_sub(LIVE_ROWS);
-    match (start..rows.len()).rev().find(|&i| is_input_prompt_row(&rows[i])) {
+    match (start..rows.len()).rev().find(|&i| is_prompt_at(rows, i)) {
         Some(prompt) => rows[..prompt]
             .iter()
             .rev()
@@ -890,6 +890,30 @@ fn status_row_text(row: &str) -> Option<&str> {
 /// typed after it, possibly inside the box's side border.
 fn is_input_prompt_row(row: &str) -> bool {
     row.trim_start_matches(|c: char| c.is_whitespace() || c == '│').starts_with('\u{276f}')
+}
+
+/// Whether `rows[i]` is the prompt line of Claude's input box. `❯` is enough on its own.
+/// Claude's plain fallback draws `>` instead, which is also how the transcript echoes
+/// what the user sent (`> run the tests`), so a `>` row counts only inside the box: a
+/// border directly above it, and another within the few rows below that typed text can
+/// take.
+fn is_prompt_at(rows: &[String], i: usize) -> bool {
+    /// Lines of typed text a box can hold before its bottom border and still be read.
+    const BOX_LINES: usize = 8;
+    let row = &rows[i];
+    if is_input_prompt_row(row) {
+        return true;
+    }
+    let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{2502}');
+    body.starts_with("> ")
+        && i > 0
+        && is_box_rule(&rows[i - 1])
+        && rows[i + 1..].iter().take(BOX_LINES).any(|r| is_box_rule(r))
+}
+
+/// A border of the input box: box-drawing characters and blanks, and not blank alone.
+fn is_box_rule(row: &str) -> bool {
+    is_blank_or_border(row) && row.chars().any(|c| matches!(c as u32, 0x2500..=0x257F))
 }
 
 /// Whether a row holds nothing but blanks and box-drawing characters, which is what the
@@ -1286,6 +1310,17 @@ mod tests {
             "",
             rule,
             "\u{276f} ",
+            rule,
+        ]));
+        // Claude's plain fallback draws the prompt as `>`; inside the box it counts.
+        assert!(screen(&["\u{2733} Waiting for 1 background agent to finish", "", rule, "> ", rule]));
+        assert!(!screen(&[
+            "\u{2733} Waiting for 1 background agent to finish",
+            "",
+            "\u{25cf} All background agents stopped",
+            "",
+            rule,
+            "> ",
             rule,
         ]));
         // Text being typed into the box does not hide the row above it.
