@@ -85,6 +85,29 @@ circle the pointer over the panes) with the result.
 If DX12 stays sharp once fixed, making it the default everywhere on Windows is worth
 considering, but it needs the NVIDIA and AMD checks first.
 
+## Decision (2026-09-23)
+
+Fix the DX12 blur first. If DX12 is then sharp on the RTX 5080, make it the primary
+backend on Windows, in this order:
+
+1. DX12, if an adapter is found (`enumerate_adapters(Backends::DX12)`).
+2. Vulkan otherwise.
+3. The existing warning when there is neither.
+
+The reasons are that DX12 is Windows' native API, every Windows driver has it, and it
+is the backend that works on the Intel PC.
+
+Memory is not one of the reasons. The saving measured in the September memory work
+came from pinning one backend instead of iced loading all three (Vulkan, DX12 and
+OpenGL). Pinning Vulkan already gets that. DX12 against Vulkan has not been measured:
+measure it (working set, `Get-Process` counters) before claiming a saving.
+
+Mac: nothing changes if the changes are gated. Backend selection is already
+`#[cfg(windows)]` (macOS is Metal), and `undecorated_shadow` and the winit
+`WM_NCCALCSIZE` shift behind the blur are Windows-only. The exception is option 2's
+change in `vendor/iced_winit/src/program.rs`, which is shared by every platform. It
+must be `#[cfg(windows)]`, or every Mac window loses a row.
+
 ## Ruled out (don't chase again)
 
 The rendering code is identical between 1.5.1 and 1.6.0, and all of the following were
