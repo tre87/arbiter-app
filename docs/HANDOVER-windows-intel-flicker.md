@@ -76,11 +76,10 @@ Test everything on both machines: the Intel PC (flicker) and the RTX 5080 (blur)
 4. **Present without stretching:** `DXGI_SCALING_NONE` in wgpu-hal. The cleanest
    picture, but it means vendoring and patching wgpu-hal (0.19.5), a third fork.
 
-Recommended: 1 with 2, or 1 with 3 if the shadow turns out not to matter. Before
-committing to either, check the blur measurement: screenshot an unmaximised window
-under `WGPU_BACKEND=dx12` on the RTX 5080 and compare a text crop against Vulkan.
-Also re-run the Intel repro (launch, open the pane context menu, minimise, restore,
-circle the pointer over the panes) with the result.
+Recommended: see "Confidence, and the order to work in" below. In short, confirm the
+cause, then option 4, then DX12 first on Windows. Re-run the Intel repro (launch,
+open the pane context menu, minimise, restore, circle the pointer over the panes)
+with the result.
 
 If DX12 stays sharp once fixed, making it the default everywhere on Windows is worth
 considering, but it needs the NVIDIA and AMD checks first.
@@ -107,6 +106,75 @@ Mac: nothing changes if the changes are gated. Backend selection is already
 `WM_NCCALCSIZE` shift behind the blur are Windows-only. The exception is option 2's
 change in `vendor/iced_winit/src/program.rs`, which is shared by every platform. It
 must be `#[cfg(windows)]`, or every Mac window loses a row.
+
+## Which GPU Arbiter renders on (matters for any Intel check)
+
+Arbiter does not set antialiasing, so iced asks wgpu for the **low-power** adapter
+(`iced_wgpu` 0.13.5, `window/compositor.rs`, `power_preference`: `LowPower` unless
+antialiasing is set; `WGPU_POWER_PREF` overrides it). On a laptop with Intel graphics
+plus an NVIDIA or AMD GPU, Arbiter therefore already renders on the Intel one, so the
+Vulkan flicker most likely hits those laptops too. An "Intel" check has to ask which
+adapter a low-power request picks (`request_adapter` with `PowerPreference::LowPower`
+on the probe instance, vendor `0x8086`), not whether a discrete GPU exists.
+
+## Confidence, and the order to work in
+
+- The cause of the blur (winit's shift against DXGI's stretch): high. It matches the
+  1.5.1 measurement and both sources.
+- Option 4, `DXGI_SCALING_NONE`: high. With no scaling DXGI presents 1:1 like Vulkan
+  does, and the hidden bottom row is clipped the same way. Flip-model swapchains
+  created for an HWND accept `DXGI_SCALING_NONE`. It is one line
+  (`scaling: d3d12::Scaling::Stretch` at `wgpu-hal` 0.19.5 `src/dx12/mod.rs:706`);
+  the cost is vendoring `wgpu-hal` under `vendor/` with a `[patch.crates-io]` entry
+  and an `ARBITER-FORK.md`, like the other two forks, and re-applying it on a wgpu
+  upgrade. Now the first choice.
+- Option 2, an H-1 frame: medium. It assumes DWM maps the frame onto the visible H-1
+  rows; if it maps onto the full client rect instead, an H-1 frame is stretched the
+  other way and stays soft. The viewport is built from `window.inner_size()` in four
+  places in `vendor/iced_winit/src/program/state.rs`: `State::new` (around line 58),
+  `WindowEvent::Resized` (146), `ScaleFactorChanged` (156) and the per-frame sync in
+  `synchronize` (around 219). Every one would need the same adjustment, gated on
+  Windows, not maximised and borderless.
+- Option 3, no `undecorated_shadow` under DX12: easy, and it costs the drop shadow.
+
+Order:
+
+1. **Confirm the cause (minutes).** Under `WGPU_BACKEND=dx12`, set
+   `undecorated_shadow = false` on the main window only and look at an unmaximised
+   window on the RTX 5080. Sharp confirms the cause. Throw the change away after.
+2. Implement option 4.
+3. Backend order DX12, then Vulkan (see Decision).
+4. Only if 2 fails: option 2, or the Intel-only fallback below.
+
+How to tell sharp from soft: screenshot the same text in an unmaximised window under
+each backend and count the distinct grey levels in a crop of it. In 1.5.1 that was 19
+under Vulkan against 176 under DX12. The softness is worst mid-window, so crop there,
+not at the top.
+
+Test matrix for whatever lands:
+- unmaximised and maximised;
+- resize by edge drag;
+- 100% and 150% display scaling;
+- moving between monitors;
+- the main window, the overview, the Agents Office and a notification card
+  (Ctrl+Shift+P), since all four use `undecorated_shadow`;
+- the RTX 5080 and the Intel laptop, and the AMD laptop if it is at hand.
+
+## If the blur cannot be fixed
+
+Use DX12 on Intel and Vulkan elsewhere: in `gpu::windows_backend`, return `"dx12"`
+when the low-power adapter is Intel (see above), otherwise keep today's Vulkan probe.
+Intel users then get the soft unmaximised window instead of the flicker; maximised is
+sharp. Say so in the changelog.
+
+## When it is done
+
+- Rewrite the CLAUDE.md bullet "Windows asks wgpu for Vulkan alone, after a probe" to
+  match whatever was chosen, and keep the DXGI stretch explanation there.
+- Add a CHANGELOG `[Unreleased]` entry under Fixed: Intel graphics flicker, plus the
+  DX12 change.
+- `VK_DRIVER_FILES=<nonexistent>` forces the no-Vulkan path, for testing the fallback
+  order.
 
 ## Ruled out (don't chase again)
 
