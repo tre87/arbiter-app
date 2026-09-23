@@ -1570,10 +1570,10 @@ fn office_grow(state: &mut State) -> Task<Message> {
         state.office_size.height.max((lh * OFFICE_SCALE) as f32),
     );
     if let Some(a) = state.office_pos.and_then(|p| {
-        arbiter_native::notify::work_area_at((
-            p.x + state.office_size.width / 2.0,
-            p.y + state.office_size.height / 2.0,
-        ))
+        arbiter_native::notify::work_area_at(
+            (p.x + state.office_size.width / 2.0, p.y + state.office_size.height / 2.0),
+            state.office_scale,
+        )
     }) {
         want.width = want.width.min(a.right - a.left).max(state.office_size.width);
         want.height = want.height.min(a.bottom - a.top).max(state.office_size.height);
@@ -1800,14 +1800,19 @@ fn office_chrome(state: &State) -> Element<'_, Message> {
 /// of a 3x3 grid, read the way it is drawn: 0 is top left, 4 is the middle, 8 is
 /// bottom right. Flush to the work area, so "left" means against the edge and not
 /// near it.
-fn office_spot(i: usize, size: iced::Size, at: Option<iced::Point>) -> Option<iced::Point> {
+fn office_spot(
+    i: usize,
+    size: iced::Size,
+    at: Option<iced::Point>,
+    scale: f32,
+) -> Option<iced::Point> {
     // The screen the window is already on, so "top right" does not mean dragging it
     // back to the main display first.
     let a = match at {
-        Some(p) => arbiter_native::notify::work_area_at((
-            p.x + size.width / 2.0,
-            p.y + size.height / 2.0,
-        )),
+        Some(p) => arbiter_native::notify::work_area_at(
+            (p.x + size.width / 2.0, p.y + size.height / 2.0),
+            scale,
+        ),
         None => arbiter_native::notify::primary_work_area(),
     }?;
     let x = match i % 3 {
@@ -3428,7 +3433,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             state.office_menu = false;
             state.office_fold = OfficeFold::None;
             if let (Some(id), Some(p)) =
-                (state.office_window, office_spot(i, state.office_size, state.office_pos))
+                (state.office_window, office_spot(i, state.office_size, state.office_pos, state.office_scale))
             {
                 state.office_pos = Some(p);
                 save_session(state);

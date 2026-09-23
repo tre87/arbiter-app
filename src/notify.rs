@@ -129,36 +129,35 @@ pub fn primary_work_area() -> Option<WorkArea> {
 /// none. For putting a window somewhere on the screen it is already on, rather than
 /// dragging it back to the main display to do it.
 ///
-/// Each monitor is converted to the same logical space the caller's point is in,
-/// which is exact while the displays share a scale factor and close enough when they
-/// do not: the answer only has to pick the right monitor.
+/// `p` is in the caller's logical space, which winit derives with the window's own
+/// `scale`; the answer comes back in that space too, ready for `move_to`. The monitor
+/// is found in physical pixels: dividing each monitor by its OWN DPI overlapped a 100%
+/// display with a 150% one beside it, and the point matched the wrong one.
 #[cfg(windows)]
-pub fn work_area_at(p: (f32, f32)) -> Option<WorkArea> {
+pub fn work_area_at(p: (f32, f32), scale: f32) -> Option<WorkArea> {
     use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
     };
-    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
     unsafe extern "system" fn cb(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
         let out = &mut *(data.0 as *mut Vec<WorkArea>);
         let mut info =
             MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if GetMonitorInfoW(mon, &mut info).as_bool() {
-            let (mut dx, mut dy) = (96u32, 96u32);
-            let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
-            let s = dx.max(1) as f32 / 96.0;
             let w = info.rcWork;
             out.push(WorkArea {
-                left: w.left as f32 / s,
-                top: w.top as f32 / s,
-                right: w.right as f32 / s,
-                bottom: w.bottom as f32 / s,
+                left: w.left as f32,
+                top: w.top as f32,
+                right: w.right as f32,
+                bottom: w.bottom as f32,
             });
         }
         BOOL(1)
     }
 
+    let s = if scale > 0.0 { scale } else { 1.0 };
+    let (px, py) = (p.0 * s, p.1 * s);
     let mut found: Vec<WorkArea> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(
@@ -170,13 +169,15 @@ pub fn work_area_at(p: (f32, f32)) -> Option<WorkArea> {
     }
     found
         .iter()
-        .find(|a| p.0 >= a.left && p.0 < a.right && p.1 >= a.top && p.1 < a.bottom)
-        .copied()
+        .find(|a| px >= a.left && px < a.right && py >= a.top && py < a.bottom)
+        .map(|a| WorkArea { left: a.left / s, top: a.top / s, right: a.right / s, bottom: a.bottom / s })
         .or_else(primary_work_area)
 }
 
+/// macOS works in points throughout, the same for every display, so `scale` is not
+/// needed there.
 #[cfg(target_os = "macos")]
-pub fn work_area_at(p: (f32, f32)) -> Option<WorkArea> {
+pub fn work_area_at(p: (f32, f32), _scale: f32) -> Option<WorkArea> {
     use objc2::{class, msg_send, runtime::AnyObject};
     use objc2_foundation::NSRect;
     unsafe {
@@ -210,7 +211,7 @@ pub fn work_area_at(p: (f32, f32)) -> Option<WorkArea> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn work_area_at(_p: (f32, f32)) -> Option<WorkArea> {
+pub fn work_area_at(_p: (f32, f32), _scale: f32) -> Option<WorkArea> {
     None
 }
 
