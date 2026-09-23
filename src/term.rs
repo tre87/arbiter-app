@@ -504,8 +504,9 @@ impl VtTerm {
     }
 
     /// The last row Claude drew above its input box: the first one above the box's
-    /// prompt that is neither blank nor the box's own border. `None` when no prompt row
-    /// is among the last 40 visible rows, or nothing is drawn above it.
+    /// prompt that is neither blank, nor the box's own border, nor a line of the task
+    /// list Claude draws under its status row. `None` when no prompt row is among the
+    /// last 40 visible rows, or nothing is drawn above it.
     fn row_above_input(&self) -> Option<String> {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
@@ -516,7 +517,7 @@ impl VtTerm {
             (0..cols).map(|col| line[Column(col)].c).collect()
         };
         let prompt = (rows.saturating_sub(40)..rows).rev().find(|&r| is_input_prompt_row(&text(r)))?;
-        (0..prompt).rev().map(text).find(|row| !is_blank_or_border(row))
+        (0..prompt).rev().map(text).find(|row| !is_blank_or_border(row) && !is_task_list_row(row))
     }
 
     /// Whether any of the last 40 visible rows contains one of `needles`.
@@ -854,6 +855,18 @@ fn is_blank_or_border(row: &str) -> bool {
     row.chars().all(|c| c.is_whitespace() || matches!(c as u32, 0x2500..=0x257F))
 }
 
+/// Whether a row is an item of Claude's task list: a checkbox or square, then the task,
+/// the first item hung from the status row by "⎿". Both of Claude's glyph sets, the
+/// Unicode one and its plain fallback.
+fn is_task_list_row(row: &str) -> bool {
+    const MARKS: &[&str] = &[
+        "\u{2610} ", "\u{2612} ", "\u{25fb} ", "\u{25fc} ", "\u{2714} ", "\u{25a1} ", "\u{25a0} ",
+        "\u{221a} ", "[ ] ", "[\u{d7}] ",
+    ];
+    let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{23bf}');
+    MARKS.iter().any(|m| body.starts_with(m))
+}
+
 /// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
 /// row (see `VtTerm::visible_waiting_background`).
 fn is_waiting_agents_row(row: &str) -> bool {
@@ -884,6 +897,14 @@ fn is_working_row(row: &str) -> bool {
 /// AskUserQuestion, plan-mode approval and its own slash-command menus.
 fn is_menu_row(row: &str) -> bool {
     if row.contains("Would you like to proceed") {
+        return true;
+    }
+    // The tool-permission dialog's question, on a row of its own. Its footer can carry
+    // a single hint, which the two-hint rule below does not accept, and a remote pane
+    // has no permission hook to fall back on. Only the whole row counts, since Claude's
+    // prose asks the same thing mid-paragraph.
+    let edge = |c: char| c.is_whitespace() || c == '\u{2502}';
+    if row.trim_matches(edge) == "Do you want to proceed?" {
         return true;
     }
     // Claude's footer reads "↑/↓ to navigate · Enter to select · Esc to cancel". Any
@@ -1087,6 +1108,9 @@ mod tests {
         use super::is_menu_row as row;
         assert!(row("  ↑/↓ to navigate · Enter to select · Esc to cancel"));
         assert!(row("Would you like to proceed?"));
+        assert!(row(" Do you want to proceed?"));
+        assert!(row("\u{2502} Do you want to proceed?            \u{2502}"));
+        assert!(!row("\u{25cf} I can rename it everywhere. Do you want to proceed?"));
         assert!(row("  ↑/↓ to navigate · Esc to cancel"));
         // One stray fragment is prose, which is what used to raise a card on every
         // pass while scrolling back over a plan.
@@ -1208,6 +1232,17 @@ mod tests {
             "",
             rule,
             "❯ ",
+            rule,
+        ]));
+        // Nor does the task list Claude draws under it.
+        assert!(screen(&[
+            "\u{2733} Waiting for 2 background agents to finish",
+            "  \u{23bf}  \u{2714} Read the logs",
+            "     \u{25fc} Fix the parser",
+            "     \u{25fb} Run the tests",
+            "",
+            rule,
+            "\u{276f} ",
             rule,
         ]));
         // Text being typed into the box does not hide the row above it.

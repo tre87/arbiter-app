@@ -225,6 +225,9 @@ const ROW_END_CONFIRM_MS: u64 = 400;
 /// A row leaving within this long of Esc or Ctrl+C is the interrupt landing, not a
 /// finish. Claude takes a few hundred ms to cancel the request and redraw.
 const INTERRUPT_WINDOW_MS: u64 = 1500;
+/// How long after a Stop hook the background-work check is made (see `count_stop`).
+/// The hook and the summary line are written together; this covers the reader drawing it.
+const STOP_CONFIRM_MS: u64 = 250;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -893,6 +896,23 @@ impl ClaudeHandle {
         holds
     }
 
+    /// The Stop hook fired: the authoritative turn end. Not counted while Claude is
+    /// waiting on its own background work, since it fires then too and Claude resumes by
+    /// itself. The hook file can be handled before the reader has seen the line that
+    /// says so ("· 1 shell still running" is drawn with the turn's summary), so the
+    /// check is made `STOP_CONFIRM_MS` later rather than at once.
+    fn count_stop(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let at = std::time::Instant::now() + Duration::from_millis(STOP_CONFIRM_MS);
+        crate::session::schedule(at, move || {
+            let Some(h) = weak.upgrade() else { return };
+            if !h.waiting_background.load(Ordering::Relaxed) {
+                h.finish_seq.fetch_add(1, Ordering::Relaxed);
+                crate::session::wake_ui();
+            }
+        });
+    }
+
     /// UI: the user sent Esc or Ctrl+C to this pane.
     pub fn note_interrupt(&self) {
         self.interrupt_ms.store(now_ms(), Ordering::Relaxed);
@@ -1185,11 +1205,7 @@ fn process_hooks(dir: &Path) {
             "stop" => {
                 h.stop_ms.store(now_ms(), Ordering::Relaxed);
                 h.hook_attention.store(false, Ordering::Relaxed);
-                // The authoritative turn end. Not counted while Claude is waiting on
-                // its own background work: it fires then too, and Claude resumes by itself.
-                if !h.waiting_background.load(Ordering::Relaxed) {
-                    h.finish_seq.fetch_add(1, Ordering::Relaxed);
-                }
+                h.count_stop();
             }
             _ => {}
         }
