@@ -100,10 +100,18 @@ pub struct ClaudeHandle {
     slash_submit_ms: AtomicU64,
     /// The menu currently on screen is the one that slash command opened.
     menu_user_opened: AtomicBool,
-    /// Claude's status row says it is working, read level-triggered from the grid.
-    /// Unlike spinner frames this survives a frozen row and a stalled read, neither
-    /// of which means the turn ended.
+    /// Claude says it is working (its interrupt hint, `VtTerm::visible_working`), read
+    /// level-triggered from the grid. Unlike spinner frames this survives a frozen row
+    /// and a stalled read, neither of which means the turn ended.
     working_row: AtomicBool,
+    /// The idle input box was on screen at the last reading (`VtTerm::claude_chrome`).
+    idle_box: AtomicBool,
+    /// Moves on every edge of `working_row`. A turn end read from the row is confirmed
+    /// `ROW_END_CONFIRM_MS` later, and only if this has not moved since.
+    row_edge_seq: AtomicU64,
+    /// When the user last sent Esc or Ctrl+C here (0 = never). A turn they interrupted
+    /// did not finish, so the row leaving right after it raises nothing.
+    interrupt_ms: AtomicU64,
     /// Bumped once per turn that is KNOWN to have ended: a Stop hook, or Claude's
     /// working row leaving the screen. The notification reads this counter rather than
     /// sampling the lifecycle, so a turn end can neither be invented by a timeout nor
@@ -210,6 +218,13 @@ const MAX_FRAME_GAP_MS: u64 = 600;
 /// A chooser appearing within this long of a slash command is the one it opened.
 /// Comfortably longer than Claude takes to draw it, far shorter than a turn.
 const SLASH_MENU_WINDOW_MS: u64 = 3000;
+/// How long the working row has to stay gone before its leaving counts as a turn end.
+/// Long enough to outlast a repaint split across reads, short enough that the card
+/// still arrives with the finish.
+const ROW_END_CONFIRM_MS: u64 = 400;
+/// A row leaving within this long of Esc or Ctrl+C is the interrupt landing, not a
+/// finish. Claude takes a few hundred ms to cancel the request and redraw.
+const INTERRUPT_WINDOW_MS: u64 = 1500;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -245,6 +260,9 @@ impl ClaudeHandle {
             slash_submit_ms: AtomicU64::new(0),
             menu_user_opened: AtomicBool::new(false),
             working_row: AtomicBool::new(false),
+            idle_box: AtomicBool::new(false),
+            row_edge_seq: AtomicU64::new(0),
+            interrupt_ms: AtomicU64::new(0),
             finish_seq: AtomicU64::new(0),
             remote: AtomicBool::new(false),
             was_remote: AtomicBool::new(false),
@@ -816,16 +834,73 @@ impl ClaudeHandle {
     /// mid-redraw, with neither the row nor the box on screen, and that must not read
     /// as a finish. Claude swaps one hint for the other, so exactly one is present
     /// whenever it is drawing at all.
-    pub fn set_working_row(&self, on: bool, idle_box: bool) {
+    ///
+    /// The edge is one sampled chunk, and a repaint split across reads (ConPTY rewrites
+    /// rows piecemeal) can drop the row for one of them while a mode line keeps the box
+    /// reading as present. So the finish is only counted if the screen still says so
+    /// `ROW_END_CONFIRM_MS` later (`confirm_row_end`).
+    pub fn set_working_row(self: &Arc<Self>, on: bool, idle_box: bool) {
+        if let Some(edge) = self.working_row_edge(on, idle_box) {
+            let weak = Arc::downgrade(self);
+            let at = std::time::Instant::now() + Duration::from_millis(ROW_END_CONFIRM_MS);
+            crate::session::schedule(at, move || {
+                if let Some(h) = weak.upgrade() {
+                    if h.confirm_row_end(edge) {
+                        crate::session::wake_ui();
+                    }
+                }
+            });
+        }
+    }
+
+    /// Records a reading of the row and the box. `Some(edge)` when it is a candidate turn
+    /// end, to be passed to `confirm_row_end` once the confirmation delay has passed.
+    fn working_row_edge(&self, on: bool, idle_box: bool) -> Option<u64> {
+        self.idle_box.store(idle_box, Ordering::Relaxed);
         let was = self.working_row.swap(on, Ordering::Relaxed);
-        let ended = was
-            && !on
+        if was == on {
+            return None;
+        }
+        let edge = self.row_edge_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let ended = !on
             && idle_box
             && !self.waiting_background.load(Ordering::Relaxed)
+            && !self.interrupted_recently()
             && now_ms() >= self.suppress_until_ms.load(Ordering::Relaxed);
-        if ended {
+        if crate::claude_shim::debug_enabled() {
+            crate::claude_shim::debug_log(&format!(
+                "working row {}: idle_box={idle_box} candidate_end={ended}",
+                if on { "on" } else { "off" }
+            ));
+        }
+        ended.then_some(edge)
+    }
+
+    /// Counts the turn end read at `edge` if nothing has contradicted it since: the row
+    /// has not come back, the box is still there, no chooser has opened (a permission
+    /// prompt replacing the row is a question, not a finish) and the user did not
+    /// interrupt. True when it was counted.
+    fn confirm_row_end(&self, edge: u64) -> bool {
+        let holds = self.row_edge_seq.load(Ordering::Relaxed) == edge
+            && !self.working_row.load(Ordering::Relaxed)
+            && self.idle_box.load(Ordering::Relaxed)
+            && !self.menu_on_screen.load(Ordering::Relaxed)
+            && !self.waiting_background.load(Ordering::Relaxed)
+            && !self.interrupted_recently();
+        if holds {
             self.finish_seq.fetch_add(1, Ordering::Relaxed);
         }
+        holds
+    }
+
+    /// UI: the user sent Esc or Ctrl+C to this pane.
+    pub fn note_interrupt(&self) {
+        self.interrupt_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    fn interrupted_recently(&self) -> bool {
+        let at = self.interrupt_ms.load(Ordering::Relaxed);
+        at != 0 && now_ms().saturating_sub(at) < INTERRUPT_WINDOW_MS
     }
 
     /// How many turns are known to have ended here (see `finish_seq`).
@@ -1210,10 +1285,13 @@ mod tests {
         std::thread::sleep(FRAME);
         h.note_activity(0b0100);
         assert_eq!(h.finish_seq(), 0);
-        // Claude's working row going, with its input box back: that is a turn end.
-        h.set_working_row(true, false);
+        // Claude's working row going, with its input box back and still so a moment
+        // later: that is a turn end.
+        assert_eq!(h.working_row_edge(true, false), None);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
-        h.set_working_row(false, true);
+        let edge = h.working_row_edge(false, true).expect("a candidate end");
+        assert_eq!(h.finish_seq(), 0, "not before it is confirmed");
+        assert!(h.confirm_row_end(edge));
         assert_eq!(h.finish_seq(), 1);
     }
 
@@ -1221,8 +1299,47 @@ mod tests {
     #[test]
     fn a_redraw_without_the_input_box_is_not_a_turn_end() {
         let h = handle();
-        h.set_working_row(true, false);
-        h.set_working_row(false, false);
+        h.working_row_edge(true, false);
+        assert_eq!(h.working_row_edge(false, false), None);
+        assert_eq!(h.finish_seq(), 0);
+    }
+
+    // One chunk of a split repaint drops the row while a mode line keeps the box on
+    // screen; the next chunk has it back. That is not a turn end.
+    #[test]
+    fn a_row_that_comes_straight_back_is_not_a_turn_end() {
+        let h = handle();
+        h.working_row_edge(true, true);
+        let edge = h.working_row_edge(false, true).expect("a candidate end");
+        h.working_row_edge(true, true);
+        assert!(!h.confirm_row_end(edge));
+        assert_eq!(h.finish_seq(), 0);
+    }
+
+    // The row gives way to a permission prompt: a question, not a finish.
+    #[test]
+    fn a_row_replaced_by_a_chooser_is_not_a_turn_end() {
+        let h = handle();
+        h.working_row_edge(true, true);
+        let edge = h.working_row_edge(false, true).expect("a candidate end");
+        h.set_menu(true, false);
+        assert!(!h.confirm_row_end(edge));
+        assert_eq!(h.finish_seq(), 0);
+    }
+
+    // Esc stops the turn; the row going is the interrupt landing, and the user knows.
+    #[test]
+    fn an_interrupted_turn_is_not_a_finish() {
+        let h = handle();
+        h.working_row_edge(true, true);
+        h.note_interrupt();
+        assert_eq!(h.working_row_edge(false, true), None);
+        // Nor when the Esc lands between the edge and its confirmation.
+        let h = handle();
+        h.working_row_edge(true, true);
+        let edge = h.working_row_edge(false, true).expect("a candidate end");
+        h.note_interrupt();
+        assert!(!h.confirm_row_end(edge));
         assert_eq!(h.finish_seq(), 0);
     }
 

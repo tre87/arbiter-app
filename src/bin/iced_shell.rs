@@ -448,6 +448,9 @@ struct ClaudeSeen {
     working_since: u64,
     /// When this pane last raised a card.
     last_raised: u64,
+    /// That card was "Claude finished". A question arriving inside its quiet window
+    /// still gets its own card: the finish did not tell the user they are needed.
+    last_was_finished: bool,
     /// `ClaudeHandle::finish_seq` as last seen: an increase is a turn that ended.
     finish_seq: u64,
 }
@@ -2293,6 +2296,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 match bytes.as_slice() {
                     b"\r" => p.session.clear_claude_suppression(),
                     b"\n" | b"\x1b[Z" => p.session.suppress_claude_activity(EDIT_KEY_SUPPRESS_MS),
+                    b"\x1b" | b"\x03" => p.session.note_claude_interrupt(),
                     _ => {}
                 }
                 // Track the typed line so a remote pane can remember the ssh command
@@ -3665,6 +3669,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                         if let Ok(mut t) = p.session.term().lock() {
                             t.scroll_to_bottom();
                         }
+                        p.session.note_claude_interrupt();
                         p.session.write(b"\x03");
                     }
                     None => {}
@@ -6993,6 +6998,7 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
                 running_since: 0,
                 working_since: 0,
                 last_raised: 0,
+                last_was_finished: false,
                 finish_seq: finished,
             });
             let was = next.lifecycle;
@@ -7015,15 +7021,18 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
             // read "ready" from any two-second gap in the spinner stream — a resize, a
             // drag, a frozen row — and every one of those used to raise a card.
             let ended = prev.is_some() && finished > was_finished;
-            let title = match (was, lifecycle) {
-                _ if quiet => None,
-                _ if ended && settled && state.settings.notify_finished => Some("Claude finished"),
-                (_, Lifecycle::Attention) if changed && state.settings.notify_attention => {
-                    Some("Claude needs your input")
-                }
-                _ => None,
+            // A question outranks a finish read in the same pass: the turn stopped
+            // because Claude is asking, and "finished" would hide that.
+            let asking = changed && lifecycle == Lifecycle::Attention;
+            let title = if asking && state.settings.notify_attention && (!quiet || next.last_was_finished) {
+                Some("Claude needs your input")
+            } else if !quiet && ended && settled && state.settings.notify_finished {
+                Some("Claude finished")
+            } else {
+                None
             };
             if let Some(title) = title {
+                next.last_was_finished = !asking;
                 raised.push(Message::Notify {
                     title: title.to_string(),
                     body: format!("{} · {}", d.name, ws.name),

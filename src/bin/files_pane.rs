@@ -1324,7 +1324,7 @@ fn apply_read(tab: &mut EditorTab, caret: (usize, usize), read: ReadFile) {
     ed::timing::phase("fill");
     ed::timing::lines(tab.content.as_ref().map(|c| c.line_count()).unwrap_or(0));
     place_caret(tab, caret);
-    tab.saved_hash = ed::hash_text(&read.loaded.text);
+    tab.saved_hash = ed::hash_text(&ed::to_buffer_text(&tab.lines()));
     tab.eol = read.loaded.eol;
     tab.trailing_newline = read.loaded.trailing_newline;
     tab.bom = read.loaded.bom;
@@ -1344,8 +1344,14 @@ fn apply_read(tab: &mut EditorTab, caret: (usize, usize), read: ReadFile) {
 /// it applies the editor's own font. Measured on a 2,400 line file that was 40%
 /// of what an open cost. A buffer that knows its viewport shapes only the lines
 /// on screen.
+///
+/// A paste ending in `\n` opens an empty last line, where `Buffer::set_text` (and
+/// `ed::buffer_lines`, which the rest of the editor reasons with) reads that newline
+/// as closing the line before it. One is stripped so the two agree; without it every
+/// save added a blank line to a file ending in a newline.
 fn set_text(tab: &mut EditorTab, text: &str) {
     let Some(c) = tab.content.as_mut() else { return };
+    let text = text.strip_suffix('\n').unwrap_or(text);
     c.perform(text_editor::Action::SelectAll);
     let mut blocks = line_blocks(text, PASTE_LINES);
     // The first paste replaces the selection; the rest land at the caret, which
@@ -2579,6 +2585,35 @@ mod tests {
             expanded: Vec::new(),
         };
         assert!(from_saved(&saved, 1600.0, false).is_none());
+    }
+
+    fn tab_with(text: &str) -> EditorTab {
+        let mut tab = EditorTab::unloaded(PathBuf::from("t.txt"));
+        tab.content = Some(text_editor::Content::new());
+        set_text(&mut tab, text);
+        tab
+    }
+
+    #[test]
+    fn a_file_read_into_the_widget_saves_back_byte_for_byte() {
+        for original in ["a\nb\n", "a\nb\n\n", "a\nb", "", "\n", "x\r\ny\r\n"] {
+            let loaded = ed::load_bytes(original.as_bytes()).expect("text");
+            let tab = tab_with(&loaded.text);
+            assert_eq!(tab.lines(), ed::buffer_lines(&loaded.text), "lines of {original:?}");
+            let back = ed::serialize(tab.lines(), loaded.eol, loaded.trailing_newline, loaded.bom);
+            assert_eq!(back, original.as_bytes(), "round trip of {original:?}");
+        }
+    }
+
+    #[test]
+    fn an_undo_snapshot_restores_the_same_lines() {
+        for original in ["a\nb\n", "a\nb\n\n", "a\n\n\n", "a"] {
+            let mut tab = tab_with(original);
+            let before = tab.lines();
+            let snap = tab.snapshot();
+            set_text(&mut tab, &snap.text);
+            assert_eq!(tab.lines(), before, "snapshot of {original:?}");
+        }
     }
 
     #[test]

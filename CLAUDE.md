@@ -140,6 +140,13 @@ a row resize (shifts the whole layout for a frame; a column does not).
   one, so the fork (`vendor/iced_winit/src/program.rs`) creates such a window visible and
   lets winit's creation `orderFront` it. Ctrl+Shift+P raises a test card
   (`Message::TestNotification`), Settings or not.
+- **Working is read from "esc to interrupt", which 2.1.28x draws in the footer**, in the slot
+  "? for shortcuts" holds while idle, not on the spinner row as older releases did
+  (`VtTerm::visible_working`, same cursor-anchored window as `claude_chrome`). The hint
+  giving way to the idle box is the hookless turn end, counted only if it still holds
+  `ROW_END_CONFIRM_MS` later with no chooser up (`ClaudeHandle::confirm_row_end`): a mode
+  line keeps the box reading as present all turn, so one split repaint would otherwise be
+  a finish. Esc or Ctrl+C (`note_interrupt`) voids it; the Stop hook never fires then.
 - **Outstanding background work is not idle.** Two rows say so: "Waiting for N background
   agents to finish", and a finished turn's line ending "· 1 shell still running"
   (`✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running`). Either way the turn is

@@ -463,12 +463,16 @@ impl VtTerm {
         self.rows_from_bottom(MENU_ROWS, is_menu_row)
     }
 
-    /// True while Claude's status row says it is working: a spinner glyph, then text
-    /// ending in the interrupt hint. Level-triggered, unlike the spinner-frame stream,
-    /// so it reads correctly when the row is FROZEN (the text is still there) and when
-    /// a read stalls — neither of which says the turn ended.
+    /// True while Claude says it is working, by the interrupt hint it shows only then.
+    /// Level-triggered, unlike the spinner-frame stream, so it reads correctly when the
+    /// status row is FROZEN and when a read stalls, neither of which says the turn ended.
+    ///
+    /// Claude 2.1.28x draws the hint in the footer under the input box, in the slot
+    /// "? for shortcuts" holds while idle, so it is looked for in the same cursor-anchored
+    /// window as the rest of the chrome. Earlier releases put it on the spinner row
+    /// ("✻ Thinking… (esc to interrupt)"), which is still accepted.
     pub fn visible_working(&self) -> bool {
-        self.any_visible_row(is_working_row)
+        self.below_cursor_contains(&[INTERRUPT_HINT]) || self.any_visible_row(is_working_row)
     }
 
     /// True while Claude's fullscreen UI is scrolled away from its live bottom: it then
@@ -577,15 +581,13 @@ impl VtTerm {
             "auto mode on",
             "bypass permissions on",
         ];
-        /// Rows below the cursor to include. Measured against a real session: the
-        /// cursor sits in the input box, and below it come the box's bottom border, an
-        /// optional warning line, the user's statusLine, and finally the mode line, so
-        /// the marker was 4 rows down. This is set well past that because everything
-        /// between is optional and a future release could add another line; the window
-        /// only ever extends DOWNWARD, which is what keeps stale chrome above the
-        /// cursor from matching, so widening it costs no precision.
-        const BELOW: usize = 8;
+        self.below_cursor_contains(CHROME)
+    }
 
+    /// Whether the cursor's row or one of the `CHROME_BELOW` rows under it contains one
+    /// of `markers`. Anchored to the cursor, which Claude keeps in its input box, so the
+    /// same words left in the transcript above never match.
+    fn below_cursor_contains(&self, markers: &[&str]) -> bool {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
@@ -593,13 +595,13 @@ impl VtTerm {
         // is running Claude must not change just because the user scrolled up.
         let cursor = grid.cursor.point.line.0.max(0) as usize;
         let mut buf = String::with_capacity(cols);
-        for row in cursor..rows.min(cursor + BELOW + 1) {
+        for row in cursor..rows.min(cursor + CHROME_BELOW + 1) {
             buf.clear();
             let line = &grid[Line(row as i32)];
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if CHROME.iter().any(|m| buf.contains(m)) {
+            if markers.iter().any(|m| buf.contains(m)) {
                 return true;
             }
         }
@@ -807,6 +809,18 @@ impl VtTerm {
 fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
 }
+
+/// Rows below the cursor that Claude's chrome can sit in. Measured against a real
+/// session: the cursor sits in the input box, and below it come the box's bottom border,
+/// an optional warning line, the user's statusLine, and finally the mode line, so the
+/// marker was 4 rows down. This is set well past that because everything between is
+/// optional and a future release could add another line; the window only ever extends
+/// DOWNWARD, which is what keeps stale chrome above the cursor from matching, so
+/// widening it costs no precision.
+const CHROME_BELOW: usize = 8;
+
+/// The footer hint Claude shows only while a turn is running.
+const INTERRUPT_HINT: &str = "esc to interrupt";
 
 /// Rows from the bottom that a LIVE menu can occupy. Claude anchors its input box and
 /// its choosers to the bottom of the screen, so a marker further up is transcript: an
@@ -1348,6 +1362,27 @@ mod tests {
             "\x1b[4A\x1b[3C",
         );
         assert!(chrome(screen));
+    }
+
+    // Claude 2.1.28x: the interrupt hint in the footer, the spinner row above the box
+    // carrying no hint of its own.
+    #[test]
+    fn working_is_read_from_the_footer_hint() {
+        let working = |s: &str| {
+            let mut t = super::VtTerm::new(80, 24);
+            t.feed(s.as_bytes());
+            t.visible_working()
+        };
+        let rule = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+        let screen = |footer: &str| {
+            format!("\u{273b} Pondering\u{2026} (12s)\r\n{rule}\r\n\u{276f} \r\n{rule}\r\n  {footer}\x1b[2A\x1b[2C")
+        };
+        assert!(working(&screen("esc to interrupt")));
+        assert!(working(&screen("\u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} esc to interrupt")));
+        assert!(!working(&screen("? for shortcuts")));
+        assert!(!working(&screen("\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)")));
+        // The hint left in the transcript above the prompt is history.
+        assert!(!working("  esc to interrupt\r\n\r\n\u{276f} "));
     }
 
     #[test]

@@ -595,7 +595,7 @@ pub fn set_ui_waker(f: Box<dyn Fn() + Send + Sync>) {
 }
 
 /// Wake the UI to redraw, if a waker is registered.
-fn wake_ui() {
+pub(crate) fn wake_ui() {
     if let Some(f) = UI_WAKER.get() {
         f();
     }
@@ -1415,6 +1415,11 @@ impl Session {
     /// working is imminent and must not be delayed by a suppression window.
     pub fn clear_claude_suppression(&self) {
         self.claude.clear_suppression();
+    }
+
+    /// The user sent Esc or Ctrl+C here (see `ClaudeHandle::note_interrupt`).
+    pub fn note_claude_interrupt(&self) {
+        self.claude.note_interrupt();
     }
 
     /// The Claude session id to resume on restore IF Claude is running here AND a

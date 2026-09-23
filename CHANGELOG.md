@@ -214,9 +214,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
   long raised a card: dragging the explorer edge or a split divider, toggling the editor,
   switching workspace, a frozen status row after scrolling, a narrow pane wrapping a
   status line. A turn end is now the event that ends it, either Claude's Stop hook or its
-  working row giving way to its input box, and nothing else can invent one. Claude's
-  status row is also read directly, so a row that has frozen or a read that has stalled no
-  longer decays into "finished".
+  "esc to interrupt" hint giving way to its idle input box and staying gone for a moment,
+  and nothing else can invent one. That hint is also read directly, so a status row that
+  has frozen or a read that has stalled no longer decays into "finished". A turn you stop
+  yourself with Esc or Ctrl+C raises nothing, and one that stops on a question raises
+  "Claude needs your input", not "Claude finished".
 - **Waiting for background agents survives scrolling.** Scrolling up during the wait ended
   the hold added in 1.5.1 and raised a card about two seconds later.
 - **The usage refresh keeps the numbers on screen.** Clicking refresh flashed "Usage
