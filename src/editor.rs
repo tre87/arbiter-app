@@ -186,6 +186,58 @@ pub fn hash_text(text: &str) -> u64 {
     h.finish()
 }
 
+/// Save `bytes` as the file at `path` so that a failure part way leaves the old
+/// contents whole: written to a temp file beside it, synced, then renamed over it.
+///
+/// The rename replaces the directory entry, so what an in-place write keeps has to
+/// be kept by hand, or the save falls back to writing in place:
+/// - a symlink is resolved and its target saved, so the link stays a link;
+/// - the permissions are copied onto the temp file;
+/// - a file with other hard links, or owned by another user, is written in place,
+///   since a new entry would split it from its other names or change its owner;
+/// - a rename the OS refuses (Windows, while another program holds the file open
+///   without sharing delete) falls back to writing in place.
+pub fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(_) => return std::fs::write(path, bytes),
+    };
+    let meta = std::fs::metadata(&target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return std::fs::write(&target, bytes);
+        }
+    }
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return std::fs::write(&target, bytes);
+    };
+    let tmp = dir.join(format!(".{}.arbiter-save-{}", name.to_string_lossy(), std::process::id()));
+    let written = (|| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if f.metadata()?.uid() != meta.uid() {
+                return Err(std::io::Error::other("owner differs"));
+            }
+        }
+        f.write_all(bytes)?;
+        f.set_permissions(meta.permissions())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return std::fs::write(&target, bytes);
+    }
+    Ok(())
+}
+
 /// What the file looked like on disk when we last read or wrote it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskStamp {
@@ -541,6 +593,51 @@ mod tests {
             let back = serialize(lines, loaded.eol, loaded.trailing_newline, loaded.bom);
             assert_eq!(back, original, "round trip failed for {original:?}");
         }
+    }
+
+    fn save_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arbiter-save-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_save_replaces_the_contents_and_leaves_no_temp_file() {
+        let d = save_dir("plain");
+        let f = d.join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        write_file(&f, b"new").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "no temp file left behind");
+        // A file that does not exist yet is simply created.
+        write_file(&d.join("b.txt"), b"b").unwrap();
+        assert_eq!(std::fs::read(d.join("b.txt")).unwrap(), b"b");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_permissions_links_and_hard_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = save_dir("unix");
+        let f = d.join("script.sh");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o750)).unwrap();
+        write_file(&f, b"new").unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o750);
+
+        let link = d.join("link.sh");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        write_file(&link, b"via link").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&f).unwrap(), b"via link");
+
+        let hard = d.join("hard.sh");
+        std::fs::hard_link(&f, &hard).unwrap();
+        write_file(&f, b"both names").unwrap();
+        assert_eq!(std::fs::read(&hard).unwrap(), b"both names");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

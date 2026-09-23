@@ -1771,7 +1771,7 @@ fn save_tab(state: &mut State) -> Task<Message> {
     }
     let lines = tab.lines();
     let bytes = ed::serialize(lines.clone(), tab.eol, tab.trailing_newline, tab.bom);
-    match std::fs::write(&tab.path, &bytes) {
+    match ed::write_file(&tab.path, &bytes) {
         Ok(()) => {
             tab.saved_hash = ed::hash_lines(lines.iter().map(String::as_str));
             tab.dirty = false;
