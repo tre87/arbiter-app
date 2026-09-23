@@ -356,6 +356,8 @@ pub enum Msg {
     EditorOpen(PathBuf),
     EditorToggle,
     EditorAction(text_editor::Action),
+    /// The trash finished with these paths; the strings are the ones it refused.
+    Deleted(Vec<PathBuf>, Vec<String>),
     /// A tab whose buffer had to be laid out first is ready for its text: which
     /// tab (its path and `doc`), where its caret goes, and the file.
     Fill(PathBuf, u64, (usize, usize), ReadFile),
@@ -555,7 +557,24 @@ pub fn unsaved_names(state: &State) -> Vec<String> {
 
 /// Run `git status` for an explorer root off the UI thread. The epoch is handed
 /// back untouched so a result for a root that has since changed is dropped.
+/// Roots with a `git status` running, each with whether another was asked for while
+/// it ran. One at a time per root: on a repository where a status outlasts the
+/// watcher's debounce, overlapping runs piled up and whichever finished last set the
+/// colours, which could be the oldest.
+static GIT_RUNS: std::sync::Mutex<Option<HashMap<PathBuf, bool>>> = std::sync::Mutex::new(None);
+
+/// Start a `git status` for `root`, or, if one is already running, have one more
+/// follow it (`git_done`).
 fn git_task(root: PathBuf, epoch: u64) -> Task<Message> {
+    {
+        let mut runs = GIT_RUNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runs = runs.get_or_insert_with(HashMap::new);
+        if let Some(again) = runs.get_mut(&root) {
+            *again = true;
+            return Task::none();
+        }
+        runs.insert(root.clone(), false);
+    }
     let (tx, rx) = iced::futures::channel::oneshot::channel();
     let for_thread = root.clone();
     std::thread::spawn(move || {
@@ -820,11 +839,24 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
         }
         Msg::FsChanged(root, paths) => return fs_changed(state, root, paths),
         Msg::GitStatus(root, epoch, status) => {
+            let mut current = None;
             for ws in &mut state.workspaces {
                 let Some(e) = ws.explorer.as_mut() else { continue };
-                if e.root == root && e.git_epoch == epoch {
-                    e.tree.set_status(&status, &root);
+                if e.root == root {
+                    current = Some(e.git_epoch);
+                    if e.git_epoch == epoch {
+                        e.tree.set_status(&status, &root);
+                    }
                 }
+            }
+            let again = GIT_RUNS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|runs| runs.remove(&root))
+                .unwrap_or(false);
+            if let (true, Some(epoch)) = (again, current) {
+                return git_task(root, epoch);
             }
         }
 
@@ -847,6 +879,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Message> {
             release_background_tabs(state);
         }
         Msg::EditorAction(action) => return editor_action(state, action),
+        Msg::Deleted(paths, failed) => return deleted(state, paths, failed),
         Msg::Fill(path, doc, caret, read) => return finish_fill(state, path, doc, caret, read),
         Msg::TabSelect(i) => {
             let ed = &mut state.active_mut().editor;
@@ -1124,29 +1157,44 @@ fn is_same_entry(old: &Path, target: &Path) -> bool {
 
 fn delete_confirm(state: &mut State) -> Task<Message> {
     let Some(d) = state.explorer_delete.take() else { return Task::none() };
-    let mut failed: Vec<String> = Vec::new();
-    for p in &d.paths {
-        if let Err(e) = trash::delete(p) {
-            failed.push(format!("{}: {e}", p.display()));
+    // Off the UI thread: on macOS the trash goes through Finder, one AppleScript per
+    // item, and on Windows a large folder takes as long as the Recycle Bin needs.
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    let paths = d.paths;
+    std::thread::spawn(move || {
+        let failed: Vec<String> = paths
+            .iter()
+            .filter_map(|p| trash::delete(p).err().map(|e| format!("{}: {e}", p.display())))
+            .collect();
+        let _ = tx.send((paths, failed));
+    });
+    Task::perform(async move { rx.await.unwrap_or_default() }, |(paths, failed)| {
+        Message::Files(Msg::Deleted(paths, failed))
+    })
+}
+
+fn deleted(state: &mut State, paths: Vec<PathBuf>, failed: Vec<String>) -> Task<Message> {
+    let mut tasks = Vec::new();
+    for ws in &mut state.workspaces {
+        let Some(e) = ws.explorer.as_mut() else { continue };
+        if !paths.iter().any(|p| p.starts_with(&e.root)) {
+            continue;
         }
-    }
-    let mut task = Task::none();
-    if let Some(e) = state.active_mut().explorer.as_mut() {
-        for p in &d.paths {
+        for p in &paths {
             e.selected.remove(p);
             e.tree.expanded.remove(p);
             if let Some(parent) = p.parent() {
                 e.tree.reload_dir(parent);
             }
         }
-        task = git_task(e.root.clone(), e.git_epoch);
+        tasks.push(git_task(e.root.clone(), e.git_epoch));
     }
     if !failed.is_empty() {
         state.notice =
             Some(Notice { title: "Could not delete everything".into(), body: failed.join("\n") });
     }
     save_session(state);
-    task
+    Task::batch(tasks)
 }
 
 fn fs_changed(state: &mut State, root: PathBuf, paths: Vec<PathBuf>) -> Task<Message> {
@@ -1158,13 +1206,19 @@ fn fs_changed(state: &mut State, root: PathBuf, paths: Vec<PathBuf>) -> Task<Mes
             continue;
         }
         touched = true;
+        // Once per folder, not once per path: a checkout touching 500 files in one
+        // folder read and sorted it 500 times, on the UI thread.
+        let mut dirs: HashSet<&Path> = HashSet::new();
         for p in &paths {
             if e.tree.entries.contains_key(p) {
-                e.tree.reload_dir(p);
+                dirs.insert(p);
             }
             if let Some(parent) = p.parent() {
-                e.tree.reload_dir(parent);
+                dirs.insert(parent);
             }
+        }
+        for d in dirs {
+            e.tree.reload_dir(d);
         }
         e.tree.expanded.retain(|d| d.is_dir());
     }

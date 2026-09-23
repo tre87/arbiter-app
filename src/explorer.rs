@@ -163,7 +163,13 @@ pub fn read_dir_entries(dir: &Path) -> Vec<DirEntry> {
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // A link to a folder (a symlink, or a junction on Windows) opens like one.
+        // Following it here is safe: `MAX_DEPTH` bounds a link that loops back.
+        let is_dir = match e.file_type() {
+            Ok(t) if t.is_symlink() => e.path().is_dir(),
+            Ok(t) => t.is_dir(),
+            Err(_) => false,
+        };
         out.push(DirEntry { name, path: normalize(&e.path()), is_dir });
     }
     out.sort_by(|a, b| {
@@ -307,8 +313,26 @@ fn emit(root: PathBuf, paths: Vec<PathBuf>) {
 /// churn inside `.git` would otherwise reload the tree continuously; the `.git`
 /// rule is `session::git_relevant_change`, which decides the same question for
 /// the footer's git status.
+///
+/// Anything inside a dot-directory other than the root's own `.git` is dropped too:
+/// the tree never shows one, and with a folder of repositories as the root every
+/// fetch or commit in one of them (`sub/.git/...`) reloaded the tree and ran a
+/// status. A dotfile itself still counts; a `.gitignore` edit changes the colours.
 pub fn watch_relevant(rel: &Path) -> bool {
-    crate::session::git_relevant_change(rel)
+    use std::path::Component;
+    let names: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let in_dot_dir = names
+        .iter()
+        .enumerate()
+        .take(names.len().saturating_sub(1))
+        .any(|(i, n)| n.to_string_lossy().starts_with('.') && !(i == 0 && *n == ".git"));
+    !in_dot_dir && crate::session::git_relevant_change(rel)
 }
 
 /// Watch `root` recursively. `None` when the OS refuses (Linux inotify limits,
@@ -316,13 +340,21 @@ pub fn watch_relevant(rel: &Path) -> bool {
 pub fn watch(root: &Path) -> Option<Watcher> {
     let root = normalize(root);
     let for_events = root.clone();
+    // FSEvents watches the resolved path and reports resolved paths, so under a root
+    // reached through a symlink (`/tmp` is `/private/tmp`) no event matched the tree
+    // or an open tab. Events are mapped back onto the root as the tree knows it.
+    let real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let mut deb = new_debouncer(WATCH_DEBOUNCE, move |res: DebounceEventResult| {
         let Ok(events) = res else { return };
         let mut paths: Vec<PathBuf> = Vec::new();
         for e in events {
-            let rel = e.path.strip_prefix(&for_events).unwrap_or(e.path.as_path());
+            let rel = e
+                .path
+                .strip_prefix(&real)
+                .or_else(|_| e.path.strip_prefix(&for_events))
+                .unwrap_or(e.path.as_path());
             if watch_relevant(rel) {
-                let p = normalize(&e.path);
+                let p = normalize(&for_events.join(rel));
                 if !paths.contains(&p) {
                     paths.push(p);
                 }
@@ -472,6 +504,11 @@ mod tests {
         assert!(!watch_relevant(Path::new("node_modules/x/index.js")));
         assert!(!watch_relevant(Path::new(".git/objects/ab/cdef")));
         assert!(watch_relevant(Path::new(".git/HEAD")));
+        // Nothing the tree shows lives in a dot-directory, a nested repo's included.
+        assert!(!watch_relevant(Path::new("sub/.git/HEAD")));
+        assert!(!watch_relevant(Path::new(".cache/x/y")));
+        assert!(watch_relevant(Path::new(".gitignore")));
+        assert!(watch_relevant(Path::new("sub/.env")));
     }
 
     #[test]
