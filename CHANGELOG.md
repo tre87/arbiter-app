@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **A desk turns green when its agent finishes.** For 30 seconds after a turn ends, the
+  agent's desk in the Agents Office shows the green "done" state, then goes back to
+  ready. It is set by the same turn end that raises "Claude finished", so it never turns
+  green from a pause, and it clears at once if the agent starts working again or asks for
+  input.
+
 ### Changed
 - **The Agents Office is as small as its agents allow, and sizes itself.** The room has
   exactly as many rows as its agents need: a sixth agent opens a second row, and when a

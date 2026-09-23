@@ -182,8 +182,13 @@ struct State {
     /// The rows and scale factor the office window was last sized for
     /// (`office_fit_window`), so each change resizes it once.
     office_sized_for: Option<(i32, u32)>,
-    /// When the wake that releases the next expiring desk hold is due (`office_arm_expiry`).
+    /// When the next office deadline wake is due (`office_arm_expiry`): a desk hold
+    /// running out, or a desk's green "done" ending.
     office_expiry_armed: Option<u64>,
+    /// Agent (`PaneData.history_id`) -> until when its desk shows green for a turn
+    /// that just ended. Set by the same turn-end event that raises "Claude finished",
+    /// so it is never guessed from a silence; dropped when the agent works or asks.
+    office_done: HashMap<String, u64>,
     /// The office window is minimised: Windows reports that as a resize to nothing,
     /// and winit sends no occlusion there (see `window_hidden`).
     office_minimized: bool,
@@ -834,8 +839,9 @@ enum Message {
     OfficeDeskClicked(String),
     /// The room's own 12fps clock, live only while a turn is in flight.
     OfficeTick,
-    /// A desk hold has run out; the refresh after it releases the desk.
-    OfficeSeatExpired,
+    /// An office deadline passed (a desk hold, or a desk's green); the refresh after it
+    /// redraws the room.
+    OfficeDeadline,
     /// The office window's scale factor, asked for when it opens or resizes.
     OfficeScale(f32),
     /// The pointer entered or left the office window; its chrome follows.
@@ -1471,6 +1477,9 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 /// The hold needs no timer: an expired reservation is invisible (its desk already
 /// draws empty) until some new agent asks for a seat, and that is a message.
 const OFFICE_SEAT_HOLD_MS: u64 = 20_000;
+/// How long a desk stays green after its agent's turn ended, before it goes back to
+/// ready: long enough to be seen at a glance, short enough that green still means "just".
+const OFFICE_DONE_MS: u64 = 30_000;
 
 /// The room's own clock, 12fps. The fastest thing in the art is `SPRITE_FPS` at 7
 /// and the spinner steps 3 times a second, so 12 resolves everything it does.
@@ -1612,18 +1621,19 @@ fn office_fit_window(state: &mut State) -> Option<Task<Message>> {
     (!same).then(|| iced::window::resize(id, want))
 }
 
-/// A desk held for an agent that left is released when the hold runs out, so the room
-/// closes up then, not at whatever message happens to arrive next: a quiet app sends
-/// none, and the emptied row stayed until something was touched. One wake for the
-/// earliest hold, re-armed by the refresh after it.
+/// The office's deadlines are met when they fall due, not at whatever message happens
+/// to arrive next: a quiet app sends none. A desk held for an agent that left is
+/// released when its hold runs out, so the room closes up then (the emptied row used
+/// to stay until something was touched), and a green desk goes back to ready after
+/// `OFFICE_DONE_MS`. One wake for the earliest, re-armed by the refresh after it.
 fn office_arm_expiry(state: &mut State) -> Option<Task<Message>> {
-    let next = state
+    let holds = state
         .office_seats
         .iter()
         .flatten()
         .filter_map(|seat| seat.vacated_ms)
-        .map(|at| at + OFFICE_SEAT_HOLD_MS)
-        .min()?;
+        .map(|at| at + OFFICE_SEAT_HOLD_MS);
+    let next = holds.chain(state.office_done.values().copied()).min()?;
     if state.office_expiry_armed.is_some_and(|armed| armed <= next) {
         return None;
     }
@@ -1631,7 +1641,7 @@ fn office_arm_expiry(state: &mut State) -> Option<Task<Message>> {
     // A little past the deadline, so the check that runs then is past it too.
     let wait = next.saturating_sub(now_ms()) + 20;
     Some(Task::perform(tokio::time::sleep(Duration::from_millis(wait)), |_| {
-        Message::OfficeSeatExpired
+        Message::OfficeDeadline
     }))
 }
 
@@ -1640,6 +1650,8 @@ fn office_sync(state: &mut State) -> bool {
     use agents_office::Desk;
     // Who is running, in workspace then pane order, which is the order seats are
     // handed out in and therefore the order desks fill.
+    let now = now_ms();
+    let done = &state.office_done;
     let live: Vec<(String, Desk, String, String)> = state
         .workspaces
         .iter()
@@ -1652,12 +1664,23 @@ fn office_sync(state: &mut State) -> bool {
                 let desk = match pane_dot(true, lc, false) {
                     Dot::Working => Desk::Working,
                     Dot::Attention => Desk::Attention,
+                    // Green for a while after a turn ended, then ready.
+                    _ if done.get(&d.history_id).is_some_and(|until| now < *until) => Desk::Done,
                     _ => Desk::Ready,
                 };
                 Some((d.history_id.clone(), desk, ws.name.clone(), d.name.clone()))
             })
         })
         .collect();
+    // A green that has run out, or whose agent has since started working or is asking,
+    // is spent: the next turn end sets a fresh one.
+    state.office_done.retain(|id, until| {
+        now < *until
+            && live
+                .iter()
+                .find(|(h, ..)| h == id)
+                .is_some_and(|(_, desk, ..)| *desk == Desk::Done)
+    });
 
     let ids: Vec<&str> = live.iter().map(|(h, ..)| h.as_str()).collect();
     agents_office::reseat(
@@ -3471,7 +3494,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 return update_app(state, Message::JumpTo(wi, pane));
             }
         }
-        Message::OfficeSeatExpired => state.office_expiry_armed = None,
+        Message::OfficeDeadline => state.office_expiry_armed = None,
         Message::OfficeTick => {
             // The phase and nothing else; `office_refresh` below draws the frame.
             state.office_ticks += 1;
@@ -7206,6 +7229,8 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
     let now = now_ms();
     let mut seen: HashMap<u64, ClaudeSeen> = HashMap::with_capacity(state.claude_seen.len());
     let mut raised: Vec<Message> = Vec::new();
+    // Agents whose turn just ended, for the office's green desk (`office_done`).
+    let mut done: Vec<String> = Vec::new();
     for ws in &state.workspaces {
         for (_, d) in ws.panes.iter() {
             let id = d.session.id();
@@ -7244,6 +7269,9 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
             // read "ready" from any two-second gap in the spinner stream — a resize, a
             // drag, a frozen row — and every one of those used to raise a card.
             let ended = prev.is_some() && finished > was_finished;
+            if ended {
+                done.push(d.history_id.clone());
+            }
             // A question outranks a finish read in the same pass: the turn stopped
             // because Claude is asking, and "finished" would hide that.
             let asking = changed && lifecycle == Lifecycle::Attention;
@@ -7267,6 +7295,9 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
         }
     }
     state.claude_seen = seen;
+    for id in done {
+        state.office_done.insert(id, now + OFFICE_DONE_MS);
+    }
     let tasks: Vec<Task<Message>> = raised.into_iter().map(|m| update(state, m)).collect();
     Task::batch(tasks)
 }
@@ -10699,6 +10730,7 @@ fn main() -> iced::Result {
                 office_scale: 1.0,
                 office_sized_for: None,
                 office_expiry_armed: None,
+                office_done: HashMap::new(),
                 office_minimized: false,
                 office_hover: false,
                 office_menu: false,
