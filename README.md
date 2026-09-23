@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/arbiter.svg" alt="Arbiter" width="120" />
+<img src="assets/logo.svg" alt="Arbiter" width="120" />
 
 # Arbiter
 
@@ -13,7 +13,7 @@ Tabs, panes, folders, Claude conversations, SSH sessions: close it, open it, car
 ---
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Arbiter screenshot" width="100%" />
+  <img src=".github/screenshots/screenshot.png" alt="Arbiter screenshot" width="100%" />
   <br />
   <em>One workspace of eight, split three ways: a Claude Code session, a git shell and a PowerShell.
   The tab bar carries the other workspaces, and the title bar your Claude usage for the last 5 hours and 7 days.</em>
@@ -54,7 +54,7 @@ The dots sit in each pane's header and roll up to the workspace tab, so a tab te
 **The overview window** is the same information as a compact list: every workspace, every terminal, its Claude state, and its git status (staged, unstaged, untracked). It opens with `Ctrl+Shift+O` and can stay on top of everything else, so when the main window is covered or minimised you still see who is working and who is waiting. Click a row to jump to that pane. It can be filtered to Claude panes only.
 
 <p align="center">
-  <img src="docs/overview_screenshot.png" alt="The Arbiter overview window" width="340" />
+  <img src=".github/screenshots/overview.png" alt="The Arbiter overview window" width="340" />
   <br />
   <em>Three workspaces and their terminals in one list. The amber row is a Claude waiting for an answer,
   <code>&#9675;1</code> is one unstaged file in that terminal's repo, and the footer repeats the usage bars.</em>
