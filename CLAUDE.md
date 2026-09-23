@@ -147,8 +147,12 @@ a row resize (shifts the whole layout for a frame; a column does not).
   reports. The reader scans the visible rows for either row's shape
   (`VtTerm::visible_waiting_background`, `term::is_waiting_agents_row`,
   `term::is_background_shell_row`: a spinner glyph, a space, the phrase; prose starts with
-  a bullet or an indent) and `ClaudeHandle::set_waiting_background` holds `Working` while
-  it shows, which also keeps the Stop hook from raising "Claude finished". The off edge
+  a bullet or an indent), and only as the last row above the input box
+  (`VtTerm::row_above_input`): aborting the agents leaves the row in the transcript with
+  "● All background agents stopped" under it, and anywhere-on-screen held the pane Working
+  for good. With no input box on screen any visible row counts.
+  `ClaudeHandle::set_waiting_background` holds `Working` while it shows, which also keeps
+  the Stop hook from raising "Claude finished". The off edge
   stamps a fresh activity TTL so the resumed turn's first frames have time to pair up;
   Escape during the wait ends it the same way, one TTL later, with a "Claude finished"
   card. **Known trade:** Claude draws the same shell line for a dev server it started in

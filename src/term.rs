@@ -485,8 +485,34 @@ impl VtTerm {
     /// that work reports, so the pane is not idle. The row is told from the same words in
     /// the transcript by its shape: a spinner glyph, a space, the phrase; Claude's prose
     /// starts with a bullet or an indent.
+    ///
+    /// The row stays in the transcript when the wait ends without the work reporting:
+    /// aborting the agents leaves "✳ Waiting for 2 background agents to finish" where it
+    /// was and writes "● All background agents stopped" under it. So with the input box
+    /// on screen the row only counts as the last thing drawn above it. Without the box
+    /// there is nothing to measure against, and any visible row counts, as before.
     pub fn visible_waiting_background(&self) -> bool {
-        self.any_visible_row(|row| is_waiting_agents_row(row) || is_background_shell_row(row))
+        let waiting = |row: &str| is_waiting_agents_row(row) || is_background_shell_row(row);
+        match self.row_above_input() {
+            Some(row) => waiting(&row),
+            None => self.any_visible_row(waiting),
+        }
+    }
+
+    /// The last row Claude drew above its input box: the first one above the box's
+    /// prompt that is neither blank nor the box's own border. `None` when no prompt row
+    /// is among the last 40 visible rows, or nothing is drawn above it.
+    fn row_above_input(&self) -> Option<String> {
+        let rows = self.term.screen_lines();
+        let cols = self.term.columns();
+        let grid = self.term.grid();
+        let off = grid.display_offset() as i32;
+        let text = |row: usize| -> String {
+            let line = &grid[Line(row as i32 - off)];
+            (0..cols).map(|col| line[Column(col)].c).collect()
+        };
+        let prompt = (rows.saturating_sub(40)..rows).rev().find(|&r| is_input_prompt_row(&text(r)))?;
+        (0..prompt).rev().map(text).find(|row| !is_blank_or_border(row))
     }
 
     /// Whether any of the last 40 visible rows contains one of `needles`.
@@ -802,6 +828,18 @@ fn status_row_text(row: &str) -> Option<&str> {
     Some(chars.as_str())
 }
 
+/// Whether a row is the prompt line of Claude's input box: "❯ " with whatever has been
+/// typed after it, possibly inside the box's side border.
+fn is_input_prompt_row(row: &str) -> bool {
+    row.trim_start_matches(|c: char| c.is_whitespace() || c == '│').starts_with('\u{276f}')
+}
+
+/// Whether a row holds nothing but blanks and box-drawing characters, which is what the
+/// input box's top and bottom borders are.
+fn is_blank_or_border(row: &str) -> bool {
+    row.chars().all(|c| c.is_whitespace() || matches!(c as u32, 0x2500..=0x257F))
+}
+
 /// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
 /// row (see `VtTerm::visible_waiting_background`).
 fn is_waiting_agents_row(row: &str) -> bool {
@@ -1108,6 +1146,64 @@ mod tests {
         assert!(seen("✳ Waiting for 2 background agents to finish"));
         assert!(seen("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
         assert!(!seen("✻ Brewed for 14m 1s · done 11:40 PM"));
+    }
+
+    // With the input box on screen, the row has to be the last thing above it. The
+    // aborted wait is the screen from the bug report: the row is still there, with
+    // Claude's own note that the agents stopped written under it.
+    #[test]
+    fn background_work_counts_only_as_the_last_row_above_the_input_box() {
+        let screen = |lines: &[&str]| {
+            let mut t = super::VtTerm::new(80, 12);
+            t.feed(lines.join("\r\n").as_bytes());
+            t.visible_waiting_background()
+        };
+        let rule = "────────────────────────────────────────";
+        let footer = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent";
+
+        // Still waiting: the row is the last thing above the box.
+        assert!(screen(&[
+            "● Launching two agents.",
+            "",
+            "✳ Waiting for 2 background agents to finish",
+            "",
+            "",
+            rule,
+            "❯ ",
+            rule,
+            footer,
+        ]));
+        // Aborted: the same row, with the stop note written under it.
+        assert!(!screen(&[
+            "✳ Waiting for 2 background agents to finish",
+            "",
+            "● All background agents stopped",
+            "",
+            "",
+            rule,
+            "❯ ",
+            rule,
+            footer,
+        ]));
+        // A shell still running, then a new prompt the user sent after it.
+        assert!(screen(&["✻ Brewed for 3s · 1 shell still running", "", rule, "❯ ", rule]));
+        assert!(!screen(&[
+            "✻ Brewed for 3s · 1 shell still running",
+            "",
+            "> run the tests",
+            "",
+            rule,
+            "❯ ",
+            rule,
+        ]));
+        // Text being typed into the box does not hide the row above it.
+        assert!(screen(&[
+            "✳ Waiting for 1 background agent to finish",
+            "",
+            rule,
+            "❯ and then check the logs",
+            rule,
+        ]));
     }
 
     /// Scrolling (wheel or drag auto-scroll) while a selection drag is active must

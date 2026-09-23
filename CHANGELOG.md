@@ -8,6 +8,11 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **Aborting background agents ends the working state.** A pane is held as working while
+  "Waiting for N background agents to finish" shows, but stopping the agents leaves that
+  line in the transcript, with "All background agents stopped" under it, and the pane
+  stayed working for good. The line now only counts as the last thing above Claude's
+  input box. The same goes for a finished turn's "1 shell still running".
 - **macOS: a Window menu, and the Dock lists your windows.** Right-clicking Arbiter in the
   Dock showed no windows, because winit's menu bar has no Window menu and AppKit keeps an
   app's window list through that menu. There is one now, with Minimize (Cmd+M), Zoom and
