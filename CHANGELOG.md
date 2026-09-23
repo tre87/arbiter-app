@@ -7,6 +7,20 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Changed
+- **The Agents Office is as small as its agents allow, and sizes itself.** The room has
+  exactly as many rows as its agents need: a sixth agent opens a second row, and when a
+  row's agents have gone, the desks below move up to close the gap, so five agents are
+  always one row. The window follows the room both ways, growing for a new row and
+  shrinking when one goes, and can no longer be resized by hand on macOS or Windows. It
+  fits the room exactly at any display scale.
+
+### Fixed
+- **A desk held for an agent that left is released on time.** An agent that stops keeps
+  its desk for 20 seconds in case its pane is only reconnecting, but the release waited
+  for the next thing to happen in the app, so an emptied row could stay until you
+  switched workspace or touched something. It now happens when the 20 seconds are up.
+
 ## [1.6.0] - 2026-09-23
 
 ### Added

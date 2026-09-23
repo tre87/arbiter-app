@@ -179,8 +179,11 @@ struct State {
     /// The office window's scale factor, so the room's pixels land on whole physical
     /// pixels at 125% and 150% too.
     office_scale: f32,
-    /// Rows of desks the window was last sized for (`office_grow`).
-    office_rows: i32,
+    /// The rows and scale factor the office window was last sized for
+    /// (`office_fit_window`), so each change resizes it once.
+    office_sized_for: Option<(i32, u32)>,
+    /// When the wake that releases the next expiring desk hold is due (`office_arm_expiry`).
+    office_expiry_armed: Option<u64>,
     /// The office window is minimised: Windows reports that as a resize to nothing,
     /// and winit sends no occlusion there (see `window_hidden`).
     office_minimized: bool,
@@ -831,6 +834,8 @@ enum Message {
     OfficeDeskClicked(String),
     /// The room's own 12fps clock, live only while a turn is in flight.
     OfficeTick,
+    /// A desk hold has run out; the refresh after it releases the desk.
+    OfficeSeatExpired,
     /// The office window's scale factor, asked for when it opens or resizes.
     OfficeScale(f32),
     /// The pointer entered or left the office window; its chrome follows.
@@ -1484,7 +1489,8 @@ fn office_refresh(state: &mut State) -> Task<Message> {
         state.office_plates.clear();
         state.office_key = None;
         state.office_plates_key = None;
-        state.office_rows = 1;
+        state.office_sized_for = None;
+        state.office_expiry_armed = None;
         state.office_minimized = false;
         // Nor does it hold anything that belongs to having the window on screen.
         // Closing from the menu's own Close item would otherwise leave the menu
@@ -1515,7 +1521,13 @@ fn office_refresh(state: &mut State) -> Task<Message> {
         state.office_plates_key = Some(plates_key);
         office_draw_plates(state, kp);
     }
-    office_grow(state)
+    let tasks: Vec<Task<Message>> =
+        [office_fit_window(state), office_arm_expiry(state)].into_iter().flatten().collect();
+    if tasks.is_empty() {
+        Task::none()
+    } else {
+        Task::batch(tasks)
+    }
 }
 
 /// The animation clock in seconds. Wrapped at an hour so the f32 keeps its precision;
@@ -1558,36 +1570,69 @@ fn office_draw_plates(state: &mut State, kp: i32) {
         .collect();
 }
 
-/// A new row of desks grows the window to show it at `OFFICE_SCALE`, as far as the
-/// screen allows; the minimum size is one row, and a room squeezed into it would draw
-/// at 1x, where the nameplates do not fit. Never shrinks the window: rows emptying out
-/// is not a reason to move what the user sized.
-fn office_grow(state: &mut State) -> Task<Message> {
-    let rows = agents_office::rows(state.office_seats.len());
-    let grew = rows > state.office_rows;
-    state.office_rows = rows;
-    let Some(id) = state.office_window else { return Task::none() };
-    if !grew {
-        return Task::none();
-    }
+/// The office window's size: the room at `OFFICE_SCALE` times, rounded to a whole
+/// number of physical pixels per room pixel so the room fills it exactly at any
+/// display scale, and stepped down a zoom at a time where the screen is smaller.
+fn office_target_size(state: &State) -> iced::Size {
     let (lw, lh) = state.office_scene.size();
-    let mut want = iced::Size::new(
-        state.office_size.width.max((lw * OFFICE_SCALE) as f32),
-        state.office_size.height.max((lh * OFFICE_SCALE) as f32),
-    );
-    if let Some(a) = state.office_pos.and_then(|p| {
+    let s = if state.office_scale > 0.0 { state.office_scale } else { 1.0 };
+    let area = state.office_pos.and_then(|p| {
         arbiter_native::notify::work_area_at(
             (p.x + state.office_size.width / 2.0, p.y + state.office_size.height / 2.0),
-            state.office_scale,
+            s,
         )
-    }) {
-        want.width = want.width.min(a.right - a.left).max(state.office_size.width);
-        want.height = want.height.min(a.bottom - a.top).max(state.office_size.height);
+    });
+    let mut kp = (OFFICE_SCALE as f32 * s).round().max(1.0);
+    loop {
+        let size = iced::Size::new(lw as f32 * kp / s, lh as f32 * kp / s);
+        let fits = area.map_or(true, |a| {
+            size.width <= a.right - a.left && size.height <= a.bottom - a.top
+        });
+        if fits || kp <= 1.0 {
+            return size;
+        }
+        kp -= 1.0;
     }
-    if want == state.office_size {
-        return Task::none();
+}
+
+/// Size the window to the room whenever its rows or the display scale change, in
+/// both directions: the room is never taller than its agents need, and neither is the
+/// window. Keyed, so each change resizes once and the resize event it causes does not
+/// start another.
+fn office_fit_window(state: &mut State) -> Option<Task<Message>> {
+    let id = state.office_window?;
+    let key = (agents_office::rows(state.office_seats.len()), state.office_scale.to_bits());
+    if state.office_sized_for == Some(key) {
+        return None;
     }
-    iced::window::resize(id, want)
+    state.office_sized_for = Some(key);
+    let want = office_target_size(state);
+    let same = (want.width - state.office_size.width).abs() < 1.0
+        && (want.height - state.office_size.height).abs() < 1.0;
+    (!same).then(|| iced::window::resize(id, want))
+}
+
+/// A desk held for an agent that left is released when the hold runs out, so the room
+/// closes up then, not at whatever message happens to arrive next: a quiet app sends
+/// none, and the emptied row stayed until something was touched. One wake for the
+/// earliest hold, re-armed by the refresh after it.
+fn office_arm_expiry(state: &mut State) -> Option<Task<Message>> {
+    let next = state
+        .office_seats
+        .iter()
+        .flatten()
+        .filter_map(|seat| seat.vacated_ms)
+        .map(|at| at + OFFICE_SEAT_HOLD_MS)
+        .min()?;
+    if state.office_expiry_armed.is_some_and(|armed| armed <= next) {
+        return None;
+    }
+    state.office_expiry_armed = Some(next);
+    // A little past the deadline, so the check that runs then is past it too.
+    let wait = next.saturating_sub(now_ms()) + 20;
+    Some(Task::perform(tokio::time::sleep(Duration::from_millis(wait)), |_| {
+        Message::OfficeSeatExpired
+    }))
 }
 
 /// Reseat and re-derive the room. Returns whether anything it draws changed.
@@ -1741,14 +1786,7 @@ fn office_view(state: &State) -> Element<'_, Message> {
         });
 
     let chrome = office_chrome(state);
-    #[cfg(target_os = "windows")]
-    {
-        stack![stage, chrome, resize_overlay()].into()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        stack![stage, chrome].into()
-    }
+    stack![stage, chrome].into()
 }
 
 /// The office's only chrome: a gear in the top-right corner, over the strip of
@@ -2002,14 +2040,16 @@ const WHEEL_FROZEN_MS: u64 = 800;
 /// repaint shows; the first frame after it waits for the output to settle.
 const WHEEL_NUDGE_HOLD_MS: u64 = 300;
 
-/// The Agents Office opens at, and never shrinks below, twice the room's logical
-/// size. The nameplates are drawn at the display's resolution into a floor strip
-/// measured against that zoom, so below it a plate does not fit.
+/// The Agents Office window is twice the room's logical size (`office_target_size`).
+/// The nameplates are drawn at the display's resolution into a floor strip measured
+/// against that zoom, so below it a plate does not fit.
 const OFFICE_SCALE: i32 = 2;
 /// Rows of desks the room will grow to before an agent has to wait for a seat.
 /// Four rows of five is twenty, which is past the point where anyone is reading
 /// faces; the overview stays the complete list.
 const OFFICE_MAX_ROWS: usize = 4;
+/// One row of desks at `OFFICE_SCALE`: the size a first open starts at, before
+/// `office_fit_window` knows the rows and the display scale.
 fn office_min_size() -> iced::Size {
     iced::Size::new(
         (agents_office::W * OFFICE_SCALE) as f32,
@@ -2020,8 +2060,9 @@ fn office_min_size() -> iced::Size {
 /// Window settings for the Agents Office popout. Borderless like the overview, but
 /// with nothing drawn in it except the room: no titlebar, no caption buttons.
 fn office_settings(size: iced::Size, pos: Option<iced::Point>, topmost: bool) -> iced::window::Settings {
-    let mut settings = iced::window::Settings { size, ..Default::default() };
-    settings.min_size = Some(office_min_size());
+    // Not resizable: the window is the room's size (`office_fit_window`), and follows its
+    // rows by itself.
+    let mut settings = iced::window::Settings { size, resizable: false, ..Default::default() };
     settings.level =
         if topmost { iced::window::Level::AlwaysOnTop } else { iced::window::Level::Normal };
     if let Some(p) = pos {
@@ -3430,6 +3471,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 return update_app(state, Message::JumpTo(wi, pane));
             }
         }
+        Message::OfficeSeatExpired => state.office_expiry_armed = None,
         Message::OfficeTick => {
             // The phase and nothing else; `office_refresh` below draws the frame.
             state.office_ticks += 1;
@@ -3583,28 +3625,14 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                     iced::Size::new(s.width.max(OVERVIEW_MIN_W), s.height.max(OVERVIEW_MIN_H)),
                 );
             }
-            // The office is borderless too, so it needs the same clamp.
+            // The office sizes itself (`office_fit_window`), so it takes no clamp.
             let is_office = state.office_window == Some(id);
-            let office_min = office_min_size();
-            if is_office
-                && s.width > 50.0
-                && s.height > 20.0
-                && (s.width < office_min.width || s.height < office_min.height)
-            {
-                return iced::window::resize(
-                    id,
-                    iced::Size::new(
-                        s.width.max(office_min.width),
-                        s.height.max(office_min.height),
-                    ),
-                );
-            }
             // Track + save real sizes; skip the degenerate minimized size (main uses a
-            // 100x100 floor, the overview its own 100x40 minimum).
+            // 100x100 floor, the overview its own 100x40 minimum, the office 50x20).
             let (min_w, min_h) = if is_overview {
                 (OVERVIEW_MIN_W, OVERVIEW_MIN_H)
             } else if is_office {
-                (office_min.width, office_min.height)
+                (50.0, 20.0)
             } else {
                 (100.0, 100.0)
             };
@@ -10669,7 +10697,8 @@ fn main() -> iced::Result {
                 office_rev: 0,
                 office_ticks: 0,
                 office_scale: 1.0,
-                office_rows: 1,
+                office_sized_for: None,
+                office_expiry_armed: None,
                 office_minimized: false,
                 office_hover: false,
                 office_menu: false,

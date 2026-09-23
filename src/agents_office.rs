@@ -12,9 +12,11 @@
 //!
 //! Three rules the rest of the design leans on:
 //!
-//! * **A desk never moves.** Slot `i` is always at row `i / COLS`, column
-//!   `i % COLS`, for the life of the pane. Sorting desks by urgency would read
-//!   better for one frame and destroy the only advantage the room has over the
+//! * **A desk does not move, except to close up the room.** Slot `i` is at row
+//!   `i / COLS`, column `i % COLS`, for the life of the pane, until the room has
+//!   more rows than its agents need; then the desks past the last needed row move
+//!   into the free desks before it (see [`reseat`]). Sorting desks by urgency would
+//!   read better for one frame and destroy the only advantage the room has over the
 //!   Overview list, which is that you learn where things are.
 //! * **Colour is a reserved word.** [`WORKING`] is painted by nothing except a
 //!   desk in [`Desk::Working`], [`ATTENTION`] by nothing except
@@ -819,10 +821,12 @@ pub struct Seat {
 /// happened to be free when it came back, which is [the founding
 /// rule](self#rules) broken invisibly.
 ///
-/// Seats are never reordered and never stolen. Past `max_rows` an agent simply
-/// waits: there is no pagination, because state in an ambient display defeats the
-/// glance, and no preemption, because a desk that moves costs more than a desk that
-/// is missing.
+/// Seats are never stolen, and reordered only to close up the room: the room is
+/// always as few rows as its seats (held ones included) need, so once a hold runs
+/// out, any seats past that last row move into the free desks before it, in order,
+/// and every other desk stays where it was. Past `max_rows` an agent simply waits:
+/// there is no pagination, because state in an ambient display defeats the glance,
+/// and no preemption.
 pub fn reseat(
     seats: &mut Vec<Option<Seat>>,
     live: &[&str],
@@ -857,13 +861,20 @@ pub fn reseat(
             None => break,
         }
     }
-    // Give back trailing empty rows so the room shrinks, keeping one row always.
-    while seats.len() > COLS && seats[seats.len() - COLS..].iter().all(|s| s.is_none()) {
-        seats.truncate(seats.len() - COLS);
+    // Close up: as few rows as the taken seats need, one row always. Seats past
+    // that move into the free desks before it, in the order they sat.
+    let keep = rows(seats.iter().flatten().count()) as usize * COLS;
+    if seats.len() > keep {
+        let spilled: Vec<Seat> = seats.drain(keep..).flatten().collect();
+        let mut spill = spilled.into_iter();
+        for slot in seats.iter_mut().filter(|s| s.is_none()) {
+            match spill.next() {
+                Some(seat) => *slot = Some(seat),
+                None => break,
+            }
+        }
     }
-    if seats.len() < COLS {
-        seats.resize(COLS, None);
-    }
+    seats.resize(keep, None);
 }
 
 // ----------------------------------------------------------------- canvas ---
@@ -1974,6 +1985,40 @@ mod tests {
         assert_eq!(seats[1].as_ref().unwrap().id, "d");
         assert_eq!(seats[0].as_ref().unwrap().id, "a", "a moved");
         assert_eq!(seats[2].as_ref().unwrap().id, "c", "c moved");
+    }
+
+    // An agent that arrives while a desk is held for one that left opens a row; once
+    // the hold runs out it moves into the free desk and the row goes again.
+    #[test]
+    fn a_row_opened_during_a_hold_closes_once_it_is_up() {
+        let mut seats = vec![None; COLS];
+        let live = ["a", "b", "c", "d", "e"];
+        reseat(&mut seats, &live, 0, 20_000, 4);
+        // `b` quits and `f` starts inside the hold: six seats taken, two rows.
+        reseat(&mut seats, &["a", "c", "d", "e", "f"], 1_000, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 2);
+        assert_eq!(seats[5].as_ref().unwrap().id, "f");
+        // The hold runs out: five agents, one row, `f` at `b`'s old desk.
+        reseat(&mut seats, &["a", "c", "d", "e", "f"], 25_000, 20_000, 4);
+        assert_eq!(seats.len(), COLS);
+        assert_eq!(seats[1].as_ref().unwrap().id, "f");
+        assert_eq!(seats[0].as_ref().unwrap().id, "a", "a desk that needed no move moved");
+    }
+
+    // Row one empties while row two is busy: the room closes up to one row.
+    #[test]
+    fn an_emptied_row_closes_up() {
+        let mut seats = vec![None; COLS];
+        let ids: Vec<String> = (0..10).map(|i| format!("a{i}")).collect();
+        let live: Vec<&str> = ids.iter().map(String::as_str).collect();
+        reseat(&mut seats, &live, 0, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 2);
+        reseat(&mut seats, &live[5..], 1_000, 20_000, 4);
+        assert_eq!(seats.len(), COLS * 2, "closed up before the hold was up");
+        reseat(&mut seats, &live[5..], 25_000, 20_000, 4);
+        assert_eq!(seats.len(), COLS);
+        let ids: Vec<&str> = seats.iter().flatten().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a5", "a6", "a7", "a8", "a9"], "not moved up in order");
     }
 
     #[test]
