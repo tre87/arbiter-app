@@ -460,7 +460,7 @@ impl VtTerm {
     /// Working is NOT detected here — it's keyed off the live byte stream (see
     /// `session.rs`), so a spinner star left on screen can't pin it to "working".
     pub fn visible_menu(&self) -> bool {
-        self.rows_from_bottom(MENU_ROWS, is_menu_row)
+        menu_in(&self.visible_rows())
     }
 
     /// True while Claude says it is working, by the interrupt hint it shows only then.
@@ -472,14 +472,14 @@ impl VtTerm {
     /// window as the rest of the chrome. Earlier releases put it on the spinner row
     /// ("✻ Thinking… (esc to interrupt)"), which is still accepted.
     pub fn visible_working(&self) -> bool {
-        self.below_cursor_contains(&[INTERRUPT_HINT]) || self.any_visible_row(is_working_row)
+        self.below_cursor_contains(&[INTERRUPT_HINT]) || working_row_in(&self.visible_rows())
     }
 
     /// True while Claude's fullscreen UI is scrolled away from its live bottom: it then
     /// shows a "Jump to bottom (ctrl+End) ↓" bar (or "N new messages (ctrl+End) ↓") and
     /// stops drawing its status row, so no spinner frames say anything about the turn.
     pub fn visible_scrolled(&self) -> bool {
-        self.screen_contains(&["(ctrl+End)"])
+        scrolled_in(&self.visible_rows())
     }
 
     /// True while Claude's status row says it has background work outstanding: either
@@ -496,60 +496,51 @@ impl VtTerm {
     /// on screen the row only counts as the last thing drawn above it. Without the box
     /// there is nothing to measure against, and any visible row counts, as before.
     pub fn visible_waiting_background(&self) -> bool {
-        let waiting = |row: &str| is_waiting_agents_row(row) || is_background_shell_row(row);
-        match self.row_above_input() {
-            Some(row) => waiting(&row),
-            None => self.any_visible_row(waiting),
+        waiting_in(&self.visible_rows())
+    }
+
+    /// Everything the reader reads from the screen for Claude's state, from one pass
+    /// over it. Run for every chunk of output while Claude owns the pane, under the
+    /// terminal lock the renderer also needs, so the rows are read once into a buffer
+    /// the reader thread keeps, rather than once per question.
+    pub fn claude_screen(&self) -> ClaudeScreen {
+        thread_local! {
+            static ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        ROWS.with(|rows| {
+            let mut rows = rows.borrow_mut();
+            self.fill_visible_rows(&mut rows);
+            ClaudeScreen {
+                menu: menu_in(&rows),
+                scrolled: scrolled_in(&rows),
+                waiting: waiting_in(&rows),
+                working: self.below_cursor_contains(&[INTERRUPT_HINT]) || working_row_in(&rows),
+                idle_box: self.claude_chrome(),
+                slash_input: self.input_row_is_slash(),
+            }
+        })
     }
 
-    /// The last row Claude drew above its input box: the first one above the box's
-    /// prompt that is neither blank, nor the box's own border, nor a line of the task
-    /// list Claude draws under its status row. `None` when no prompt row is among the
-    /// last 40 visible rows, or nothing is drawn above it.
-    fn row_above_input(&self) -> Option<String> {
+    fn visible_rows(&self) -> Vec<String> {
+        let mut rows = Vec::new();
+        self.fill_visible_rows(&mut rows);
+        rows
+    }
+
+    /// The text of every visible row, top to bottom, into `out`, reusing its strings.
+    fn fill_visible_rows(&self, out: &mut Vec<String>) {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
-        let text = |row: usize| -> String {
-            let line = &grid[Line(row as i32 - off)];
-            (0..cols).map(|col| line[Column(col)].c).collect()
-        };
-        let prompt = (rows.saturating_sub(40)..rows).rev().find(|&r| is_input_prompt_row(&text(r)))?;
-        (0..prompt).rev().map(text).find(|row| !is_blank_or_border(row) && !is_task_list_row(row))
-    }
-
-    /// Whether any of the last 40 visible rows contains one of `needles`.
-    fn screen_contains(&self, needles: &[&str]) -> bool {
-        self.any_visible_row(|row| needles.iter().any(|m| row.contains(m)))
-    }
-
-    /// Whether `matches` holds for the text of any of the last 40 visible rows.
-    fn any_visible_row(&self, matches: impl Fn(&str) -> bool) -> bool {
-        self.rows_from_bottom(40, matches)
-    }
-
-    /// Whether `matches` holds for any of the last `n` visible rows. A narrow window
-    /// is how a LIVE element is told from the same words sitting in the transcript:
-    /// Claude anchors its input box and menus to the bottom of the screen.
-    fn rows_from_bottom(&self, n: usize, matches: impl Fn(&str) -> bool) -> bool {
-        let rows = self.term.screen_lines();
-        let cols = self.term.columns();
-        let grid = self.term.grid();
-        let off = grid.display_offset() as i32;
-        let mut buf = String::with_capacity(cols);
-        for row in rows.saturating_sub(n)..rows {
+        out.resize_with(rows, String::new);
+        for (row, buf) in out.iter_mut().enumerate() {
             buf.clear();
             let line = &grid[Line(row as i32 - off)];
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if matches(&buf) {
-                return true;
-            }
         }
-        false
     }
 
     /// True if Claude Code's own UI chrome is on the visible screen. This is how a
@@ -822,6 +813,58 @@ const CHROME_BELOW: usize = 8;
 
 /// The footer hint Claude shows only while a turn is running.
 const INTERRUPT_HINT: &str = "esc to interrupt";
+
+/// What `VtTerm::claude_screen` reads, one field per question the reader asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClaudeScreen {
+    pub menu: bool,
+    pub scrolled: bool,
+    pub waiting: bool,
+    pub working: bool,
+    pub idle_box: bool,
+    pub slash_input: bool,
+}
+
+/// Rows from the bottom that Claude's live status rows are looked for in. A marker
+/// further up is transcript.
+const LIVE_ROWS: usize = 40;
+
+/// The last `n` of `rows`.
+fn bottom(rows: &[String], n: usize) -> &[String] {
+    &rows[rows.len().saturating_sub(n)..]
+}
+
+/// A live chooser's footer among the bottom `MENU_ROWS` (`VtTerm::visible_menu`).
+fn menu_in(rows: &[String]) -> bool {
+    bottom(rows, MENU_ROWS).iter().any(|r| is_menu_row(r))
+}
+
+/// Claude's "Jump to bottom (ctrl+End)" bar (`VtTerm::visible_scrolled`).
+fn scrolled_in(rows: &[String]) -> bool {
+    bottom(rows, LIVE_ROWS).iter().any(|r| r.contains("(ctrl+End)"))
+}
+
+/// The pre-2.1.28x working row, the interrupt hint on the spinner row.
+fn working_row_in(rows: &[String]) -> bool {
+    bottom(rows, LIVE_ROWS).iter().any(|r| is_working_row(r))
+}
+
+/// Outstanding background work (`VtTerm::visible_waiting_background`): with the
+/// input box's prompt among the live rows, only the last row drawn above it counts,
+/// the first that is neither blank, nor the box's border, nor a task-list item.
+/// Without the box any live row counts.
+fn waiting_in(rows: &[String]) -> bool {
+    let waiting = |row: &str| is_waiting_agents_row(row) || is_background_shell_row(row);
+    let start = rows.len().saturating_sub(LIVE_ROWS);
+    match (start..rows.len()).rev().find(|&i| is_input_prompt_row(&rows[i])) {
+        Some(prompt) => rows[..prompt]
+            .iter()
+            .rev()
+            .find(|r| !is_blank_or_border(r) && !is_task_list_row(r))
+            .is_some_and(|r| waiting(r)),
+        None => bottom(rows, LIVE_ROWS).iter().any(|r| waiting(r)),
+    }
+}
 
 /// Rows from the bottom that a LIVE menu can occupy. Claude anchors its input box and
 /// its choosers to the bottom of the screen, so a marker further up is transcript: an
@@ -1418,6 +1461,33 @@ mod tests {
         assert!(!working(&screen("\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)")));
         // The hint left in the transcript above the prompt is history.
         assert!(!working("  esc to interrupt\r\n\r\n\u{276f} "));
+    }
+
+    // The reader's one pass says what each question asked on its own says.
+    #[test]
+    fn the_single_screen_read_matches_each_question() {
+        let rule = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+        for screen in [
+            format!("\u{2733} Waiting for 2 background agents to finish\r\n{rule}\r\n\u{276f} /mod\r\n{rule}\r\n  esc to interrupt\x1b[2A\x1b[3C"),
+            format!("\u{25cf} done\r\n{rule}\r\n\u{276f} \r\n{rule}\r\n  ? for shortcuts\x1b[2A\x1b[2C"),
+            "  \u{2191}/\u{2193} to navigate \u{b7} Enter to select \u{b7} Esc to cancel\r\nJump to bottom (ctrl+End)".to_string(),
+        ] {
+            let mut t = super::VtTerm::new(80, 24);
+            t.feed(screen.as_bytes());
+            let read = t.claude_screen();
+            assert_eq!(
+                read,
+                super::ClaudeScreen {
+                    menu: t.visible_menu(),
+                    scrolled: t.visible_scrolled(),
+                    waiting: t.visible_waiting_background(),
+                    working: t.visible_working(),
+                    idle_box: t.claude_chrome(),
+                    slash_input: t.input_row_is_slash(),
+                },
+                "{screen:?}"
+            );
+        }
     }
 
     #[test]

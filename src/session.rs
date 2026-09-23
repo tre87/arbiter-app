@@ -1702,17 +1702,8 @@ fn reader_loop(
             // so amber clears the instant the prompt leaves). Working: the ✻ spinner
             // glyph in the *new* bytes (chunk-based like the web — instant, and a
             // stale star left on screen can't pin it to "working").
-            let (menu, scrolled, waiting, working, idle_box, slash_input) = {
-                let t = term.lock().unwrap();
-                (
-                    t.visible_menu(),
-                    t.visible_scrolled(),
-                    t.visible_waiting_background(),
-                    t.visible_working(),
-                    t.claude_chrome(),
-                    t.input_row_is_slash(),
-                )
-            };
+            let crate::term::ClaudeScreen { menu, scrolled, waiting, working, idle_box, slash_input } =
+                term.lock().unwrap().claude_screen();
             // Scrolled away, everything on screen is history: an approval box the user
             // is reading back over is not a prompt waiting on them.
             let menu = menu && !scrolled;
