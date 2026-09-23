@@ -163,16 +163,24 @@ struct FrameKey {
     canvas: (u32, u32),
 }
 
+/// Set when Arbiter put `WGPU_BACKEND` in its own environment for iced, rather than
+/// inheriting it. Panes then leave it out (`Session::spawn`): a wgpu program started in
+/// one, Arbiter itself under `cargo run` included, would take it for the user's choice.
+pub static BACKEND_ENV_IS_OURS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Windows: the one wgpu backend to ask for (`WGPU_BACKEND`), decided before iced starts.
 /// Pinning one keeps iced from initialising all three (DX12, Vulkan, OpenGL), tens of MB
 /// of driver for nothing. DX12 first: it is Windows' own API, every driver has it, and
 /// Vulkan flickers on Intel graphics. It used to draw an unmaximised window soft; the
 /// vendored wgpu-hal presents 1:1 now (vendor/wgpu-hal/ARBITER-FORK.md). DX12 always lists
 /// WARP, the software rasteriser, so only a hardware adapter counts; Vulkan next, and with
-/// neither, WARP with a notice. The probe enumerates adapters synchronously and drops the
-/// instances again at once.
+/// neither, WARP with a notice. `preferred` Vulkan only swaps the first two. The probe
+/// enumerates adapters synchronously and drops the instances again at once.
+/// The flag is false when a forced backend had no hardware adapter and the other was used.
 #[cfg(windows)]
-pub fn windows_backend() -> &'static str {
+pub fn windows_backend(preferred: crate::persist::GraphicsBackend) -> (&'static str, bool) {
+    use crate::persist::GraphicsBackend;
     let has_hardware = |backends: wgpu::Backends| {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
         instance
@@ -180,14 +188,16 @@ pub fn windows_backend() -> &'static str {
             .iter()
             .any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
     };
-    if has_hardware(wgpu::Backends::DX12) {
-        return "dx12";
-    }
-    if has_hardware(wgpu::Backends::VULKAN) {
-        return "vulkan";
+    let dx12 = (wgpu::Backends::DX12, "dx12");
+    let vulkan = (wgpu::Backends::VULKAN, "vulkan");
+    let order = if preferred == GraphicsBackend::Vulkan { [vulkan, dx12] } else { [dx12, vulkan] };
+    for (i, (backends, name)) in order.into_iter().enumerate() {
+        if has_hardware(backends) {
+            return (name, i == 0 || preferred == GraphicsBackend::Auto);
+        }
     }
     warn_no_gpu();
-    "dx12"
+    ("dx12", preferred != GraphicsBackend::Vulkan)
 }
 
 // On its own thread so the window opens behind it rather than after it.

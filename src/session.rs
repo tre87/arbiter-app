@@ -864,6 +864,9 @@ impl Session {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         cmd.env(crate::claude_shim::PANE_ID_ENV, id.to_string());
         cmd.env(TERMINAL_ENV, TERMINAL_NAME);
+        if crate::gpu::BACKEND_ENV_IS_OURS.load(Ordering::Relaxed) {
+            cmd.env_remove("WGPU_BACKEND");
+        }
         // Read before `cmd` is consumed by the spawn. The pane's private history file
         // (set on the command by the shell layer) is a second source for its startup
         // command when keystroke tracking gives up on an up-arrow recall.

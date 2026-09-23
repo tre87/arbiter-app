@@ -30,7 +30,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   where no DirectX 12 hardware is found. DirectX 12 used to draw every window that was
   not maximised slightly soft, which is why Vulkan was used before; that is fixed too, so
   text is as sharp on DirectX 12 as it was on Vulkan. Settings, Display, Graphics shows
-  which one is in use. Setting `WGPU_BACKEND` still overrides the choice.
+  which one is in use, and can choose DirectX 12 or Vulkan instead of Automatic (applies
+  after a restart; a choice with no graphics adapter falls back to the other). Setting
+  `WGPU_BACKEND` still overrides both.
+- **Programs started in an Arbiter terminal no longer inherit its graphics backend.**
+  Arbiter passed the backend it picked for itself (`WGPU_BACKEND`) on to every terminal,
+  so a program there that draws with wgpu, a second Arbiter included, used Arbiter's
+  choice as if it were yours.
 - **A desk held for an agent that left is released on time.** An agent that stops keeps
   its desk for 20 seconds in case its pane is only reconnecting, but the release waited
   for the next thing to happen in the app, so an emptied row could stay until you

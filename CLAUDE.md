@@ -265,10 +265,16 @@ crafted `session.json` files. Findings that shape the code:
   isolated runs. The best-fitting owner is the NVIDIA in-game overlay's capture hook
   (`nvspcap64.dll` was loaded in the process). Disable the overlay to test.
 - **Windows asks wgpu for DX12 alone, after a probe** (`gpu::windows_backend`, set as
-  `WGPU_BACKEND` in `main`; Settings, Display, Graphics names the one in use). Order: DX12
-  on a hardware adapter (WARP is always listed, so it does not count), then Vulkan, then
-  WARP with a message box. Vulkan was the default until 2026-09-23 and flickers every
-  textured thing on Intel graphics (Core Ultra 5 225U, latest driver); DX12 does not.
+  `WGPU_BACKEND` in `main` by `choose_graphics_backend`). Order: DX12 on a hardware adapter
+  (WARP is always listed, so it does not count), then Vulkan, then WARP with a message box.
+  Settings, Display, Graphics can put Vulkan first or insist on DX12
+  (`Settings::graphics_backend`, read from the saved state before iced starts, so it
+  applies after a restart; a forced backend with no adapter falls back to the other) and
+  names the backend in use. A `WGPU_BACKEND` already in the environment beats both, so
+  one Arbiter set for itself is kept out of panes (`gpu::BACKEND_ENV_IS_OURS`,
+  `Session::spawn`); a second Arbiter run from a pane took it for the user's.
+  Vulkan was the default until 2026-09-23 and flickers every textured thing on Intel
+  graphics (Core Ultra 5 225U, latest driver); DX12 does not.
   DX12 used to draw every unmaximised window blurry: wgpu-hal created the DXGI swapchain
   with `DXGI_SCALING_STRETCH`, and winit's `undecorated_shadow` hack (`WM_NCCALCSIZE`:
   `top += 1; bottom += 1`) makes the client rect one row taller than the window shows, so

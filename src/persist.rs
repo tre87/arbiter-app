@@ -263,6 +263,10 @@ pub struct Settings {
     /// never be the reason a frame is drawn.
     #[serde(default = "default_true")]
     pub office_weather_auto: bool,
+    /// Windows: the graphics backend to ask for (Settings, Display, Graphics). Read once
+    /// at startup, so a change applies after a restart.
+    #[serde(default)]
+    pub graphics_backend: GraphicsBackend,
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -332,6 +336,33 @@ impl std::fmt::Display for IntenseStyle {
     }
 }
 
+/// Windows: which wgpu backend to ask for. `Auto` is `gpu::windows_backend`'s own order
+/// (DX12, then Vulkan); a forced one with no hardware adapter falls back to that order.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphicsBackend {
+    #[default]
+    Auto,
+    Dx12,
+    Vulkan,
+}
+
+impl GraphicsBackend {
+    /// All variants, in menu order (for the Settings picker).
+    pub const ALL: [GraphicsBackend; 3] =
+        [GraphicsBackend::Auto, GraphicsBackend::Dx12, GraphicsBackend::Vulkan];
+}
+
+impl std::fmt::Display for GraphicsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GraphicsBackend::Auto => "Automatic",
+            GraphicsBackend::Dx12 => "DirectX 12",
+            GraphicsBackend::Vulkan => "Vulkan",
+        })
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -384,6 +415,7 @@ impl Default for Settings {
             office_show_names: true,
             office_weather: 0,
             office_weather_auto: true,
+            graphics_backend: GraphicsBackend::Auto,
         }
     }
 }

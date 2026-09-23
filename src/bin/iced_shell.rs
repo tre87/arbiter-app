@@ -675,6 +675,8 @@ enum Message {
     ToggleNameRemoteSessions(bool),
     /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
     SetIntenseStyle(persist::IntenseStyle),
+    #[cfg(windows)]
+    SetGraphicsBackend(persist::GraphicsBackend),
     /// Settings → background colour (hex `#rrggbb`); from a preset button or the input.
     SetBackground(String),
     /// Settings → scrollback lines (text input; parsed + clamped).
@@ -2798,6 +2800,11 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             save_session(state);
             // Existing terminals re-render from the global on the next frame.
         }
+        #[cfg(windows)]
+        Message::SetGraphicsBackend(b) => {
+            state.settings.graphics_backend = b;
+            save_session(state);
+        }
         Message::SetBackground(hex) => {
             let hex = hex.trim().to_string();
             state.settings.background = hex.clone();
@@ -4436,26 +4443,66 @@ fn settings_section(label: &str) -> Element<'static, Message> {
     .into()
 }
 
-// Set when WGPU_BACKEND was already in the environment at startup, so main did not probe.
 #[cfg(windows)]
-static BACKEND_FROM_USER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendSource {
+    Auto,
+    Settings,
+    // The backend forced in Settings had no hardware adapter, so the other one was used.
+    SettingsUnavailable,
+    // WGPU_BACKEND was already set, so nothing was probed and the setting was not read.
+    Env,
+}
 
-// Read back from WGPU_BACKEND, which main always sets on Windows before iced creates its
-// wgpu instance, so it names the backend iced asked for.
+// What `choose_graphics_backend` decided at startup; the running backend cannot change.
 #[cfg(windows)]
-fn graphics_backend_label() -> String {
+static BACKEND_AT_START: std::sync::OnceLock<(persist::GraphicsBackend, BackendSource)> =
+    std::sync::OnceLock::new();
+
+// Sets WGPU_BACKEND before iced creates its wgpu instance, which reads it.
+#[cfg(windows)]
+fn choose_graphics_backend(preferred: persist::GraphicsBackend) {
+    let source = if std::env::var_os("WGPU_BACKEND").is_some() {
+        BackendSource::Env
+    } else {
+        let (name, honoured) = arbiter_native::gpu::windows_backend(preferred);
+        std::env::set_var("WGPU_BACKEND", name);
+        arbiter_native::gpu::BACKEND_ENV_IS_OURS.store(true, std::sync::atomic::Ordering::Relaxed);
+        match (preferred, honoured) {
+            (persist::GraphicsBackend::Auto, _) => BackendSource::Auto,
+            (_, true) => BackendSource::Settings,
+            (_, false) => BackendSource::SettingsUnavailable,
+        }
+    };
+    let _ = BACKEND_AT_START.set((preferred, source));
+}
+
+// The running backend comes from WGPU_BACKEND, set by the user or by
+// `choose_graphics_backend`; `selected` is the setting as it is now, maybe not yet applied.
+#[cfg(windows)]
+fn graphics_backend_status(selected: persist::GraphicsBackend) -> String {
     let raw = std::env::var("WGPU_BACKEND").unwrap_or_default();
     let name = match raw.to_ascii_lowercase().as_str() {
         "dx12" | "d3d12" => "DirectX 12",
         "vulkan" | "vk" => "Vulkan",
         _ => raw.as_str(),
     };
-    let source = if BACKEND_FROM_USER.load(std::sync::atomic::Ordering::Relaxed) {
-        "set by WGPU_BACKEND"
-    } else {
-        "chosen by probe"
+    let (preferred, source) =
+        BACKEND_AT_START.get().copied().unwrap_or((persist::GraphicsBackend::Auto, BackendSource::Auto));
+    let mut status = match source {
+        BackendSource::Auto => format!("Rendering with {name}, chosen automatically."),
+        BackendSource::Settings => format!("Rendering with {name}."),
+        BackendSource::SettingsUnavailable => {
+            format!("Rendering with {name}: no {preferred} adapter was found.")
+        }
+        BackendSource::Env => {
+            format!("Rendering with {name}. WGPU_BACKEND is set, which overrides this setting.")
+        }
     };
-    format!("Rendering with {name} ({source}).")
+    if source != BackendSource::Env && selected != preferred {
+        status.push_str(" Restart Arbiter to apply the change.");
+    }
+    status
 }
 
 /// Small muted explanatory text under a section (web `.panel-hint`).
@@ -4600,23 +4647,27 @@ fn wol_host_row(i: usize, h: &persist::WolHost) -> Element<'static, Message> {
     .into()
 }
 
-/// A `label  [picker]` row for the intense-text style (label + hint on the left, a
-/// pick_list on the right) — mirrors `settings_number_row`'s layout.
-fn settings_intense_row(
+/// A `label  [picker]` row (label + hint on the left, a pick_list on the right) —
+/// mirrors `settings_number_row`'s layout.
+fn settings_pick_row<T: ToString + PartialEq + Clone + 'static>(
     label: &str,
     sub: &str,
-    selected: persist::IntenseStyle,
+    options: &'static [T],
+    selected: T,
+    on_select: fn(T) -> Message,
 ) -> Element<'static, Message> {
+    // Fill, so a long hint wraps instead of squeezing the fixed-width picker.
     let labels = column![
         text(label.to_string()).size(13).color(TXT_SECONDARY),
         text(sub.to_string()).size(11).color(TXT_MUTED),
     ]
-    .spacing(2);
-    let picker = pick_list(&persist::IntenseStyle::ALL[..], Some(selected), Message::SetIntenseStyle)
+    .spacing(2)
+    .width(Length::Fill);
+    let picker = pick_list(options, Some(selected), on_select)
         .padding([6, 8])
         .text_size(13)
         .width(Length::Fixed(150.0));
-    container(row![labels, horizontal_space(), picker].spacing(12).align_y(iced::Center))
+    container(row![labels, picker].spacing(12).align_y(iced::Center))
         .padding([10, 4])
         .into()
 }
@@ -4901,10 +4952,12 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                     &state.font_size_input,
                     Message::SetFontSize,
                 ),
-                settings_intense_row(
+                settings_pick_row(
                     "Bold text style",
                     "How bold (SGR 1) text renders: Bold = bold font, Bright = brighter colour, both, or none.",
+                    &persist::IntenseStyle::ALL[..],
                     state.settings.intense_text_style,
+                    Message::SetIntenseStyle,
                 ),
                 settings_bg_row(&state.settings.background),
             ]
@@ -4924,7 +4977,14 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 col = col
                     .push(Space::with_height(Length::Fixed(8.0)))
                     .push(settings_section("Graphics"))
-                    .push(settings_hint(&graphics_backend_label()));
+                    .push(settings_pick_row(
+                        "Backend",
+                        "Automatic is DirectX 12, with Vulkan as the fallback. Applies after a restart.",
+                        &persist::GraphicsBackend::ALL[..],
+                        state.settings.graphics_backend,
+                        Message::SetGraphicsBackend,
+                    ))
+                    .push(settings_hint(&graphics_backend_status(state.settings.graphics_backend)));
             }
             col
         }
@@ -10552,14 +10612,9 @@ fn main() -> iced::Result {
     install_panic_log();
     let _ = iced_winit::conversion::OCCLUSION_HOOK.set(on_occluded);
     arbiter_native::memdiag::start_summary_thread();
-    // One graphics backend, chosen by a probe (see `gpu::windows_backend`). A WGPU_BACKEND
-    // the user set themselves is respected.
+    let saved = arbiter_native::persist::load();
     #[cfg(windows)]
-    if std::env::var_os("WGPU_BACKEND").is_none() {
-        std::env::set_var("WGPU_BACKEND", arbiter_native::gpu::windows_backend());
-    } else {
-        BACKEND_FROM_USER.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+    choose_graphics_backend(saved.as_ref().map(|s| s.settings.graphics_backend).unwrap_or_default());
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();
     // Event-driven Claude status: a single notify watcher over the capture + hook
@@ -10595,7 +10650,6 @@ fn main() -> iced::Result {
         .default_font(ui_font())
         .run_with(move || {
             // daemon starts with no windows — open the main one here.
-            let saved = arbiter_native::persist::load();
             let main_geom = saved.as_ref().and_then(|s| s.main_window);
             let overview_geom = saved.as_ref().and_then(|s| s.overview_window);
             let overview_was_open = saved.as_ref().map(|s| s.overview_visible).unwrap_or(false);
