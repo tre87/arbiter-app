@@ -282,13 +282,15 @@ pub fn disable_snap(hwnd: isize) {
     }
 }
 
-/// macOS tiles a window dragged to an edge unless it says not to, which is what
-/// `NSWindowCollectionBehaviorDisallowsTiling` is for. Takes the `NSView` iced hands
-/// out, and asks it for its window.
+/// Keeps a window out of full-screen Split View tiles, which is all
+/// `NSWindowCollectionBehaviorFullScreenDisallowsTiling` governs (NSWindow.h). macOS
+/// 15's drag-to-edge tiling has no public opt-out; it rides AppKit's own window drag,
+/// which the office never uses, since `trafficlights::begin_drag` moves it by hand.
+/// Takes the `NSView` iced hands out, and asks it for its window.
 #[cfg(target_os = "macos")]
 pub fn disable_snap_view(ns_view: *mut std::ffi::c_void) {
     use objc2::{msg_send, runtime::AnyObject};
-    /// `NSWindowCollectionBehaviorDisallowsTiling`, which AppKit defines as 1 << 12.
+    /// `NSWindowCollectionBehaviorFullScreenDisallowsTiling`, 1 << 12 in NSWindow.h.
     const DISALLOWS_TILING: usize = 1 << 12;
     if ns_view.is_null() {
         return;

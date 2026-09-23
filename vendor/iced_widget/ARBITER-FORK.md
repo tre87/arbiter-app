@@ -49,8 +49,11 @@ from the application side; nothing in the widget's own behaviour changes.
 
 ## Keeping it up to date
 
-Nothing else is modified. On an iced upgrade, re-copy the new `iced_widget` from
-the registry, re-apply both changes above, and check whether upstream has fixed
+Nothing else changes behaviour. One line in `src/lib.rs` quiets a lint,
+`#![allow(unknown_lints, mismatched_lifetime_syntaxes)]`: a path dependency reports
+the warnings a registry one hides, and this crate's style predates the lint. On an
+iced upgrade, re-copy the new `iced_widget` from the registry, re-apply both
+changes above and that line, and check whether upstream has fixed
 the hit-test (in which case that half goes; the accessor stays until `Content`
 exposes the scroll itself). The same manual step already applies to
 `vendor/iced_winit`.
