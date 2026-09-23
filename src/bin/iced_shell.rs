@@ -156,9 +156,9 @@ struct State {
     /// either.
     office_seats: Vec<Option<agents_office::Seat>>,
     /// The room as last built from the panes, and the frame drawn from it. Built in
-    /// `update`, not in `view`: `view` takes `&State` so it cannot cache, and a frame
-    /// is a couple of megabytes, which is not a thing to rebuild on every PTY wake.
-    /// Same bargain as `gpu::FrameKey` for the terminals.
+    /// `update`, not in `view`: `view` takes `&State` so it cannot cache, and iced
+    /// rebuilds every window's view on every PTY wake. Same bargain as `gpu::FrameKey`
+    /// for the terminals.
     office_scene: agents_office::Scene,
     /// The room at 1x; the image widget enlarges it by a whole number of physical
     /// pixels (`office_fit`), so an animation frame costs the room's own size.
