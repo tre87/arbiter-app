@@ -509,6 +509,12 @@ mod tests {
     fn remote_names_are_stamped_and_plain() {
         let name = |p: &str| remote_name(Path::new(p), at(NOW));
         assert_eq!(
+            name("/Users/tre/Pictures/Screenshot 2026-09-13 101010.png"),
+            "20260913-101530-Screenshot_2026-09-13_101010.png"
+        );
+        // `\\` separates only on Windows; elsewhere the whole string is one file name.
+        #[cfg(windows)]
+        assert_eq!(
             name("C:\\Users\\TRE\\Pictures\\Screenshot 2026-09-13 101010.png"),
             "20260913-101530-Screenshot_2026-09-13_101010.png"
         );
