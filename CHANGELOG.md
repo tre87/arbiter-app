@@ -194,6 +194,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
   the pointer takes the floor marker, so you can see which agent you are about to click
   without anything having to light up in a colour the room has reserved.
 
+### Changed
+- **Scrollbars show only while you are over them.** The file explorer, Settings, the
+  shortcuts sheet, the Overview list and the dialogs drew iced's default scrollbar, a
+  grey track with a thumb, all the time. They now match the terminal's: a thin rounded
+  thumb and no track, hidden until the pointer is over the list, a little brighter on
+  the bar itself or while dragging it.
+
 ### Fixed
 - **A window saved on a monitor that is not connected opens on one that is.** Quitting
   at home with Arbiter on an external monitor and starting it at work put the window

@@ -2004,6 +2004,8 @@ pub fn pane_view<'a>(state: &'a State, e: &'a Explorer) -> Element<'a, Message> 
     let tree = scrollable(rows)
         .width(Length::Fill)
         .height(Length::Fill)
+        .direction(scrollable::Direction::Vertical(thin_scrollbar()))
+        .style(thin_scrollbar_style)
         .on_scroll(|v| Message::Files(Msg::TreeScrolled(v.absolute_offset().y, v.bounds().height)));
     let body = mouse_area(tree)
         .on_press(Message::Files(Msg::ClearSelection))
@@ -2399,9 +2401,13 @@ fn tab_strip(ed: &Editor) -> Element<'_, Message> {
             ),
         );
     }
-    container(scrollable(tabs).direction(scrollable::Direction::Horizontal(
-        scrollable::Scrollbar::new().width(2).scroller_width(2),
-    )))
+    container(
+        scrollable(tabs)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(2).scroller_width(2),
+            ))
+            .style(thin_scrollbar_style),
+    )
     .width(Length::Fill)
     .height(Length::Fixed(HEADER_H))
     .align_y(iced::Center)

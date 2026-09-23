@@ -4687,7 +4687,10 @@ fn settings_tab_item(label: &str, tab: SettingsTab, active: SettingsTab) -> Elem
 /// (web `.content` → `.tab-panel` scroll area + `.dialog-actions`).
 fn settings_content(body: Element<'static, Message>) -> Element<'static, Message> {
     column![
-        scrollable(container(body).padding(24).width(Length::Fill)).height(Length::Fill),
+        scrollable(container(body).padding(24).width(Length::Fill))
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(thin_scrollbar()))
+            .style(thin_scrollbar_style),
         settings_hdivider(),
         container(row![horizontal_space(), settings_btn("Close", Message::CloseSettings, BtnKind::Secondary)])
             .padding([12, 16]),
@@ -5104,7 +5107,10 @@ fn shortcuts_dialog_view() -> Element<'static, Message> {
     ]
     .padding(20);
     let card = container(column![
-        scrollable(body).height(Length::Fill),
+        scrollable(body)
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(thin_scrollbar()))
+            .style(thin_scrollbar_style),
         settings_hdivider(),
         container(row![horizontal_space(), settings_btn("Close", Message::CloseShortcuts, BtnKind::Secondary)])
             .padding([12, 16]),
@@ -6524,7 +6530,10 @@ fn connect_prompt_view(p: &ConnectPrompt) -> Element<'static, Message> {
     let panel = column![
         text(title).size(15).font(ui_semibold()),
         text(hint).size(12).color(TXT_SECONDARY),
-        scrollable(body).height(Length::Shrink),
+        scrollable(body)
+            .height(Length::Shrink)
+            .direction(scrollable::Direction::Vertical(thin_scrollbar()))
+            .style(thin_scrollbar_style),
         actions,
     ]
     .spacing(14)
@@ -7605,7 +7614,13 @@ fn overview_view(state: &State) -> Element<'_, Message> {
     } else {
         8.0.into()
     };
-    let list = container(scrollable(col).width(Length::Fill).height(Length::Fill))
+    let list = container(
+        scrollable(col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(thin_scrollbar()))
+            .style(thin_scrollbar_style),
+    )
         .width(Length::Fill)
         .height(Length::Fill)
         // Top inset INSIDE the list so the first workspace title sits ~12px from the
@@ -8846,6 +8861,37 @@ fn header_reconnect_btn(pane: pane_grid::Pane) -> Element<'static, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// Every list's scrollbar, drawn like the terminal's scroll indicator: a 6 px rounded
+/// thumb and no track. Hidden until the pointer is over the list, which it has to be
+/// for the wheel to scroll it, so it shows while scrolling without a timer to fade it.
+fn thin_scrollbar() -> scrollable::Scrollbar {
+    scrollable::Scrollbar::new().width(6).scroller_width(6).margin(2)
+}
+
+fn thin_scrollbar_style(_t: &iced::Theme, status: scrollable::Status) -> scrollable::Style {
+    let alpha = match status {
+        scrollable::Status::Active => 0.0,
+        scrollable::Status::Hovered { is_vertical_scrollbar_hovered: true, .. }
+        | scrollable::Status::Hovered { is_horizontal_scrollbar_hovered: true, .. }
+        | scrollable::Status::Dragged { .. } => 0.6,
+        scrollable::Status::Hovered { .. } => 0.42,
+    };
+    let rail = scrollable::Rail {
+        background: None,
+        border: iced::Border::default(),
+        scroller: scrollable::Scroller {
+            color: iced::Color { r: 0.78, g: 0.79, b: 0.84, a: alpha },
+            border: iced::Border { radius: 3.0.into(), ..Default::default() },
+        },
+    };
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+    }
 }
 
 /// How long the scroll indicator stays fully opaque after the last scroll, then
