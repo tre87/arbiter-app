@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-24
+
 ### Added
 - **A desk turns green when its agent finishes.** For 30 seconds after a turn ends, the
   agent's desk in the Agents Office shows the green "done" state, then goes back to
