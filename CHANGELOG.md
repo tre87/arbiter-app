@@ -7,6 +7,59 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Each workspace remembers its focused terminal across a restart.** A relaunch used
+  to focus the first terminal of every workspace; it now comes back to the one that had
+  focus when Arbiter closed.
+
+## [1.6.2] - 2026-10-02
+
+### Added
+- **GitHub Copilot CLI and OpenAI Codex CLI, experimentally.** Arbiter now recognises
+  `copilot` and `codex` in a pane the way it recognises `claude`: the pane, tab, overview,
+  Agents Office and cards show when it is working, when it needs you and when it has
+  finished, and a restore brings its conversation back (`copilot --resume=<id>`,
+  `codex resume <id>`), locally and over SSH. Both are built from their documentation and
+  source and have not yet been run against the real CLIs, so expect rough edges; a pane
+  where either misbehaves still works as a plain terminal. Copilot gets its hooks through
+  a plugin directory passed with `--plugin-dir`. Codex runs only hooks you have reviewed,
+  so Arbiter follows it through its `notify` program (your own `notify`, if you have one,
+  still runs), its desktop notifications and its window title instead.
+- **Cards name the agent**: "Codex finished", "Copilot needs your input".
+- **`arbiter` in a pane lists the version of every agent CLI installed**, not just Claude.
+- **Recorders for building an agent's screen profile.** `ARBITER_RECORD_PTY=1` records a
+  pane's raw output and `ARBITER_SCREEN_DUMP=1` its screen whenever what Arbiter reads
+  from it changes, both to the temp directory. They capture whatever is on screen,
+  secrets included, so they are for a debugging session only.
+
+### Changed
+- **Your Claude status line is left alone.** Arbiter used to put its own command in
+  Claude's `statusLine`, to learn each pane's conversation, and pass the input on to
+  yours. It now learns the conversation from a `SessionStart` hook, so your status line
+  runs exactly as you configured it (on Windows, no more guessing between Git Bash and
+  cmd), and no Arbiter process starts on every status line redraw.
+- **Settings speak of agents.** "Name remote agent sessions" (Claude and Copilot, the two
+  that take a `--session-id`), "Only show terminals running an agent", and the
+  notification toggles "An agent needs your input" and "An agent finished". Existing
+  settings keep their values.
+- **Every agent is one file behind one interface** (`src/agent/`): its process, its hooks,
+  what its screen means and how to resume it. Adding another agent is one file and one
+  line in the registry.
+
+### Fixed
+- **Esc during a turn no longer raises a "finished" card.** Only Ctrl+C counted as an
+  interrupt; Esc went to the terminal without telling the turn-end detection.
+- **A restore resumes Claude when `CLAUDE_CONFIG_DIR` moves its config.** The check that
+  a conversation exists looked under `~/.claude` regardless, so such panes came back as a
+  fresh `claude`. It now uses the transcript path Claude itself reports.
+- **Scrolling a plan waiting for approval no longer raises "Claude needs your input" again.**
+  Each scroll ended with the nudge meant for a frozen status row, which repainted
+  Claude's screen; the approval prompt vanished for a moment, and its return read as a new
+  question. The nudge now runs only while a turn is working, and a prompt counts as
+  answered only once it has stayed gone for 0.4 s, so resizing or splitting a pane while a
+  prompt waits no longer raises its card twice either, nor turns a `/model` chooser you
+  opened into a question from Claude.
+
 ## [1.6.1] - 2026-09-24
 
 ### Added

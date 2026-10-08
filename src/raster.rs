@@ -739,7 +739,7 @@ mod dwrite {
             let regular = primary_face(&dwrite, &family);
             let mut symbol: Vec<u16> = "Segoe UI Symbol".encode_utf16().collect();
             symbol.push(0);
-            crate::claude_shim::debug_log(&format!(
+            crate::debug::debug_log(&format!(
                 "raster: dwrite ctx for {font_name:?} at {em_px}px: family installed={}, bundled bold={}, bundled symbols={}",
                 regular.is_some(),
                 bold.is_some(),

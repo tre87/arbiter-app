@@ -26,7 +26,8 @@ use iced::widget::{
 use iced::{Element, Length, Rectangle, Subscription, Task};
 
 use arbiter_native::agents_office;
-use arbiter_native::claude_status::Lifecycle;
+use arbiter_native::agent::AgentKind;
+use arbiter_native::agent_state::Lifecycle;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Secret, Session, SharedMaster, SharedTerm};
 use arbiter_native::persist;
@@ -263,8 +264,8 @@ struct State {
     /// away early can never take a newer one with it.
     next_toast_id: u64,
     /// Each pane's Claude lifecycle as last seen, by session id. Transitions between
-    /// looks raise the cards (see `notify_claude_transitions`).
-    claude_seen: HashMap<u64, ClaudeSeen>,
+    /// looks raise the cards (see `notify_agent_transitions`).
+    agent_seen: HashMap<u64, AgentSeen>,
     /// User preferences (the Settings dialog) — persisted with the session.
     settings: persist::Settings,
     /// Whether the Settings modal is open, and which tab it's showing.
@@ -462,22 +463,25 @@ const NOTIFY_QUIET_MS: u64 = 5000;
 /// from there.
 const LAUNCH_SETTLE_MS: u64 = 8000;
 
-/// A pane's Claude lifecycle as last seen (see `notify_claude_transitions`). Times in ms
+/// A pane's Claude lifecycle as last seen (see `notify_agent_transitions`). Times in ms
 /// since the epoch, 0 for never.
 #[derive(Clone, Copy)]
-struct ClaudeSeen {
+struct AgentSeen {
     lifecycle: Lifecycle,
-    /// When Claude was first seen running in this pane; 0 while it is not.
+    /// When an agent was first seen running in this pane; 0 while none is.
     running_since: u64,
     /// When the current, or latest, `Working` began.
     working_since: u64,
     /// When this pane last raised a card.
     last_raised: u64,
-    /// That card was "Claude finished". A question arriving inside its quiet window
-    /// still gets its own card: the finish did not tell the user they are needed.
+    /// That card was "finished". A question arriving inside its quiet window still gets
+    /// its own card: the finish did not tell the user they are needed.
     last_was_finished: bool,
-    /// `ClaudeHandle::finish_seq` as last seen: an increase is a turn that ended.
+    /// `AgentHandle::finish_seq` as last seen: an increase is a turn that ended.
     finish_seq: u64,
+    /// `AgentStatus::epoch` as last seen. A different one is a different agent in the
+    /// pane, which is a first sighting, not a transition of the old one.
+    epoch: u64,
 }
 /// The most cards on screen at once; the oldest leaves to make room.
 const TOAST_MAX: usize = 4;
@@ -1001,16 +1005,13 @@ fn spawn_restored(
     shell: persist::SavedShell,
     cwd: Option<&str>,
     git_bash: Option<&str>,
-    claude_running: bool,
-    claude_session: Option<&str>,
+    agent: Option<persist::SavedAgent>,
     history_id: &str,
     startup_cmd: Option<&str>,
     prompts_for_credential: Option<bool>,
     credential_kind: Option<persist::CredentialKind>,
     credential_detail: Option<&str>,
     remote_cwd: Option<&str>,
-    remote_claude: bool,
-    remote_session: Option<&str>,
 ) -> (Session, ShellKind) {
     // A saved cwd that no longer exists falls back to the shell's default dir.
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
@@ -1025,9 +1026,8 @@ fn spawn_restored(
     };
     // A remote pane replays the command that built it (its ssh line). Where the far
     // host reports its directory (the opt-in snippet), the pane then goes back there
-    // and, if Claude was running, resumes it with `claude -c`; otherwise it lands at the
-    // far prompt. Nothing here has to discover or guess a remote session id, so there is
-    // nothing to go stale.
+    // and, if an agent was running, resumes it as its adapter says; otherwise it lands
+    // at the far prompt.
     //
     // Only RECORDED here, not queued. Nothing connects until the credential dialog has
     // been answered (see `connections_needing_secret`), because a connection parked on
@@ -1035,20 +1035,18 @@ fn spawn_restored(
     // runs the whitelist, so a save from an earlier build cannot smuggle in whatever was
     // typed last (that bug persisted `claude`).
     if startup_cmd.is_some_and(|cmd| session.set_startup_cmd(cmd)) {
+        let far = agent.filter(|a| a.remote);
         session.set_prompts_for_credential(prompts_for_credential);
         session.seed_credential_prompt(credential_kind, credential_detail);
         session.seed_remote_cwd(remote_cwd);
-        session.seed_remote_claude(remote_claude);
-        session.seed_remote_session(remote_session);
-    } else if claude_running {
-        // Relaunch Claude here — resuming the previous conversation if one was bound,
+        session.seed_remote_agent(far.as_ref().map(|a| a.kind));
+        session.seed_remote_session(far.as_ref().and_then(|a| a.session.as_deref()));
+    } else if let Some(a) = agent.filter(|a| !a.remote) {
+        // Relaunch the agent here, resuming the previous conversation if one was bound,
         // else a fresh session. The command queues in the PTY and runs at the shell's
         // first prompt (after rc sets the shim PATH), so it goes through our launcher
-        // and rebinds statusline/hooks.
-        let cmd = match claude_session {
-            Some(sid) => format!("claude --resume {sid}\r"),
-            None => "claude\r".to_string(),
-        };
+        // and gets its hooks again.
+        let cmd = format!("{}\r", a.kind.agent().resume_local(a.session.as_deref()));
         session.write(cmd.as_bytes());
     }
     (session, kind)
@@ -1059,6 +1057,7 @@ fn saved_to_config(
     node: persist::SavedNode,
     git_bash: Option<&str>,
 ) -> pane_grid::Configuration<PaneData> {
+    let agent = node.saved_agent();
     match node {
         persist::SavedNode::Split { vertical, ratio, a, b } => pane_grid::Configuration::Split {
             axis: if vertical { pane_grid::Axis::Vertical } else { pane_grid::Axis::Horizontal },
@@ -1070,16 +1069,13 @@ fn saved_to_config(
             name,
             shell,
             cwd,
-            claude_running,
-            claude_session,
             history_id,
             startup_cmd,
             prompts_for_credential,
             credential_kind,
             credential_detail,
             remote_cwd,
-            remote_claude,
-            remote_session,
+            ..
         } => {
             // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
             let history_id = history_id.unwrap_or_else(new_history_id);
@@ -1087,16 +1083,13 @@ fn saved_to_config(
                 shell,
                 cwd.as_deref(),
                 git_bash,
-                claude_running,
-                claude_session.as_deref(),
+                agent,
                 &history_id,
                 startup_cmd.as_deref(),
                 prompts_for_credential,
                 credential_kind,
                 credential_detail.as_deref(),
                 remote_cwd.as_deref(),
-                remote_claude,
-                remote_session.as_deref(),
             );
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind, history_id })
         }
@@ -1139,23 +1132,38 @@ fn leaf_panes(node: &pane_grid::Node, out: &mut Vec<pane_grid::Pane>) {
     }
 }
 
+// `focus` as `SavedWorkspace::focus` stores it.
+fn focus_index(layout: &pane_grid::Node, focus: pane_grid::Pane) -> Option<usize> {
+    let mut leaves = Vec::new();
+    leaf_panes(layout, &mut leaves);
+    leaves.iter().position(|p| *p == focus)
+}
+
+// The pane a restored workspace focuses: the saved leaf, else the first in layout order.
+// None only for an empty layout.
+fn restored_focus(layout: &pane_grid::Node, saved: Option<usize>) -> Option<pane_grid::Pane> {
+    let mut leaves = Vec::new();
+    leaf_panes(layout, &mut leaves);
+    saved.and_then(|i| leaves.get(i)).or(leaves.first()).copied()
+}
+
 /// Run one pane's connection: arm it from the vault, queue its follow-ups (back to the
-/// saved remote directory, and Claude there unless another pane already claimed that
-/// directory), then queue the command itself. `claimed` holds the (command, directory)
-/// pairs already resuming Claude, so two panes in one directory cannot both attach to
-/// the same most-recent conversation.
-fn connect_pane(d: &mut PaneData, vault: &Vault, claimed: &mut HashSet<(String, String)>) {
+/// saved remote directory, and its agent there unless another pane already claimed that
+/// directory for the same agent), then queue the command itself. `claimed` holds the
+/// (command, directory, agent) triples already resuming, so two panes in one directory
+/// cannot both attach to the same most-recent conversation.
+fn connect_pane(d: &mut PaneData, vault: &Vault, claimed: &mut HashSet<(String, String, AgentKind)>) {
     let Some(cmd) = d.session.startup_cmd() else { return };
     if let Some(secret) = vault.arm_copy(&cmd) {
         d.session.arm_credential(secret);
     }
-    let resume = d.session.take_remote_claude_pending();
+    let resume = d.session.take_remote_pending();
     if let Some(dir) = d.session.remote_cwd() {
         // With its conversation known the pane resumes exactly that and contends with
-        // nobody; without one, `claude -c` takes the directory's most recent, which two
+        // nobody; without one, continue-last takes the directory's most recent, which two
         // panes must not both claim.
         let session = d.session.remote_session();
-        let resume = resume && (session.is_some() || claimed.insert((cmd.clone(), dir.clone())));
+        let resume = resume.filter(|k| session.is_some() || claimed.insert((cmd.clone(), dir.clone(), *k)));
         d.session.set_followup(&dir, resume, session.as_deref());
     }
     d.session.queue_startup_cmd(&cmd);
@@ -1163,7 +1171,7 @@ fn connect_pane(d: &mut PaneData, vault: &Vault, claimed: &mut HashSet<(String, 
 
 /// Let every held connection run (see `spawn_restored`), each pane armed from the vault,
 /// except the connections in `skipped`: their panes stay at the local prompt, dismissed
-/// (amber button kept, saved as local; see `ClaudeHandle::dismissed`).
+/// (amber button kept, saved as local; see `ConnHandle::dismissed`).
 fn release_connections(state: &mut State, skipped: &HashSet<String>) {
     let State { workspaces, vault, .. } = state;
     let mut claimed = HashSet::new();
@@ -1243,7 +1251,7 @@ fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
         let prompts = s.prompts_for_credential();
         let credential = s.credential_prompt();
         let remote_cwd = s.remote_cwd();
-        let remote_claude = s.remote_claude();
+        let remote_agent = s.remote_agent();
         let remote_session = s.remote_session();
         let hid = data.history_id.clone();
         let shell_arg = match data.shell {
@@ -1260,7 +1268,7 @@ fn reconnect_pane(state: &mut State, ws_idx: usize, pane: pane_grid::Pane) {
         let (kind, detail) = credential.map(|(k, d)| (Some(k), Some(d))).unwrap_or((None, None));
         data.session.seed_credential_prompt(kind, detail.as_deref());
         data.session.seed_remote_cwd(remote_cwd.as_deref());
-        data.session.seed_remote_claude(remote_claude);
+        data.session.seed_remote_agent(remote_agent);
         data.session.seed_remote_session(remote_session.as_deref());
     }
     // Asked for by hand, so a Skip from the dialog no longer applies.
@@ -1393,7 +1401,7 @@ fn restore_workspaces(
     let mut workspaces = Vec::new();
     for sw in saved.workspaces {
         let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
-        let Some(focus) = panes.iter().next().map(|(p, _)| *p) else { continue };
+        let Some(focus) = restored_focus(panes.layout(), sw.focus) else { continue };
         workspaces.push(Workspace {
             panes,
             focus,
@@ -1426,6 +1434,19 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
         pane_grid::Node::Pane(pane) => {
             let data = grid.get(*pane);
             let remote = data.filter(|d| !d.session.dismissed());
+            let local = data.and_then(|d| d.session.local_agent());
+            let resumable = data.and_then(|d| d.session.resumable_session());
+            let far = remote.and_then(|d| d.session.remote_agent());
+            let far_session = remote.and_then(|d| d.session.remote_session());
+            let session_of = |kind: AgentKind| resumable.clone().filter(|(k, _)| *k == kind).map(|(_, id)| id);
+            // A connection's far agent is what a remote pane brings back; the local one
+            // only matters for a pane that is not remote.
+            let agent = match (far, local) {
+                (Some(kind), _) => Some(persist::SavedAgent { kind, session: far_session.clone(), remote: true }),
+                (None, Some(kind)) => Some(persist::SavedAgent { kind, session: session_of(kind), remote: false }),
+                (None, None) => None,
+            };
+            let claude = |k: Option<AgentKind>| k == Some(AgentKind::Claude);
             persist::SavedNode::Leaf {
                 name: data.map(|d| d.name.clone()).unwrap_or_default(),
                 shell: match data.map(|d| d.shell) {
@@ -1433,8 +1454,9 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                     _ => persist::SavedShell::PowerShell,
                 },
                 cwd: data.and_then(|d| d.session.cwd()),
-                claude_running: data.map(|d| d.session.claude_running_local()).unwrap_or(false),
-                claude_session: data.and_then(|d| d.session.claude_session_id()),
+                // The 1.6 fields, still written for Claude so a downgrade relaunches it.
+                claude_running: claude(local),
+                claude_session: session_of(AgentKind::Claude),
                 history_id: data.map(|d| d.history_id.clone()),
                 // A dismissed connection (Skip in the sign-in dialog, never brought back)
                 // is saved as the plain local pane it now is: nothing to replay next time.
@@ -1443,8 +1465,9 @@ fn node_to_saved(grid: &pane_grid::State<PaneData>, node: &pane_grid::Node) -> p
                 credential_kind: remote.and_then(|d| d.session.credential_prompt()).map(|(k, _)| k),
                 credential_detail: remote.and_then(|d| d.session.credential_prompt()).map(|(_, who)| who),
                 remote_cwd: remote.and_then(|d| d.session.remote_cwd()),
-                remote_claude: remote.map_or(false, |d| d.session.remote_claude()),
-                remote_session: remote.and_then(|d| d.session.remote_session()),
+                remote_claude: claude(far),
+                remote_session: far_session.filter(|_| claude(far)),
+                agent,
             }
         }
     }
@@ -1470,10 +1493,10 @@ fn corner_pane(node: &pane_grid::Node, right: bool, bottom: bool) -> pane_grid::
 /// How long a desk is held for an agent that has stopped running.
 ///
 /// `reconnect_pane` and `SwitchShell` both keep the pane's `history_id` and then
-/// assign over `data.session`, which drops the old `Session` and its `ClaudeHandle`.
-/// So `claude_running()` reads false for the whole respawn, which for an ssh
+/// assign over `data.session`, which drops the old `Session` and its `AgentHandle`.
+/// So `agent_running()` reads false for the whole respawn, which for an ssh
 /// reconnect replaying its startup command is seconds. Freeing the desk on that
-/// edge would move the agent to whatever slot happened to be free when Claude came
+/// edge would move the agent to whatever slot happened to be free when the agent came
 /// back, which is the founding rule broken silently and invisibly.
 ///
 /// The hold needs no timer: an expired reservation is invisible (its desk already
@@ -1659,10 +1682,10 @@ fn office_sync(state: &mut State) -> bool {
         .iter()
         .flat_map(|ws| {
             ws.panes.iter().filter_map(move |(_, d)| {
-                if !d.session.claude_running() {
+                if !d.session.agent_running() {
                     return None;
                 }
-                let lc = d.session.claude_status().lifecycle;
+                let lc = d.session.agent_status().lifecycle;
                 let desk = match pane_dot(true, lc, false) {
                     Dot::Working => Desk::Working,
                     Dot::Attention => Desk::Attention,
@@ -2298,6 +2321,7 @@ fn save_session(state: &State) {
                     explorer: ws.explorer.as_ref().map(files_pane::to_saved),
                     editor_tabs,
                     editor_active,
+                    focus: focus_index(ws.panes.layout(), ws.focus),
                 }
             })
             .collect(),
@@ -2411,7 +2435,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             // event-driven wake. A bind always coincides with PTY output, which is
             // exactly what fires this Redraw. Cheap atomic read; saves only on the
             // rare bind, never per frame.
-            if arbiter_native::claude_status::SAVE_DIRTY
+            if arbiter_native::persist::SAVE_DIRTY
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 save_session(state);
@@ -2421,13 +2445,13 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             // that triggered the redraw. So does a shell's exit (its watcher wakes the
             // UI the same way).
             close_exited_panes(state);
-            return Task::batch([poll_connection_signals(state), notify_claude_transitions(state)]);
+            return Task::batch([poll_connection_signals(state), notify_agent_transitions(state)]);
         }
         Message::Tick => {
             // Persist when a Claude session newly bound in a pane (the watcher sets
             // this on an FS event; the tick just reacts to the flag — a cheap atomic
             // read, and the save only runs on the rare bind, not every frame).
-            if arbiter_native::claude_status::SAVE_DIRTY
+            if arbiter_native::persist::SAVE_DIRTY
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 save_session(state);
@@ -2483,7 +2507,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             }
             // A turn ends by its activity going stale, which no output announces: the
             // tick that runs while Claude works is what sees it.
-            return notify_claude_transitions(state);
+            return notify_agent_transitions(state);
         }
         Message::Input(bytes) => {
             // While the Wake-on-LAN menu is open the keyboard drives it: arrows move the
@@ -2538,9 +2562,9 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 // and re-emit a stale ✻, so suppress briefly so a burst can't pair into a
                 // false "working". Plain typing is left alone (no delay anywhere).
                 match bytes.as_slice() {
-                    b"\r" => p.session.clear_claude_suppression(),
-                    b"\n" | b"\x1b[Z" => p.session.suppress_claude_activity(EDIT_KEY_SUPPRESS_MS),
-                    b"\x1b" | b"\x03" => p.session.note_claude_interrupt(),
+                    b"\r" => p.session.clear_suppression(),
+                    b"\n" | b"\x1b[Z" => p.session.suppress_activity(EDIT_KEY_SUPPRESS_MS),
+                    b"\x1b" | b"\x03" => p.session.note_interrupt(),
                     _ => {}
                 }
                 // Track the typed line so a remote pane can remember the ssh command
@@ -2548,20 +2572,21 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 // through here, which is why it isn't done inside `write`.
                 p.session.note_typed(&bytes);
                 // Enter in a far shell: the command as the SCREEN shows it (completed,
-                // recalled) is what Arbiter reads a `cd` or a `claude` from, and a bare
-                // `claude` gets its conversation named before the Enter goes through (see
-                // `Session::on_remote_enter`).
+                // recalled) is what Arbiter reads a `cd` or an agent launch from, and a
+                // bare launch gets its conversation named before the Enter goes through
+                // (see `Session::on_remote_enter`).
                 if bytes.as_slice() == b"\r" {
                     // Also the cheapest way to know the user is opening a chooser
                     // themselves: `/model` and friends report through no hook, and
                     // draw the footer a real prompt draws.
+                    let profile = p.session.agent().map(|a| a.screen());
                     let (row, slash) = p
                         .session
                         .term()
                         .lock()
-                        .map(|t| (t.cursor_row_text(), t.input_row_is_slash()))
+                        .map(|t| (t.cursor_row_text(), profile.is_some_and(|pr| t.input_row_is_slash(pr))))
                         .unwrap_or_default();
-                    if slash && p.session.claude_running() {
+                    if slash {
                         p.session.note_slash_command();
                     }
                     if let Some(completion) = p.session.on_remote_enter(&row, name_sessions) {
@@ -2578,9 +2603,9 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             if files_pane::editor_visible(state) {
                 return Task::none();
             }
-            // Claude (Ink) wants the kitty Shift+Enter sequence to insert a
-            // newline; a plain shell would echo those bytes as garbage, so send
-            // a normal CR there instead.
+            // An agent's input box takes its own newline sequence (Claude's Ink wants
+            // the kitty Shift+Enter); a plain shell would echo those bytes as garbage,
+            // so send a normal CR there instead.
             let ws = state.active_mut();
             if let Some(p) = ws.panes.get_mut(ws.focus) {
                 if let Ok(mut t) = p.session.term().lock() {
@@ -2589,8 +2614,8 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                 // Inserting a newline makes Windows ConPTY repaint the region and re-emit a
                 // stale ✻; suppress detection briefly so rapid Shift+Enter can't pair into a
                 // false "working". A subsequent Enter/submit clears it (see Message::Input).
-                p.session.suppress_claude_activity(EDIT_KEY_SUPPRESS_MS);
-                let bytes: &[u8] = if p.session.claude_running() { b"\x1b[13;2u" } else { b"\r" };
+                p.session.suppress_activity(EDIT_KEY_SUPPRESS_MS);
+                let bytes: &[u8] = p.session.agent().map_or(b"\r", |a| a.shift_enter());
                 p.session.write(bytes);
             }
         }
@@ -2936,7 +2961,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             let start = attach_default_dir(state, src);
             return iced::Task::perform(
                 async move {
-                    let mut d = rfd::AsyncFileDialog::new().set_title("Attach file(s) for Claude");
+                    let mut d = rfd::AsyncFileDialog::new().set_title("Attach file(s) for the agent");
                     if let Some(dir) = start {
                         d = d.set_directory(dir);
                     }
@@ -3191,6 +3216,9 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                         t.scroll_to_bottom();
                         t.clear_selection();
                     }
+                    // Escape never travels as `Message::Input`, so the interrupt
+                    // bookkeeping `Input` does for Ctrl+C has to happen here too.
+                    p.session.note_interrupt();
                     p.session.write(&[0x1b]);
                 }
             }
@@ -3216,18 +3244,18 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             // turn that's genuinely working still sustains itself.
             let ws = state.active_mut();
             let Some(p) = ws.panes.get_mut(pane) else { return Task::none() };
-            p.session.suppress_claude_activity(SCROLL_SUPPRESS_MS);
+            p.session.suppress_activity(SCROLL_SUPPRESS_MS);
             p.session.write(&bytes);
-            let nudge_claude = p.session.claude_running();
-            arbiter_native::claude_shim::debug_log(&format!(
-                "wheel notch handed to pane {}: claude={nudge_claude}",
+            let nudge = p.session.agent().is_some_and(|a| a.wheel_nudge());
+            arbiter_native::debug::debug_log(&format!(
+                "wheel notch handed to pane {}: nudge={nudge}",
                 p.session.id()
             ));
             // Claude's fullscreen UI stops animating its status row once the row has
             // scrolled out of view, and scrolling back does not resume it (see
             // `WheelSettled`). Once the gesture has settled, start checking on the pane;
             // each notch starts a new chain and retires the old one.
-            if nudge_claude {
+            if nudge {
                 state.wheel_nudge += 1;
                 let gesture = state.wheel_nudge;
                 return Task::perform(
@@ -3243,8 +3271,14 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             let Some(p) = state.active_mut().panes.get_mut(pane) else { return Task::none() };
             // Scrolled away from the bottom, Claude hides its status row on purpose, and a
             // repaint there could throw the reader's place away: nothing to do until the
-            // gesture that brings the view back, which starts a chain of its own.
-            if !p.session.claude_running() || p.session.claude_scrolled() {
+            // gesture that brings the view back, which starts a chain of its own. Nor
+            // unless a turn is working: only a working status row can freeze, and idle or
+            // waiting on a prompt nothing animates, so every gesture read as frozen and
+            // the repaint cleared and redrew the prompt, which raised its card again.
+            if !p.session.agent().is_some_and(|a| a.wheel_nudge())
+                || p.session.agent_scrolled()
+                || p.session.agent_status().lifecycle != Lifecycle::Working
+            {
                 return Task::none();
             }
             let age = p.session.spinner_age_ms();
@@ -3253,7 +3287,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             if frozen {
                 // Either nudge makes Claude repaint its whole screen, static stars
                 // included: keep spinner-detection held off across it, as for the notches.
-                p.session.suppress_claude_activity(SCROLL_SUPPRESS_MS);
+                p.session.suppress_activity(SCROLL_SUPPRESS_MS);
                 // A local Windows Claude never sees the pulse (node drops console focus
                 // records), so there the resize goes first rather than a check later.
                 let wants_focus = p.session.term().lock().map(|t| t.reports_focus()).unwrap_or(false)
@@ -3272,7 +3306,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                     _ => {}
                 }
             }
-            arbiter_native::claude_shim::debug_log(&format!(
+            arbiter_native::debug::debug_log(&format!(
                 "wheel check {check} on pane {}: spinner_age={age:?} frozen={frozen} nudged={nudged}",
                 p.session.id()
             ));
@@ -3637,7 +3671,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             if id == state.main_window {
                 for ws in &state.workspaces {
                     for (_, d) in ws.panes.iter() {
-                        d.session.suppress_claude_activity(500);
+                        d.session.suppress_activity(500);
                     }
                 }
             }
@@ -3912,7 +3946,7 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
                         if let Ok(mut t) = p.session.term().lock() {
                             t.scroll_to_bottom();
                         }
-                        p.session.note_claude_interrupt();
+                        p.session.note_interrupt();
                         p.session.write(b"\x03");
                     }
                     None => {}
@@ -4170,7 +4204,7 @@ fn open_path(path: &str) {
 }
 
 fn claude_settings_json_path() -> Option<std::path::PathBuf> {
-    arbiter_native::claude_shim::claude_config_dir().map(|d| d.join("settings.json"))
+    arbiter_native::agent::claude::config_dir().map(|d| d.join("settings.json"))
 }
 
 /// Path to Claude's main `.claude.json` — `$CLAUDE_CONFIG_DIR/.claude.json` if that env
@@ -4883,9 +4917,9 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             Space::with_height(Length::Fixed(8.0)),
             settings_section("Remote Terminals"),
             settings_toggle(
-                "Name remote Claude sessions",
+                "Name remote agent sessions",
                 Some(
-                    "When you type `claude` in an SSH terminal, add `--session-id <id>` to the line as \
+                    "When you type `claude` or `copilot` in an SSH terminal, add `--session-id <id>` to the line as \
                      you press Enter, so a restored terminal resumes exactly that conversation instead \
                      of the directory's most recent one. You will see the argument appear.",
                 ),
@@ -4913,8 +4947,8 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 Space::with_height(Length::Fixed(8.0)),
                 settings_section("Overview"),
                 settings_toggle(
-                    "Only show terminals running Claude",
-                    Some("Filter the overview popout to terminals with Claude running."),
+                    "Only show terminals running an agent",
+                    Some("Filter the overview popout to terminals with an agent running."),
                     state.settings.overview_claude_only,
                     Message::ToggleOverviewClaudeOnly,
                 ),
@@ -5087,14 +5121,14 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             Space::with_height(Length::Fixed(8.0)),
             settings_section("Announce"),
             settings_toggle(
-                "Claude needs your input",
+                "An agent needs your input",
                 Some("A permission to grant, or a question to answer."),
                 state.settings.notify_attention,
                 Message::ToggleNotifyAttention,
             ),
             settings_toggle(
-                "Claude finished",
-                Some("A turn ended and Claude waits for the next prompt."),
+                "An agent finished",
+                Some("A turn ended and the agent waits for the next prompt."),
                 state.settings.notify_finished,
                 Message::ToggleNotifyFinished,
             ),
@@ -7088,8 +7122,8 @@ fn main_view(state: &State) -> Element<'_, Message> {
             bottom_left: pick(rbl),
         };
         // Claude status indicator in the header while Claude runs in this pane.
-        let claude_running = data.session.claude_running();
-        let cstatus = data.session.claude_status();
+        let claude_running = data.session.agent_running();
+        let cstatus = data.session.agent_status();
         let lc = cstatus.lifecycle;
         let status = claude_running.then(|| pane_dot(true, lc, false));
         // Right-clicking the header opens the same context menu as the terminal body
@@ -7309,34 +7343,32 @@ fn place_toasts(state: &State) -> Task<Message> {
     }))
 }
 
-/// Raise a card for what changed in the panes' Claude lifecycles since the last look: a
+/// Raise a card for what changed in the panes' agent lifecycles since the last look: a
 /// prompt that appeared ("needs your input") and a turn that ended ("finished"). Called
 /// from the two messages that follow every change, the PTY wake and the tick. A pane's
 /// first sighting only records it, so a launch or a restore raises nothing. The pane
 /// being looked at raises a card like any other: the user asked for every event.
-fn notify_claude_transitions(state: &mut State) -> Task<Message> {
+fn notify_agent_transitions(state: &mut State) -> Task<Message> {
     let now = now_ms();
-    let mut seen: HashMap<u64, ClaudeSeen> = HashMap::with_capacity(state.claude_seen.len());
+    let mut seen: HashMap<u64, AgentSeen> = HashMap::with_capacity(state.agent_seen.len());
     let mut raised: Vec<Message> = Vec::new();
     // Agents whose turn just ended, for the office's green desk (`office_done`).
     let mut done: Vec<String> = Vec::new();
     for ws in &state.workspaces {
         for (_, d) in ws.panes.iter() {
             let id = d.session.id();
-            let lifecycle = if d.session.claude_running() {
-                d.session.claude_status().lifecycle
-            } else {
-                Lifecycle::Closed
-            };
-            let finished = d.session.claude_finish_seq();
-            let prev = state.claude_seen.get(&id).copied();
-            let mut next = prev.unwrap_or(ClaudeSeen {
+            let status = d.session.agent_status();
+            let lifecycle = if d.session.agent_running() { status.lifecycle } else { Lifecycle::Closed };
+            let finished = d.session.finish_seq();
+            let prev = state.agent_seen.get(&id).copied().filter(|p| p.epoch == status.epoch);
+            let mut next = prev.unwrap_or(AgentSeen {
                 lifecycle: Lifecycle::Closed,
                 running_since: 0,
                 working_since: 0,
                 last_raised: 0,
                 last_was_finished: false,
                 finish_seq: finished,
+                epoch: status.epoch,
             });
             let was = next.lifecycle;
             let was_finished = next.finish_seq;
@@ -7353,28 +7385,29 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
             let changed = prev.is_some() && was != lifecycle;
             let quiet = now.saturating_sub(next.last_raised) < NOTIFY_QUIET_MS;
             let settled = next.working_since.saturating_sub(next.running_since) >= LAUNCH_SETTLE_MS;
-            // A turn END is an event Claude reports (its Stop hook, or its status row
-            // leaving the screen), never the absence of one. The lifecycle alone can
-            // read "ready" from any two-second gap in the spinner stream — a resize, a
-            // drag, a frozen row — and every one of those used to raise a card.
+            // A turn END is an event the agent reports (its Stop hook, a notification, or
+            // its status row leaving the screen), never the absence of one. The lifecycle
+            // alone can read "ready" from any two-second gap in the spinner stream (a
+            // resize, a drag, a frozen row) and every one of those used to raise a card.
             let ended = prev.is_some() && finished > was_finished;
             if ended {
                 done.push(d.history_id.clone());
             }
+            let name = status.kind.map_or("Agent", |k| k.agent().display_name());
             // A question outranks a finish read in the same pass: the turn stopped
-            // because Claude is asking, and "finished" would hide that.
+            // because the agent is asking, and "finished" would hide that.
             let asking = changed && lifecycle == Lifecycle::Attention;
             let title = if asking && state.settings.notify_attention && (!quiet || next.last_was_finished) {
-                Some("Claude needs your input")
+                Some(format!("{name} needs your input"))
             } else if !quiet && ended && settled && state.settings.notify_finished {
-                Some("Claude finished")
+                Some(format!("{name} finished"))
             } else {
                 None
             };
             if let Some(title) = title {
                 next.last_was_finished = !asking;
                 raised.push(Message::Notify {
-                    title: title.to_string(),
+                    title,
                     body: format!("{} · {}", d.name, ws.name),
                     target: Some(id),
                 });
@@ -7383,7 +7416,7 @@ fn notify_claude_transitions(state: &mut State) -> Task<Message> {
             seen.insert(id, next);
         }
     }
-    state.claude_seen = seen;
+    state.agent_seen = seen;
     for id in done {
         state.office_done.insert(id, now + OFFICE_DONE_MS);
     }
@@ -7661,7 +7694,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         let panes: Vec<_> = ws
             .panes
             .iter()
-            .filter(|(_, data)| !only_claude || data.session.claude_running())
+            .filter(|(_, data)| !only_claude || data.session.agent_running())
             .collect();
         if panes.is_empty() {
             continue;
@@ -7681,8 +7714,8 @@ fn overview_view(state: &State) -> Element<'_, Message> {
         col = col.push(header);
 
         for (pane, data) in panes {
-            let running = data.session.claude_running();
-            let lc = data.session.claude_status().lifecycle;
+            let running = data.session.agent_running();
+            let lc = data.session.agent_status().lifecycle;
             let busy = data.session.shell_busy();
             let dot = pane_dot(running, lc, busy);
             let attention = matches!(dot, Dot::Attention);
@@ -7690,7 +7723,7 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             // Truncate the title so it can't push the right cluster (git stats + status
             // dot) out of its column or wrap to a second line. Width-aware char budget:
             // reserve the dot (~22), the git stats (so they take priority — title gets
-            // shorter when present), the Claude icon, and chrome/padding/gaps. The Fill
+            // shorter when present), the agent icon, and chrome/padding/gaps. The Fill
             // container below pins the right cluster regardless; this just lands the "…".
             // `overview_git` draws nothing for a remote pane, so reserve nothing for it
             // either, or the title would be truncated to make room for a blank column.
@@ -7702,11 +7735,11 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             let reserved = 66.0 + git_px + if running { 19.0 } else { 0.0 };
             let max_chars = (((state.overview_size.width - reserved) / 6.0) as i32).max(6) as usize;
 
-            // Left: Claude icon (when active) + terminal name. Raised 1px so the
-            // starburst sits level with the title (centred read a touch low).
+            // Left: the agent's icon (when one runs) + terminal name. Raised 1px so the
+            // icon sits level with the title (centred read a touch low).
             let mut left = row![].spacing(6).align_y(iced::Center);
-            if running {
-                left = left.push(nudge_up_1px(claude_icon(13.0)));
+            if let Some(agent) = data.session.agent() {
+                left = left.push(nudge_up_1px(agent_icon(agent, 13.0)));
             }
             left = left.push(
                 text(truncate_name(&data.name, max_chars))
@@ -8671,8 +8704,6 @@ mod winresize {
 const ICON_POWERSHELL: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#b0b0b0" d="M21.83,4C22.32,4 22.63,4.4 22.5,4.89L19.34,19.11C19.23,19.6 18.75,20 18.26,20H2.17C1.68,20 1.37,19.6 1.5,19.11L4.66,4.89C4.77,4.4 5.25,4 5.74,4H21.83M15.83,16H11.83C11.37,16 11,16.38 11,16.84C11,17.31 11.37,17.69 11.83,17.69H15.83C16.3,17.69 16.68,17.31 16.68,16.84C16.68,16.38 16.3,16 15.83,16M5.78,16.28C5.38,16.56 5.29,17.11 5.57,17.5C5.85,17.92 6.41,18 6.81,17.73C14.16,12.56 14.21,12.5 14.26,12.47C14.44,12.31 14.53,12.09 14.54,11.87C14.55,11.67 14.5,11.5 14.38,11.31L9.46,6.03C9.13,5.67 8.57,5.65 8.21,6C7.85,6.32 7.83,6.88 8.16,7.24L12.31,11.68L5.78,16.28Z"/></svg>"##;
 const ICON_BASH: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#b0b0b0" d="M5 9H7.31L7.63 6H9.63L9.31 9H11.31L11.63 6H13.63L13.31 9H15V11H13.1L12.9 13H15V15H12.69L12.37 18H10.37L10.69 15H8.69L8.37 18H6.37L6.69 15H5V13H6.9L7.1 11H5V9M9.1 11L8.9 13H10.9L11.1 11M19 6H17V14H19M19 16H17V18H19Z"/></svg>"##;
 
-/// The Claude starburst logo (matches the web's ClaudeIcon, fill #D97757).
-const CLAUDE_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 248"><path fill="#D97757" d="M52.4285 162.873L98.7844 136.879L99.5485 134.602L98.7844 133.334H96.4921L88.7237 132.862L62.2346 132.153L39.3113 131.207L17.0249 130.026L11.4214 128.844L6.2 121.873L6.7094 118.447L11.4214 115.257L18.171 115.847L33.0711 116.911L55.485 118.447L71.6586 119.392L95.728 121.873H99.5485L100.058 120.337L98.7844 119.392L97.7656 118.447L74.5877 102.732L49.4995 86.1905L36.3823 76.62L29.3779 71.7757L25.8121 67.2858L24.2839 57.3608L30.6515 50.2716L39.3113 50.8623L41.4763 51.4531L50.2636 58.1879L68.9842 72.7209L93.4357 90.6804L97.0015 93.6343L98.4374 92.6652L98.6571 91.9801L97.0015 89.2625L83.757 65.2772L69.621 40.8192L63.2534 30.6579L61.5978 24.632C60.9565 22.1032 60.579 20.0111 60.579 17.4246L67.8381 7.49965L71.9133 6.19995L81.7193 7.49965L85.7946 11.0443L91.9074 24.9865L101.714 46.8451L116.996 76.62L121.453 85.4816L123.873 93.6343L124.764 96.1155H126.292V94.6976L127.566 77.9197L129.858 57.3608L132.15 30.8942L132.915 23.4505L136.608 14.4708L143.994 9.62643L149.725 12.344L154.437 19.0788L153.8 23.4505L150.998 41.6463L145.522 70.1215L141.957 89.2625H143.994L146.414 86.7813L156.093 74.0206L172.266 53.698L179.398 45.6635L187.803 36.802L193.152 32.5484H203.34L210.726 43.6549L207.415 55.1159L196.972 68.3492L188.312 79.5739L175.896 96.2095L168.191 109.585L168.882 110.689L170.738 110.53L198.755 104.504L213.91 101.787L231.994 98.7149L240.144 102.496L241.036 106.395L237.852 114.311L218.495 119.037L195.826 123.645L162.07 131.592L161.696 131.893L162.137 132.547L177.36 133.925L183.855 134.279H199.774L229.447 136.524L237.215 141.605L241.8 147.867L241.036 152.711L229.065 158.737L213.019 154.956L175.45 145.977L162.587 142.787H160.805V143.85L171.502 154.366L191.242 172.089L215.82 195.011L217.094 200.682L213.91 205.172L210.599 204.699L188.949 188.394L180.544 181.069L161.696 165.118H160.422V166.772L164.752 173.152L187.803 207.771L188.949 218.405L187.294 221.832L181.308 223.959L174.813 222.777L161.187 203.754L147.305 182.486L136.098 163.345L134.745 164.2L128.075 235.42L125.019 239.082L117.887 241.8L111.902 237.31L108.718 229.984L111.902 215.452L115.722 196.547L118.779 181.541L121.58 162.873L123.291 156.636L123.14 156.219L121.773 156.449L107.699 175.752L86.304 204.699L69.3663 222.777L65.291 224.431L58.2867 220.768L58.9235 214.27L62.8713 208.48L86.304 178.705L100.44 160.155L109.551 149.507L109.462 147.967L108.959 147.924L46.6977 188.512L35.6182 189.93L30.7788 185.44L31.4156 178.115L33.7079 175.752L52.4285 162.873Z"/></svg>"##;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -8867,7 +8898,7 @@ fn workspace_dot(ws: &Workspace) -> Option<Dot> {
     let mut running = false;
     for (_, d) in ws.panes.iter() {
         let busy = d.session.shell_busy();
-        match pane_dot(d.session.claude_running(), d.session.claude_status().lifecycle, busy) {
+        match pane_dot(d.session.agent_running(), d.session.agent_status().lifecycle, busy) {
             Dot::Attention => return Some(Dot::Attention), // top priority — return at once
             Dot::Working => working = true,
             Dot::Running => running = true,
@@ -8898,9 +8929,9 @@ fn tab_status_dot(dot: Dot) -> Element<'static, Message> {
     text("●").size(8).color(c).into()
 }
 
-/// The Claude starburst icon at `size` px.
-fn claude_icon(size: f32) -> Element<'static, Message> {
-    svg(svg::Handle::from_memory(CLAUDE_ICON.as_bytes())).width(size).height(size).into()
+/// An agent's icon at `size` px.
+fn agent_icon(agent: &'static dyn arbiter_native::agent::Agent, size: f32) -> Element<'static, Message> {
+    svg(svg::Handle::from_memory(agent.icon_svg().as_bytes())).width(size).height(size).into()
 }
 
 /// Per-pane header: the terminal name centred on the full width with its status
@@ -9574,8 +9605,8 @@ fn needs_fast_tick(state: &State) -> bool {
         ws.panes.iter().any(|(_, d)| {
             // Only *Working* animates (the ✻ bloom / avatar bob). Attention is a
             // static dot, so a pane waiting at a prompt does not force the fast tick.
-            if d.session.claude_running()
-                && matches!(d.session.claude_status().lifecycle, Lifecycle::Working)
+            if d.session.agent_running()
+                && matches!(d.session.agent_status().lifecycle, Lifecycle::Working)
             {
                 return true;
             }
@@ -10584,17 +10615,21 @@ fn main() -> iced::Result {
         usage_helper::run();
         return Ok(());
     }
-    // Headless subcommands Claude invokes via our injected --settings: capture
-    // its statusLine JSON / hook signals, then exit without starting the GUI.
-    match std::env::args().nth(1).as_deref() {
-        Some("claude-statusline") => {
-            arbiter_native::claude_shim::run_statusline_capture();
+    // Headless subcommands the agents invoke through the hooks Arbiter hands them at
+    // launch: record the event for the pane, then exit without starting the GUI.
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("agent-hook") => {
+            arbiter_native::agent_shim::run_agent_hook(&args[2..]);
             return Ok(());
         }
+        // The names a Claude launched by 1.6 or earlier still calls. The status line
+        // is no longer Arbiter's, so it has nothing to do.
         Some("claude-hook") => {
-            arbiter_native::claude_shim::run_hook_signal();
+            arbiter_native::agent_shim::run_agent_hook(&["claude".to_string()]);
             return Ok(());
         }
+        Some("claude-statusline") => return Ok(()),
         // `arbiter` typed in a pane (via the shim launcher): the mark and the build facts.
         Some("about") => {
             arbiter_native::about::attach_parent_console();
@@ -10617,9 +10652,9 @@ fn main() -> iced::Result {
     choose_graphics_backend(saved.as_ref().map(|s| s.settings.graphics_backend).unwrap_or_default());
     let font = Arc::new(arbiter_native::font::load());
     let git_bash = arbiter_native::shell::detect_git_bash();
-    // Event-driven Claude status: a single notify watcher over the capture + hook
-    // dirs updates each Session's shared status (no polling). Lives for the app.
-    std::mem::forget(arbiter_native::claude_status::start_watcher());
+    // Event-driven agent status: a single notify watcher over the pane event logs
+    // updates each Session's shared status (no polling). Lives for the app.
+    std::mem::forget(arbiter_native::agent_watch::start_watcher());
 
     let title = |state: &State, id: iced::window::Id| {
         if state.overview_window == Some(id) {
@@ -10845,7 +10880,7 @@ fn main() -> iced::Result {
                 wol_add_error: None,
                 toasts: Vec::new(),
                 next_toast_id: 1,
-                claude_seen: HashMap::new(),
+                agent_seen: HashMap::new(),
                 font_size_input: saved_settings.font_size.to_string(),
                 settings: saved_settings,
                 settings_open: false,
@@ -10901,6 +10936,38 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::{encode_mouse, parse_usage_line, trim_history_file, usage_poke, MouseModes, UsagePoke};
+
+    #[test]
+    fn a_restored_workspace_focuses_the_terminal_it_was_saved_with() {
+        use super::{focus_index, pane_grid, restored_focus};
+        use pane_grid::{Axis, Configuration, Node, State};
+
+        fn config(grid: &State<&'static str>, node: &Node) -> Configuration<&'static str> {
+            match node {
+                Node::Split { axis, ratio, a, b, .. } => Configuration::Split {
+                    axis: *axis,
+                    ratio: *ratio,
+                    a: Box::new(config(grid, a)),
+                    b: Box::new(config(grid, b)),
+                },
+                Node::Pane(p) => Configuration::Pane(*grid.get(*p).unwrap()),
+            }
+        }
+        // Grown by splits as in a session, so its ids differ from the restored grid's.
+        let (mut live, one) = State::new("one");
+        let (two, _) = live.split(Axis::Vertical, one, "two").unwrap();
+        let (three, _) = live.split(Axis::Horizontal, two, "three").unwrap();
+        let restored = State::with_configuration(config(&live, live.layout()));
+        let name = |pane| restored.get(pane).copied();
+
+        for (pane, want) in [(one, "one"), (two, "two"), (three, "three")] {
+            let saved = focus_index(live.layout(), pane);
+            assert_eq!(restored_focus(restored.layout(), saved).and_then(name), Some(want));
+        }
+        // A save from before focus was kept, and one naming a leaf that no longer exists.
+        assert_eq!(restored_focus(restored.layout(), None).and_then(name), Some("one"));
+        assert_eq!(restored_focus(restored.layout(), Some(9)).and_then(name), Some("one"));
+    }
 
     #[test]
     fn a_helper_line_carries_fable_as_its_own_window() {

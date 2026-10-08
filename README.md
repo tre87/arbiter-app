@@ -29,7 +29,7 @@ Because most of what runs in it is Claude Code, Arbiter also knows what each Cla
 
 ## Why it exists
 
-- **Resume, for real.** Layout, folders, Claude sessions and SSH connections all come back on their own. Resume of a running program is Claude Code specific today; anything else comes back to a shell in the right place.
+- **Resume, for real.** Layout, folders, Claude sessions and SSH connections all come back on their own. Resume of a running program covers Claude Code, and experimentally GitHub Copilot CLI and OpenAI Codex CLI; anything else comes back to a shell in the right place.
 - **Cross-platform, and the same everywhere.** One look, one set of shortcuts, one behaviour on Windows and macOS. Text is rasterised with each OS's own engine (DirectWrite, CoreText) so it reads like a native terminal on both.
 - **Lightweight.** Native Rust, no browser engine, no Electron. Everything is event driven, so it uses nothing while nothing is happening, and it lets your display sleep.
 - **Fast.** Terminal output is parsed by the same engine Alacritty uses and drawn straight to the GPU. Redraws happen on output, not on a clock.
@@ -49,6 +49,8 @@ Arbiter knows what Claude is doing in every pane, whether it runs locally or on 
 - **Needs attention**, amber, when Claude is waiting on a permission or a question.
 - A green dot when a shell is running an ordinary command.
 
+GitHub Copilot CLI (`copilot`) and OpenAI Codex CLI (`codex`) are followed the same way, experimentally: built from their documentation and source, and not yet tried against the real CLIs.
+
 The dots sit in each pane's header and roll up to the workspace tab, so a tab tells you when something inside it needs you.
 
 **The overview window** is the same information as a compact list: every workspace, every terminal, its Claude state, and its git status (staged, unstaged, untracked). It opens with `Ctrl+Shift+O` and can stay on top of everything else, so when the main window is covered or minimised you still see who is working and who is waiting. Click a row to jump to that pane. It can be filtered to Claude panes only.
@@ -64,7 +66,7 @@ The dots sit in each pane's header and roll up to the workspace tab, so a tab te
 
 ## Sessions stick around
 
-Arbiter saves continuously and restores on launch: the pane layout of every tab with exact split sizes, each terminal's working directory, the window size and position, and which panes had Claude running. Those panes relaunch Claude with `claude --resume` on the exact conversation, thanks to a small shim that runs as Claude's status line and learns each pane's session id. An unexpected quit does not cost you your layout.
+Arbiter saves continuously and restores on launch: the pane layout of every tab with exact split sizes, each terminal's working directory, the window size and position, and which panes had Claude running. Those panes relaunch Claude with `claude --resume` on the exact conversation, thanks to a small shim that hands Claude a session hook and learns each pane's session id; your own Claude status line is left alone. An unexpected quit does not cost you your layout.
 
 ## SSH
 
@@ -77,11 +79,11 @@ Remote terminals are first class. Type `ssh host` in a pane and Arbiter treats t
 
 ## The `arbiter` command
 
-Type `arbiter` in any pane for the mark turning in ASCII, followed by the version, the commit it was built from, the target and compiler, your OS and host, the shell, the saved layout, the data directory and the Claude version. `arbiter --version` prints one line.
+Type `arbiter` in any pane for the mark turning in ASCII, followed by the version, the commit it was built from, the target and compiler, your OS and host, the shell, the saved layout, the data directory and the version of each agent CLI installed. `arbiter --version` prints one line.
 
 ## Settings
 
-Font size, scrollback length, background colour and bold style for the terminals; whether to confirm before quitting; the overview's always-on-top, Claude-only and usage-footer options; a screenshot folder; and the remote Claude session naming described above.
+Font size, scrollback length, background colour and bold style for the terminals; whether to confirm before quitting; the overview's always-on-top, agents-only and usage-footer options; a screenshot folder; and the remote agent session naming described above.
 
 ## A few more things
 

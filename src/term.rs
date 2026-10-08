@@ -15,6 +15,10 @@ use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
+use crate::agent::{AgentKind, ScreenProfile};
+use crate::agent_screen::{self, ScreenState};
+use crate::term_signal::TermSignal;
+
 /// App-wide "intense text" (SGR 1 / bold) rendering mode, mirroring Windows Terminal's
 /// `intenseTextStyle` (see [`crate::persist::IntenseStyle`]): 0 = None, 1 = Bold,
 /// 2 = Bright, 3 = All. Read per-cell in `for_each_cell`; set from Settings on load and
@@ -113,15 +117,38 @@ impl EventListener for NoopListener {}
 /// reader loop drains this after each `feed` and writes it back to the PTY. With
 /// the old `NoopListener` these replies were dropped, so query-driven programs
 /// (vim, many .NET / Spectre.Console UIs) would hang or misread their own input.
+/// It also keeps the window titles and bells the program emits, which agents use to say
+/// they are working or waiting (see `term_signal`). Neither changes the picture, so
+/// neither bumps the generation.
 #[derive(Clone, Default)]
 pub struct Responder {
     buf: Arc<Mutex<Vec<u8>>>,
+    signals: Arc<Mutex<Vec<TermSignal>>>,
 }
+
+/// Signals kept between two drains. A program that retitles on every frame (Codex's
+/// spinner, 10 a second) only matters by its latest title, so an undrained buffer is
+/// bounded rather than grown.
+const MAX_PENDING_SIGNALS: usize = 64;
+
 impl EventListener for Responder {
     fn send_event(&self, event: alacritty_terminal::event::Event) {
-        if let alacritty_terminal::event::Event::PtyWrite(text) = event {
-            self.buf.lock().unwrap().extend_from_slice(text.as_bytes());
+        use alacritty_terminal::event::Event;
+        let signal = match event {
+            Event::PtyWrite(text) => {
+                self.buf.lock().unwrap().extend_from_slice(text.as_bytes());
+                return;
+            }
+            Event::Title(t) => TermSignal::Title(t),
+            Event::ResetTitle => TermSignal::Title(String::new()),
+            Event::Bell => TermSignal::Bell,
+            _ => return,
+        };
+        let mut signals = self.signals.lock().unwrap();
+        if signals.len() >= MAX_PENDING_SIGNALS {
+            signals.remove(0);
         }
+        signals.push(signal);
     }
 }
 
@@ -130,10 +157,10 @@ impl EventListener for Responder {
 /// every `Session::spawn`/`VtTerm::new` call site; existing grids keep their size.
 pub static SCROLLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(5000);
 
-/// Scrollback kept while Claude owns a pane (see the reader loop in `session.rs`): its
-/// wheel goes to Claude, so Arbiter's history is unreachable there and only holds redraw
-/// churn. Enough to keep the shell's recent output around Claude's launch.
-pub const CLAUDE_SCROLLBACK: usize = 1000;
+/// Scrollback kept while an agent owns a pane (see the reader loop in `session.rs`): its
+/// wheel goes to the agent, so Arbiter's history is unreachable there and only holds
+/// redraw churn. Enough to keep the shell's recent output around the agent's launch.
+pub const AGENT_SCROLLBACK: usize = 1000;
 
 #[derive(Clone, Copy)]
 struct Size {
@@ -170,6 +197,8 @@ pub struct VtTerm {
     /// PTY replies the term produced (query responses), drained by the reader loop
     /// and written back to the PTY. Shared with the `Responder` event sink.
     responses: Arc<Mutex<Vec<u8>>>,
+    /// Titles and bells, drained by the reader loop (see `Responder`).
+    signals: Arc<Mutex<Vec<TermSignal>>>,
     /// Bumped by every change that can alter what a frame shows: output, resize, scroll,
     /// selection, search, history depth. The renderer skips rebuilding a frame whose
     /// generation it already drew (see `gpu::TermGpu::prepare`), so a mutating method
@@ -182,7 +211,9 @@ impl VtTerm {
         let mut config = Config::default();
         config.scrolling_history = SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed);
         let responses: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let term = Term::new(config, &Size { cols, rows }, Responder { buf: responses.clone() });
+        let signals: Arc<Mutex<Vec<TermSignal>>> = Arc::new(Mutex::new(Vec::new()));
+        let responder = Responder { buf: responses.clone(), signals: signals.clone() };
+        let term = Term::new(config, &Size { cols, rows }, responder);
         Self {
             term,
             parser: Processor::new(),
@@ -196,6 +227,7 @@ impl VtTerm {
             hidden_since: None,
             last_scroll: None,
             responses,
+            signals,
             generation: 0,
         }
     }
@@ -230,6 +262,11 @@ impl VtTerm {
     /// caller can write them back to the PTY. Empty when nothing was asked.
     pub fn take_responses(&self) -> Vec<u8> {
         std::mem::take(&mut *self.responses.lock().unwrap())
+    }
+
+    /// Drain the titles and bells emitted since the last call, oldest first.
+    pub fn take_signals(&self) -> Vec<TermSignal> {
+        std::mem::take(&mut *self.signals.lock().unwrap())
     }
 
     /// Set the find query: collect all matches over the grid (incl. scrollback)
@@ -449,79 +486,40 @@ impl VtTerm {
         }
     }
 
-    /// Classify Claude's visible screen for status. Scanning the *rendered grid*
-    /// (vs the raw byte stream) is robust to chunk splits and is level-triggered,
-    /// so a menu reads as attention only while it's actually on screen — it clears
-    /// the instant the user escapes/answers. Returns `None` for plain output
-    /// (typing, redraws), which is neither working nor attention.
-    /// True if a menu / approval prompt is currently on the visible screen
-    /// (AskUserQuestion, plan mode, "proceed?"). Level-triggered on the rendered
-    /// grid, so attention clears the instant the prompt leaves (escape/answer).
-    /// Working is NOT detected here — it's keyed off the live byte stream (see
-    /// `session.rs`), so a spinner star left on screen can't pin it to "working".
-    pub fn visible_menu(&self) -> bool {
-        menu_in(&self.visible_rows())
-    }
-
-    /// True while Claude says it is working, by the interrupt hint it shows only then.
-    /// Level-triggered, unlike the spinner-frame stream, so it reads correctly when the
-    /// status row is FROZEN and when a read stalls, neither of which says the turn ended.
-    ///
-    /// Claude 2.1.28x draws the hint in the footer under the input box, in the slot
-    /// "? for shortcuts" holds while idle, so it is looked for in the same cursor-anchored
-    /// window as the rest of the chrome. Earlier releases put it on the spinner row
-    /// ("✻ Thinking… (esc to interrupt)"), which is still accepted.
-    pub fn visible_working(&self) -> bool {
-        self.below_cursor_contains(&[INTERRUPT_HINT]) || working_row_in(&self.visible_rows())
-    }
-
-    /// True while Claude's fullscreen UI is scrolled away from its live bottom: it then
-    /// shows a "Jump to bottom (ctrl+End) ↓" bar (or "N new messages (ctrl+End) ↓") and
-    /// stops drawing its status row, so no spinner frames say anything about the turn.
-    pub fn visible_scrolled(&self) -> bool {
-        scrolled_in(&self.visible_rows())
-    }
-
-    /// True while Claude's status row says it has background work outstanding: either
-    /// "✳ Waiting for N background agents to finish", or a finished turn's line ending
-    /// "· 1 shell still running". Its turn is over by every other sign (the spinner
-    /// stands still, the Stop hook has fired), yet it picks the work up by itself when
-    /// that work reports, so the pane is not idle. The row is told from the same words in
-    /// the transcript by its shape: a spinner glyph, a space, the phrase; Claude's prose
-    /// starts with a bullet or an indent.
-    ///
-    /// The row stays in the transcript when the wait ends without the work reporting:
-    /// aborting the agents leaves "✳ Waiting for 2 background agents to finish" where it
-    /// was and writes "● All background agents stopped" under it. So with the input box
-    /// on screen the row only counts as the last thing drawn above it. Without the box
-    /// there is nothing to measure against, and any visible row counts, as before.
-    pub fn visible_waiting_background(&self) -> bool {
-        waiting_in(&self.visible_rows())
-    }
-
-    /// Everything the reader reads from the screen for Claude's state, from one pass
-    /// over it. Run for every chunk of output while Claude owns the pane, under the
+    /// Everything the reader reads from the screen for an agent's state, from one pass
+    /// over it, by that agent's profile. Scanning the *rendered grid* (vs the raw byte
+    /// stream) is robust to chunk splits and level-triggered, so a menu reads as
+    /// attention only while it is on screen and clears the instant the user escapes or
+    /// answers. Run for every chunk of output while an agent owns the pane, under the
     /// terminal lock the renderer also needs, so the rows are read once into a buffer
     /// the reader thread keeps, rather than once per question.
-    pub fn claude_screen(&self) -> ClaudeScreen {
+    ///
+    /// Working is read two ways: the footer hint in the cursor-anchored window (Claude
+    /// 2.1.28x draws its interrupt hint under the input box), and a working row among
+    /// the live rows. Both are levels, unlike the spinner-frame stream, so they read
+    /// correctly when a status row is FROZEN and when a read stalls, neither of which
+    /// says the turn ended.
+    pub fn screen_state(&self, p: &ScreenProfile) -> ScreenState {
         thread_local! {
             static ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         ROWS.with(|rows| {
             let mut rows = rows.borrow_mut();
             self.fill_visible_rows(&mut rows);
-            ClaudeScreen {
-                menu: menu_in(&rows),
-                scrolled: scrolled_in(&rows),
-                waiting: waiting_in(&rows),
-                working: self.below_cursor_contains(&[INTERRUPT_HINT]) || working_row_in(&rows),
-                idle_box: self.claude_chrome(),
-                slash_input: self.input_row_is_slash(),
+            ScreenState {
+                menu: agent_screen::menu_in(p, &rows),
+                scrolled: agent_screen::scrolled_in(p, &rows),
+                waiting: agent_screen::waiting_in(p, &rows),
+                working: self.below_cursor_contains(p.chrome_rows_below, p.working_footer)
+                    || agent_screen::working_row_in(p, &rows),
+                idle_box: self.chrome(p),
+                slash_input: self.input_row_is_slash(p),
             }
         })
     }
 
-    fn visible_rows(&self) -> Vec<String> {
+    /// The text of every visible row, top to bottom.
+    pub fn visible_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
         self.fill_visible_rows(&mut rows);
         rows
@@ -543,67 +541,72 @@ impl VtTerm {
         }
     }
 
-    /// True if Claude Code's own UI chrome is on the visible screen. This is how a
-    /// pane running Claude on a REMOTE host is recognised: the markers ride the PTY
-    /// like any other output, so it works identically over SSH, where the local
-    /// process scan sees only `ssh` and no statusLine capture is ever written.
+    /// True if the agent's own idle chrome (its input box's hint line) is on screen. This
+    /// is how a pane running an agent on a REMOTE host is recognised: the markers ride the
+    /// PTY like any other output, so it works identically over SSH, where the local
+    /// process scan sees only `ssh` and no hook ever fires.
     ///
-    /// The markers are Claude's hint line, which reads `? for shortcuts` in the
-    /// default mode and shows the mode label in each of the other three (verified
-    /// against the shipped CLI's mode table: default / accept edits on / plan mode
-    /// on / auto mode on).
+    /// Only rows from the cursor DOWN are scanned, which is the load-bearing detail. The
+    /// agent renders its input box at the cursor with the hint line just below, so
+    /// anchoring there finds it wherever the box currently sits: a fixed window at the
+    /// screen bottom would miss a freshly started agent, whose transcript is still short
+    /// and whose box is near the top. Anchoring also makes the signal self-clearing. Once
+    /// the agent exits, its last screen stays in the transcript ABOVE the returning shell
+    /// prompt, and text above the cursor is never scanned, so a stale hint line cannot
+    /// keep the pane marked as running an agent.
     ///
-    /// Only rows from the cursor DOWN are scanned, which is the load-bearing detail.
-    /// Claude renders its input box at the cursor with the hint line just below, so
-    /// anchoring there finds it wherever the box currently sits: a fixed window at
-    /// the screen bottom would miss a freshly-started Claude, whose transcript is
-    /// still short and whose box is near the top. Anchoring also makes the signal
-    /// self-clearing. Once Claude exits, its last screen stays in the transcript
-    /// ABOVE the returning shell prompt, and text above the cursor is never scanned,
-    /// so a stale hint line cannot keep the pane marked as running Claude.
-    ///
-    /// During a turn Claude replaces the hint with the interrupt hint, so a single
-    /// absent scan does not mean it exited (see `ClaudeHandle::note_screen`).
-    pub fn claude_chrome(&self) -> bool {
-        const CHROME: &[&str] = &[
-            "? for shortcuts",
-            "manual mode on",
-            "accept edits on",
-            "plan mode on",
-            "auto mode on",
-            "bypass permissions on",
-        ];
-        self.below_cursor_contains(CHROME)
+    /// During a turn Claude replaces the hint with the interrupt hint, so a single absent
+    /// scan does not mean it exited (see `session::note_screen`).
+    pub fn chrome(&self, p: &ScreenProfile) -> bool {
+        self.below_cursor_contains(p.chrome_rows_below, p.chrome)
     }
 
-    /// Whether the cursor's row or one of the `CHROME_BELOW` rows under it contains one
-    /// of `markers`. Anchored to the cursor, which Claude keeps in its input box, so the
+    /// Which agent's chrome is on screen, for a remote pane whose agent is not known yet:
+    /// the first whose markers match on a row that none of its vetoes share. Per row, so
+    /// Codex's footer ("? for shortcuts" beside "100% context left") vetoes Claude while
+    /// a Claude whose own status line prints "72% context left" is still Claude.
+    pub fn detect(&self) -> Option<AgentKind> {
+        crate::agent::all()
+            .iter()
+            .find(|a| {
+                let p = a.screen();
+                let has = |row: &str, markers: &[&str]| markers.iter().any(|m| row.contains(m));
+                self.below_cursor_any(p.chrome_rows_below, |row| has(row, p.chrome) && !has(row, p.chrome_veto))
+            })
+            .map(|a| a.kind())
+    }
+
+    /// Whether the cursor's row or one of the `below` rows under it contains one of
+    /// `markers`. Anchored to the cursor, which the agent keeps in its input box, so the
     /// same words left in the transcript above never match.
-    fn below_cursor_contains(&self, markers: &[&str]) -> bool {
+    fn below_cursor_contains(&self, below: usize, markers: &[&str]) -> bool {
+        !markers.is_empty() && self.below_cursor_any(below, |row| markers.iter().any(|m| row.contains(m)))
+    }
+
+    fn below_cursor_any(&self, below: usize, matches: impl Fn(&str) -> bool) -> bool {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
         // Absolute grid line, deliberately NOT display-offset adjusted: whether a pane
-        // is running Claude must not change just because the user scrolled up.
+        // is running an agent must not change just because the user scrolled up.
         let cursor = grid.cursor.point.line.0.max(0) as usize;
         let mut buf = String::with_capacity(cols);
-        for row in cursor..rows.min(cursor + CHROME_BELOW + 1) {
+        for row in cursor..rows.min(cursor + below + 1) {
             buf.clear();
             let line = &grid[Line(row as i32)];
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if markers.iter().any(|m| buf.contains(m)) {
+            if matches(&buf) {
                 return true;
             }
         }
         false
     }
 
-
     /// The text of the row the cursor is on, trailing blanks trimmed. Read at Enter, it
     /// is the command line exactly as the shell showed it: completed, recalled, edited.
-    /// Absolute grid line, like `claude_chrome`, so scrolling does not change it.
+    /// Absolute grid line, like `chrome`, so scrolling does not change it.
     pub fn cursor_row_text(&self) -> String {
         let cols = self.term.columns();
         let grid = self.term.grid();
@@ -619,12 +622,12 @@ impl VtTerm {
         buf.trim_end().to_string()
     }
 
-    /// Whether the row the cursor is on is a slash command in Claude's input box.
+    /// Whether the row the cursor is on is a slash command in the agent's input box.
     /// Read at Enter, this says the user is about to open a chooser themselves
-    /// (`/model`, `/config`), which no hook reports and which must not read as Claude
+    /// (`/model`, `/config`), which no hook reports and which must not read as the agent
     /// asking for something.
-    pub fn input_row_is_slash(&self) -> bool {
-        row_is_slash_command(&self.cursor_row_text())
+    pub fn input_row_is_slash(&self, p: &ScreenProfile) -> bool {
+        agent_screen::row_is_slash_command(p, &self.cursor_row_text())
     }
 
     pub fn default_bg(&self) -> [f32; 3] { rgbf(term_bg()) }
@@ -802,204 +805,6 @@ fn rgbf(c: Rgb) -> [f32; 3] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]
 }
 
-/// Rows below the cursor that Claude's chrome can sit in. Measured against a real
-/// session: the cursor sits in the input box, and below it come the box's bottom border,
-/// an optional warning line, the user's statusLine, and finally the mode line, so the
-/// marker was 4 rows down. This is set well past that because everything between is
-/// optional and a future release could add another line; the window only ever extends
-/// DOWNWARD, which is what keeps stale chrome above the cursor from matching, so
-/// widening it costs no precision.
-const CHROME_BELOW: usize = 8;
-
-/// The footer hint Claude shows only while a turn is running.
-const INTERRUPT_HINT: &str = "esc to interrupt";
-
-/// What `VtTerm::claude_screen` reads, one field per question the reader asks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClaudeScreen {
-    pub menu: bool,
-    pub scrolled: bool,
-    pub waiting: bool,
-    pub working: bool,
-    pub idle_box: bool,
-    pub slash_input: bool,
-}
-
-/// Rows from the bottom that Claude's live status rows are looked for in. A marker
-/// further up is transcript.
-const LIVE_ROWS: usize = 40;
-
-/// The last `n` of `rows`.
-fn bottom(rows: &[String], n: usize) -> &[String] {
-    &rows[rows.len().saturating_sub(n)..]
-}
-
-/// A live chooser's footer among the bottom `MENU_ROWS` (`VtTerm::visible_menu`).
-fn menu_in(rows: &[String]) -> bool {
-    bottom(rows, MENU_ROWS).iter().any(|r| is_menu_row(r))
-}
-
-/// Claude's "Jump to bottom (ctrl+End)" bar (`VtTerm::visible_scrolled`).
-fn scrolled_in(rows: &[String]) -> bool {
-    bottom(rows, LIVE_ROWS).iter().any(|r| r.contains("(ctrl+End)"))
-}
-
-/// The pre-2.1.28x working row, the interrupt hint on the spinner row.
-fn working_row_in(rows: &[String]) -> bool {
-    bottom(rows, LIVE_ROWS).iter().any(|r| is_working_row(r))
-}
-
-/// Outstanding background work (`VtTerm::visible_waiting_background`): with the
-/// input box's prompt among the live rows, only the last row drawn above it counts,
-/// the first that is neither blank, nor the box's border, nor a task-list item.
-/// Without the box any live row counts.
-fn waiting_in(rows: &[String]) -> bool {
-    let waiting = |row: &str| is_waiting_agents_row(row) || is_background_shell_row(row);
-    let start = rows.len().saturating_sub(LIVE_ROWS);
-    match (start..rows.len()).rev().find(|&i| is_prompt_at(rows, i)) {
-        Some(prompt) => rows[..prompt]
-            .iter()
-            .rev()
-            .find(|r| !is_blank_or_border(r) && !is_task_list_row(r))
-            .is_some_and(|r| waiting(r)),
-        None => bottom(rows, LIVE_ROWS).iter().any(|r| waiting(r)),
-    }
-}
-
-/// Rows from the bottom that a LIVE menu can occupy. Claude anchors its input box and
-/// its choosers to the bottom of the screen, so a marker further up is transcript: an
-/// old approval box scrolled back into view, or prose quoting the words. Scanning the
-/// whole screen for them raised a card every time the user scrolled past one.
-const MENU_ROWS: usize = 12;
-
-/// The text after a spinner glyph at the start of `row`, if the row is one of Claude's
-/// status rows. The glyph is one of the spinner's frames (Claude's ✢✳✶✻✽ range, or its
-/// `·` frame) followed by a space, which no transcript line begins with.
-fn status_row_text(row: &str) -> Option<&str> {
-    let trimmed = row.trim_start();
-    let mut chars = trimmed.chars();
-    let glyph = chars.next()?;
-    let is_frame = matches!(glyph as u32, 0x2722..=0x273F) || glyph == '·';
-    if !is_frame || chars.next() != Some(' ') {
-        return None;
-    }
-    Some(chars.as_str())
-}
-
-/// Whether a row is the prompt line of Claude's input box: "❯ " with whatever has been
-/// typed after it, possibly inside the box's side border.
-fn is_input_prompt_row(row: &str) -> bool {
-    row.trim_start_matches(|c: char| c.is_whitespace() || c == '│').starts_with('\u{276f}')
-}
-
-/// Whether `rows[i]` is the prompt line of Claude's input box. `❯` is enough on its own.
-/// Claude's plain fallback draws `>` instead, which is also how the transcript echoes
-/// what the user sent (`> run the tests`), so a `>` row counts only inside the box: a
-/// border directly above it, and another within the few rows below that typed text can
-/// take.
-fn is_prompt_at(rows: &[String], i: usize) -> bool {
-    /// Lines of typed text a box can hold before its bottom border and still be read.
-    const BOX_LINES: usize = 8;
-    let row = &rows[i];
-    if is_input_prompt_row(row) {
-        return true;
-    }
-    let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{2502}');
-    body.starts_with("> ")
-        && i > 0
-        && is_box_rule(&rows[i - 1])
-        && rows[i + 1..].iter().take(BOX_LINES).any(|r| is_box_rule(r))
-}
-
-/// A border of the input box: box-drawing characters and blanks, and not blank alone.
-fn is_box_rule(row: &str) -> bool {
-    is_blank_or_border(row) && row.chars().any(|c| matches!(c as u32, 0x2500..=0x257F))
-}
-
-/// Whether a row holds nothing but blanks and box-drawing characters, which is what the
-/// input box's top and bottom borders are.
-fn is_blank_or_border(row: &str) -> bool {
-    row.chars().all(|c| c.is_whitespace() || matches!(c as u32, 0x2500..=0x257F))
-}
-
-/// Whether a row is an item of Claude's task list: a checkbox or square, then the task,
-/// the first item hung from the status row by "⎿". Both of Claude's glyph sets, the
-/// Unicode one and its plain fallback.
-fn is_task_list_row(row: &str) -> bool {
-    const MARKS: &[&str] = &[
-        "\u{2610} ", "\u{2612} ", "\u{25fb} ", "\u{25fc} ", "\u{2714} ", "\u{25a1} ", "\u{25a0} ",
-        "\u{221a} ", "[ ] ", "[\u{d7}] ",
-    ];
-    let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{23bf}');
-    MARKS.iter().any(|m| body.starts_with(m))
-}
-
-/// Whether a screen row is Claude's "✳ Waiting for N background agents to finish" status
-/// row (see `VtTerm::visible_waiting_background`).
-fn is_waiting_agents_row(row: &str) -> bool {
-    let Some(rest) = status_row_text(row) else { return false };
-    rest.starts_with("Waiting for ") && rest.contains(" background agent") && rest.contains(" to finish")
-}
-
-/// Whether a screen row is a finished turn's line with a background shell still going:
-/// "✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running". Claude is woken when
-/// that shell exits, exactly as it is when a background agent reports. The count comes
-/// before "shell" and may be plural; anything else on the line (the verb, the duration,
-/// the clock) varies and is not relied on.
-fn is_background_shell_row(row: &str) -> bool {
-    let Some(rest) = status_row_text(row) else { return false };
-    rest.contains(" still running")
-        && (rest.contains(" shell still running") || rest.contains(" shells still running"))
-}
-
-/// Whether a screen row is Claude's working status row: a spinner frame and a line
-/// carrying the interrupt hint ("✻ Thinking… (esc to interrupt)"). The shape is what
-/// separates it from prose containing the same words, including Arbiter's own source
-/// shown in a diff.
-fn is_working_row(row: &str) -> bool {
-    status_row_text(row).is_some_and(|rest| rest.contains("esc to interrupt"))
-}
-
-/// Whether a row is the footer of a live chooser. Claude draws the same hint under
-/// AskUserQuestion, plan-mode approval and its own slash-command menus.
-fn is_menu_row(row: &str) -> bool {
-    if row.contains("Would you like to proceed") {
-        return true;
-    }
-    // The tool-permission dialog's question, on a row of its own. Its footer can carry
-    // a single hint, which the two-hint rule below does not accept, and a remote pane
-    // has no permission hook to fall back on. Only the whole row counts, since Claude's
-    // prose asks the same thing mid-paragraph.
-    let edge = |c: char| c.is_whitespace() || c == '\u{2502}';
-    if row.trim_matches(edge) == "Do you want to proceed?" {
-        return true;
-    }
-    // Claude's footer reads "↑/↓ to navigate · Enter to select · Esc to cancel". Any
-    // ONE of those fragments also turns up in ordinary prose ("explains how to
-    // navigate the tree"), which is how scrolling a transcript used to raise a card,
-    // so a footer has to carry at least two of them.
-    const HINTS: &[&str] = &["to navigate", "to select", "Esc to cancel", "Enter to"];
-    HINTS.iter().filter(|h| row.contains(**h)).count() >= 2
-}
-
-/// Whether a rendered input row holds a slash command. Claude's box draws a border and
-/// a prompt marker before the text, so those are stripped first; everything after the
-/// first character must still look like a command, not prose that happens to start
-/// with a slash.
-fn row_is_slash_command(row: &str) -> bool {
-    // Claude draws the text inside a box, so strip the border and prompt marker from
-    // both ends: the row is `│ > /model        │`.
-    let edge = |c: char| c.is_whitespace() || matches!(c, '│' | '|' | '>' | '\u{276f}');
-    let body = row.trim_start_matches(edge).trim_end_matches(edge);
-    let Some(rest) = body.strip_prefix('/') else { return false };
-    // A bare `/` counts: Claude lists its commands on that first keystroke, which is
-    // the moment the list appears and the earliest this has to be right.
-    let Some(first) = rest.chars().next() else { return true };
-    // `/usr/bin/x` or `//` is a path or a comment, not a command.
-    first.is_ascii_alphabetic()
-        && rest.chars().take_while(|c| !c.is_whitespace()).all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
-}
-
 /// http(s):// scheme length at `t[i]` (8 for `https://`, 7 for `http://`), else
 /// `None`.
 fn url_scheme_len(t: &[char], i: usize) -> Option<usize> {
@@ -1120,6 +925,7 @@ fn build_palette() -> [Rgb; 256] {
 #[cfg(test)]
 mod tests {
     use super::url_spans;
+    use crate::agent::claude::PROFILE as CLAUDE;
 
     /// Run the URL scanner over `s` and return the matched substrings.
     fn matches(s: &str) -> Vec<String> {
@@ -1153,100 +959,13 @@ mod tests {
         assert!(matches("http://").is_empty()); // scheme with no body
     }
 
-    // Claude's working row, against the same words as they appear in a transcript —
-    // including Arbiter's own source, which contains the phrase in these very tests.
-    #[test]
-    fn the_working_row_is_known_by_its_shape() {
-        use super::is_working_row as row;
-        assert!(row("✻ Thinking… (esc to interrupt)"));
-        assert!(row("· Brewing… (esc to interrupt · ctrl+t to hide todos)"));
-        assert!(row("✳ Waiting for 2 background agents to finish · esc to interrupt   "));
-        // Prose, quoted text and source: same words, no status-row shape.
-        assert!(!row("  the hint reads (esc to interrupt) while it works"));
-        assert!(!row("● Ran tool, esc to interrupt was shown"));
-        assert!(!row("+    assert!(row(\"✻ Thinking… (esc to interrupt)\"));"));
-        assert!(!row("✻ Brewed for 7s"));
-        assert!(!row(""));
-    }
-
-    // A live chooser's footer, against an approval box sitting in the transcript.
-    #[test]
-    fn a_menu_footer_is_matched_by_its_words() {
-        use super::is_menu_row as row;
-        assert!(row("  ↑/↓ to navigate · Enter to select · Esc to cancel"));
-        assert!(row("Would you like to proceed?"));
-        assert!(row(" Do you want to proceed?"));
-        assert!(row("\u{2502} Do you want to proceed?            \u{2502}"));
-        assert!(!row("\u{25cf} I can rename it everywhere. Do you want to proceed?"));
-        assert!(row("  ↑/↓ to navigate · Esc to cancel"));
-        // One stray fragment is prose, which is what used to raise a card on every
-        // pass while scrolling back over a plan.
-        assert!(!row("  the plan explains how to navigate the tree"));
-        assert!(!row("  press Esc to cancel, it said, and I did"));
-        assert!(!row(""));
-    }
-
-    // Telling a slash command in Claude's input box from an ordinary prompt.
-    #[test]
-    fn a_slash_command_is_told_from_a_prompt() {
-        use super::row_is_slash_command as slash;
-        assert!(slash("> /model"));
-        assert!(slash("│ ❯ /config "));
-        assert!(slash("  /agents"));
-        assert!(slash("> /statusline setup"));
-        // The first keystroke, which is when Claude puts its command list up.
-        assert!(slash("> /"));
-        assert!(slash("│ > /   │"));
-        assert!(slash("> /mod"));
-        assert!(!slash("> fix the bug in /src/main.rs"));
-        assert!(!slash("> /usr/bin/env"));
-        assert!(!slash("> //"));
-        assert!(!slash("> how do I use /model?"));
-        assert!(!slash("> "));
-        assert!(!slash(""));
-    }
-
-    // The status row while Claude waits on agents it launched, against the same words
-    // where Claude writes them in its transcript.
-    #[test]
-    fn the_waiting_for_agents_row_is_known_by_its_shape() {
-        use super::is_waiting_agents_row as row;
-        assert!(row("✳ Waiting for 3 background agents to finish"));
-        assert!(row("· Waiting for 1 background agent to finish"));
-        assert!(row("✻ Waiting for 2 background agents to finish · esc to interrupt   "));
-        assert!(!row("● Waiting for 3 background agents to finish."));
-        assert!(!row("  Waiting for 3 background agents to finish"));
-        assert!(!row("✳ Waiting for API response"));
-        assert!(!row("✳ Brewed for 7s"));
-        assert!(!row(""));
-    }
-
-    // A finished turn's line while a shell Claude started in the background runs on.
-    // The first is captured from a real session; the verb and the clock both vary.
-    #[test]
-    fn the_background_shell_row_is_known_by_its_shape() {
-        use super::is_background_shell_row as row;
-        assert!(row("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
-        assert!(row("✳ Cooked for 3s · done 9:02 AM · 2 shells still running   "));
-        assert!(row("· Baked for 1m 12s · 1 shell still running"));
-        // The same turn with nothing left behind is an ordinary turn end.
-        assert!(!row("✻ Brewed for 14m 1s · done 11:40 PM"));
-        assert!(!row("✻ Brewed for 7s"));
-        // The same words where Claude writes them in its transcript, or in a pane that
-        // is not Claude's status row at all.
-        assert!(!row("● The build is done, 1 shell still running in the background."));
-        assert!(!row("  1 shell still running"));
-        assert!(!row("⏵⏵ auto mode on · 1 shell · ← for agents"));
-        assert!(!row(""));
-    }
-
     // Either kind of outstanding work holds the pane, and a plain turn end does not.
     #[test]
     fn background_work_of_either_kind_is_seen_on_screen() {
         let seen = |line: &str| {
             let mut t = super::VtTerm::new(80, 4);
             t.feed(line.as_bytes());
-            t.visible_waiting_background()
+            t.screen_state(&CLAUDE).waiting
         };
         assert!(seen("✳ Waiting for 2 background agents to finish"));
         assert!(seen("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
@@ -1261,7 +980,7 @@ mod tests {
         let screen = |lines: &[&str]| {
             let mut t = super::VtTerm::new(80, 12);
             t.feed(lines.join("\r\n").as_bytes());
-            t.visible_waiting_background()
+            t.screen_state(&CLAUDE).waiting
         };
         let rule = "────────────────────────────────────────";
         let footer = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent";
@@ -1423,7 +1142,7 @@ mod tests {
         use super::VtTerm;
         let mut t = VtTerm::new(80, 24);
         t.feed(s.as_bytes());
-        t.claude_chrome()
+        t.chrome(&CLAUDE)
     }
 
     /// Claude's rendered shape: an input box holding the cursor, then its hint line
@@ -1484,7 +1203,7 @@ mod tests {
         let working = |s: &str| {
             let mut t = super::VtTerm::new(80, 24);
             t.feed(s.as_bytes());
-            t.visible_working()
+            t.screen_state(&CLAUDE).working
         };
         let rule = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
         let screen = |footer: &str| {
@@ -1498,31 +1217,40 @@ mod tests {
         assert!(!working("  esc to interrupt\r\n\r\n\u{276f} "));
     }
 
-    // The reader's one pass says what each question asked on its own says.
+    // Titles and bells come out of the parse as signals, split across feeds or not, with
+    // either terminator; a BEL that ends an OSC is not a bell.
     #[test]
-    fn the_single_screen_read_matches_each_question() {
-        let rule = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
-        for screen in [
-            format!("\u{2733} Waiting for 2 background agents to finish\r\n{rule}\r\n\u{276f} /mod\r\n{rule}\r\n  esc to interrupt\x1b[2A\x1b[3C"),
-            format!("\u{25cf} done\r\n{rule}\r\n\u{276f} \r\n{rule}\r\n  ? for shortcuts\x1b[2A\x1b[2C"),
-            "  \u{2191}/\u{2193} to navigate \u{b7} Enter to select \u{b7} Esc to cancel\r\nJump to bottom (ctrl+End)".to_string(),
-        ] {
+    fn titles_and_bells_are_signals() {
+        use crate::term_signal::TermSignal;
+        let mut t = super::VtTerm::new(20, 4);
+        t.feed(b"\x1b]0;\xe2\xa0\x8b work");
+        t.feed(b"ing\x07\x07\x1b]2;done\x1b\\");
+        assert_eq!(
+            t.take_signals(),
+            vec![TermSignal::Title("\u{280b} working".into()), TermSignal::Bell, TermSignal::Title("done".into())]
+        );
+        assert!(t.take_signals().is_empty(), "drained");
+    }
+
+    // A remote pane with no agent bound yet is told which agent it runs by the chrome,
+    // and Codex's footer, which carries Claude's "? for shortcuts" beside its context
+    // meter, must not pass for Claude's.
+    #[test]
+    fn detection_tells_the_agents_apart() {
+        use crate::agent::AgentKind;
+        let detect = |s: &str| {
             let mut t = super::VtTerm::new(80, 24);
-            t.feed(screen.as_bytes());
-            let read = t.claude_screen();
-            assert_eq!(
-                read,
-                super::ClaudeScreen {
-                    menu: t.visible_menu(),
-                    scrolled: t.visible_scrolled(),
-                    waiting: t.visible_waiting_background(),
-                    working: t.visible_working(),
-                    idle_box: t.claude_chrome(),
-                    slash_input: t.input_row_is_slash(),
-                },
-                "{screen:?}"
-            );
-        }
+            t.feed(s.as_bytes());
+            t.detect()
+        };
+        assert_eq!(detect(&claude_screen("? for shortcuts")), Some(AgentKind::Claude));
+        assert_eq!(detect(&claude_screen("  ? for shortcuts            100% context left")), Some(AgentKind::Codex));
+        // A Claude whose own status line, a row of its own, speaks of context left.
+        assert_eq!(
+            detect("> \r\nmdl:opus | 72% context left\r\n? for shortcuts\x1b[A\x1b[A"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(detect("$ ls\r\nsrc\r\n$ "), None);
     }
 
     #[test]

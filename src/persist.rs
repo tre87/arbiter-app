@@ -8,8 +8,15 @@
 //! serialisable shape + the on-disk read/write.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
+
+/// Set by the background threads (the event watcher, the reader, the process scan) when
+/// something the saved layout records has changed: an agent started or bound a
+/// conversation, a connection learnt something. The UI persists on its next frame and
+/// clears it, so those threads never need the window state.
+pub static SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Which shell a saved terminal ran (mirrors the bin's `ShellKind`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -90,10 +97,52 @@ pub enum SavedNode {
         #[serde(default)]
         remote_claude: bool,
         /// That Claude's session id when Arbiter named or read it (see
-        /// `ClaudeHandle::remote_session`), so the very conversation is resumed.
+        /// `AgentHandle::remote_session`), so the very conversation is resumed.
         #[serde(default)]
         remote_session: Option<String>,
+        /// The agent running here and its conversation, for any agent. The four Claude
+        /// fields above are still written for a Claude pane, so a downgrade to 1.6
+        /// relaunches it; this one wins when both are present (see `saved_agent`). An
+        /// agent this build does not know (a newer build's) loads as none, rather than
+        /// failing the whole layout.
+        #[serde(default, deserialize_with = "lenient_agent", skip_serializing_if = "Option::is_none")]
+        agent: Option<SavedAgent>,
     },
+}
+
+/// Which agent a saved pane was running, and which conversation to bring back.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SavedAgent {
+    pub kind: crate::agent::AgentKind,
+    #[serde(default)]
+    pub session: Option<String>,
+    /// It ran on the far side of the pane's connection, so the replayed connection
+    /// resumes it there, not a local shell.
+    #[serde(default)]
+    pub remote: bool,
+}
+
+fn lenient_agent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SavedAgent>, D::Error> {
+    let value: Option<serde_json::Value> = Option::deserialize(d)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+impl SavedNode {
+    /// The agent a saved leaf brings back: its `agent` field, else what the legacy
+    /// Claude fields of a 1.6 save say. `None` for a split.
+    pub fn saved_agent(&self) -> Option<SavedAgent> {
+        let SavedNode::Leaf { agent, claude_running, claude_session, remote_claude, remote_session, .. } = self else {
+            return None;
+        };
+        if agent.is_some() {
+            return agent.clone();
+        }
+        let claude = crate::agent::AgentKind::Claude;
+        if *remote_claude {
+            return Some(SavedAgent { kind: claude, session: remote_session.clone(), remote: true });
+        }
+        claude_running.then(|| SavedAgent { kind: claude, session: claude_session.clone(), remote: false })
+    }
 }
 
 /// A window's saved size + (optional) position, in logical pixels.
@@ -118,6 +167,10 @@ pub struct SavedWorkspace {
     pub editor_tabs: Vec<String>,
     #[serde(default)]
     pub editor_active: Option<usize>,
+    /// The focused terminal, as its position among `layout`'s leaves (a before b).
+    /// Pane ids are renumbered on every launch, so the id itself would mean nothing.
+    #[serde(default)]
+    pub focus: Option<usize>,
 }
 
 /// Default width of the explorer pane, in logical pixels.
@@ -511,6 +564,7 @@ mod tests {
                             remote_cwd: None,
                             remote_claude: false,
                             remote_session: None,
+                            agent: None,
                         }),
                         b: Box::new(SavedNode::Leaf {
                             name: "Terminal 2".into(),
@@ -526,6 +580,7 @@ mod tests {
                             remote_cwd: Some("/home/tre/src".into()),
                             remote_claude: true,
                             remote_session: Some("abc-123".into()),
+                            agent: None,
                         }),
                     },
                     explorer: Some(SavedExplorer {
@@ -536,12 +591,14 @@ mod tests {
                     }),
                     editor_tabs: vec!["/tmp/project/src/main.rs".into()],
                     editor_active: Some(0),
+                    focus: Some(1),
                 },
                 SavedWorkspace {
                     name: "Workspace 2".into(),
                     explorer: None,
                     editor_tabs: Vec::new(),
                     editor_active: None,
+                    focus: None,
                     layout: SavedNode::Leaf {
                         name: "Terminal 1".into(),
                         shell: SavedShell::PowerShell,
@@ -556,6 +613,7 @@ mod tests {
                         remote_cwd: None,
                         remote_claude: false,
                         remote_session: None,
+                        agent: None,
                     },
                 },
             ],
@@ -573,6 +631,7 @@ mod tests {
         assert_eq!(explorer.expanded, vec!["/tmp/project/src".to_string()]);
         assert_eq!(back.workspaces[0].editor_tabs, vec!["/tmp/project/src/main.rs".to_string()]);
         assert_eq!(back.workspaces[0].editor_active, Some(0));
+        assert_eq!(back.workspaces[0].focus, Some(1));
         assert!(back.workspaces[1].explorer.is_none());
         match &back.workspaces[0].layout {
             SavedNode::Split { vertical, ratio, a, b } => {
@@ -691,5 +750,107 @@ mod tests {
             }
             _ => panic!("expected a leaf"),
         }
+    }
+
+    fn leaf(json: &str) -> SavedNode {
+        serde_json::from_str(&format!(r#"{{"Leaf":{{"name":"T","shell":"PowerShell","cwd":null,{json}}}}}"#)).unwrap()
+    }
+
+    // A 1.6 save names only Claude, in its own fields; those still bring Claude back.
+    #[test]
+    fn a_legacy_claude_pane_is_read_as_a_claude_agent() {
+        use crate::agent::AgentKind::Claude;
+        assert_eq!(
+            leaf(r#""claude_running":true,"claude_session":"sid-1""#).saved_agent(),
+            Some(SavedAgent { kind: Claude, session: Some("sid-1".into()), remote: false })
+        );
+        assert_eq!(
+            leaf(r#""startup_cmd":"ssh mini","remote_claude":true,"remote_session":"abc""#).saved_agent(),
+            Some(SavedAgent { kind: Claude, session: Some("abc".into()), remote: true })
+        );
+        assert_eq!(leaf(r#""claude_running":false"#).saved_agent(), None);
+    }
+
+    // The agent field wins over the legacy ones, which are still written for Claude.
+    #[test]
+    fn the_agent_field_wins_over_the_legacy_ones() {
+        let node = leaf(r#""claude_running":true,"claude_session":"old","agent":{"kind":"codex","session":"019a"}"#);
+        assert_eq!(
+            node.saved_agent(),
+            Some(SavedAgent { kind: crate::agent::AgentKind::Codex, session: Some("019a".into()), remote: false })
+        );
+    }
+
+    // An agent this build does not know must cost that one pane its agent, not every
+    // terminal: a failed parse makes `load()` start fresh.
+    #[test]
+    fn an_unknown_agent_loads_as_none_and_the_layout_survives() {
+        let json = r#"{"active":0,"workspaces":[{"name":"W","layout":{"Split":{"vertical":true,"ratio":0.5,
+            "a":{"Leaf":{"name":"A","shell":"PowerShell","cwd":null,"agent":{"kind":"gemini","session":"x"}}},
+            "b":{"Leaf":{"name":"B","shell":"PowerShell","cwd":null,"agent":{"kind":"copilot"}}}}}}]}"#;
+        let s: SavedState = serde_json::from_str(json).unwrap();
+        let SavedNode::Split { a, b, .. } = &s.workspaces[0].layout else { panic!("expected a split") };
+        assert_eq!(a.saved_agent(), None);
+        assert_eq!(b.saved_agent().map(|g| g.kind), Some(crate::agent::AgentKind::Copilot));
+    }
+
+    // What this build writes, read by 1.6.1's own shape of a leaf (copied here as it
+    // was): a downgrade still relaunches Claude, and ignores the new field.
+    #[test]
+    fn a_downgrade_to_1_6_still_reads_the_claude_fields() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum Node161 {
+            Leaf {
+                name: String,
+                #[serde(default)]
+                claude_running: bool,
+                #[serde(default)]
+                claude_session: Option<String>,
+                #[serde(default)]
+                remote_claude: bool,
+                #[serde(default)]
+                remote_session: Option<String>,
+            },
+        }
+        let written = SavedNode::Leaf {
+            name: "T".into(),
+            shell: SavedShell::PowerShell,
+            cwd: None,
+            claude_running: true,
+            claude_session: Some("sid-1".into()),
+            history_id: None,
+            startup_cmd: None,
+            prompts_for_credential: None,
+            credential_kind: None,
+            credential_detail: None,
+            remote_cwd: None,
+            remote_claude: false,
+            remote_session: None,
+            agent: Some(SavedAgent { kind: crate::agent::AgentKind::Claude, session: Some("sid-1".into()), remote: false }),
+        };
+        let json = serde_json::to_string(&written).unwrap();
+        assert!(json.contains(r#""agent":{"kind":"claude""#), "{json}");
+        let Node161::Leaf { claude_running, claude_session, .. } = serde_json::from_str(&json).unwrap();
+        assert!(claude_running);
+        assert_eq!(claude_session.as_deref(), Some("sid-1"));
+        // And a pane with no agent writes no `agent` key at all.
+        let plain = SavedNode::Leaf {
+            name: "T".into(),
+            shell: SavedShell::PowerShell,
+            cwd: None,
+            claude_running: false,
+            claude_session: None,
+            history_id: None,
+            startup_cmd: None,
+            prompts_for_credential: None,
+            credential_kind: None,
+            credential_detail: None,
+            remote_cwd: None,
+            remote_claude: false,
+            remote_session: None,
+            agent: None,
+        };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("agent"));
     }
 }

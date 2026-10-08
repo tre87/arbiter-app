@@ -1,18 +1,18 @@
 //! Shell-integration: build the login shell command with OSC-7 (cwd) + OSC-133
 //! (FinalTerm prompt markers: A/D=idle, B/C=busy) emitters injected, so the
 //! terminal can detect cwd changes + shell busy/idle without polling. Ported
-//! from `src-tauri/src/shell.rs` (the OSC-133 injection; the claude-shim
-//! PATH/statusLine setup comes with the statusLine work later). Tauri-free:
+//! from `src-tauri/src/shell.rs` (the OSC-133 injection), plus the agent-shim
+//! PATH and environment (see `agent_shim`). Tauri-free:
 //! the zsh integration dir lives under the per-OS data dir via `dirs`.
 
 use std::sync::OnceLock;
 
 use portable_pty::CommandBuilder;
 
-use crate::claude_shim;
+use crate::agent_shim;
 
-/// Arbiter's per-OS data dir — session.json + the claude-shim, capture, and hook
-/// files live under here (the watchers read the same dirs). `ARBITER_DATA_DIR`
+/// Arbiter's per-OS data dir: session.json, the agent shim and the pane event logs
+/// live under here (the watchers read the same dirs). `ARBITER_DATA_DIR`
 /// overrides it, so a test/dev instance can run fully ISOLATED and never read or
 /// clobber the real session.json.
 pub fn app_data_dir() -> Option<std::path::PathBuf> {
@@ -21,54 +21,43 @@ pub fn app_data_dir() -> Option<std::path::PathBuf> {
     }
     // Debug builds (`cargo run`) use a SEPARATE dir from the installed release
     // app, so dev work doesn't share/clobber its workspaces, layout, settings, or
-    // Claude shim state. Release (incl. `cargo run --release`) uses the canonical
+    // agent shim state. Release (incl. `cargo run --release`) uses the canonical
     // dir. `cfg!(debug_assertions)` is false under `--release`, which is exactly
     // the split we want.
     let name = if cfg!(debug_assertions) { "arbiter-native-debug" } else { "arbiter-native" };
     Some(dirs::data_dir()?.join(name))
 }
 
-static SHIM: OnceLock<Option<claude_shim::ShimSetup>> = OnceLock::new();
+static SHIM: OnceLock<Option<agent_shim::ShimSetup>> = OnceLock::new();
 
-/// Lazily set up the claude shim (idempotent file writes) on first shell spawn.
-fn shim() -> Option<&'static claude_shim::ShimSetup> {
+/// Lazily set up the agent shim (idempotent file writes) on first shell spawn.
+fn shim() -> Option<&'static agent_shim::ShimSetup> {
     SHIM.get_or_init(|| {
         let data_dir = app_data_dir()?;
         let path = std::env::var("PATH").unwrap_or_default();
         let exe = std::env::current_exe().ok()?;
-        claude_shim::setup(&data_dir, &path, &exe)
+        agent_shim::setup(&data_dir, &path, &exe)
     })
     .as_ref()
 }
 
-/// Prepend the shim `bin/` to PATH and export the shim env, so `claude` in the
-/// spawned shell resolves to our launcher (which runs the real claude with our
-/// generated `--settings` → statusLine/hook capture). Best-effort; a missing
-/// shim just means no Claude stats, never a broken shell.
-fn apply_claude_shim(cmd: &mut CommandBuilder) {
+/// Prepend the shim `bin/` to PATH and export the shim env, so an agent's command in
+/// the spawned shell resolves to Arbiter's launcher (which runs the real binary with
+/// the agent's hooks). Best-effort; a missing shim just means no agent status, never a
+/// broken shell.
+fn apply_agent_shim(cmd: &mut CommandBuilder) {
     let Some(s) = shim() else {
-        claude_shim::debug_log("apply_claude_shim: shim() returned None (no shim set up)");
+        crate::debug::debug_log("apply_agent_shim: shim() returned None (no shim set up)");
         return;
     };
     let sep = if cfg!(windows) { ";" } else { ":" };
     let path = std::env::var("PATH").unwrap_or_default();
     cmd.env("PATH", format!("{}{sep}{path}", s.bin_dir.display()));
-    claude_shim::debug_log(&format!(
-        "apply_claude_shim: PATH prepend bin={} real_claude={:?} settings={}",
-        s.bin_dir.display(),
-        s.real_claude,
-        s.settings_file.display(),
-    ));
+    crate::debug::debug_log(&format!("apply_agent_shim: PATH prepend bin={} env={:?}", s.bin_dir.display(), s.env));
     // zsh re-applies this last, after sourcing the user's rc (see ZSH_ZSHRC).
-    cmd.env(claude_shim::SHIM_BIN_ENV, s.bin_dir.display().to_string());
-    if let Some(rc) = &s.real_claude {
-        cmd.env(claude_shim::REAL_CLAUDE_ENV, rc.display().to_string());
-    }
-    cmd.env(claude_shim::SETTINGS_ENV, s.settings_file.display().to_string());
-    cmd.env(claude_shim::CAPTURE_DIR_ENV, s.capture_dir.display().to_string());
-    cmd.env(claude_shim::HOOKS_DIR_ENV, s.hooks_dir.display().to_string());
-    if let Some(orig) = &s.orig_statusline {
-        cmd.env(claude_shim::ORIG_STATUSLINE_ENV, orig);
+    cmd.env(agent_shim::SHIM_BIN_ENV, s.bin_dir.display().to_string());
+    for (k, v) in &s.env {
+        cmd.env(k, v);
     }
 }
 
@@ -100,8 +89,8 @@ if (( $+functions[add-zsh-hook] )); then
   add-zsh-hook preexec _arbiter_preexec
 fi
 
-# Re-prepend Arbiter's claude-shim dir LAST (after the user's rc + path_helper),
-# so `claude` resolves to our launcher. No-op until the shim sets ARBITER_SHIM_BIN.
+# Re-prepend Arbiter's agent-shim dir LAST (after the user's rc + path_helper),
+# so `claude` (and every other agent) resolves to our launcher. No-op until the shim sets ARBITER_SHIM_BIN.
 [[ -n "$ARBITER_SHIM_BIN" ]] && export PATH="$ARBITER_SHIM_BIN:$PATH"
 
 # Private per-pane command history: switch to a fresh history list backed by this
@@ -174,7 +163,7 @@ pub fn detect_git_bash() -> Option<String> {
 /// recorded, so it can't pollute history. Functions are declared `global:` so they
 /// survive into the interactive session (a script scope wouldn't). Sets OSC-7/133
 /// emitters, per-pane private history (see the per-terminal-history feature), and
-/// re-prepends the claude-shim dir after $PROFILE.
+/// re-prepends the agent-shim dir after $PROFILE.
 #[cfg(target_os = "windows")]
 const PS_INIT: &str = r#"$global:__arbiter_orig_prompt = $function:prompt
 # Point PSReadLine's history at this pane's file at SCRIPT TOP LEVEL, i.e. before
@@ -263,10 +252,10 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                     // and the history housekeeping below would overwrite it.
                     r#"__arb_ec=$?; if [ -z "$_ARB_HIST" ] && [ -n "$ARBITER_HISTFILE" ]; then shopt -s histappend; export HISTFILE="$(cygpath -u "$ARBITER_HISTFILE" 2>/dev/null || echo "$ARBITER_HISTFILE")"; history -c; history -r; _ARB_HIST=1; fi; [ -n "$ARBITER_HISTFILE" ] && history -a; "#,
                     r#"printf '\e]133;D;%d\a\e]7;file:///%s\a\e]133;A\a' "$__arb_ec" "$(pwd -W | sed 's/ /%20/g' | sed 's/\\/\//g')""#,
-                    // Re-prepend Arbiter's claude-shim dir LAST (after Git Bash's
-                    // profile/rc, which may reorder PATH so the real claude wins), so
-                    // `claude` resolves to our launcher and our --settings →
-                    // statusLine/hook capture applies. Mirrors the macOS zsh precmd
+                    // Re-prepend Arbiter's agent-shim dir LAST (after Git Bash's
+                    // profile/rc, which may reorder PATH so the real binaries win), so
+                    // each agent resolves to our launcher and gets Arbiter's hooks.
+                    // Mirrors the macOS zsh precmd
                     // re-prepend. `cygpath -u` converts the Windows shim path to the
                     // /c/... form Git Bash's PATH uses; only prepends when not already
                     // first. No-op until the shim sets ARBITER_SHIM_BIN.
@@ -274,7 +263,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
                 ),
             );
             cmd.env("PS0", "\x1b]133;C\x07");
-            apply_claude_shim(&mut cmd);
+            apply_agent_shim(&mut cmd);
             cmd
         } else {
             let mut cmd = CommandBuilder::new("powershell.exe");
@@ -288,7 +277,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
             } else {
                 cmd.arg("-NoExit");
             }
-            apply_claude_shim(&mut cmd);
+            apply_agent_shim(&mut cmd);
             cmd
         }
     }
@@ -340,7 +329,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
             );
             cmd.env("PS0", "\x1b]133;C\x07");
         }
-        apply_claude_shim(&mut cmd);
+        apply_agent_shim(&mut cmd);
         cmd
     }
 }

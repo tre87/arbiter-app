@@ -269,7 +269,7 @@ fn facts(build: &Build) -> Vec<Fact> {
         })
         .or_else(|| cfg!(windows).then(|| "PowerShell".to_string()));
     let data = crate::shell::app_data_dir().map(|p| p.display().to_string());
-    vec![
+    let mut facts = vec![
         ("Build", Some(format!("{} · {} · {}", build.commit, build.date, build.profile))),
         ("Target", Some(build.target.to_string())),
         ("Rust", Some(build.rustc.to_string())),
@@ -285,8 +285,9 @@ fn facts(build: &Build) -> Vec<Fact> {
         ("Shell", shell),
         ("Layout", layout_summary()),
         ("Data", data),
-        ("Claude", claude_version()),
-    ]
+    ];
+    facts.extend(agent_versions());
+    facts
 }
 
 /// "2 workspaces · 5 terminals · 3 over ssh", from the saved layout.
@@ -319,38 +320,53 @@ fn layout_summary() -> Option<String> {
     Some(s)
 }
 
-/// `claude --version`, from the real Claude when a pane's shim names it, else whatever
-/// `claude` is on PATH. Given two seconds; a missing or slow Claude just drops the line.
-fn claude_version() -> Option<String> {
-    let real = std::env::var("ARBITER_REAL_CLAUDE").ok();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let output = if cfg!(windows) {
-            let target = real.unwrap_or_else(|| "claude".to_string());
-            let mut cmd = std::process::Command::new("cmd");
-            cmd.args(["/c", &target, "--version"]);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                // CREATE_NO_WINDOW: the release exe has no console of its own for cmd to
-                // share, and a fresh one would flash on screen.
-                cmd.creation_flags(0x0800_0000);
-            }
-            cmd.output()
-        } else {
-            match real {
-                Some(path) => std::process::Command::new(path).arg("--version").output(),
-                None => std::process::Command::new("claude").arg("--version").output(),
-            }
-        };
-        let _ = tx.send(
-            output
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()),
-        );
-    });
-    rx.recv_timeout(Duration::from_secs(2)).ok().flatten().filter(|s| !s.is_empty())
+/// Every registered agent's `--version`, from the real binary when a pane's shim names
+/// it, else whatever is on PATH. All asked at once and given two seconds together; a
+/// missing or slow agent just drops its line.
+fn agent_versions() -> Vec<Fact> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let asks: Vec<_> = crate::agent::all()
+        .iter()
+        .map(|a| {
+            let bin = a.binaries()[0];
+            let real = std::env::var(crate::agent_shim::real_binary_env(bin)).ok();
+            let args = a.version_args();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(version_of(real.as_deref().unwrap_or(bin), args));
+            });
+            (a.display_name(), rx)
+        })
+        .collect();
+    asks.into_iter()
+        .filter_map(|(name, rx)| {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx.recv_timeout(left).ok().flatten().filter(|s| !s.is_empty())?;
+            Some((name, Some(v)))
+        })
+        .collect()
+}
+
+fn version_of(target: &str, args: &[&str]) -> Option<String> {
+    let output = if cfg!(windows) {
+        // Through cmd, which resolves a `.cmd` wrapper (npm installs) as a shell would.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/c").arg(target).args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW: the release exe has no console of its own for cmd to
+            // share, and a fresh one would flash on screen.
+            cmd.creation_flags(0x0800_0000);
+        }
+        cmd.output()
+    } else {
+        std::process::Command::new(target).args(args).output()
+    };
+    output
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string())
 }
 
 /// Lay the facts beside the mark: the title on the first row, a rule, then label and
@@ -396,7 +412,7 @@ fn spin_angle(i: usize, n: usize) -> f32 {
 }
 
 /// Give `about` and `--version` the terminal they were typed in. The Windows release exe
-/// is a GUI-subsystem program (so Claude's shim calls never flash a console), which means
+/// is a GUI-subsystem program (so the agents' hook calls never flash a console), which means
 /// a process launched from a prompt starts with no console at all and everything it prints
 /// is dropped. Attach to the launcher's console and point stdout and stderr at its screen,
 /// keeping any handle the launcher wired itself (`arbiter about > file`). A no-op where

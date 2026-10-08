@@ -535,7 +535,7 @@ fn boot_git_tasks(state: &State) -> Vec<Task<Message>> {
 /// later. Only the active workspace is affected: nothing else is being laid out.
 pub fn suppress_reflow(state: &State) {
     for (_, d) in state.active().panes.iter() {
-        d.session.suppress_claude_activity(REFLOW_SUPPRESS_MS);
+        d.session.suppress_activity(REFLOW_SUPPRESS_MS);
     }
 }
 
@@ -1886,7 +1886,7 @@ fn send_to_agent(state: &mut State) -> Task<Message> {
         .active()
         .panes
         .iter()
-        .filter(|(_, d)| d.session.claude_running())
+        .filter(|(_, d)| d.session.agent_running())
         .map(|(p, d)| (*p, d.name.clone(), pane_where(d)))
         .collect();
     if claude.len() == 1 {
@@ -2700,9 +2700,9 @@ pub fn close_confirm_view(state: &State) -> Option<Element<'static, Message>> {
 
 pub fn send_target_view(t: &SendTarget) -> Element<'static, Message> {
     let title = if t.all_terminals {
-        "No Claude is running here. Send to which terminal?"
+        "No agent is running here. Send to which terminal?"
     } else {
-        "Send to which Claude?"
+        "Send to which agent?"
     };
     let mut panel = column![text(title).size(15).font(ui_semibold())].spacing(10);
     for (i, (_, name, where_)) in t.rows.iter().enumerate() {

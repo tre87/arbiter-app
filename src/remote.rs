@@ -105,46 +105,25 @@ fn sh_escape_dir(dir: &str) -> Option<String> {
     sh_escape_word(dir)
 }
 
-/// Whether `id` is a session id Claude could have issued or accepted: letters, digits and
-/// hyphens, which also means it needs no escaping anywhere it is used.
-pub fn plausible_session_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
-/// The command that brings Claude back on the far host with no conversation to name: the
-/// directory's most recent one, else a fresh one.
-pub const CLAUDE_COMMAND: &str = "claude -c || claude";
-
-/// The command that brings Claude back on the far host: the pane's own conversation when
-/// Arbiter knows its id (see `ClaudeHandle::remote_session`), else the directory's most
-/// recent one, else a fresh one. The remote counterpart of the local
-/// `claude --resume <id>` / `claude` rule; each step runs only if the previous could not.
-pub fn claude_command(session: Option<&str>) -> String {
-    match session.filter(|s| plausible_session_id(s)) {
-        Some(id) => format!("claude --resume {id} || {CLAUDE_COMMAND}"),
-        None => CLAUDE_COMMAND.to_string(),
-    }
-}
-
 /// The line to type into the LOCAL shell to rebuild a remote pane: in `dir` when known,
-/// with Claude relaunched there when `claude`, into `session` when known. `None` when the
-/// saved line is not a plain `ssh` invocation, when `dir` cannot be expressed, or when
-/// there is nothing to add (no directory but home, no Claude); the caller then replays
-/// the line as saved and types what is needed at the far prompt instead.
+/// with `agent` relaunched there (into its conversation, when known) as its adapter's
+/// `resume_remote` says. `None` when the saved line is not a plain `ssh` invocation, when
+/// `dir` cannot be expressed, or when there is nothing to add (no directory but home, no
+/// agent); the caller then replays the line as saved and types what is needed at the far
+/// prompt instead.
 ///
-/// Claude runs through `$SHELL -lic`, an interactive login shell, because the shell sshd
-/// hands a remote command to reads no rc file and so typically has no `claude` on its
-/// PATH; the rc files are where the native installer and Homebrew put it. Its command,
-/// followed by the user's login shell in the same place, is passed as one
+/// The agent runs through `$SHELL -lic`, an interactive login shell, because the shell
+/// sshd hands a remote command to reads no rc file and so typically has no agent on its
+/// PATH; the rc files are where the native installers, npm and Homebrew put them. Its
+/// command, followed by the user's login shell in the same place, is passed as one
 /// backslash-escaped word (see `sh_escape_word`), which is why it looks the way it does.
 pub fn remote_launch_line(
     startup_cmd: &str,
     dir: Option<&str>,
-    claude: bool,
-    session: Option<&str>,
+    agent: Option<(crate::agent::AgentKind, Option<&str>)>,
 ) -> Option<String> {
     let dir = dir.filter(|d| *d != "~");
-    if dir.is_none() && !claude {
+    if dir.is_none() && agent.is_none() {
         return None;
     }
     let ssh = parse_simple_ssh(startup_cmd.trim())?;
@@ -166,8 +145,8 @@ pub fn remote_launch_line(
         out.push_str(&cd);
         out.push_str(" && ");
     }
-    if claude {
-        let then_shell = format!("{}; exec $SHELL -l", claude_command(session));
+    if let Some((kind, session)) = agent {
+        let then_shell = format!("{}; exec $SHELL -l", kind.agent().resume_remote(session));
         out.push_str("exec $SHELL -lic ");
         out.push_str(&sh_escape_word(&then_shell).expect("built from checked parts"));
     } else {
@@ -251,29 +230,32 @@ pub fn sftp_invocation(startup_cmd: &str) -> Option<SftpInvocation> {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::AgentKind;
+
     fn line(cmd: &str, dir: &str) -> Option<String> {
-        super::remote_launch_line(cmd, Some(dir), false, None)
+        super::remote_launch_line(cmd, Some(dir), None)
     }
 
     fn full(cmd: &str, dir: Option<&str>, claude: bool) -> Option<String> {
-        super::remote_launch_line(cmd, dir, claude, None)
+        super::remote_launch_line(cmd, dir, claude.then_some((AgentKind::Claude, None)))
     }
 
     // The pane's own conversation first, then the directory's most recent, then a fresh
-    // one; an id that could not be Claude's is ignored rather than escaped.
+    // one (see `Claude::resume_remote`), all inside the one escaped word.
     #[test]
     fn claude_resumes_its_own_conversation_when_the_id_is_known() {
-        use super::claude_command;
-        assert_eq!(claude_command(None), "claude -c || claude");
         assert_eq!(
-            claude_command(Some("3f2a9c1e-7b4d-4e8a-9f01-2c5d6e7f8a9b")),
-            "claude --resume 3f2a9c1e-7b4d-4e8a-9f01-2c5d6e7f8a9b || claude -c || claude"
-        );
-        assert_eq!(claude_command(Some("")), "claude -c || claude");
-        assert_eq!(claude_command(Some("x; rm -rf ~")), "claude -c || claude");
-        assert_eq!(
-            super::remote_launch_line("ssh mini", Some("~/src"), true, Some("abc-123")).as_deref(),
+            super::remote_launch_line("ssh mini", Some("~/src"), Some((AgentKind::Claude, Some("abc-123")))).as_deref(),
             Some("ssh -t mini 'cd ~/src && exec $SHELL -lic claude\\ --resume\\ abc-123\\ \\|\\|\\ claude\\ -c\\ \\|\\|\\ claude\\;\\ exec\\ \\$SHELL\\ -l'")
+        );
+    }
+
+    // Any agent rides the line the same way, by its own resume chain.
+    #[test]
+    fn another_agent_rides_the_line_by_its_own_chain() {
+        assert_eq!(
+            super::remote_launch_line("ssh mini", None, Some((AgentKind::Codex, None))).as_deref(),
+            Some("ssh -t mini 'exec $SHELL -lic codex\\ resume\\ --last\\ \\|\\|\\ codex\\;\\ exec\\ \\$SHELL\\ -l'")
         );
     }
 

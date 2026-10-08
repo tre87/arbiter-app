@@ -16,10 +16,13 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
-use crate::persist::CredentialKind;
+use crate::agent::{AgentKind, TypedLaunch};
+use crate::agent_state::{AgentHandle, KindSource};
+use crate::conn::ConnHandle;
+use crate::persist::{CredentialKind, SAVE_DIRTY};
 use crate::term::VtTerm;
 
-/// Bumped on each OSC-133 idle→busy edge; the Claude monitor waits on it.
+/// Bumped on each OSC-133 idle→busy edge; the agent monitor waits on it.
 type CmdEpoch = Arc<(Mutex<u64>, Condvar)>;
 /// Native FS watcher for the current repo (refreshes git on external edits).
 type GitWatcher = Debouncer<RecommendedWatcher>;
@@ -297,7 +300,7 @@ fn local_path(decoded: &str) -> String {
 }
 
 /// What a restored or reconnected remote pane still has to do once its far shell is at
-/// a prompt: go back to the saved directory, then optionally bring Claude back there.
+/// a prompt: go back to the saved directory, then optionally bring its agent back there.
 ///
 /// Typed only once the far shell is known to be reading input: on its OSC-7 report (the
 /// opt-in snippet) or, failing that, when its prompt is recognised on screen. Nothing is
@@ -305,28 +308,29 @@ fn local_path(decoded: &str) -> String {
 /// credential prompt.
 struct Followup {
     dir: String,
-    resume_claude: bool,
-    /// The conversation to resume, when Arbiter knows the far Claude's id.
+    /// The agent to bring back, if one was running there.
+    resume: Option<AgentKind>,
+    /// The conversation to resume, when Arbiter knows the far agent's id.
     session: Option<String>,
     /// The connection command itself carries the `cd` (see `remote::remote_launch_line`),
-    /// so the far shell starts in `dir` and only Claude is left to type.
+    /// so the far shell starts in `dir` and only the agent is left to type.
     cd_in_command: bool,
 }
 
 /// What to type at the far prompt for a follow-up, and the directory it changes into,
 /// if it does. `reported` is the directory the far shell itself announced, if it did:
 /// already being there, by report, by the command line, or because the directory is
-/// home, saves the `cd`. Claude comes back as `remote::claude_command` says.
+/// home, saves the `cd`. The agent comes back as its `resume_remote` says.
 fn followup_line(f: Followup, reported: Option<&str>) -> Option<(Vec<u8>, Option<String>)> {
     let there = f.cd_in_command
         || reported == Some(f.dir.as_str())
         || (f.dir == "~" && reported.is_none());
-    let claude = format!("({})", crate::remote::claude_command(f.session.as_deref()));
-    let line = match (there, f.resume_claude) {
-        (true, false) => return None,
-        (true, true) => format!("{claude}\r"),
-        (false, false) => format!("{}\r", cd_cmd(&f.dir)),
-        (false, true) => format!("{} && {claude}\r", cd_cmd(&f.dir)),
+    let agent = f.resume.map(|k| format!("({})", k.agent().resume_remote(f.session.as_deref())));
+    let line = match (there, agent) {
+        (true, None) => return None,
+        (true, Some(agent)) => format!("{agent}\r"),
+        (false, None) => format!("{}\r", cd_cmd(&f.dir)),
+        (false, Some(agent)) => format!("{} && {agent}\r", cd_cmd(&f.dir)),
     };
     Some((line.into_bytes(), (!there).then_some(f.dir)))
 }
@@ -345,67 +349,18 @@ fn cd_cmd(dir: &str) -> String {
     format!("cd {tilde}'{}'", rest.replace('\'', "'\\''"))
 }
 
-/// What a command typed at the far prompt means for the pane's Claude conversation.
-#[derive(Debug, PartialEq, Eq)]
-enum ClaudeLaunch {
-    NotClaude,
-    /// A plain interactive launch naming no conversation: Arbiter may name one.
-    Bare,
-    /// Launched into a named conversation (`--resume <id>` or `--session-id <id>`).
-    Named(String),
-    /// Something Arbiter cannot follow: `-c`, a subcommand, a prompt, `--print`, the
-    /// resume picker.
-    Other,
+/// Which agent a command typed at the far prompt launches, and what it means for the
+/// conversation, by the first agent that recognises it.
+fn classify_launch(cmd: &str) -> Option<(AgentKind, TypedLaunch)> {
+    crate::agent::all().iter().find_map(|a| match a.classify_launch(cmd) {
+        TypedLaunch::NotThis => None,
+        launch => Some((a.kind(), launch)),
+    })
 }
 
-/// Claude's subcommands, which take no `--session-id`. A first bare word that is one of
-/// these is a subcommand; any other bare word is an initial prompt, which an interactive
-/// launch happily takes alongside a session id.
-const CLAUDE_SUBCOMMANDS: &[&str] = &[
-    "mcp", "update", "doctor", "install", "auth", "config", "plugin", "agents", "setup-token",
-    "migrate-installer",
-];
-
-fn classify_claude_launch(cmd: &str) -> ClaudeLaunch {
-    let mut words = cmd.split_whitespace();
-    let Some(first) = words.next() else { return ClaudeLaunch::NotClaude };
-    if first.rsplit('/').next().unwrap_or(first) != "claude" {
-        return ClaudeLaunch::NotClaude;
-    }
-    let mut named = None;
-    let mut after_flag = false;
-    while let Some(word) = words.next() {
-        let (flag, inline) = match word.split_once('=') {
-            Some((f, v)) => (f, Some(v)),
-            None => (word, None),
-        };
-        match flag {
-            "--resume" | "-r" | "--session-id" => {
-                let value = inline.or_else(|| words.next());
-                match value.filter(|v| crate::remote::plausible_session_id(v)) {
-                    Some(id) => named = Some(id.to_string()),
-                    None => return ClaudeLaunch::Other,
-                }
-                after_flag = false;
-            }
-            "-c" | "--continue" | "-p" | "--print" | "-h" | "--help" | "-v" | "--version" => {
-                return ClaudeLaunch::Other;
-            }
-            f if f.starts_with('-') => after_flag = inline.is_none(),
-            // A bare word: the preceding flag's value, a subcommand, or an initial prompt.
-            w if !after_flag && CLAUDE_SUBCOMMANDS.contains(&w) => return ClaudeLaunch::Other,
-            _ => after_flag = false,
-        }
-    }
-    match named {
-        Some(id) => ClaudeLaunch::Named(id),
-        None => ClaudeLaunch::Bare,
-    }
-}
-
-/// A fresh conversation id for a far Claude, in the UUID form `claude --session-id`
-/// accepts. Randomness comes from the standard library's per-process hash seeds mixed
-/// with the clock, plenty for uniqueness: this is an identifier, not a secret.
+/// A fresh conversation id for a far agent, in the UUID form `--session-id` accepts.
+/// Randomness comes from the standard library's per-process hash seeds mixed with the
+/// clock, plenty for uniqueness: this is an identifier, not a secret.
 fn new_session_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     let nanos = std::time::SystemTime::now()
@@ -428,11 +383,6 @@ fn new_session_id() -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
-}
-
-/// Claude's own words for a `--resume` that named a conversation it no longer has.
-fn conversation_gone(text: &str) -> bool {
-    text.contains("No conversation found with session ID")
 }
 
 /// Characters a shell prompt ends with: sh/bash, zsh, root, PowerShell and fish, and the
@@ -551,35 +501,64 @@ fn connect_failed(text: &str) -> bool {
 }
 
 /// The far shell is at a prompt, so the login is complete. Settles what the connection
-/// taught (see `ClaudeHandle::note_login_evidence`), releases a credential still held
+/// taught (see `ConnHandle::note_login_evidence`), releases a credential still held
 /// for it, records where the shell is (its home, unless it said otherwise), and types
 /// the pane's follow-up, if one is pending.
 fn remote_ready(
-    claude: &crate::claude_status::ClaudeHandle,
+    conn: &ConnHandle,
+    agent: &AgentHandle,
     credential: &Armed,
     followup: &Mutex<Option<Followup>>,
     writer_tx: &std::sync::mpsc::Sender<Vec<u8>>,
     reported: Option<&str>,
 ) {
     let pending = followup.lock().unwrap().take();
-    if claude.note_login_evidence() {
+    if conn.note_login_evidence() {
         *credential.lock().unwrap() = None;
-        if reported.is_none() && !claude.remote_cwd_reported() {
+        if reported.is_none() && !conn.remote_cwd_reported() {
             // Where the far shell is: where its command line put it, else home.
             let now = pending.as_ref().filter(|f| f.cd_in_command).map_or("~", |f| f.dir.as_str());
-            claude.set_remote_cwd(Some(now.to_string()));
+            conn.set_remote_cwd(Some(now.to_string()));
         }
     }
-    // Claude already has the keyboard (its own screen is up), so nothing may be typed:
-    // it would land in the conversation. Whatever was pending is simply dropped.
-    if claude.on_screen() {
+    // The agent already has the keyboard (its own screen is up), so nothing may be
+    // typed: it would land in the conversation. Whatever was pending is simply dropped.
+    if agent.on_screen() {
         return;
     }
     if let Some((line, dir)) = pending.and_then(|f| followup_line(f, reported)) {
         let _ = writer_tx.send(line);
         if dir.is_some() {
-            claude.set_remote_cwd(dir);
+            conn.set_remote_cwd(dir);
         }
+    }
+}
+
+/// Busy-edge scan: an SSH/mosh client is (or is no longer) running in this pane. The
+/// connection's half, then the far agent's: turning remote off drops the on-screen
+/// latch, so a pane that leaves a remote session can't keep reporting the far host's
+/// agent, and an agent still there when it ended is remembered for the next connection.
+pub(crate) fn connection_edge(conn: &ConnHandle, agent: &AgentHandle, on: bool) {
+    conn.set_remote(on);
+    agent.connection_edge(on);
+}
+
+/// The user ended the remote session themselves: forget the connection, and the far
+/// agent's conversation with it.
+pub(crate) fn forget_connection(conn: &ConnHandle, agent: &AgentHandle) {
+    conn.forget();
+    agent.forget_remote();
+}
+
+/// Reader: what scanning a remote pane's screen for agent chrome found. Present latches
+/// the pane on; the agent's own UI on screen also means the login is long done.
+pub(crate) fn note_screen(conn: &ConnHandle, agent: &AgentHandle, detected: Option<AgentKind>) {
+    match detected {
+        Some(kind) => {
+            agent.latch_screen(kind);
+            conn.note_login_evidence();
+        }
+        None => agent.unlatch_screen(),
     }
 }
 
@@ -814,9 +793,9 @@ pub struct Session {
     wake_hold: WakeHold,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
-    claude_running: Arc<AtomicBool>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
-    claude: Arc<crate::claude_status::ClaudeHandle>,
+    agent: Arc<AgentHandle>,
+    conn: Arc<ConnHandle>,
     /// The shell exited (the PTY reader hit EOF). Nothing can be written to this
     /// session any more; the pane shows it as disconnected and offers Reconnect,
     /// which respawns rather than trying to revive it.
@@ -830,20 +809,20 @@ pub struct Session {
     followup: Arc<Mutex<Option<Followup>>>,
     /// The input line being typed. Fed only from real keystrokes (see `note_typed`),
     /// so PTY query replies and program output can never pollute it. The submitted
-    /// commands it yields live on the `ClaudeHandle`, which the busy-edge monitor also
+    /// commands it yields live on the `ConnHandle`, which the busy-edge monitor also
     /// holds and so can latch one the instant it sees an ssh client.
     typed_line: Arc<Mutex<TypedLine>>,
     _watcher: Arc<Mutex<Option<GitWatcher>>>,
     /// The shell's exit code, set by the exit watcher before `exited` (see `spawn`).
     exit_code: Arc<Mutex<Option<u32>>>,
-    /// The busy-edge epoch the Claude monitor waits on; Drop notifies it so the monitor
+    /// The busy-edge epoch the agent monitor waits on; Drop notifies it so the monitor
     /// thread can see `closed` and end instead of waiting on for a pane that is gone.
     cmd_epoch: CmdEpoch,
     closed: Arc<AtomicBool>,
 }
 
 // Dropping a session releases its PTY (which ends the shell and the reader thread), ends
-// its Claude monitor thread, and retires its id so the GPU renderer store frees the pane's
+// its agent monitor thread, and retires its id so the GPU renderer store frees the pane's
 // renderer on the next frame. Without the last two, a closed pane kept a blocked thread
 // and 6 MB of atlas copies for the life of the app.
 impl Drop for Session {
@@ -858,15 +837,19 @@ impl Drop for Session {
 
 impl Session {
     pub fn spawn(cols: u16, rows: u16, mut cmd: CommandBuilder) -> std::io::Result<Self> {
-        // Unique pane id, tagged onto the shell env so the statusLine/hook
-        // subcommand (claude → our shim) keys its capture to THIS pane — robust
-        // when many Claudes launch at once or several share a cwd.
+        // Unique pane id, tagged onto the shell env so an agent's hook subcommand keys
+        // its events to THIS pane: robust when many agents launch at once or several
+        // share a cwd.
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        cmd.env(crate::claude_shim::PANE_ID_ENV, id.to_string());
+        cmd.env(crate::agent_shim::PANE_ID_ENV, id.to_string());
         cmd.env(TERMINAL_ENV, TERMINAL_NAME);
         if crate::gpu::BACKEND_ENV_IS_OURS.load(Ordering::Relaxed) {
             cmd.env_remove("WGPU_BACKEND");
         }
+        // An Arbiter started from inside an agent (`cargo run` from Claude's Bash tool)
+        // inherits that agent's mark, which would launch every agent in its own panes
+        // untouched.
+        cmd.env_remove(crate::agent_shim::LAUNCHED_ENV);
         // Read before `cmd` is consumed by the spawn. The pane's private history file
         // (set on the command by the shell layer) is a second source for its startup
         // command when keystroke tracking gives up on an up-arrow recall.
@@ -897,7 +880,7 @@ impl Session {
         let term: SharedTerm = Arc::new(Mutex::new(VtTerm::new(cols as usize, rows as usize)));
         let cwd = Arc::new(Mutex::new(None));
         let shell_idle = Arc::new(Mutex::new(None));
-        let claude_running = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(false));
         let git = Arc::new(Mutex::new(None));
         let watcher: Arc<Mutex<Option<GitWatcher>>> = Arc::new(Mutex::new(None));
         let cmd_epoch: CmdEpoch = Arc::new((Mutex::new(0), Condvar::new()));
@@ -909,24 +892,20 @@ impl Session {
         let last_exit: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let followup: Arc<Mutex<Option<Followup>>> = Arc::new(Mutex::new(None));
 
-        // Shared Claude status, updated by the capture/hook watcher (registered
-        // here so it routes by cwd / session id) + the reader (spinner/menu →
-        // activity/attention). Created before the reader so it gets a clone.
-        let claude = crate::claude_status::ClaudeHandle::new(
-            id,
-            shell_pid,
-            cwd.clone(),
-            claude_running.clone(),
-            histfile,
-        );
-        crate::claude_status::register(&claude);
+        // Shared agent status, updated by the event-log watcher (registered here so it
+        // routes by pane id) + the reader (screen/spinner/signals → activity/attention).
+        // Created before the reader so it gets a clone.
+        let agent = AgentHandle::new(id, cwd.clone(), running.clone());
+        crate::agent_state::register(&agent);
+        let conn = Arc::new(ConnHandle::new(histfile));
 
         let wake_hold = WakeHold::default();
         {
             let term = term.clone();
             let cwd = cwd.clone();
             let shell_idle = shell_idle.clone();
-            let claude = claude.clone();
+            let agent = agent.clone();
+            let conn = conn.clone();
             let git = git.clone();
             let watcher = watcher.clone();
             let cmd_epoch = cmd_epoch.clone();
@@ -938,25 +917,23 @@ impl Session {
             let wake_hold = wake_hold.clone();
             std::thread::spawn(move || {
                 reader_loop(
-                    reader, writer_tx, term, cwd, shell_idle, claude, git, watcher, cmd_epoch,
+                    reader, writer_tx, term, cwd, shell_idle, agent, conn, git, watcher, cmd_epoch,
                     exited, startup, credential, last_exit, followup, wake_hold,
                 )
             });
         }
 
-        // Event-driven Claude monitor: on each busy edge, scan the shell's descendants
-        // for a `claude` process (it execs shortly after the edge), or for an ssh/mosh
+        // Event-driven agent monitor: on each busy edge, scan the shell's descendants
+        // for an agent process (it execs shortly after the edge), or for an ssh/mosh
         // client, which means the foreground program is on another machine.
         let closed = Arc::new(AtomicBool::new(false));
         if let Some(pid) = shell_pid {
-            let claude_running = claude_running.clone();
             let shell_idle = shell_idle.clone();
-            let claude = claude.clone();
+            let agent = agent.clone();
+            let conn = conn.clone();
             let cmd_epoch = cmd_epoch.clone();
             let closed = closed.clone();
-            std::thread::spawn(move || {
-                claude_monitor(pid, cmd_epoch, claude_running, shell_idle, claude, closed)
-            });
+            std::thread::spawn(move || agent_monitor(pid, cmd_epoch, shell_idle, agent, conn, closed));
         }
 
         // The shell's exit is watched on its own thread: ConPTY gives the reader no EOF
@@ -969,14 +946,14 @@ impl Session {
             let mut child = child;
             let exit_code = exit_code.clone();
             let exited = exited.clone();
-            let claude_running = claude_running.clone();
-            let claude = claude.clone();
+            let agent = agent.clone();
+            let conn = conn.clone();
             std::thread::spawn(move || {
                 let status = child.wait().ok();
                 *exit_code.lock().unwrap_or_else(PoisonError::into_inner) = status.map(|s| s.exit_code());
                 exited.store(true, Ordering::Release);
-                claude_running.store(false, Ordering::Relaxed);
-                claude.set_remote(false);
+                agent.running.store(false, Ordering::Relaxed);
+                connection_edge(&conn, &agent, false);
                 wake_ui();
             });
         }
@@ -989,9 +966,9 @@ impl Session {
             term,
             cwd,
             shell_idle,
-            claude_running,
             git,
-            claude,
+            agent,
+            conn,
             exited,
             startup,
             credential,
@@ -1029,19 +1006,19 @@ impl Session {
     pub fn note_typed(&self, bytes: &[u8]) {
         let mut line = self.typed_line.lock().unwrap();
         if let Some(cmd) = line.fold(bytes) {
-            self.claude.note_command(cmd);
+            self.conn.note_command(cmd);
         }
     }
 
     /// Seed the startup command on restore, so a replayed ssh line is still known to
     /// this session (nobody typed it) and survives the next save.
     pub fn set_startup_cmd(&self, cmd: &str) -> bool {
-        self.claude.set_startup_cmd(cmd)
+        self.conn.set_startup_cmd(cmd)
     }
 
     /// Remember `cmd` as this pane's startup command AND schedule it to run once the
     /// shell reaches its first prompt. Returns whether it was accepted (see
-    /// `ClaudeHandle::set_startup_cmd` for the whitelist).
+    /// `ConnHandle::set_startup_cmd` for the whitelist).
     ///
     /// The command is queued rather than written immediately, because writing into a
     /// PTY that nothing is reading yet leaves a stray newline behind on ConPTY, which
@@ -1051,20 +1028,20 @@ impl Session {
             return false;
         }
         // What is remembered is the line as saved. What is typed may carry the saved
-        // remote directory, and Claude, in the connection itself, which then has nothing
-        // to type after connecting; where that is not possible the follow-up types them.
+        // remote directory, and the agent, in the connection itself, which then has
+        // nothing to type after connecting; where that is not possible the follow-up
+        // types them.
         let mut line = cmd.to_string();
         if let Some(f) = self.followup.lock().unwrap().as_mut() {
             let chained = crate::remote::remote_launch_line(
                 cmd,
                 Some(&f.dir),
-                f.resume_claude,
-                f.session.as_deref(),
+                f.resume.map(|k| (k, f.session.as_deref())),
             );
             if let Some(chained) = chained {
                 line = chained;
                 f.cd_in_command = true;
-                f.resume_claude = false;
+                f.resume = None;
             }
         }
         self.startup.queue(&line);
@@ -1122,17 +1099,22 @@ impl Session {
             return false;
         }
         let _ = self.writer_tx.send(secret.line());
-        self.claude.note_credential_typed();
+        self.conn.note_credential_typed();
         true
     }
 
     /// Queue what to type once the far shell is at its prompt after the next connection:
-    /// `cd` into `dir`, then `claude -c` if `resume_claude`. Set right before
-    /// `queue_startup_cmd`. Nothing happens unless the far shell reports its directory.
-    pub fn set_followup(&self, dir: &str, resume_claude: bool, session: Option<&str>) {
+    /// `cd` into `dir`, then `resume`'s agent. Set right before `queue_startup_cmd`.
+    /// Nothing happens unless the far shell reports its directory.
+    pub fn set_followup(&self, dir: &str, resume: Option<AgentKind>, session: Option<&str>) {
+        // Arbiter is the one launching it, so which agent the far screen will show is
+        // known: its chrome is then read by that agent's profile, not guessed.
+        if let Some(kind) = resume {
+            self.agent.bind(kind, KindSource::Typed);
+        }
         *self.followup.lock().unwrap() = Some(Followup {
             dir: dir.to_string(),
-            resume_claude,
+            resume,
             session: session.map(str::to_string),
             cd_in_command: false,
         });
@@ -1140,65 +1122,66 @@ impl Session {
 
     /// Enter was pressed with `row` on screen in this pane. Returns what to type BEFORE
     /// the Enter, if anything: with `name_sessions` (a setting, off by default), a bare
-    /// `claude` at the far shell's prompt gets ` --session-id <uuid>`, so the conversation
-    /// is known from its first moment and a restore can resume exactly it (the local shim
-    /// learns the id from Claude's status line; nothing on the far host can tell Arbiter,
-    /// so Arbiter names it). Only at a prompt ending a shell uses (`$`, `%`, `#`), which
-    /// Claude's own `>` box never shows.
+    /// launch of an agent that takes a session id (`claude`, `copilot`) at the far
+    /// shell's prompt gets ` --session-id <uuid>`, so the conversation is known from its
+    /// first moment and a restore can resume exactly it (locally the agent's hook tells
+    /// Arbiter; nothing on the far host can, so Arbiter names it). Only at a prompt
+    /// ending a shell uses (`$`, `%`, `#`), which an agent's own box never shows.
     ///
-    /// The row also keeps the pane's remote facts current: `claude` typed there is Claude
-    /// running (with the id it was launched into, when the line names one), any other
-    /// command at a shell prompt means it is not, and a `cd` moves the inferred directory
-    /// (see `remote_cd`) unless the far shell reports it itself. Ignored when Claude has
-    /// the keyboard.
+    /// The row also keeps the pane's remote facts current: an agent typed there is that
+    /// agent running (with the id it was launched into, when the line names one), any
+    /// other command at a shell prompt means it is not, and a `cd` moves the inferred
+    /// directory (see `remote_cd`) unless the far shell reports it itself. Ignored when
+    /// an agent has the keyboard.
     pub fn on_remote_enter(&self, row: &str, name_sessions: bool) -> Option<Vec<u8>> {
         // A dismissed connection's pane being used as a local terminal: the user has moved
         // on, so the connection is forgotten and the amber button goes with it. An ssh
         // typed here latches afresh as usual.
-        if self.claude.dismissed() && !self.is_remote() {
+        if self.conn.dismissed() && !self.is_remote() {
             if let Some((_, cmd)) = command_on_row(row).filter(|(_, cmd)| !cmd.is_empty()) {
-                self.claude.forget_connection();
+                forget_connection(&self.conn, &self.agent);
                 // Forgetting drops the typed-line record too, and this very line may be
                 // the new connection (typed before this ran), so it is recorded again.
-                self.claude.note_command(cmd.to_string());
+                self.conn.note_command(cmd.to_string());
             }
             return None;
         }
-        if !self.is_remote() || self.claude_running() {
+        if !self.is_remote() || self.agent_running() {
             return None;
         }
         let (ending, cmd) = command_on_row(row)?;
         let shell_prompt = matches!(ending, '$' | '%' | '#');
-        match classify_claude_launch(cmd) {
-            ClaudeLaunch::Bare => {
-                self.claude.set_remote_claude_typed(true);
-                if !name_sessions || !shell_prompt {
-                    self.claude.set_remote_session(None);
+        match classify_launch(cmd) {
+            Some((kind, TypedLaunch::Bare)) => {
+                self.agent.set_remote_typed(Some(kind));
+                let flag = kind.agent().name_flag().filter(|_| name_sessions && shell_prompt);
+                let Some(flag) = flag else {
+                    self.agent.set_remote_session(None);
                     return None;
-                }
+                };
                 let id = new_session_id();
-                self.claude.set_remote_session(Some(id.clone()));
-                Some(format!(" --session-id {id}").into_bytes())
+                self.agent.set_remote_session(Some(id.clone()));
+                Some(format!(" {flag} {id}").into_bytes())
             }
-            ClaudeLaunch::Named(id) => {
-                self.claude.set_remote_claude_typed(true);
-                self.claude.set_remote_session(Some(id));
+            Some((kind, TypedLaunch::Named(id))) => {
+                self.agent.set_remote_typed(Some(kind));
+                self.agent.set_remote_session(Some(id));
                 None
             }
-            ClaudeLaunch::Other => {
-                self.claude.set_remote_claude_typed(true);
-                self.claude.set_remote_session(None);
+            Some((kind, _)) => {
+                self.agent.set_remote_typed(Some(kind));
+                self.agent.set_remote_session(None);
                 None
             }
-            ClaudeLaunch::NotClaude => {
+            None => {
                 if shell_prompt {
-                    self.claude.set_remote_claude_typed(false);
-                    self.claude.set_remote_session(None);
+                    self.agent.set_remote_typed(None);
+                    self.agent.set_remote_session(None);
                 }
-                if !self.claude.remote_cwd_reported() {
+                if !self.conn.remote_cwd_reported() {
                     let base = self.remote_cwd().unwrap_or_else(|| "~".to_string());
                     if let Some(target) = remote_cd(row, &base) {
-                        self.claude.set_remote_cwd(target);
+                        self.conn.set_remote_cwd(target);
                     }
                 }
                 None
@@ -1206,110 +1189,109 @@ impl Session {
         }
     }
 
-    /// The far Claude's session id, if Arbiter knows it.
+    /// The far agent's session id, if Arbiter knows it.
     pub fn remote_session(&self) -> Option<String> {
-        self.claude.remote_session()
+        self.agent.remote_session()
     }
 
     /// The user declined to bring this pane's connection back for now: it stays at its
     /// local prompt with the amber button, and is saved as a local pane.
     pub fn dismiss_connection(&self) {
-        self.claude.dismiss_connection();
+        self.conn.dismiss_connection();
     }
 
     /// The connection is being brought back after all.
     pub fn undismiss(&self) {
-        self.claude.undismiss();
+        self.conn.undismiss();
     }
 
     pub fn dismissed(&self) -> bool {
-        self.claude.dismissed()
+        self.conn.dismissed()
     }
 
     /// Seed from a saved layout.
     pub fn seed_remote_session(&self, id: Option<&str>) {
-        self.claude.seed_remote_session(id);
+        self.agent.seed_remote_session(id);
     }
 
     /// Whether the header should offer Reconnect: the shell has exited, or this was a
     /// remote pane whose connection is not up AND whose shell is not busy making one.
     /// The busy half keeps the button from flashing while a restored pane connects.
     pub fn show_reconnect(&self) -> bool {
-        self.exited()
-            || (self.claude.was_remote() && !self.is_remote() && self.shell_idle() != Some(false))
+        self.exited() || (self.conn.was_remote() && !self.is_remote() && self.shell_idle() != Some(false))
     }
 
     /// What is known about whether this pane's connection asks for a credential:
     /// `None` never observed, `Some(true)` it prompted, `Some(false)` it logged in
     /// without prompting.
     pub fn prompts_for_credential(&self) -> Option<bool> {
-        self.claude.prompts_for_credential()
+        self.conn.prompts_for_credential()
     }
 
     /// Seed from a saved layout.
     pub fn set_prompts_for_credential(&self, prompts: Option<bool>) {
-        self.claude.set_prompts_for_credential(prompts);
+        self.conn.set_prompts_for_credential(prompts);
     }
 
     /// Which secret this pane's connection asks for, and for what, if it has been seen.
     pub fn credential_prompt(&self) -> Option<(CredentialKind, String)> {
-        self.claude.credential_prompt()
+        self.conn.credential_prompt()
     }
 
     /// Seed from a saved layout.
     pub fn seed_credential_prompt(&self, kind: Option<CredentialKind>, detail: Option<&str>) {
-        self.claude.seed_credential_prompt(kind, detail);
+        self.conn.seed_credential_prompt(kind, detail);
     }
 
     /// The far host's working directory, if its shell has ever reported one.
     pub fn remote_cwd(&self) -> Option<String> {
-        self.claude.remote_cwd()
+        self.conn.remote_cwd()
     }
 
     /// Seed from a saved layout.
     pub fn seed_remote_cwd(&self, path: Option<&str>) {
-        self.claude.seed_remote_cwd(path);
+        self.conn.seed_remote_cwd(path);
     }
 
     /// Whether the far shell has reported its directory on the current connection.
     pub fn remote_cwd_reported(&self) -> bool {
-        self.claude.remote_cwd_reported()
+        self.conn.remote_cwd_reported()
     }
 
-    /// Claude is, or when the connection ended was, running on the far side.
-    pub fn remote_claude(&self) -> bool {
-        self.claude.remote_claude()
+    /// Which agent is, or when the connection ended was, running on the far side.
+    pub fn remote_agent(&self) -> Option<AgentKind> {
+        self.agent.remote_agent()
     }
 
-    /// Take the "resume Claude on the next connection" flag.
-    pub fn take_remote_claude_pending(&self) -> bool {
-        self.claude.take_remote_claude_pending()
+    /// Take the "resume the agent on the next connection" flag.
+    pub fn take_remote_pending(&self) -> Option<AgentKind> {
+        self.agent.take_remote_pending()
     }
 
     /// Seed from a saved layout.
-    pub fn seed_remote_claude(&self, pending: bool) {
-        self.claude.seed_remote_claude(pending);
+    pub fn seed_remote_agent(&self, kind: Option<AgentKind>) {
+        self.agent.seed_remote_agent(kind);
     }
 
     /// UI: this pane's connection dropped and should be re-run once (taken).
     pub fn take_retry_wanted(&self) -> bool {
-        self.claude.take_retry_wanted()
+        self.conn.take_retry_wanted()
     }
 
     /// UI: the credential typed into this pane was rejected; ask again (taken).
     pub fn take_reask_wanted(&self) -> bool {
-        self.claude.take_reask_wanted()
+        self.conn.take_reask_wanted()
     }
 
     /// The command to replay to rebuild this pane, if there is one.
     ///
     /// Only a recognised remote-client invocation is ever accepted, and only at the
-    /// moment an ssh client is detected (see `ClaudeHandle::latch_startup_cmd`). A local
+    /// moment an ssh client is detected (see `ConnHandle::latch_startup_cmd`). A local
     /// pane is fully described by its shell and cwd, which the saved layout already
     /// carries, and replaying its last command could re-run something with side effects
     /// on every launch.
     pub fn startup_cmd(&self) -> Option<String> {
-        self.claude.startup_cmd()
+        self.conn.startup_cmd()
     }
 
     /// Whether this pane should be offering to reconnect: its shell has exited, or it
@@ -1317,29 +1299,34 @@ impl Session {
     /// built it is still known). The `was_remote` half is what keeps a freshly restored
     /// pane from flashing the affordance before its ssh has started.
     pub fn needs_reconnect(&self) -> bool {
-        self.exited() || (self.claude.was_remote() && !self.is_remote())
+        self.exited() || (self.conn.was_remote() && !self.is_remote())
     }
 
-    /// Current Claude status for this pane (stats + derived lifecycle). Cheap;
-    /// read it from the view.
-    pub fn claude_status(&self) -> crate::claude_status::ClaudeStatus {
-        self.claude.snapshot()
+    /// Current agent status for this pane (derived lifecycle, kind). Cheap; read it from
+    /// the view.
+    pub fn agent_status(&self) -> crate::agent_state::AgentStatus {
+        self.agent.snapshot()
     }
 
-    /// How many turns are known to have ended here (see `ClaudeHandle::finish_seq`).
-    pub fn claude_finish_seq(&self) -> u64 {
-        self.claude.finish_seq()
+    /// The agent running here, locally or remotely, if Arbiter knows which.
+    pub fn agent(&self) -> Option<&'static dyn crate::agent::Agent> {
+        self.agent_running().then(|| self.agent.kind()).flatten().map(|k| k.agent())
+    }
+
+    /// How many turns are known to have ended here (see `AgentHandle::finish_seq`).
+    pub fn finish_seq(&self) -> u64 {
+        self.agent.finish_seq()
     }
 
     /// The user submitted a slash command here, so the chooser it opens is theirs.
     pub fn note_slash_command(&self) {
-        self.claude.note_slash_command();
+        self.agent.note_slash_command();
     }
 
-    /// Milliseconds since Claude last drew a spinner glyph here, None if never. Static
-    /// stars in a repaint count too: this says whether its status row is being drawn.
+    /// Milliseconds since the agent last drew a spinner glyph here, None if never.
+    /// Static stars in a repaint count too: this says whether its status row is drawn.
     pub fn spinner_age_ms(&self) -> Option<u64> {
-        self.claude.star_age_ms()
+        self.agent.star_age_ms()
     }
 
     /// Keep this pane's frame as it is for `dur`, then redraw once the output has settled
@@ -1348,10 +1335,10 @@ impl Session {
         self.wake_hold.freeze(dur);
     }
 
-    /// Whether Claude's transcript here is scrolled away from its live bottom (see
-    /// `VtTerm::visible_scrolled`).
-    pub fn claude_scrolled(&self) -> bool {
-        self.claude.scrolled()
+    /// Whether the agent's transcript here is scrolled away from its live bottom (see
+    /// `ScreenProfile::scrolled`).
+    pub fn agent_scrolled(&self) -> bool {
+        self.agent.scrolled()
     }
 
     /// Nudge the program with a resize it cannot ignore: the PTY one column narrower,
@@ -1383,53 +1370,57 @@ impl Session {
         });
     }
 
-    /// True if Claude is running in this pane right now, whether that is a local
-    /// `claude` process or one on the far side of an ssh session (recognised from its
-    /// on-screen chrome). Every Claude-gated affordance reads this, so the remote case
-    /// lights the status dot, lists in the overview and picks the right Shift+Enter
-    /// encoding without any of them knowing the difference.
-    pub fn claude_running(&self) -> bool {
-        self.claude_running.load(Ordering::Relaxed) || self.claude.on_screen()
+    /// True if an agent is running in this pane right now, whether that is a local
+    /// process or one on the far side of an ssh session (recognised from its on-screen
+    /// chrome). Every agent-gated affordance reads this, so the remote case lights the
+    /// status dot, lists in the overview and picks the right Shift+Enter encoding
+    /// without any of them knowing the difference.
+    pub fn agent_running(&self) -> bool {
+        self.agent.running.load(Ordering::Relaxed) || self.agent.on_screen()
     }
 
     /// True if this pane is driving a shell on another machine (an ssh/mosh client is
     /// its foreground program).
     pub fn is_remote(&self) -> bool {
-        self.claude.is_remote()
+        self.conn.is_remote()
     }
 
-    /// Whether a LOCAL `claude` process is running here. This is the flag the saved
-    /// layout must use: restore relaunches Claude by typing `claude` into a freshly
-    /// spawned LOCAL shell, and a remote pane's Claude lives on another machine, so
-    /// persisting the broader `claude_running()` would have a restored ssh pane start
-    /// a local Claude instead.
-    pub fn claude_running_local(&self) -> bool {
-        self.claude_running.load(Ordering::Relaxed)
+    /// Whether a LOCAL agent process is running here. This is the flag the saved layout
+    /// must use: restore relaunches the agent by typing into a freshly spawned LOCAL
+    /// shell, and a remote pane's agent lives on another machine, so persisting the
+    /// broader `agent_running()` would have a restored ssh pane start a local agent.
+    pub fn agent_running_local(&self) -> bool {
+        self.agent.running.load(Ordering::Relaxed)
     }
 
-    /// Ignore Claude spinner detection for `dur_ms` — called for a repaint that doesn't
-    /// start work (window/PTY resize, or a newline/mode edit key on Windows ConPTY) so the
+    /// Which agent runs here locally, if one does.
+    pub fn local_agent(&self) -> Option<AgentKind> {
+        self.agent_running_local().then(|| self.agent.kind()).flatten()
+    }
+
+    /// Ignore spinner detection for `dur_ms`: called for a repaint that doesn't start
+    /// work (window/PTY resize, or a newline/mode edit key on Windows ConPTY) so the
     /// rapid redraws don't read as "working".
-    pub fn suppress_claude_activity(&self, dur_ms: u64) {
-        self.claude.suppress_activity(dur_ms);
+    pub fn suppress_activity(&self, dur_ms: u64) {
+        self.agent.suppress_activity(dur_ms);
     }
 
-    /// Resume Claude spinner detection immediately — called on Enter/submit, where real
-    /// working is imminent and must not be delayed by a suppression window.
-    pub fn clear_claude_suppression(&self) {
-        self.claude.clear_suppression();
+    /// Resume spinner detection immediately: called on Enter/submit, where real working
+    /// is imminent and must not be delayed by a suppression window.
+    pub fn clear_suppression(&self) {
+        self.agent.clear_suppression();
     }
 
-    /// The user sent Esc or Ctrl+C here (see `ClaudeHandle::note_interrupt`).
-    pub fn note_claude_interrupt(&self) {
-        self.claude.note_interrupt();
+    /// The user sent Esc or Ctrl+C here (see `AgentHandle::note_interrupt`).
+    pub fn note_interrupt(&self) {
+        self.agent.note_interrupt();
     }
 
-    /// The Claude session id to resume on restore IF Claude is running here AND a
-    /// real conversation has happened (else `None`, so restore launches a clean
-    /// `claude` rather than `--resume`ing a non-existent empty session).
-    pub fn claude_session_id(&self) -> Option<String> {
-        self.claude_running_local().then(|| self.claude.resumable_session()).flatten()
+    /// The agent and conversation to resume on restore IF an agent is running here AND
+    /// a real conversation has happened (else `None`, so restore launches a clean agent
+    /// rather than resuming a non-existent empty session).
+    pub fn resumable_session(&self) -> Option<(AgentKind, String)> {
+        self.agent_running_local().then(|| self.agent.resumable_session()).flatten()
     }
 
     /// Basename of the current working directory, if known.
@@ -1533,43 +1524,14 @@ impl TypedLine {
     }
 }
 
-/// Bit index for one spinner glyph, or `None` if the char isn't one. The animated
-/// bloom frames are the star/asterisk dingbats U+2722..U+273F (verified by capturing
-/// the CLI); tool spinners and Claude's window-title spinner use Braille
-/// U+2800..U+28FF. Deliberately NOT the whole U+2700..U+27BF range: that includes the
-/// input prompt arrow (U+276F), which would make typing read as working.
-///
-/// Each star gets its own bit; the 256 Braille frames fold into the upper 34, so two
-/// of those can collide. Harmless: a collision costs one animation frame before the
-/// next differing pair confirms working.
-fn spinner_bit(c: char) -> Option<u32> {
-    match c as u32 {
-        u @ 0x2722..=0x273F => Some(u - 0x2722),
-        u @ 0x2800..=0x28FF => Some(30 + (u - 0x2800) % 34),
-        _ => None,
-    }
-}
-
-/// Fingerprint of the DISTINCT spinner glyphs in a chunk, or `None` if it has none.
-/// Two chunks fingerprint alike iff they drew the same *set* of spinner glyphs, which
-/// is what separates a real animation frame from a plain repaint: the bloom draws a
-/// different frame every time, while a repaint re-emits whatever static stars are on
-/// screen. Chief among those are the thinking summaries Claude leaves in the
-/// transcript ("* Brewed for 7s"), which use the very glyph the animation cycles
-/// through.
-fn chunk_spinner_key(bytes: &[u8]) -> Option<u64> {
-    let text = unsafe { std::str::from_utf8_unchecked(bytes) };
-    let key = text.chars().filter_map(spinner_bit).fold(0u64, |k, bit| k | 1 << bit);
-    (key != 0).then_some(key)
-}
-
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
     term: SharedTerm,
     cwd: Arc<Mutex<Option<String>>>,
     shell_idle: Arc<Mutex<Option<bool>>>,
-    claude: Arc<crate::claude_status::ClaudeHandle>,
+    agent: Arc<AgentHandle>,
+    conn: Arc<ConnHandle>,
     git: Arc<Mutex<Option<crate::git::GitInfo>>>,
     watcher: Arc<Mutex<Option<GitWatcher>>>,
     cmd_epoch: CmdEpoch,
@@ -1580,16 +1542,16 @@ fn reader_loop(
     followup: Arc<Mutex<Option<Followup>>>,
     wake_hold: WakeHold,
 ) {
-    let claude_running = claude.claude_running.clone();
+    let running = agent.running.clone();
     let mut buf = [0u8; 8192];
     let mut remainder: Vec<u8> = Vec::new();
     let mut osc = String::new();
     let mut in_osc = false;
     let mut prev_cwd: Option<String> = None;
     let mut prev_idle: Option<bool> = None;
-    let mut prev_menu = false;
-    let mut prev_claude_owns = false;
+    let mut prev_agent_owns = false;
     let hide_wake_pending = Arc::new(AtomicBool::new(false));
+    let mut recorder = crate::debug::PaneRecorder::new(agent.pane_id);
 
     loop {
         let n = match reader.read(&mut buf) {
@@ -1599,8 +1561,8 @@ fn reader_loop(
             // silently dropped from here on, so recovery has to respawn the session.
             Ok(0) | Err(_) => {
                 exited.store(true, Ordering::Relaxed);
-                claude_running.store(false, Ordering::Relaxed);
-                claude.set_remote(false);
+                running.store(false, Ordering::Relaxed);
+                connection_edge(&conn, &agent, false);
                 wake_ui();
                 break;
             }
@@ -1625,25 +1587,26 @@ fn reader_loop(
         if valid.is_empty() {
             continue;
         }
+        recorder.chunk(valid);
 
         // Feed the full byte stream to the grid (alacritty parses VT incl. OSC),
-        // then write back any replies it produced — responses to queries the
-        // running program sent (cursor position, device attributes, status). Apps
-        // like vim or .NET/Spectre console UIs wait on these; dropping them made
-        // their input handling misbehave.
-        let (responses, cursor_grace) = {
+        // then write back any replies it produced: responses to queries the running
+        // program sent (cursor position, device attributes, status). Apps like vim or
+        // .NET/Spectre console UIs wait on these; dropping them made their input
+        // handling misbehave. Titles and bells come out of the same parse.
+        let (responses, cursor_grace, signals) = {
             let mut t = term.lock().unwrap();
             t.feed(valid);
-            (t.take_responses(), t.cursor_grace_remaining())
+            (t.take_responses(), t.cursor_grace_remaining(), t.take_signals())
         };
         if !responses.is_empty() {
-            // Hand off to the writer thread — never write from here, or a blocking
-            // PTY write would stop us draining output and could deadlock the slave.
+            // Hand off to the writer thread: never write from here, or a blocking PTY
+            // write would stop us draining output and could deadlock the slave.
             let _ = writer_tx.send(responses);
         }
-        // The grid changed — wake the UI to redraw (event-driven; the UI no longer
-        // polls the grid every frame), once this burst of output has landed (see
-        // `WakeHold`); the UI coalesces wakes further, so a burst is one redraw.
+        // The grid changed: wake the UI to redraw (event-driven; the UI no longer polls
+        // the grid every frame), once this burst of output has landed (see `WakeHold`);
+        // the UI coalesces wakes further, so a burst is one redraw.
         wake_hold.extend();
         // A cursor the program hid is still drawn for a grace period (see
         // `term::CURSOR_HIDE_GRACE`). If it stays hidden, only a frame after the grace
@@ -1657,88 +1620,94 @@ fn reader_loop(
                 });
             }
         }
-        // While Claude owns the pane its wheel goes to Claude (mouse reporting), so
-        // Arbiter's scrollback cannot be read there, yet Claude's redraws fill it: a
+        // While an agent owns the pane its wheel goes to the agent (mouse reporting), so
+        // Arbiter's scrollback cannot be read there, yet the agent's redraws fill it: a
         // 5000-line history of redraw churn per Claude pane, some 25 MB each. Cap it for
-        // the duration and give the configured depth back when Claude leaves.
-        let claude_owns = claude_running.load(Ordering::Relaxed) || claude.on_screen();
-        if claude_owns != prev_claude_owns {
-            prev_claude_owns = claude_owns;
+        // the duration and give the configured depth back when the agent leaves.
+        let agent_owns = running.load(Ordering::Relaxed) || agent.on_screen();
+        if agent_owns != prev_agent_owns {
+            prev_agent_owns = agent_owns;
             let configured = crate::term::SCROLLBACK.load(Ordering::Relaxed);
-            let lines = if claude_owns { configured.min(crate::term::CLAUDE_SCROLLBACK) } else { configured };
+            let lines = if agent_owns { configured.min(crate::term::AGENT_SCROLLBACK) } else { configured };
             term.lock().unwrap().set_history(lines);
         }
 
-        // Tier-3b: while Claude runs here, reflect the live turn from the *rendered
-        // screen* (level-triggered, so attention clears the instant a menu leaves —
-        // e.g. the user escapes/answers). A menu/approval prompt → attention (no
-        // hook covers AskUserQuestion/plan); Claude's "(esc to interrupt)" status
-        // line → working. Plain output (typing, redraws) is neither.
         // A REMOTE pane (an ssh/mosh client in the foreground) can't be detected the
-        // local way: the process scan sees only `ssh` and the far host writes no
-        // statusLine capture. So probe the rendered screen for Claude's own chrome
-        // instead. Deliberately gated on `remote`, so a local pane's detection path is
-        // byte-for-byte the one that already works and can't regress here.
-        if claude.is_remote() {
-            let chrome = term.lock().unwrap().claude_chrome();
-            claude.note_screen(chrome);
-        } else if std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some() {
+        // local way: the process scan sees only `ssh` and the far host fires no hook. So
+        // probe the rendered screen for the agent's own chrome instead: the bound
+        // agent's, or while none is bound, every agent's. Deliberately gated on `remote`,
+        // so a local pane's detection path is byte-for-byte the one that already works
+        // and can't regress here.
+        if conn.is_remote() {
+            let detected = {
+                let t = term.lock().unwrap();
+                match agent.kind() {
+                    Some(k) => t.chrome(k.agent().screen()).then_some(k),
+                    None => t.detect(),
+                }
+            };
+            note_screen(&conn, &agent, detected);
+        } else if crate::debug::debug_enabled() {
             // Diagnostic (ARBITER_CLAUDE_DEBUG): run the probe on LOCAL panes too, where
             // the process scan is ground truth, and log both. It changes nothing, but it
-            // is how the chrome markers get verified against a real Claude, and how a
-            // future Claude UI change that breaks them gets caught: a pane with
-            // local_claude=true and chrome=false at its prompt means the markers or the
-            // cursor geometry in `VtTerm::claude_chrome` have drifted.
-            let chrome = term.lock().unwrap().claude_chrome();
-            crate::claude_shim::debug_log(&format!(
-                "chrome probe: chrome={chrome} local_claude={}",
-                claude_running.load(Ordering::Relaxed)
-            ));
+            // is how the chrome markers get verified against a real agent, and how a
+            // future UI change that breaks them gets caught: a pane with a local agent
+            // and chrome=false at its prompt means the markers or the cursor geometry in
+            // the agent's `ScreenProfile` have drifted.
+            if let Some(k) = agent.kind() {
+                let chrome = term.lock().unwrap().chrome(k.agent().screen());
+                crate::debug::debug_log(&format!(
+                    "chrome probe: {k:?} chrome={chrome} local_agent={}",
+                    running.load(Ordering::Relaxed)
+                ));
+            }
         }
-        // The login is known to be over (see `ClaudeHandle::note_login_evidence`), so a
+        // The login is known to be over (see `ConnHandle::note_login_evidence`), so a
         // credential still held for it cannot be meant for anything on this pane.
-        if claude.login_seen() {
+        if conn.login_seen() {
             *credential.lock().unwrap() = None;
         }
-        if claude_running.load(Ordering::Relaxed) || claude.on_screen() {
-            // Attention: a menu/approval prompt on the rendered screen (level-based,
-            // so amber clears the instant the prompt leaves). Working: the ✻ spinner
-            // glyph in the *new* bytes (chunk-based like the web — instant, and a
-            // stale star left on screen can't pin it to "working").
-            let crate::term::ClaudeScreen { menu, scrolled, waiting, working, idle_box, slash_input } =
-                term.lock().unwrap().claude_screen();
+        let agent_owns = running.load(Ordering::Relaxed) || agent.on_screen();
+        if let Some(kind) = agent.kind().filter(|_| agent_owns) {
+            // Read the live turn from the *rendered screen*, by this agent's profile
+            // (level-triggered, so attention clears the instant a menu leaves: the user
+            // escapes/answers). A menu/approval prompt → attention (no hook covers
+            // AskUserQuestion/plan); a working row → working. Working is also the
+            // spinner glyphs in the *new* bytes (chunk-based like the web: instant, and
+            // a stale star left on screen can't pin it to "working").
+            let profile = kind.agent().screen();
+            let state = term.lock().unwrap().screen_state(profile);
+            let crate::agent_screen::ScreenState { menu, scrolled, waiting, working, idle_box, slash_input } = state;
             // Scrolled away, everything on screen is history: an approval box the user
             // is reading back over is not a prompt waiting on them.
             let menu = menu && !scrolled;
             // Order matters: the two holds below read `waiting_background` and
             // `working_row`, so both must be current before the scroll edge is taken.
-            claude.set_waiting_background(waiting);
-            // While scrolled, Claude draws no status row, so its absence says nothing
-            // and must not count as a turn end. Leave the last reading standing; the
-            // redraw that puts the view back at the bottom refreshes it.
+            agent.set_waiting_background(waiting);
+            // While scrolled, Claude draws no status row, so its absence says nothing and
+            // must not count as a turn end. Leave the last reading standing; the redraw
+            // that puts the view back at the bottom refreshes it.
             if !scrolled {
-                claude.set_working_row(working, idle_box);
+                agent.set_working_row(working, idle_box);
             }
-            claude.set_menu(menu, slash_input);
-            claude.set_scrolled(scrolled);
-            if prev_menu && !menu {
-                // A menu just LEFT the screen (answered or escaped). AskUserQuestion
-                // fires a permission/elicitation hook, but escaping it produces no
-                // spinner/Stop to clear that sticky hook attention — so clear it on
-                // this on→off edge (markerless prompts never set a menu, so they're
-                // unaffected and still clear via activity/Stop).
-                claude.clear_hook_attention();
-            }
-            prev_menu = menu;
+            agent.set_menu(menu, slash_input);
+            agent.set_scrolled(scrolled);
             if !menu {
-                if let Some(glyphs) = chunk_spinner_key(valid) {
-                    claude.note_activity(glyphs);
+                if let Some(glyphs) = crate::agent_screen::activity_key(profile, valid) {
+                    agent.note_activity(glyphs);
                 }
+            }
+            for s in &signals {
+                agent.note_signal(s);
+            }
+            if recorder.wants_screen() {
+                let lifecycle = agent.snapshot().lifecycle;
+                recorder.screen(kind, || term.lock().unwrap().visible_rows(), state, lifecycle, &signals);
             }
         }
 
         // Separately scan for OSC-7 (cwd) + OSC-133 (busy/idle), which the grid
-        // doesn't surface.
+        // doesn't surface, and OSC 9 / 777, which alacritty drops.
         let text = unsafe { std::str::from_utf8_unchecked(valid) };
 
         // ssh's credential prompt. An ARMED pane (a connection whose credential the user
@@ -1755,31 +1724,32 @@ fn reader_loop(
             // Once the login is known complete, a further prompt or denial belongs to
             // something else on the far host (a nested ssh, a `cd` into a forbidden
             // directory) and says nothing about this connection's credential.
-            if is_credential_prompt(text) && claude.startup_cmd().is_some() {
-                claude.note_credential_prompt(describe_credential_prompt(text));
+            if is_credential_prompt(text) && conn.startup_cmd().is_some() {
+                conn.note_credential_prompt(describe_credential_prompt(text));
                 match credential.lock().unwrap().take() {
                     Some((secret, _)) => {
                         let _ = writer_tx.send(secret.line());
-                        claude.note_credential_typed();
+                        conn.note_credential_typed();
                     }
-                    None if !claude.login_seen() => {
-                        claude.note_credential_rejected();
+                    None if !conn.login_seen() => {
+                        conn.note_credential_rejected();
                     }
                     None => {}
                 }
-            } else if !claude.login_seen() && permission_denied(text) {
-                claude.note_credential_rejected();
+            } else if !conn.login_seen() && permission_denied(text) {
+                conn.note_credential_rejected();
             }
             if connect_failed(text) {
-                claude.note_connect_failure();
+                conn.note_connect_failure();
             }
-            if claude.is_remote() && !claude.remote_cwd_reported() && cd_failed(text) {
-                claude.revert_remote_cwd();
+            if conn.is_remote() && !conn.remote_cwd_reported() && cd_failed(text) {
+                conn.revert_remote_cwd();
             }
             // The conversation Arbiter would resume no longer exists on the far host, so
-            // stop naming it: the fallbacks (`-c`, then a fresh `claude`) take over.
-            if claude.is_remote() && conversation_gone(text) {
-                claude.set_remote_session(None);
+            // stop naming it: the fallbacks (continue-last, then a fresh agent) take over.
+            let gone = agent.kind().is_some_and(|k| k.agent().gone_markers().iter().any(|m| text.contains(m)));
+            if conn.is_remote() && gone {
+                agent.set_remote_session(None);
             }
         }
         for ch in text.chars() {
@@ -1811,28 +1781,28 @@ fn reader_loop(
                                     // stop holding one. Bounds the armed window to the
                                     // connection itself.
                                     *credential.lock().unwrap() = None;
-                                    // Prompt returned → the foreground command
-                                    // (incl. Claude, or an ssh session) ended.
-                                    let was = claude_running.swap(false, Ordering::Relaxed);
+                                    // Prompt returned → the foreground command (incl. an
+                                    // agent, or an ssh session) ended.
+                                    let was = running.swap(false, Ordering::Relaxed);
                                     if was {
-                                        // Claude stopped → persist so a restore doesn't relaunch it,
-                                        // and remove its statusLine capture so a lingering file can't
-                                        // re-mark this pane as running on the next watcher pass.
-                                        crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
-                                        claude.clear_capture();
+                                        // The agent stopped → persist so a restore doesn't
+                                        // relaunch it, and forget its event log so a late
+                                        // hook can't re-mark this pane as running it.
+                                        SAVE_DIRTY.store(true, Ordering::Relaxed);
+                                        agent.end_session();
                                     }
                                     // The LOCAL prompt is back, so any ssh session is over and
-                                    // the remote Claude with it (this also drops the on-screen
+                                    // the remote agent with it (this also drops the on-screen
                                     // latch). The chrome probe would clear it on the next chunk
                                     // anyway; doing it on the edge means the dot goes out the
                                     // moment the session ends rather than on the next output.
-                                    if claude.is_remote() {
+                                    if conn.is_remote() {
                                         let code = *last_exit.lock().unwrap();
                                         // ssh's own failure code after a session that was
                                         // up is a drop: not a refusal, not an `exit`. Worth
                                         // one automatic re-run, which the UI performs.
                                         if code == Some(SSH_CONNECTION_FAILED) {
-                                            claude.request_retry(RETRY_MIN_CONNECTION);
+                                            conn.request_retry(RETRY_MIN_CONNECTION);
                                         }
                                         // Ended before the far shell ever showed a prompt,
                                         // with the command's own status rather than ssh's:
@@ -1845,26 +1815,26 @@ fn reader_loop(
                                             .as_ref()
                                             .is_some_and(|f| f.cd_in_command);
                                         if chained
-                                            && !claude.login_seen()
+                                            && !conn.login_seen()
                                             && code.is_some_and(|c| c != 0 && c != SSH_CONNECTION_FAILED)
                                         {
-                                            claude.set_remote_cwd(None);
+                                            conn.set_remote_cwd(None);
                                         }
                                         // A session that was up and ended with the far
                                         // shell's own status was ended by the user (`exit`),
                                         // not lost. The pane is a local shell again.
-                                        let left = claude.login_seen()
+                                        let left = conn.login_seen()
                                             && code.is_some_and(|c| c != SSH_CONNECTION_FAILED);
-                                        claude.set_remote(false);
+                                        connection_edge(&conn, &agent, false);
                                         if left {
-                                            claude.forget_connection();
+                                            forget_connection(&conn, &agent);
                                         }
-                                        crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
+                                        SAVE_DIRTY.store(true, Ordering::Relaxed);
                                     }
                                     // Whatever was to be typed at the far prompt has no far
                                     // prompt to go to any more.
                                     *followup.lock().unwrap() = None;
-                                    // A command just finished — it may have changed
+                                    // A command just finished: it may have changed
                                     // files, so refresh the git status.
                                     recompute_git(cwd.clone(), git.clone());
                                 } else {
@@ -1875,18 +1845,16 @@ fn reader_loop(
                                 }
                             }
                         }
+                    } else if let Some(signal) = crate::term_signal::parse_osc(payload) {
+                        if agent_owns {
+                            agent.note_signal(&signal);
+                        }
                     }
                     if let Some(report) = parse_osc7(payload) {
-                        match osc7_origin(&report.host, local_host_name(), claude.is_remote()) {
+                        match osc7_origin(&report.host, local_host_name(), conn.is_remote()) {
                             Osc7Origin::Remote => {
-                                claude.note_remote_cwd(report.path.clone());
-                                remote_ready(
-                                    &claude,
-                                    &credential,
-                                    &followup,
-                                    &writer_tx,
-                                    Some(&report.path),
-                                );
+                                conn.note_remote_cwd(report.path.clone());
+                                remote_ready(&conn, &agent, &credential, &followup, &writer_tx, Some(&report.path));
                             }
                             Osc7Origin::Local => {
                                 let path = local_path(&report.path);
@@ -1927,14 +1895,14 @@ fn reader_loop(
         // is unconfirmed, never while a credential is still to be typed, and for a
         // connection known to prompt not before that prompt has been seen: a pre-login
         // banner line must not pass for the prompt.
-        if claude.is_remote()
-            && !claude.login_seen()
+        if conn.is_remote()
+            && !conn.login_seen()
             && credential.lock().unwrap().is_none()
-            && (claude.prompts_for_credential() != Some(true) || claude.prompted_this_connection())
+            && (conn.prompts_for_credential() != Some(true) || conn.prompted_this_connection())
         {
             let row = term.lock().unwrap().cursor_row_text();
             if looks_like_prompt(&row) {
-                remote_ready(&claude, &credential, &followup, &writer_tx, None);
+                remote_ready(&conn, &agent, &credential, &followup, &writer_tx, None);
             }
         }
     }
@@ -2044,24 +2012,24 @@ fn repoint_watcher(
     });
 }
 
-/// Per-session Claude monitor: blocks until a busy edge (a command started),
-/// then scans the shell's descendants for `claude` — with a short retry since
-/// `claude` execs a moment after the edge. Bails early if the shell returns to
-/// idle (a quick command that wasn't Claude). The reader clears `claude_running`
-/// on the idle edge. Ends when the session is dropped: Drop raises `closed` and
-/// notifies the epoch condvar (see `Session`'s Drop).
-fn claude_monitor(
+/// Per-session agent monitor: blocks until a busy edge (a command started), then scans
+/// the shell's descendants for any registered agent, with a short retry since the agent
+/// execs a moment after the edge. Bails early if the shell returns to idle (a quick
+/// command that wasn't an agent). The reader clears `running` on the idle edge. Ends
+/// when the session is dropped: Drop raises `closed` and notifies the epoch condvar
+/// (see `Session`'s Drop).
+fn agent_monitor(
     shell_pid: u32,
     cmd_epoch: CmdEpoch,
-    claude_running: Arc<AtomicBool>,
     shell_idle: Arc<Mutex<Option<bool>>>,
-    claude: Arc<crate::claude_status::ClaudeHandle>,
+    agent: Arc<AgentHandle>,
+    conn: Arc<ConnHandle>,
     closed: Arc<AtomicBool>,
 ) {
-    // How long to keep looking for Claude after a command starts. Enough to catch a
+    // How long to keep looking for an agent after a command starts. Enough to catch a
     // slow cold launch (Windows especially: $PROFILE + shim + node + MCP servers,
-    // antivirus scanning node.exe) — well beyond the old 2s that missed them — yet
-    // bounded so a long-running NON-Claude command (a build, a dev server) only gets a
+    // antivirus scanning node.exe), well beyond the old 2s that missed them, yet
+    // bounded so a long-running NON-agent command (a build, a dev server) only gets a
     // short burst (~7 backed-off checks) and then nothing.
     const SCAN_WINDOW: Duration = Duration::from_secs(10);
 
@@ -2070,7 +2038,7 @@ fn claude_monitor(
     loop {
         // Block until a command actually starts (a busy edge bumps the epoch). The 60s
         // timeout is ONLY a lost-wakeup safety net: on a pure timeout the epoch is
-        // unchanged, so we loop back WITHOUT scanning — nothing runs while idle.
+        // unchanged, so we loop back WITHOUT scanning; nothing runs while idle.
         let prev = last;
         {
             let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2087,50 +2055,49 @@ fn claude_monitor(
         if last == prev {
             continue; // woke on the timeout with no new command → don't scan
         }
-        // A command started. Look for Claude with BACKOFF until we find it, the shell
-        // returns to idle (command ended → wasn't Claude), or the window elapses. The
-        // loop stops the instant Claude appears, so a running Claude is never scanned,
+        // A command started. Look for an agent with BACKOFF until we find one, the shell
+        // returns to idle (command ended → wasn't an agent), or the window elapses. The
+        // loop stops the instant an agent appears, so a running agent is never scanned,
         // and it never runs while idle (that's the blocking wait above).
-        crate::claude_shim::debug_log(&format!(
-            "claude_monitor: busy edge on shell_pid={shell_pid}, scanning"
-        ));
+        crate::debug::debug_log(&format!("agent_monitor: busy edge on shell_pid={shell_pid}, scanning"));
         let started = Instant::now();
         let mut delay = Duration::from_millis(250);
         loop {
-            if crate::claude::running_under(shell_pid) {
-                claude_running.store(true, Ordering::Relaxed);
-                // Persist that Claude is running here (even before a session binds) so
-                // a restore relaunches it.
-                crate::claude_status::SAVE_DIRTY.store(true, Ordering::Relaxed);
-                crate::claude_shim::debug_log(&format!("claude_monitor: found on shell_pid={shell_pid}"));
+            if let Some(kind) = crate::procscan::agent_under(shell_pid) {
+                agent.bind(kind, KindSource::Scan);
+                agent.running.store(true, Ordering::Relaxed);
+                // Persist that an agent is running here (even before a conversation
+                // binds) so a restore relaunches it.
+                SAVE_DIRTY.store(true, Ordering::Relaxed);
+                crate::debug::debug_log(&format!("agent_monitor: {kind:?} found on shell_pid={shell_pid}"));
                 break;
             }
-            // Not Claude locally. An ssh/mosh client means the foreground program is on
+            // Not an agent locally. An ssh/mosh client means the foreground program is on
             // another machine, so hand the pane to the screen probe (see `reader_loop`)
             // and stop scanning: nothing local will ever appear for it. Uses the same
-            // 250ms-gated snapshot the Claude scan just took, so it is effectively free.
-            if crate::claude::ssh_under(shell_pid) {
-                claude.set_remote(true);
-                crate::claude_shim::debug_log(&format!("claude_monitor: ssh on shell_pid={shell_pid}"));
+            // 250ms-gated snapshot the agent scan just took, so it is effectively free.
+            if crate::procscan::ssh_under(shell_pid) {
+                connection_edge(&conn, &agent, true);
+                crate::debug::debug_log(&format!("agent_monitor: ssh on shell_pid={shell_pid}"));
                 // A connection still up when the arm window closes, having never
                 // prompted, logged in without a credential. Learned here because a far
-                // host without the snippet and without Claude offers no other evidence.
+                // host without the snippet and without an agent offers no other evidence.
                 // One sleep, not a poll; checks it is still the same connection.
-                let since = claude.remote_since_ms();
-                let claude = claude.clone();
+                let since = conn.remote_since_ms();
+                let conn = conn.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(ARM_WINDOW);
-                    if claude.remote_since_ms() == since {
-                        claude.note_login_evidence();
+                    if conn.remote_since_ms() == since {
+                        conn.note_login_evidence();
                     }
                 });
                 break;
             }
             if *shell_idle.lock().unwrap() == Some(true) {
-                break; // command finished → it wasn't Claude
+                break; // command finished → it wasn't an agent
             }
             if started.elapsed() >= SCAN_WINDOW {
-                break; // give up for this command — don't scan a long non-Claude one forever
+                break; // give up for this command: don't scan a long non-agent one forever
             }
             std::thread::sleep(delay);
             delay = (delay * 2).min(Duration::from_secs(2)); // 250ms → 500ms → 1s → 2s cap
@@ -2167,12 +2134,8 @@ fn hex(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_spinner_key, git_relevant_change, TypedLine};
+    use super::{git_relevant_change, TypedLine};
     use std::path::Path;
-
-    fn key(s: &str) -> Option<u64> {
-        chunk_spinner_key(s.as_bytes())
-    }
 
     /// Type `s` a byte at a time (as real keystrokes arrive) and return the last
     /// command submitted.
@@ -2305,37 +2268,6 @@ mod tests {
         assert_eq!(typed("ssh mini\u{3}\r"), None);
         // A line abandoned mid-way still lets the NEXT clean line be remembered.
         assert_eq!(typed("ssh mi\u{1b}[A\rssh mini\r").as_deref(), Some("ssh mini"));
-    }
-
-    #[test]
-    fn plain_output_carries_no_spinner() {
-        assert_eq!(key("cargo build --bin arbiter\r\n"), None);
-        // The input prompt arrow sits just outside the star range on purpose: typing
-        // must never read as working.
-        assert_eq!(key("\u{1b}[2K\u{276F} write the file"), None);
-    }
-
-    #[test]
-    fn bloom_frames_fingerprint_differently() {
-        // Consecutive frames of the animation Claude draws at its status line.
-        assert_ne!(key("\u{1b}[23;1H\u{273B}"), key("\u{1b}[23;1H\u{273D}"));
-        // The window-title spinner is Braille, and its frames differ from each other
-        // and from the stars.
-        assert_ne!(key("\u{1b}]0;\u{2802} Claude Code\u{7}"), key("\u{1b}]0;\u{2810} Claude Code\u{7}"));
-        assert_ne!(key("\u{1b}]0;\u{2802} Claude Code\u{7}"), key("\u{1b}[23;1H\u{273B}"));
-    }
-
-    #[test]
-    fn repainting_a_thinking_summary_fingerprints_the_same() {
-        // Scrolling Claude's transcript redraws the screen, re-emitting whichever
-        // "thinking summary" lines are on it. They all use the same star, so however
-        // many land in a chunk the fingerprint is identical: no false animation.
-        let a = key("\u{1b}[14;1H\u{273B} Brewed for 7s");
-        let b = key("\u{1b}[9;1H\u{273B} Crunched for 2m 5s");
-        let both = key("\u{1b}[9;1H\u{273B} Crunched for 2m 5s\u{1b}[14;1H\u{273B} Brewed for 7s");
-        assert!(a.is_some());
-        assert_eq!(a, b);
-        assert_eq!(a, both);
     }
 
     fn rel(p: &str) -> bool {
@@ -2482,7 +2414,8 @@ mod tests {
     }
 
     fn followup(dir: &str, claude: bool) -> super::Followup {
-        super::Followup { dir: dir.into(), resume_claude: claude, session: None, cd_in_command: false }
+        let resume = claude.then_some(crate::agent::AgentKind::Claude);
+        super::Followup { dir: dir.into(), resume, session: None, cd_in_command: false }
     }
 
     #[test]
@@ -2496,48 +2429,16 @@ mod tests {
         );
     }
 
-    // What a typed `claude` line tells Arbiter about the conversation it starts.
-    #[test]
-    fn classifies_typed_claude_launches() {
-        use super::{classify_claude_launch as c, ClaudeLaunch::*};
-        assert_eq!(c("claude"), Bare);
-        assert_eq!(c("claude --dangerously-skip-permissions"), Bare);
-        assert_eq!(c("claude --model opus"), Bare, "a value after a flag is still a flag's");
-        assert_eq!(c("claude --model=opus mcp"), Other, "an inline value does not swallow the next word");
-        assert_eq!(c("claude fix the tests"), Bare, "an initial prompt is still interactive");
-        assert_eq!(c("/opt/homebrew/bin/claude"), Bare);
-        assert_eq!(c("claude --resume abc-123"), Named("abc-123".into()));
-        assert_eq!(c("claude -r abc-123"), Named("abc-123".into()));
-        assert_eq!(c("claude --resume=abc-123"), Named("abc-123".into()));
-        assert_eq!(c("claude --session-id abc-123"), Named("abc-123".into()));
-        assert_eq!(c("claude -r"), Other, "the picker: whatever is chosen is unknown");
-        assert_eq!(c("claude -c"), Other);
-        assert_eq!(c("claude --continue"), Other);
-        assert_eq!(c("claude -p hello"), Other, "non-interactive");
-        assert_eq!(c("claude mcp list"), Other, "a subcommand");
-        assert_eq!(c("claude update"), Other);
-        assert_eq!(c("claude --version"), Other);
-        assert_eq!(c("claudette"), NotClaude);
-        assert_eq!(c("ls"), NotClaude);
-        assert_eq!(c(""), NotClaude);
-    }
-
     #[test]
     fn fresh_session_ids_are_uuids_claude_accepts() {
         let id = super::new_session_id();
         assert_eq!(id.len(), 36);
-        assert!(crate::remote::plausible_session_id(&id));
+        assert!(crate::agent::plausible_session_id(&id));
         let parts: Vec<&str> = id.split('-').collect();
         assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
         assert!(parts[2].starts_with('4'), "version 4: {id}");
         assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'), "variant: {id}");
         assert_ne!(id, super::new_session_id());
-    }
-
-    #[test]
-    fn recognises_claude_saying_a_conversation_is_gone() {
-        assert!(super::conversation_gone("No conversation found with session ID: abc-123"));
-        assert!(!super::conversation_gone("tre ~/src $ "));
     }
 
     fn line(out: Option<(Vec<u8>, Option<String>)>) -> (String, Option<String>) {
@@ -2732,5 +2633,157 @@ mod tests {
         assert!(!hold.settled());
         assert!(!hold.frame_due(super::OUTPUT_HOLD_MAX - Duration::from_millis(1)));
         assert!(hold.frame_due(super::OUTPUT_HOLD_MAX));
+    }
+
+    /// A pane's connection and agent halves, as `Session::spawn` wires them.
+    fn pair() -> (crate::conn::ConnHandle, std::sync::Arc<crate::agent_state::AgentHandle>) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        let agent = crate::agent_state::AgentHandle::new(1, Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)));
+        (crate::conn::ConnHandle::new(None), agent)
+    }
+
+    const CLAUDE: Option<crate::agent::AgentKind> = Some(crate::agent::AgentKind::Claude);
+
+    // Each typed launch is recognised by its own agent, and anything else by none.
+    #[test]
+    fn a_typed_launch_is_classified_by_the_agent_it_names() {
+        use crate::agent::{AgentKind, TypedLaunch};
+        assert_eq!(super::classify_launch("claude --resume abc-1"), Some((AgentKind::Claude, TypedLaunch::Named("abc-1".into()))));
+        assert_eq!(super::classify_launch("copilot"), Some((AgentKind::Copilot, TypedLaunch::Bare)));
+        assert_eq!(super::classify_launch("codex resume --last"), Some((AgentKind::Codex, TypedLaunch::Other)));
+        assert_eq!(super::classify_launch("ls -la"), None);
+        assert_eq!(super::classify_launch(""), None);
+    }
+
+    // Chrome on screen latches the pane as running an agent; chrome gone clears it. This
+    // is what makes a remote pane light up and, when the agent exits on the far host, go
+    // dark again on the very next chunk (the returning remote prompt).
+    #[test]
+    fn chrome_latches_claude_on_and_off() {
+        let (conn, agent) = pair();
+        assert!(!agent.on_screen());
+        super::note_screen(&conn, &agent, CLAUDE);
+        assert!(agent.on_screen());
+        assert_eq!(agent.kind(), CLAUDE);
+        super::note_screen(&conn, &agent, None);
+        assert!(!agent.on_screen());
+        assert_eq!(agent.kind(), None, "a far agent that exited leaves no kind behind");
+    }
+
+    // The mid-turn case. While Claude works it swaps its hint line for the interrupt
+    // hint, so the chrome scan comes back empty even though Claude is very much there.
+    // Clearing on that would drop the pane's Claude state (and its dot) mid-answer.
+    #[test]
+    fn chrome_gone_during_a_live_turn_does_not_clear() {
+        let (conn, agent) = pair();
+        super::note_screen(&conn, &agent, CLAUDE);
+        // Two differing spinner frames an animation gap apart = a turn is under way.
+        agent.note_activity(0b1000);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        agent.note_activity(0b0100);
+        assert_eq!(agent.snapshot().lifecycle, crate::agent_state::Lifecycle::Working);
+
+        super::note_screen(&conn, &agent, None);
+        assert!(agent.on_screen(), "a working turn must keep the pane marked as Claude");
+    }
+
+    // Leaving the ssh session drops both, so the far host's Claude can't linger on a
+    // pane that is back at a local prompt.
+    #[test]
+    fn clearing_remote_also_drops_the_chrome_latch() {
+        let (conn, agent) = pair();
+        super::connection_edge(&conn, &agent, true);
+        super::note_screen(&conn, &agent, CLAUDE);
+        assert!(conn.is_remote() && agent.on_screen());
+        super::connection_edge(&conn, &agent, false);
+        assert!(!conn.is_remote());
+        assert!(!agent.on_screen());
+    }
+
+    // Leaving a session with `exit` makes the pane local again: no Reconnect, nothing to
+    // replay on the next launch, and the next `ssh` typed defines a new connection.
+    #[test]
+    fn leaving_a_session_forgets_the_connection() {
+        let (conn, agent) = pair();
+        conn.note_command("ssh mini".into());
+        super::connection_edge(&conn, &agent, true);
+        conn.note_credential_prompt(None);
+        conn.note_remote_cwd("/home/tre/src".into());
+        super::note_screen(&conn, &agent, CLAUDE);
+        super::connection_edge(&conn, &agent, false);
+        super::forget_connection(&conn, &agent);
+        assert!(conn.startup_cmd().is_none());
+        assert!(!conn.was_remote());
+        assert_eq!(conn.prompts_for_credential(), None);
+        assert!(conn.remote_cwd().is_none());
+        assert_eq!(agent.remote_agent(), None);
+        // The next connection latches afresh.
+        conn.note_command("ssh other".into());
+        super::connection_edge(&conn, &agent, true);
+        assert_eq!(conn.startup_cmd().as_deref(), Some("ssh other"));
+        assert!(conn.was_remote());
+    }
+
+    // Claude still on screen when the connection ends is what the next connection
+    // resumes; a Claude that had already exited is not.
+    #[test]
+    fn a_far_claude_alive_at_the_drop_is_resumed_next_time() {
+        let (conn, agent) = pair();
+        super::connection_edge(&conn, &agent, true);
+        super::note_screen(&conn, &agent, CLAUDE);
+        assert_eq!(agent.remote_agent(), CLAUDE);
+        super::connection_edge(&conn, &agent, false);
+        assert_eq!(agent.remote_agent(), CLAUDE, "pending for the next connection");
+        assert_eq!(agent.take_remote_pending(), CLAUDE);
+        assert_eq!(agent.take_remote_pending(), None, "taken once");
+
+        let (conn, agent) = pair();
+        super::connection_edge(&conn, &agent, true);
+        super::note_screen(&conn, &agent, CLAUDE);
+        super::note_screen(&conn, &agent, None); // Claude exited at the remote prompt
+        super::connection_edge(&conn, &agent, false);
+        assert_eq!(agent.remote_agent(), None);
+
+        // A stale pending flag does not survive a new connection being detected.
+        let (conn, agent) = pair();
+        agent.seed_remote_agent(CLAUDE);
+        super::connection_edge(&conn, &agent, true);
+        assert_eq!(agent.take_remote_pending(), None);
+    }
+
+    // The keyboard is a second witness: `claude` typed at the far prompt counts as
+    // running until another command is typed at a shell prompt, or its chrome leaves.
+    #[test]
+    fn claude_typed_at_the_far_prompt_counts_as_running() {
+        let (conn, agent) = pair();
+        super::connection_edge(&conn, &agent, true);
+        agent.set_remote_typed(CLAUDE);
+        assert_eq!(agent.remote_agent(), CLAUDE);
+        super::connection_edge(&conn, &agent, false);
+        assert_eq!(agent.take_remote_pending(), CLAUDE, "resumed on the next connection");
+
+        let (conn, agent) = pair();
+        super::connection_edge(&conn, &agent, true);
+        agent.set_remote_typed(CLAUDE);
+        agent.set_remote_typed(None); // `ls` at the shell prompt: Claude has exited
+        super::connection_edge(&conn, &agent, false);
+        assert_eq!(agent.remote_agent(), None);
+
+        let (conn, agent) = pair();
+        super::connection_edge(&conn, &agent, true);
+        agent.set_remote_typed(CLAUDE);
+        super::note_screen(&conn, &agent, CLAUDE);
+        super::note_screen(&conn, &agent, None); // chrome gone with no turn in flight
+        assert_eq!(agent.remote_agent(), None, "the screen outranks what was typed");
+    }
+
+    // The far agent comes back as its own adapter says, whichever it was.
+    #[test]
+    fn followup_brings_back_the_agent_that_was_running() {
+        let mut f = followup("~/src", false);
+        f.resume = Some(crate::agent::AgentKind::Codex);
+        f.cd_in_command = true;
+        assert_eq!(line(super::followup_line(f, None)), ("(codex resume --last || codex)\r".into(), None));
     }
 }

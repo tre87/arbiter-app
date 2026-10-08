@@ -90,7 +90,7 @@ pub fn upload(inv: &SftpInvocation, paths: &[String], secret: Option<&Secret>) -
 /// not reported: the next day's sweep gets another chance.
 pub fn sweep(inv: &SftpInvocation, secret: Option<&Secret>) {
     if let Err(e) = run(inv, &sweep_batch(SystemTime::now()), secret) {
-        crate::claude_shim::debug_log(&format!("attach sweep on {}: {e:?}", inv.host()));
+        crate::debug::debug_log(&format!("attach sweep on {}: {e:?}", inv.host()));
     }
 }
 
@@ -278,7 +278,7 @@ fn run(inv: &SftpInvocation, batch: &str, secret: Option<&Secret>) -> Result<Str
     let result = run_batch_file(inv, &path, secret);
     let _ = std::fs::remove_file(&path);
     if let Err(e) = &result {
-        crate::claude_shim::debug_log(&format!("attach: sftp to {} failed: {e:?}", inv.host()));
+        crate::debug::debug_log(&format!("attach: sftp to {} failed: {e:?}", inv.host()));
     }
     result
 }
@@ -420,7 +420,7 @@ fn run_batch_file(inv: &SftpInvocation, batch_path: &Path, secret: Option<&Secre
     }
     drop(master);
     let text = strip_escapes(&String::from_utf8_lossy(&raw));
-    crate::claude_shim::debug_log(&format!(
+    crate::debug::debug_log(&format!(
         "attach: sftp exit {:?}, {} bytes of output: {:?} (raw {:?})",
         status.as_ref().map(|s| s.as_ref().map(|s| s.exit_code()).map_err(|e| e.to_string())),
         raw.len(),
