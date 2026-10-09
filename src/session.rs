@@ -896,6 +896,9 @@ impl Session {
         // routes by pane id) + the reader (screen/spinner/signals → activity/attention).
         // Created before the reader so it gets a clone.
         let agent = AgentHandle::new(id, cwd.clone(), running.clone());
+        if let Some(pid) = shell_pid {
+            let _ = agent.shell_pid.set(pid);
+        }
         crate::agent_state::register(&agent);
         let conn = Arc::new(ConnHandle::new(histfile));
 
@@ -1549,6 +1552,7 @@ fn reader_loop(
     let mut in_osc = false;
     let mut prev_cwd: Option<String> = None;
     let mut prev_idle: Option<bool> = None;
+    let mut first_prompt = true;
     let mut prev_agent_owns = false;
     let hide_wake_pending = Arc::new(AtomicBool::new(false));
     let mut recorder = crate::debug::PaneRecorder::new(agent.pane_id);
@@ -1677,13 +1681,15 @@ fn reader_loop(
             // a stale star left on screen can't pin it to "working").
             let profile = kind.agent().screen();
             let state = term.lock().unwrap().screen_state(profile);
-            let crate::agent_screen::ScreenState { menu, scrolled, waiting, working, idle_box, slash_input } = state;
+            let crate::agent_screen::ScreenState { menu, scrolled, waiting, working, idle_box, slash_input, shells } =
+                state;
             // Scrolled away, everything on screen is history: an approval box the user
             // is reading back over is not a prompt waiting on them.
             let menu = menu && !scrolled;
             // Order matters: the two holds below read `waiting_background` and
             // `working_row`, so both must be current before the scroll edge is taken.
             agent.set_waiting_background(waiting);
+            agent.set_background_shells(shells);
             // While scrolled, Claude draws no status row, so its absence says nothing and
             // must not count as a turn end. Leave the last reading standing; the redraw
             // that puts the view back at the bottom refreshes it.
@@ -1777,6 +1783,12 @@ fn reader_loop(
                                     // The PTY is being read. If the pane has also been
                                     // resized, this releases any queued startup command.
                                     startup.note_prompt();
+                                    // The shell drew this prompt, so a launcher has started it.
+                                    if std::mem::take(&mut first_prompt) {
+                                        if let Some(&pid) = agent.shell_pid.get() {
+                                            crate::priority::raise_launched_shell(pid);
+                                        }
+                                    }
                                     // The command that needed a credential has ended, so
                                     // stop holding one. Bounds the armed window to the
                                     // connection itself.
@@ -2033,6 +2045,7 @@ fn agent_monitor(
     // short burst (~7 backed-off checks) and then nothing.
     const SCAN_WINDOW: Duration = Duration::from_secs(10);
 
+    crate::priority::raise_pane(shell_pid);
     let (lock, cvar) = &*cmd_epoch;
     let mut last = *lock.lock().unwrap();
     loop {
@@ -2063,7 +2076,8 @@ fn agent_monitor(
         let started = Instant::now();
         let mut delay = Duration::from_millis(250);
         loop {
-            if let Some(kind) = crate::procscan::agent_under(shell_pid) {
+            if let Some((kind, pid)) = crate::procscan::agent_under(shell_pid) {
+                crate::priority::raise(pid);
                 agent.bind(kind, KindSource::Scan);
                 agent.running.store(true, Ordering::Relaxed);
                 // Persist that an agent is running here (even before a conversation
@@ -2076,7 +2090,8 @@ fn agent_monitor(
             // another machine, so hand the pane to the screen probe (see `reader_loop`)
             // and stop scanning: nothing local will ever appear for it. Uses the same
             // 250ms-gated snapshot the agent scan just took, so it is effectively free.
-            if crate::procscan::ssh_under(shell_pid) {
+            if let Some(pid) = crate::procscan::ssh_under(shell_pid) {
+                crate::priority::raise(pid);
                 connection_edge(&conn, &agent, true);
                 crate::debug::debug_log(&format!("agent_monitor: ssh on shell_pid={shell_pid}"));
                 // A connection still up when the arm window closes, having never

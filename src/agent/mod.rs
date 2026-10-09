@@ -296,8 +296,13 @@ pub struct ScreenProfile {
     /// Among the bottom `live_rows`: the bar shown while scrolled away from the bottom.
     pub scrolled: &'static [&'static str],
     pub menu: MenuRule,
-    /// The last row above the input box saying background work is outstanding.
+    /// The last row above the input box saying the agent waits on work it will resume
+    /// from by itself, which holds the pane working.
     pub waiting_rows: &'static [RowRule],
+    /// In the cursor-anchored window: the footer's count of shells the agent left
+    /// running in the background, a `·` segment of a number and one of these words.
+    /// Shown beside the pane, never read as working: a shell can run for good.
+    pub shells: &'static [&'static str],
     pub prompt: PromptShape,
     /// Task-list items, which do not count as "the last row above the box".
     pub task_marks: &'static [&'static str],
@@ -396,7 +401,7 @@ mod tests {
     fn no_profile_has_an_empty_marker() {
         for a in all() {
             let s = a.screen();
-            let lists: [&[&str]; 5] = [s.chrome, s.chrome_veto, s.working_footer, s.scrolled, s.task_marks];
+            let lists: [&[&str]; 6] = [s.chrome, s.chrome_veto, s.working_footer, s.scrolled, s.task_marks, s.shells];
             for list in lists {
                 assert!(list.iter().all(|m| !m.is_empty()), "{}: empty marker", a.id());
             }

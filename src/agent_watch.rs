@@ -16,6 +16,7 @@ use std::time::Duration;
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
+use crate::agent::AgentEvent;
 use crate::agent_state::{live_handles, AgentHandle};
 
 pub type Watcher = Debouncer<RecommendedWatcher>;
@@ -94,6 +95,14 @@ pub(crate) fn apply_lines(h: &Arc<AgentHandle>, text: &str) {
             h.running.load(Ordering::Relaxed)
         ));
         h.apply(kind, session.as_deref(), &event);
+        let bound = matches!(event, AgentEvent::SessionBound { .. })
+            && h.kind() == Some(kind)
+            && h.running.load(Ordering::Relaxed);
+        if bound {
+            if let Some(&shell) = h.shell_pid.get() {
+                crate::priority::raise_agent_under(shell, kind);
+            }
+        }
     }
 }
 

@@ -20,6 +20,7 @@ pub mod gpu;
 pub mod highlight;
 pub mod notify;
 pub mod persist;
+pub mod priority;
 pub mod procscan;
 pub mod raster;
 pub mod remote;

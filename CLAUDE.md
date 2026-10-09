@@ -242,23 +242,60 @@ a row resize (shifts the whole layout for a frame; a column does not).
 - **One finish is counted once.** The Stop hook and the row end (or, for Codex, `notify`
   and its OSC 9) report the same turn end; a second within `FINISH_DEDUPE_MS` with no
   work in between is dropped (`AgentHandle::count_finish`).
-- **Outstanding background work is not idle.** Two rows say so: "Waiting for N background
-  agents to finish", and a finished turn's line ending "· 1 shell still running"
-  (`✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running`). Either way the turn is
-  over (Stop hook fired, spinner still), yet Claude resumes by itself when the work
-  reports. The reader scans the visible rows for either row's shape (Claude's
-  `ScreenProfile::waiting_rows` in `agent/claude.rs`, matched by `agent_screen::waiting_in`:
-  a spinner glyph, a space, the phrase; prose starts with a bullet or an indent), and only
-  as the last row above the input box: aborting the agents leaves the row in the
-  transcript with "● All background agents stopped" under it, and anywhere-on-screen held
-  the pane Working for good. With no input box on screen any visible row counts.
-  `AgentHandle::set_waiting_background` holds `Working` while it shows, which also keeps
-  the Stop hook from raising "Claude finished". The off edge
-  stamps a fresh activity TTL so the resumed turn's first frames have time to pair up;
-  Escape during the wait ends it the same way, one TTL later, with a "Claude finished"
-  card. **Known trade:** Claude draws the same shell line for a dev server it started in
-  the background, which never finishes, so such a pane stays Working (and keeps the fast
-  tick) for as long as the server runs. Nothing on screen tells a finite job from a server.
+- **Waiting on background agents is not idle.** "Waiting for N background agents to
+  finish": the turn is over (Stop hook fired, spinner still), yet Claude resumes by itself
+  when they report, and they always do. The reader scans the visible rows for the row's
+  shape (Claude's `ScreenProfile::waiting_rows` in `agent/claude.rs`, matched by
+  `agent_screen::waiting_in`: a spinner glyph, a space, the phrase; prose starts with a
+  bullet or an indent), and only as the last row above the input box: aborting the agents
+  leaves the row in the transcript with "● All background agents stopped" under it, and
+  anywhere-on-screen held the pane Working for good. With no input box on screen any
+  visible row counts. `AgentHandle::set_waiting_background` holds `Working` while it shows,
+  which also keeps the Stop hook from raising "Claude finished". The off edge stamps a
+  fresh activity TTL so the resumed turn's first frames have time to pair up; Escape
+  during the wait ends it the same way, one TTL later, with a "Claude finished" card.
+- **A background shell is not work (2026-10-09).** A shell Claude left running (a dev
+  server) can run all day, and holding the pane Working for it kept the 60 fps clock on
+  and the "finished" card back for as long as it lived. It is a count beside the pane
+  instead: Claude's mode line under the box says "⏵⏵ auto mode on · 1 shell · ← for
+  agents" (2.1.291, captured in a ConPTY: "⏸ manual mode on · 2 shells"), read in the
+  cursor-anchored chrome window (`ScreenProfile::shells`, `agent_screen::shell_count`, a
+  whole `·` segment, so the summary line's "· 2 shells still running" never counts). It is
+  read only with the chrome on screen; a chooser over the footer keeps the last count. It
+  shows as a static muted chip (console icon, "1 shell") in the pane header and the
+  overview, a hollow green ring around the workspace tab's dot (a layer apart: the dot
+  keeps its amber > azure > green order and the ring hides nothing), a server box with a
+  lit LED under the office desk (`Scene::servers`, at most three), and "· 1 shell
+  running" on the "finished" card. The quit dialog Claude shows ("Background work is
+  running", each shell listed) is this same count.
+
+## Priority under full CPU load (Windows, 2026-10-09)
+
+With a CPU-bound program on every core (the Fenfire balance runner), the window stayed
+responsive but the terminals froze for seconds to minutes. Measured headless with 32 busy
+threads on 16 cores, typing into a Claude pane through `Session`: the redraw wake, which
+passes through a timer (the `WakeHold` settle on the `session::schedule` thread), stalled
+past 3.5 s, and keystroke echo, which also passes through the pane's console host and
+agent, reached a p90 of 278 ms; the hops that wake for I/O stayed under a second. The
+likely cause is that Windows boosts a thread woken for input or I/O ahead of busy threads
+of its priority more readily than one woken by a timer (the working tick is a tokio timer
+too); the boost rules themselves were not measured. With everything raised: 26 ms and
+4.5 ms; Arbiter alone fixed the redraws, not the echo.
+
+`src/priority.rs` raises, all to ABOVE_NORMAL, each from an event and never on a timer:
+Arbiter itself (`raise_self`, GUI path of `main` only); each pane's shell and every console
+host Arbiter owns (`raise_pane`, as `agent_monitor` starts); the shell a launcher started
+(`raise_launched_shell`, at the pane's first OSC-133 prompt in `reader_loop`: Git Bash's
+`bin\bash.exe` runs `usr\bin\bash.exe`); the agent or ssh client the busy-edge scan finds
+(`procscan::agent_under` / `ssh_under` return the pid); and the agent whenever its hook
+reports a session (`raise_agent_under`, from `agent_watch`, via `AgentHandle::shell_pid`),
+which covers one the scan's ten-second window missed. A raised class is not inherited (only
+idle and below-normal are), so whatever a pane runs stays normal. Tests:
+`priority::tests::a_pane_runs_above_normal_and_what_it_starts_does_not` (shell, host,
+launched shell, and a command under it staying normal) and
+`an_agent_its_hook_binds_is_raised` (a copy of the test binary named `claude-probe-*.exe`
+as the agent). Use a bounded burner for any load test: it freezes the panes of an older
+Arbiter, this session's included.
 
 ## The editor is the viewport, and the gutter follows it (2026-09-22)
 
@@ -316,7 +353,11 @@ without painting over (erasing) the neighbour. Consequences, both intentional / 
   No font is looked up by name; the user's terminal font stays what it is. Windows Terminal
   makes you set a Nerd Font as the face instead; this was chosen so nothing is manual.
   Test: `raster::tests::icons_render_with_nothing_installed_or_configured` (Windows, in
-  the suite). The macOS side cannot be type-checked from Windows (`objc_exception` needs a
+  the suite). The DirectWrite context is per thread and is never dropped by a thread's
+  exit (`ManuallyDrop` in `dwrite::CTX`): Rust runs thread-local destructors under the
+  loader lock, and releasing its COM objects there hung the next thread's first render in
+  WIC/D2D (`a_thread_that_rasterised_and_exited_leaves_the_next_one_working`). Only the
+  UI thread rasterises today, so the app never hit it; the tests, one thread each, did. The macOS side cannot be type-checked from Windows (`objc_exception` needs a
   C compiler and the SDK), so CoreText changes are verified on the Mac.
 - `fit_to_box` (`src/gpu.rs`) instead **center-clips** a mono fallback symbol that's only
   slightly wider than the cell (e.g. ✻), keeping full height, unless the clip would cut

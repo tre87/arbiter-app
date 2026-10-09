@@ -7,7 +7,25 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Changed
+- **A shell Claude leaves running no longer counts as working.** A dev server started in
+  the background kept its pane "working" for as long as it ran: the animation never
+  stopped, Arbiter never went idle, and the turn's "finished" card never came. The turn
+  now finishes like any other, and the shell shows as a quiet marker instead: "1 shell"
+  beside the pane's name and in the overview, a ring around the workspace tab's dot, a
+  small server box under the desk in the Agents Office, and "1 shell running" on the
+  "finished" card. None of it animates. Waiting on background agents still shows as
+  working, since those always finish and Claude carries on by itself.
+
 ### Fixed
+- **Terminals stay live while another program uses every core (Windows).** A CPU-bound
+  job on all cores (a simulation, a big build) left Arbiter's window responsive but its
+  terminals frozen: output showed seconds or minutes late, typing went nowhere, and the
+  working animation stopped. Arbiter, and each pane's console host and shell, and the
+  agent or ssh client running in it, now run at above-normal priority. Programs started in
+  a pane do not inherit it, so the job itself still runs at normal priority. Measured with
+  every core busy: keystroke echo in a Claude pane went from 278 ms (and redraws stalled
+  for over 3 s) to under 5 ms.
 - **Each workspace remembers its focused terminal across a restart.** A relaunch used
   to focus the first terminal of every workspace; it now comes back to the one that had
   focus when Arbiter closed.

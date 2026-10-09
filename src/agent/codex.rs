@@ -59,6 +59,7 @@ pub static PROFILE: ScreenProfile = ScreenProfile {
         min_hints: 1,
     },
     waiting_rows: &[],
+    shells: &[],
     prompt: PromptShape {
         glyphs: &['\u{203a}'],
         boxed: None,

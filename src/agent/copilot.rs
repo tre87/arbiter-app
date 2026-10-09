@@ -34,6 +34,7 @@ pub static PROFILE: ScreenProfile = ScreenProfile {
     scrolled: &[],
     menu: MenuRule { rows: 12, anywhere: &[], whole_row: &[], edges: &['\u{2502}'], hints: &[], min_hints: 2 },
     waiting_rows: &[],
+    shells: &[],
     prompt: PromptShape {
         glyphs: &['\u{276f}'],
         boxed: None,

@@ -506,16 +506,27 @@ impl VtTerm {
         ROWS.with(|rows| {
             let mut rows = rows.borrow_mut();
             self.fill_visible_rows(&mut rows);
+            let idle_box = self.chrome(p);
             ScreenState {
                 menu: agent_screen::menu_in(p, &rows),
                 scrolled: agent_screen::scrolled_in(p, &rows),
                 waiting: agent_screen::waiting_in(p, &rows),
                 working: self.below_cursor_contains(p.chrome_rows_below, p.working_footer)
                     || agent_screen::working_row_in(p, &rows),
-                idle_box: self.chrome(p),
+                idle_box,
                 slash_input: self.input_row_is_slash(p),
+                shells: self.background_shells(p, idle_box),
             }
         })
+    }
+
+    /// The footer's count of background shells, 0 when the footer shows none. Read only
+    /// with the agent's chrome on screen, where the footer is.
+    fn background_shells(&self, p: &ScreenProfile, chrome: bool) -> Option<u32> {
+        if p.shells.is_empty() || !chrome {
+            return None;
+        }
+        Some(self.below_cursor_find(p.chrome_rows_below, |row| agent_screen::shell_count(p, row)).unwrap_or(0))
     }
 
     /// The text of every visible row, top to bottom.
@@ -584,6 +595,11 @@ impl VtTerm {
     }
 
     fn below_cursor_any(&self, below: usize, matches: impl Fn(&str) -> bool) -> bool {
+        self.below_cursor_find(below, |row| matches(row).then_some(())).is_some()
+    }
+
+    /// The first reading `find` takes from the cursor's row or the `below` rows under it.
+    fn below_cursor_find<T>(&self, below: usize, find: impl Fn(&str) -> Option<T>) -> Option<T> {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let grid = self.term.grid();
@@ -597,11 +613,11 @@ impl VtTerm {
             for col in 0..cols {
                 buf.push(line[Column(col)].c);
             }
-            if matches(&buf) {
-                return true;
+            if let Some(found) = find(&buf) {
+                return Some(found);
             }
         }
-        false
+        None
     }
 
     /// The text of the row the cursor is on, trailing blanks trimmed. Read at Enter, it
@@ -959,17 +975,36 @@ mod tests {
         assert!(matches("http://").is_empty()); // scheme with no body
     }
 
-    // Either kind of outstanding work holds the pane, and a plain turn end does not.
+    // Waiting on agents holds the pane. A turn that left a shell running is a turn end
+    // like any other, whatever its summary line says.
     #[test]
-    fn background_work_of_either_kind_is_seen_on_screen() {
+    fn only_a_wait_on_agents_is_seen_as_one() {
         let seen = |line: &str| {
             let mut t = super::VtTerm::new(80, 4);
             t.feed(line.as_bytes());
             t.screen_state(&CLAUDE).waiting
         };
         assert!(seen("✳ Waiting for 2 background agents to finish"));
-        assert!(seen("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
+        assert!(!seen("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
         assert!(!seen("✻ Brewed for 14m 1s · done 11:40 PM"));
+    }
+
+    // The shell count is read under the cursor, where the chrome is: the mode line keeps
+    // it up for as long as the shell runs, while the summary line above scrolls away.
+    #[test]
+    fn the_footer_count_of_background_shells_is_read_under_the_cursor() {
+        let shells = |footer: &str| {
+            let mut t = super::VtTerm::new(80, 8);
+            let rule = "────────────────────────────────────────";
+            let lines = ["✻ Cogitated for 4s · done 12:12 AM · 2 shells still running", rule, "❯ ", rule, footer];
+            t.feed(lines.join("\r\n").as_bytes());
+            t.feed(b"\x1b[3;3H");
+            t.screen_state(&CLAUDE).shells
+        };
+        assert_eq!(shells("  ⏸ manual mode on · 2 shells"), Some(2));
+        assert_eq!(shells("  ⏸ manual mode on"), Some(0));
+        // No chrome under the cursor (a chooser over the box): the count is unknown.
+        assert_eq!(shells("  ↑/↓ to navigate · Enter to select"), None);
     }
 
     // With the input box on screen, the row has to be the last thing above it. The
@@ -1009,10 +1044,9 @@ mod tests {
             rule,
             footer,
         ]));
-        // A shell still running, then a new prompt the user sent after it.
-        assert!(screen(&["✻ Brewed for 3s · 1 shell still running", "", rule, "❯ ", rule]));
+        // A prompt the user sent after it, echoed below the row.
         assert!(!screen(&[
-            "✻ Brewed for 3s · 1 shell still running",
+            "✳ Waiting for 2 background agents to finish",
             "",
             "> run the tests",
             "",

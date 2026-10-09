@@ -8,8 +8,8 @@
 //! never fight over a single field; each just stamps its latest event time or level.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agent::{AgentEvent, AgentKind};
@@ -33,6 +33,9 @@ pub struct AgentStatus {
     /// Moves when the pane's agent changes kind, so the UI can treat the new one as a
     /// first sighting rather than a transition of the old.
     pub epoch: u64,
+    /// Shells the agent left running in the background, by its footer. Not work: the
+    /// lifecycle never reads it, since a dev server can run for as long as the session.
+    pub shells: u32,
 }
 
 /// What said which agent a pane runs. A weaker source never overrides a stronger one
@@ -59,6 +62,8 @@ pub struct AgentHandle {
     /// This pane's id (== `Session.id`), set as `ARBITER_PANE_ID` on its shell, which is
     /// how the agent's hooks name the pane their events belong to.
     pub pane_id: u64,
+    /// The pane's shell process, set once it is spawned; where agents are looked for.
+    pub shell_pid: OnceLock<u32>,
     pub cwd: Arc<Mutex<Option<String>>>,
     /// A LOCAL agent process runs in this pane (the scan saw it, or its hook spoke).
     pub running: Arc<AtomicBool>,
@@ -94,13 +99,14 @@ pub struct AgentHandle {
     /// Set when the transcript was scrolled away during a live turn: the turn is held as
     /// working, frames or not, until the row is back in view (then it gets a fresh TTL).
     scroll_holds_working: AtomicBool,
-    /// The status row says background work is outstanding: agents it launched, or a
-    /// shell it started in the background (see `ScreenProfile::waiting_rows`). Its turn
-    /// has ended by every other sign, the Stop hook included, yet it resumes by itself
-    /// when that work reports, so the pane is held as working for as long as the row
-    /// shows; when the row goes, the resumed turn gets a fresh TTL to show its first
-    /// frames in.
+    /// The status row says the agent waits on agents it launched (see
+    /// `ScreenProfile::waiting_rows`). Its turn has ended by every other sign, the Stop
+    /// hook included, yet it resumes by itself when they report, so the pane is held as
+    /// working for as long as the row shows; when the row goes, the resumed turn gets a
+    /// fresh TTL to show its first frames in.
     waiting_background: AtomicBool,
+    /// Background shells by the footer's count (see `AgentStatus::shells`).
+    background_shells: AtomicU32,
     /// Spinner detection is ignored until this time: set briefly on app-initiated
     /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
     suppress_until_ms: AtomicU64,
@@ -211,7 +217,7 @@ const ROW_END_CONFIRM_MS: u64 = 400;
 /// finish. Claude takes a few hundred ms to cancel the request and redraw.
 const INTERRUPT_WINDOW_MS: u64 = 1500;
 /// How long after a Stop hook the background-work check is made (see `count_stop`).
-/// The hook and the summary line are written together; this covers the reader drawing it.
+/// The hook and the waiting row are written together; this covers the reader drawing it.
 const STOP_CONFIRM_MS: u64 = 250;
 /// A second turn end this soon after one, with no work in between, is the same one
 /// reported twice (see `last_finish_ms`).
@@ -233,6 +239,7 @@ impl AgentHandle {
     pub fn new(pane_id: u64, cwd: Arc<Mutex<Option<String>>>, running: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             pane_id,
+            shell_pid: OnceLock::new(),
             cwd,
             running,
             kind: AtomicU8::new(0),
@@ -248,6 +255,7 @@ impl AgentHandle {
             scrolled: AtomicBool::new(false),
             scroll_holds_working: AtomicBool::new(false),
             waiting_background: AtomicBool::new(false),
+            background_shells: AtomicU32::new(0),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             menu_gap: AtomicU64::new(0),
@@ -358,6 +366,7 @@ impl AgentHandle {
         ] {
             f.store(false, Ordering::Relaxed);
         }
+        self.background_shells.store(0, Ordering::Relaxed);
         self.sessions.lock().unwrap().clear();
     }
 
@@ -374,6 +383,7 @@ impl AgentHandle {
             f.store(false, Ordering::Relaxed);
         }
         self.turn_started_ms.store(0, Ordering::Relaxed);
+        self.background_shells.store(0, Ordering::Relaxed);
         if !self.on_screen() {
             self.clear_kind();
         }
@@ -435,6 +445,7 @@ impl AgentHandle {
         }
         // Its screen went away with no turn in flight: the agent exited, whatever was typed.
         self.waiting_background.store(false, Ordering::Relaxed);
+        self.background_shells.store(0, Ordering::Relaxed);
         self.remote_typed.store(false, Ordering::Relaxed);
         *self.remote_session.lock().unwrap() = None;
         if !self.running.load(Ordering::Relaxed) {
@@ -840,10 +851,10 @@ impl AgentHandle {
     }
 
     /// A reported turn end (a Stop hook, a turn-end notification): the authoritative one.
-    /// Not counted while the agent is waiting on its own background work, since Claude's
-    /// hook fires then too and it resumes by itself. The hook can be handled before the
-    /// reader has seen the line that says so ("· 1 shell still running" is drawn with
-    /// the turn's summary), so the check is made `STOP_CONFIRM_MS` later rather than at once.
+    /// Not counted while the agent is waiting on agents it launched, since Claude's hook
+    /// fires then too and it resumes by itself. The hook can be handled before the reader
+    /// has seen the row that says so, so the check is made `STOP_CONFIRM_MS` later rather
+    /// than at once.
     fn count_stop(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let at = std::time::Instant::now() + Duration::from_millis(STOP_CONFIRM_MS);
@@ -917,15 +928,23 @@ impl AgentHandle {
         self.scrolled.load(Ordering::Relaxed)
     }
 
-    /// Reader: whether the status row says background agents or a background shell are
-    /// outstanding. While it does the pane is working (see `waiting_background`); when
-    /// the row goes, the turn the agent resumes with gets a fresh TTL, so the moment
-    /// before its first frames pair up is not read as a turn end. A wait the user broke
-    /// off with Escape ends the same way, one TTL later.
+    /// Reader: whether the status row says the agent waits on agents it launched. While it
+    /// does the pane is working (see `waiting_background`); when the row goes, the turn
+    /// the agent resumes with gets a fresh TTL, so the moment before its first frames pair
+    /// up is not read as a turn end. A wait the user broke off with Escape ends the same
+    /// way, one TTL later.
     pub fn set_waiting_background(&self, on: bool) {
         let was = self.waiting_background.swap(on, Ordering::Relaxed);
         if was && !on {
             self.activity_ms.store(now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Reader: the footer's count of background shells. `None` (no footer on screen)
+    /// keeps the last count.
+    pub fn set_background_shells(&self, count: Option<u32>) {
+        if let Some(n) = count {
+            self.background_shells.store(n, Ordering::Relaxed);
         }
     }
 
@@ -1029,6 +1048,7 @@ impl AgentHandle {
             lifecycle: self.lifecycle(),
             kind: self.kind(),
             epoch: self.epoch.load(Ordering::Relaxed),
+            shells: self.background_shells.load(Ordering::Relaxed),
         }
     }
 }
@@ -1335,6 +1355,24 @@ mod tests {
         h.set_waiting_background(true);
         h.set_menu(true, false);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Attention);
+    }
+
+    // A shell left running (a dev server) is shown beside the pane, never held as work:
+    // the turn's Stop counts as its finish, and a footer the reader cannot see (a chooser
+    // over it) keeps the count it last read.
+    #[test]
+    fn a_background_shell_is_not_work() {
+        let h = handle();
+        h.set_background_shells(Some(2));
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        assert_eq!(h.snapshot().shells, 2);
+        h.set_background_shells(None);
+        assert_eq!(h.snapshot().shells, 2);
+        h.apply(AgentKind::Claude, None, &AgentEvent::TurnEnded);
+        std::thread::sleep(Duration::from_millis(super::STOP_CONFIRM_MS + 150));
+        assert_eq!(h.finish_seq(), 1);
+        h.end_session();
+        assert_eq!(h.snapshot().shells, 0);
     }
 
     // A stronger witness to which agent runs here is not overridden by a weaker one

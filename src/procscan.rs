@@ -88,9 +88,10 @@ fn looks_like_env_assignment(s: &str) -> bool {
     }
 }
 
-/// The agent running as a descendant of `shell_pid`, if any: the one nearest the shell,
-/// since an agent's own children can be agents too (Claude running `codex mcp-server`).
-pub fn agent_under(shell_pid: u32) -> Option<AgentKind> {
+/// The agent running as a descendant of `shell_pid`, and its pid, if any: the one nearest
+/// the shell, since an agent's own children can be agents too (Claude running
+/// `codex mcp-server`).
+pub fn agent_under(shell_pid: u32) -> Option<(AgentKind, u32)> {
     shared_system().with(Duration::from_millis(250), |sys| {
         let mut best: Option<(usize, AgentKind, u32)> = None;
         for (pid, proc) in sys.processes() {
@@ -110,26 +111,26 @@ pub fn agent_under(shell_pid: u32) -> Option<AgentKind> {
                 ancestry_chain(sys, pid),
             ));
         }
-        Some(kind)
+        Some((kind, pid))
     })
 }
 
-/// True if an SSH (or mosh) client is a descendant of `shell_pid`, i.e. this pane is
-/// driving a shell on another machine. Scanned on the same OSC-133 busy edge as
+/// The pid of an SSH (or mosh) client descended from `shell_pid`, if there is one, i.e.
+/// this pane is driving a shell on another machine. Scanned on the same OSC-133 busy edge as
 /// `agent_under`, off the same 250ms-gated snapshot, so it costs nothing extra.
 ///
 /// A remote pane needs different treatment in two places: the agent runs on the far
 /// host, so the process scan and the hooks can never see it (the pane is recognised from
 /// the agent's on-screen chrome instead), and the local shell stays "busy" for the whole
 /// session, so its busy dot would otherwise be stuck on.
-pub fn ssh_under(shell_pid: u32) -> bool {
+pub fn ssh_under(shell_pid: u32) -> Option<u32> {
     shared_system().with(Duration::from_millis(250), |sys| {
-        for (pid, proc) in sys.processes() {
-            if is_ssh_name(&proc.name().to_string_lossy()) && is_descendant(sys, pid.as_u32(), shell_pid) {
-                return true;
-            }
-        }
-        false
+        sys.processes()
+            .iter()
+            .find(|(pid, proc)| {
+                is_ssh_name(&proc.name().to_string_lossy()) && is_descendant(sys, pid.as_u32(), shell_pid)
+            })
+            .map(|(pid, _)| pid.as_u32())
     })
 }
 

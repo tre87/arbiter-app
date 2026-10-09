@@ -513,6 +513,29 @@ mod tests {
         assert!(raster('a').2 > 0);
     }
 
+    // A thread that rasterised and then exited must leave the next thread able to. Its
+    // context used to be released by the exit itself, and the next thread's first render
+    // then never returned; the test runner put these tests on separate threads, so they hung
+    // whenever two ran one after the other.
+    #[test]
+    fn a_thread_that_rasterised_and_exited_leaves_the_next_one_working() {
+        let raster = |chars: &'static [char]| {
+            std::thread::spawn(move || {
+                for &ch in chars {
+                    sig(super::rasterize("Cascadia Mono", &[], 0, None, 16.0, ch, false, false, false));
+                }
+            })
+        };
+        raster(&['H', '\u{F02B}']).join().unwrap();
+        let next = raster(&[NOWHERE, 'a']);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !next.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the second thread's render hung");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        next.join().unwrap();
+    }
+
     // An icon at the text size is already wider than a cell and taller than a capital:
     // what the one-cell renderer had been shrinking (see `gpu::fit_to_box`'s tests).
     #[test]
@@ -546,6 +569,7 @@ mod icon_tests {
 mod dwrite {
     use super::GlyphBitmap;
     use std::cell::RefCell;
+    use std::mem::ManuallyDrop;
     use windows::core::{Result, PCWSTR};
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
@@ -616,7 +640,12 @@ mod dwrite {
     }
 
     thread_local! {
-        static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
+        // Never released by the thread's exit: Rust runs thread-local destructors from the
+        // thread-exit TLS callback, under the loader lock, and releasing these COM objects
+        // there left the next thread's first render hung in WIC/D2D for good (the raster
+        // tests, one thread each, hung that way). A context is dropped only in `rasterize`,
+        // when the font or size changes, which is ordinary code.
+        static CTX: RefCell<Option<ManuallyDrop<Ctx>>> = const { RefCell::new(None) };
     }
 
     pub fn rasterize(
@@ -634,7 +663,10 @@ mod dwrite {
                 .as_ref()
                 .map_or(true, |c| c.name != font_name || (c.em - em_px).abs() > 0.5);
             if stale {
-                *cell = build_ctx(font_name, bold_data, em_px).ok();
+                if let Some(old) = cell.take() {
+                    drop(ManuallyDrop::into_inner(old));
+                }
+                *cell = build_ctx(font_name, bold_data, em_px).ok().map(ManuallyDrop::new);
             }
             let ctx = cell.as_ref()?;
             // An icon given two cells is drawn larger (see `ICON_EM_SCALE`); the context

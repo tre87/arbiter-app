@@ -17,6 +17,9 @@ pub struct ScreenState {
     pub working: bool,
     pub idle_box: bool,
     pub slash_input: bool,
+    /// Background shells by the footer's count; `None` while the footer is not on screen
+    /// (a chooser covers it), which says nothing about them.
+    pub shells: Option<u32>,
 }
 
 /// The last `n` of `rows`.
@@ -83,9 +86,9 @@ pub fn menu_in(p: &ScreenProfile, rows: &[String]) -> bool {
     bottom(rows, p.menu.rows).iter().any(|r| is_menu_row(p, r))
 }
 
-/// Outstanding background work: with the input box's prompt among the live rows, only the
-/// last row drawn above it counts, the first that is neither blank, nor the box's border,
-/// nor a task-list item. Without the box any live row counts.
+/// The agent waiting on its own background work: with the input box's prompt among the
+/// live rows, only the last row drawn above it counts, the first that is neither blank,
+/// nor the box's border, nor a task-list item. Without the box any live row counts.
 pub fn waiting_in(p: &ScreenProfile, rows: &[String]) -> bool {
     if p.waiting_rows.is_empty() {
         return false;
@@ -100,6 +103,19 @@ pub fn waiting_in(p: &ScreenProfile, rows: &[String]) -> bool {
             .is_some_and(|r| waiting(r)),
         None => bottom(rows, p.live_rows).iter().any(|r| waiting(r)),
     }
+}
+
+/// The background-shell count `row` carries as a whole `·` segment ("2 shells"). The turn's
+/// summary line says "2 shells still running", which is not one, so only the footer counts.
+pub fn shell_count(p: &ScreenProfile, row: &str) -> Option<u32> {
+    if p.shells.is_empty() {
+        return None;
+    }
+    row.split('·').find_map(|segment| {
+        let (n, word) = segment.trim().split_once(' ')?;
+        let n = n.parse().ok()?;
+        p.shells.contains(&word).then_some(n)
+    })
 }
 
 /// Whether a row is the prompt line of the input box, possibly inside its side border.
@@ -206,8 +222,10 @@ mod tests {
         pub fn working_row_in(rows: &[String]) -> bool {
             bottom(rows, LIVE_ROWS).iter().any(|r| is_working_row(r))
         }
+        // Without the background-shell row it had: a shell left running is no longer a
+        // wait (it is shown beside the pane instead), so that reading changed on purpose.
         pub fn waiting_in(rows: &[String]) -> bool {
-            let waiting = |row: &str| is_waiting_agents_row(row) || is_background_shell_row(row);
+            let waiting = |row: &str| is_waiting_agents_row(row);
             let start = rows.len().saturating_sub(LIVE_ROWS);
             match (start..rows.len()).rev().find(|&i| is_prompt_at(rows, i)) {
                 Some(prompt) => rows[..prompt]
@@ -260,11 +278,6 @@ mod tests {
         pub fn is_waiting_agents_row(row: &str) -> bool {
             let Some(rest) = status_row_text(row) else { return false };
             rest.starts_with("Waiting for ") && rest.contains(" background agent") && rest.contains(" to finish")
-        }
-        pub fn is_background_shell_row(row: &str) -> bool {
-            let Some(rest) = status_row_text(row) else { return false };
-            rest.contains(" still running")
-                && (rest.contains(" shell still running") || rest.contains(" shells still running"))
         }
         pub fn is_working_row(row: &str) -> bool {
             status_row_text(row).is_some_and(|rest| rest.contains("esc to interrupt"))
@@ -390,11 +403,6 @@ mod tests {
                 row_matches(&CLAUDE, &CLAUDE.waiting_rows[0], row),
                 legacy::is_waiting_agents_row(row),
                 "agents {row:?}"
-            );
-            assert_eq!(
-                row_matches(&CLAUDE, &CLAUDE.waiting_rows[1], row),
-                legacy::is_background_shell_row(row),
-                "shell {row:?}"
             );
         }
     }
@@ -533,22 +541,39 @@ mod tests {
         assert!(!row(""));
     }
 
-    // A finished turn's line while a shell Claude started in the background runs on.
-    // The first is captured from a real session; the verb and the clock both vary.
+    // A turn that left a dev server running is over: the summary line above the box says
+    // so, and nothing about it holds the pane working.
     #[test]
-    fn the_background_shell_row_is_known_by_its_shape() {
-        let row = |r: &str| super::row_matches(&CLAUDE, &CLAUDE.waiting_rows[1], r);
-        assert!(row("✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running"));
-        assert!(row("✳ Cooked for 3s · done 9:02 AM · 2 shells still running   "));
-        assert!(row("· Baked for 1m 12s · 1 shell still running"));
-        // The same turn with nothing left behind is an ordinary turn end.
-        assert!(!row("✻ Brewed for 14m 1s · done 11:40 PM"));
-        assert!(!row("✻ Brewed for 7s"));
-        // The same words where Claude writes them in its transcript, or in a pane that
-        // is not Claude's status row at all.
-        assert!(!row("● The build is done, 1 shell still running in the background."));
-        assert!(!row("  1 shell still running"));
-        assert!(!row("⏵⏵ auto mode on · 1 shell · ← for agents"));
-        assert!(!row(""));
+    fn a_shell_left_running_is_not_a_wait() {
+        let rows: Vec<String> = [
+            "● done",
+            "",
+            "✻ Cogitated for 4s · done 12:12 AM · 2 shells still running",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  ⏸ manual mode on · 2 shells",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(!super::waiting_in(&CLAUDE, &rows));
+    }
+
+    // The mode line's count, against the same words in the summary line, the agents
+    // hint and the transcript. The first two rows are captured from Claude 2.1.291 and a
+    // real session.
+    #[test]
+    fn the_footer_counts_background_shells() {
+        let count = |r: &str| super::shell_count(&CLAUDE, r);
+        assert_eq!(count("  ⏸ manual mode on · 2 shells"), Some(2));
+        assert_eq!(count("⏵⏵ auto mode on · 1 shell · ← for agents"), Some(1));
+        assert_eq!(count("  ? for shortcuts · 12 shells"), Some(12));
+        assert_eq!(count("✻ Cogitated for 4s · done 12:12 AM · 2 shells still running"), None);
+        assert_eq!(count("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent"), None);
+        assert_eq!(count("  ⏸ manual mode on"), None);
+        assert_eq!(count("● The build is done, 1 shell still running in the background."), None);
+        assert_eq!(count("  shells · many shells"), None);
+        assert_eq!(count(""), None);
     }
 }

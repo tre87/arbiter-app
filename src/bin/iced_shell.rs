@@ -1677,7 +1677,7 @@ fn office_sync(state: &mut State) -> bool {
     // handed out in and therefore the order desks fill.
     let now = now_ms();
     let done = &state.office_done;
-    let live: Vec<(String, Desk, String, String)> = state
+    let live: Vec<(String, Desk, String, String, u8)> = state
         .workspaces
         .iter()
         .flat_map(|ws| {
@@ -1685,15 +1685,16 @@ fn office_sync(state: &mut State) -> bool {
                 if !d.session.agent_running() {
                     return None;
                 }
-                let lc = d.session.agent_status().lifecycle;
-                let desk = match pane_dot(true, lc, false) {
+                let status = d.session.agent_status();
+                let desk = match pane_dot(true, status.lifecycle, false) {
                     Dot::Working => Desk::Working,
                     Dot::Attention => Desk::Attention,
                     // Green for a while after a turn ended, then ready.
                     _ if done.get(&d.history_id).is_some_and(|until| now < *until) => Desk::Done,
                     _ => Desk::Ready,
                 };
-                Some((d.history_id.clone(), desk, ws.name.clone(), d.name.clone()))
+                let servers = status.shells.min(u8::MAX as u32) as u8;
+                Some((d.history_id.clone(), desk, ws.name.clone(), d.name.clone(), servers))
             })
         })
         .collect();
@@ -1719,6 +1720,7 @@ fn office_sync(state: &mut State) -> bool {
     let mut scene = agents_office::Scene {
         desks: vec![Desk::Empty; state.office_seats.len()],
         labels: vec![(String::new(), String::new()); state.office_seats.len()],
+        servers: vec![0; state.office_seats.len()],
         ..agents_office::Scene::default()
     };
     // Auto drifts the sky on the room's own clock, which only runs while some agent
@@ -1736,13 +1738,15 @@ fn office_sync(state: &mut State) -> bool {
     scene.selected = state.office_hovered.filter(|i| *i < scene.desks.len());
     for (i, seat) in state.office_seats.iter().enumerate() {
         let Some(s) = seat else { continue };
-        if let Some((_, desk, ws, pane)) = live.iter().find(|(h, ..)| *h == s.id) {
+        if let Some((_, desk, ws, pane, servers)) = live.iter().find(|(h, ..)| *h == s.id) {
             scene.desks[i] = *desk;
             scene.labels[i] = (ws.clone(), pane.clone());
+            scene.servers[i] = *servers;
         }
     }
     let changed = scene.desks != state.office_scene.desks
         || scene.labels != state.office_scene.labels
+        || scene.servers != state.office_scene.servers
         || scene.selected != state.office_scene.selected
         || scene.weather != state.office_scene.weather
         || scene.show_names != state.office_scene.show_names;
@@ -5376,8 +5380,12 @@ fn tab_pill(
         .align_y(iced::Center)
         .height(Length::Fixed(26.0));
     // After the name, before the close: a pulsing dot when a terminal in this workspace
-    // has Claude working (azure) or needing attention (amber, takes priority).
-    if let Some(dot) = workspace_dot(ws) {
+    // has Claude working (azure) or needing attention (amber, takes priority), ringed
+    // while an agent here has a shell running in the background.
+    let dot = workspace_dot(ws);
+    if workspace_has_shells(ws) {
+        content = content.push(tab_ring(dot));
+    } else if let Some(dot) = dot {
         content = content.push(nudge_down_1px(tab_status_dot(dot)));
     }
     if show_close {
@@ -7126,11 +7134,12 @@ fn main_view(state: &State) -> Element<'_, Message> {
         let cstatus = data.session.agent_status();
         let lc = cstatus.lifecycle;
         let status = claude_running.then(|| pane_dot(true, lc, false));
+        let shells = if claude_running { cstatus.shells } else { 0 };
         // Right-clicking the header opens the same context menu as the terminal body
         // (anchored at the cursor); left-clicks still fall through to focus / the
         // header's own buttons (mouse_area only captures the right-press).
         let header: Element<Message> = mouse_area(pane_header(
-            &data.name, focused, data.shell, has_git_bash, pane, status,
+            &data.name, focused, data.shell, has_git_bash, pane, status, shells,
             // Held connections (dialog up) are idle and not yet remote, which would read
             // as "dropped" on every restored pane behind the scrim.
             data.session.show_reconnect() && state.connect_prompt.is_none(),
@@ -7406,11 +7415,11 @@ fn notify_agent_transitions(state: &mut State) -> Task<Message> {
             };
             if let Some(title) = title {
                 next.last_was_finished = !asking;
-                raised.push(Message::Notify {
-                    title,
-                    body: format!("{} · {}", d.name, ws.name),
-                    target: Some(id),
-                });
+                let mut body = format!("{} · {}", d.name, ws.name);
+                if !asking && status.shells > 0 {
+                    body = format!("{body} · {} running", shells_label(status.shells));
+                }
+                raised.push(Message::Notify { title, body, target: Some(id) });
                 next.last_raised = now;
             }
             seen.insert(id, next);
@@ -7715,10 +7724,12 @@ fn overview_view(state: &State) -> Element<'_, Message> {
 
         for (pane, data) in panes {
             let running = data.session.agent_running();
-            let lc = data.session.agent_status().lifecycle;
+            let status = data.session.agent_status();
+            let lc = status.lifecycle;
             let busy = data.session.shell_busy();
             let dot = pane_dot(running, lc, busy);
             let attention = matches!(dot, Dot::Attention);
+            let shells = if running { status.shells } else { 0 };
 
             // Truncate the title so it can't push the right cluster (git stats + status
             // dot) out of its column or wrap to a second line. Width-aware char budget:
@@ -7732,7 +7743,8 @@ fn overview_view(state: &State) -> Element<'_, Message> {
                 let seg = |n: u32| if n > 0 { (1 + n.to_string().len()) as f32 * 6.5 + 6.0 } else { 0.0 };
                 seg(g.staged) + seg(g.unstaged) + seg(g.untracked)
             });
-            let reserved = 66.0 + git_px + if running { 19.0 } else { 0.0 };
+            let shells_px = if shells > 0 { 22.0 + shells.to_string().len() as f32 * 6.5 } else { 0.0 };
+            let reserved = 66.0 + git_px + shells_px + if running { 19.0 } else { 0.0 };
             let max_chars = (((state.overview_size.width - reserved) / 6.0) as i32).max(6) as usize;
 
             // Left: the agent's icon (when one runs) + terminal name. Raised 1px so the
@@ -7754,15 +7766,20 @@ fn overview_view(state: &State) -> Element<'_, Message> {
             // a Fill-width text in this flex layout, so an over-long title still wraps —
             // clamping to one line's height (16px) and clipping renders only that first
             // line, so the row can never grow to two lines regardless.
-            let r = row![
+            let mut r = row![
                 container(left).width(Length::Fill).height(Length::Fixed(16.0)).clip(true),
                 overview_git(&data.session),
-                container(indicator(dot, 12))
-                    .width(Length::Fixed(22.0))
-                    .center_x(Length::Fixed(22.0)),
             ]
             .spacing(8)
             .align_y(iced::Center);
+            if shells > 0 {
+                r = r.push(
+                    row![cmdi(mdi_path::CONSOLE, 11.0, TXT_MUTED), text(shells.to_string()).size(11).color(TXT_MUTED)]
+                        .spacing(3)
+                        .align_y(iced::Center),
+                );
+            }
+            let r = r.push(container(indicator(dot, 12)).width(Length::Fixed(22.0)).center_x(Length::Fixed(22.0)));
 
             // A waiting Claude gets its row washed amber, not only its dot.
             let style: fn(&iced::Theme, button::Status) -> button::Style =
@@ -8920,13 +8937,61 @@ fn workspace_dot(ws: &Workspace) -> Option<Dot> {
 /// steady "waiting" states that appear/disappear event-driven, so neither needs a
 /// fast tick, keeping a prompt or a long-running command from pinning the UI at 60fps.
 fn tab_status_dot(dot: Dot) -> Element<'static, Message> {
+    text("●").size(8).color(tab_dot_color(dot)).into()
+}
+
+fn tab_dot_color(dot: Dot) -> iced::Color {
     let rgba = iced::Color::from_rgba8;
-    let c = match dot {
-        Dot::Attention => rgba(0xe5, 0xa0, 0x3c, 1.0),               // amber — needs input (solid)
-        Dot::Running => rgba(0x22, 0xc5, 0x5e, 1.0),                 // green — shell busy (solid)
-        _ => rgba(0x4d, 0xa6, 0xff, pulse_alpha(1500)),             // azure — Claude working
-    };
-    text("●").size(8).color(c).into()
+    match dot {
+        Dot::Attention => rgba(0xe5, 0xa0, 0x3c, 1.0), // amber: needs input (solid)
+        Dot::Running => rgba(0x22, 0xc5, 0x5e, 1.0),   // green: shell busy (solid)
+        _ => rgba(0x4d, 0xa6, 0xff, pulse_alpha(1500)), // azure: Claude working
+    }
+}
+
+/// Whether an agent in this workspace has a shell running in the background, for the
+/// ring around the tab's dot. A layer apart from `workspace_dot`, so it hides nothing:
+/// the dot keeps saying the most urgent thing.
+fn workspace_has_shells(ws: &Workspace) -> bool {
+    ws.panes.iter().any(|(_, d)| d.session.agent_running() && d.session.agent_status().shells > 0)
+}
+
+/// The tab's status mark with the background-shell ring: the dot inside the ring, or the
+/// ring alone when nothing else is going on. Green like a running command, and hollow
+/// because the shell runs behind the agent rather than in the pane's foreground.
+fn tab_ring(dot: Option<Dot>) -> Element<'static, Message> {
+    // Drawn, not the dot glyph: a glyph sits a pixel high in its line, which the ring
+    // around it would show.
+    let inner = container(Space::new(Length::Fixed(4.0), Length::Fixed(4.0))).style(move |_t: &iced::Theme| {
+        container::Style {
+            background: dot.map(|d| iced::Background::Color(tab_dot_color(d))),
+            border: iced::Border { radius: 2.0.into(), ..Default::default() },
+            ..Default::default()
+        }
+    });
+    container(inner)
+        .width(Length::Fixed(10.0))
+        .height(Length::Fixed(10.0))
+        .center_x(Length::Fixed(10.0))
+        .center_y(Length::Fixed(10.0))
+        .style(|_t: &iced::Theme| container::Style {
+            border: iced::Border { color: iced::Color::from_rgb8(0x22, 0xc5, 0x5e), width: 1.0, radius: 5.0.into() },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn shells_label(n: u32) -> String {
+    if n == 1 { "1 shell".to_string() } else { format!("{n} shells") }
+}
+
+/// "N shells" beside a console icon, muted: shells an agent left running in the
+/// background. Static, since one can run for the whole session.
+fn shell_chip(n: u32) -> Element<'static, Message> {
+    row![cmdi(mdi_path::CONSOLE, 11.0, TXT_MUTED), text(shells_label(n)).size(10).color(TXT_MUTED)]
+        .spacing(3)
+        .align_y(iced::Center)
+        .into()
 }
 
 /// An agent's icon at `size` px.
@@ -8945,6 +9010,7 @@ fn pane_header(
     has_git_bash: bool,
     pane: pane_grid::Pane,
     status: Option<Dot>,
+    shells: u32,
     needs_reconnect: bool,
     copying_to: Option<&str>,
     round: iced::border::Radius,
@@ -8960,6 +9026,9 @@ fn pane_header(
         center = center.push(header_dot(d));
     }
     center = center.push(text(name.to_string()).size(11).color(color));
+    if shells > 0 {
+        center = center.push(container(shell_chip(shells)).padding(iced::Padding { left: 4.0, ..Default::default() }));
+    }
     // Nudge the dot + name down 1px (top padding shifts centred content by half its value).
     let center = container(center)
         .center_x(Length::Fill)
@@ -10645,6 +10714,7 @@ fn main() -> iced::Result {
     }
 
     install_panic_log();
+    arbiter_native::priority::raise_self();
     let _ = iced_winit::conversion::OCCLUSION_HOOK.set(on_occluded);
     arbiter_native::memdiag::start_summary_thread();
     let saved = arbiter_native::persist::load();

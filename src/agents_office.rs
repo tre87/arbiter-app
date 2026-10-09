@@ -707,6 +707,10 @@ pub struct Scene {
     /// The nameplate under each desk: the workspace, then the pane. Kept the same
     /// length as `desks`; a free desk carries empty strings and draws nothing.
     pub labels: Vec<(String, String)>,
+    /// Shells each desk's agent left running in the background, drawn as server boxes
+    /// under the desk. Kept the same length as `desks`. Never a state: a dev server can
+    /// run all day, so the boxes are still pixels and earn no clock.
+    pub servers: Vec<u8>,
     /// Draw the nameplates. Off gives the room back as pure art.
     pub show_names: bool,
     pub selected: Option<usize>,
@@ -718,6 +722,7 @@ impl Default for Scene {
         Scene {
             desks: vec![Desk::Empty; COLS],
             labels: vec![(String::new(), String::new()); COLS],
+            servers: vec![0; COLS],
             show_names: true,
             selected: None,
             weather: Weather::default(),
@@ -742,11 +747,13 @@ impl Scene {
                 self.desks.extend(std::iter::repeat(Desk::Empty).take(COLS));
                 self.labels
                     .resize(self.desks.len(), (String::new(), String::new()));
+                self.servers.resize(self.desks.len(), 0);
                 i
             }
         };
         self.desks[i] = state;
         self.labels[i] = (workspace.to_string(), pane.to_string());
+        self.servers[i] = 0;
         i
     }
 
@@ -756,6 +763,7 @@ impl Scene {
         if let Some(i) = self.desks.iter().rposition(|d| *d != Desk::Empty) {
             self.desks[i] = Desk::Empty;
             self.labels[i] = (String::new(), String::new());
+            self.servers[i] = 0;
         }
         while self.desks.len() > COLS
             && self.desks[self.desks.len() - COLS..]
@@ -764,6 +772,7 @@ impl Scene {
         {
             self.desks.truncate(self.desks.len() - COLS);
             self.labels.truncate(self.desks.len());
+            self.servers.truncate(self.desks.len());
             if self.selected.is_some_and(|s| s >= self.desks.len()) {
                 self.selected = None;
             }
@@ -993,7 +1002,8 @@ pub fn render(scene: &Scene, t: f32) -> Buf {
     let mut b = Buf::new(w, h);
     room(&mut b, scene, t);
     for (i, desk) in scene.desks.iter().enumerate() {
-        station(&mut b, i, *desk, scene.selected == Some(i), t);
+        let servers = scene.servers.get(i).copied().unwrap_or(0);
+        station(&mut b, i, *desk, servers, scene.selected == Some(i), t);
     }
     // A faint scanline over everything, which is the cheapest way to stop a
     // field of flat rectangles reading as a chart.
@@ -1586,9 +1596,29 @@ fn light_and_shadow(b: &mut Buf, cx: i32, r: i32, d: Desk, lean: i32, t: f32) {
     b.fill(ch - 1, r + FLOOR_Y, 22, 2, Rgba(0, 0, 0, 0.3));
 }
 
+/// The most server boxes one desk shows; the space under the desk holds three.
+const MAX_SERVERS: u8 = 3;
+
+/// Small towers on the floor under the desk, one per shell the agent left running,
+/// packed against the pedestal. A lit power LED in the ceiling light's colour, since
+/// every saturated colour in the room already means a state and these are not one.
+fn servers_under_desk(b: &mut Buf, cx: i32, r: i32, n: u8) {
+    let h = 12;
+    let top = r + FLOOR_Y - h;
+    for k in 0..i32::from(n.min(MAX_SERVERS)) {
+        let x = cx + 15 - k * 6;
+        b.fill(x, top, 5, h, METAL_DK);
+        b.fill(x, top, 5, 1, METAL);
+        b.fill(x + 1, top + 5, 3, 1, rgb(0x1b, 0x1f, 0x25));
+        b.fill(x + 1, top + 7, 3, 1, rgb(0x1b, 0x1f, 0x25));
+        b.fill(x + 2, top + 1, 3, 3, CEIL_LIGHT.alpha(0.12));
+        b.fill(x + 3, top + 2, 1, 1, CEIL_LIGHT);
+    }
+}
+
 /// One workstation. Everything is positioned from the slot's centre `cx` and the
 /// row band top `r`, so a desk is identical wherever it lands.
-fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
+fn station(b: &mut Buf, i: usize, d: Desk, servers: u8, selected: bool, t: f32) {
     let (cx, r) = slot_origin(i);
     let shirt = SHIRTS[i % COLS];
     let trews = rgb(0x39, 0x42, 0x4d);
@@ -1696,6 +1726,9 @@ fn station(b: &mut Buf, i: usize, d: Desk, selected: bool, t: f32) {
     b.fill(cx + 24, r + DESK_Y + 11, 10, 1, POT_DK);
     b.fill(cx + 24, r + DESK_Y + 18, 10, 1, POT_DK);
     b.fill(cx - 16, r + FLOOR_Y, 52, 2, Rgba(0, 0, 0, 0.3));
+    if occupied && servers > 0 {
+        servers_under_desk(b, cx, r, servers);
+    }
 
     // Monitor. The screen faces the camera while the figure beside it stays in
     // profile: the standard side-view cheat, and the only way the screen can
@@ -1895,6 +1928,21 @@ mod tests {
             s.spawn_named(*d, ws, pane);
         }
         s
+    }
+
+    // A dev server left running shows under its desk and earns no clock: it can run all
+    // day.
+    #[test]
+    fn background_shells_are_still_boxes_under_the_desk() {
+        let plain = scene(&[Desk::Ready]);
+        let mut with = plain.clone();
+        with.servers[0] = 2;
+        assert!(!with.animates());
+        assert_ne!(render(&with, 0.0).px, render(&plain, 0.0).px, "the boxes are drawn");
+        // A free desk draws none, whatever the count says.
+        let mut free = Scene::default();
+        free.servers[0] = 2;
+        assert_eq!(render(&free, 0.0).px, render(&Scene::default(), 0.0).px);
     }
 
     #[test]

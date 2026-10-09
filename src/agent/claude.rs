@@ -68,23 +68,17 @@ pub static PROFILE: ScreenProfile = ScreenProfile {
         hints: &["to navigate", "to select", "Esc to cancel", "Enter to"],
         min_hints: 2,
     },
-    waiting_rows: &[
-        // "✳ Waiting for N background agents to finish".
-        RowRule {
-            lead: Lead::StatusGlyph,
-            starts: "Waiting for ",
-            all: &[" background agent", " to finish"],
-            any: &[],
-        },
-        // "✻ Brewed for 14m 1s · done 11:40 PM · 1 shell still running": the count comes
-        // before "shell" and may be plural; the verb, duration and clock vary.
-        RowRule {
-            lead: Lead::StatusGlyph,
-            starts: "",
-            all: &[" still running"],
-            any: &[" shell still running", " shells still running"],
-        },
-    ],
+    // "✳ Waiting for N background agents to finish".
+    waiting_rows: &[RowRule {
+        lead: Lead::StatusGlyph,
+        starts: "Waiting for ",
+        all: &[" background agent", " to finish"],
+        any: &[],
+    }],
+    // The mode line under the box, "⏸ manual mode on · 2 shells" (2.1.291, captured in a
+    // ConPTY) or "⏵⏵ auto mode on · 1 shell · ← for agents". Unlike the turn's summary
+    // line ("· 1 shell still running"), it stays up for as long as the shell does.
+    shells: &["shell", "shells"],
     prompt: PromptShape {
         glyphs: &['\u{276f}'],
         // Claude's plain fallback draws `>`, which is also how the transcript echoes a
