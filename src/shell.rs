@@ -116,17 +116,43 @@ fi
 "#;
 
 #[cfg(not(target_os = "windows"))]
-fn ensure_zsh_integration_dir() -> Option<std::path::PathBuf> {
-    let dir = dirs::data_dir()?
-        .join("arbiter-native")
-        .join("shell-integration")
-        .join("zsh");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::write(dir.join(".zshenv"), ZSH_ZSHENV).ok()?;
-    std::fs::write(dir.join(".zprofile"), ZSH_ZPROFILE).ok()?;
-    std::fs::write(dir.join(".zshrc"), ZSH_ZSHRC).ok()?;
-    std::fs::write(dir.join(".zlogin"), ZSH_ZLOGIN).ok()?;
-    Some(dir)
+fn zsh_integration_dir() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = app_data_dir()?.join("shell-integration").join("zsh");
+        let files =
+            [(".zshenv", ZSH_ZSHENV), (".zprofile", ZSH_ZPROFILE), (".zshrc", ZSH_ZSHRC), (".zlogin", ZSH_ZLOGIN)];
+        install_integration(&dir, &files).then_some(dir)
+    })
+    .as_deref()
+}
+
+/// Put a shell's integration files in `dir`, writing only those whose content on disk
+/// differs. Called once per run, before the first shell of that kind starts: every
+/// shell reads these files, and rewriting one a shell started moments earlier still has
+/// open fails on Windows with a sharing violation (os error 32). Rewritten per spawn,
+/// that left 4 of 26 PowerShell panes of one restore without any integration, so they
+/// never reported their folder and came back in the home folder next time.
+///
+/// False when a file is missing and cannot be written. A file that exists but could
+/// not be brought up to date is used as it is: an older integration is better than none.
+fn install_integration(dir: &std::path::Path, files: &[(&str, &str)]) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    files.iter().all(|(name, body)| {
+        let path = dir.join(name);
+        if std::fs::read(&path).is_ok_and(|on_disk| on_disk == body.as_bytes()) {
+            return true;
+        }
+        match std::fs::write(&path, body) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::debug::debug_log(&format!("shell integration: cannot write {}: {e}", path.display()));
+                path.is_file()
+            }
+        }
+    })
 }
 
 /// Locate Git Bash (`bash.exe`) on Windows so a terminal can switch to it.
@@ -204,14 +230,16 @@ if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
 if ($env:ARBITER_SHIM_BIN -and ($env:PATH -split ';')[0] -ne $env:ARBITER_SHIM_BIN) { $env:PATH = $env:ARBITER_SHIM_BIN + ';' + $env:PATH }
 "#;
 
-/// Write the PowerShell init script and return its path (run via `-File`).
+/// The PowerShell init script (run via `-File`), put in place once per run (see
+/// `install_integration`).
 #[cfg(target_os = "windows")]
-fn ensure_powershell_init() -> Option<std::path::PathBuf> {
-    let dir = dirs::data_dir()?.join("arbiter-native").join("shell-integration").join("powershell");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("arbiter-init.ps1");
-    std::fs::write(&path, PS_INIT).ok()?;
-    Some(path)
+fn powershell_init() -> Option<&'static std::path::Path> {
+    static INIT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let dir = app_data_dir()?.join("shell-integration").join("powershell");
+        install_integration(&dir, &[("arbiter-init.ps1", PS_INIT)]).then(|| dir.join("arbiter-init.ps1"))
+    })
+    .as_deref()
 }
 
 /// What a REMOTE host's bash or zsh needs so a pane connected to it can be restored to
@@ -279,9 +307,9 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
             // to PSReadLine history (our own startup kept appearing on up-arrow). `-File`
             // is executed, not recorded. `-ExecutionPolicy Bypass` so a Restricted policy
             // can't block our own script. Falls back to a plain shell if the write fails.
-            if let Some(init) = ensure_powershell_init() {
+            if let Some(init) = powershell_init() {
                 cmd.args(["-NoExit", "-ExecutionPolicy", "Bypass", "-File"]);
-                cmd.arg(&init);
+                cmd.arg(init);
             } else {
                 cmd.arg("-NoExit");
             }
@@ -309,7 +337,7 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
         cmd.env("COLORTERM", "truecolor");
 
         if shell_name.ends_with("zsh") {
-            if let Some(zdotdir) = ensure_zsh_integration_dir() {
+            if let Some(zdotdir) = zsh_integration_dir() {
                 if let Ok(orig) = std::env::var("ZDOTDIR") {
                     cmd.env("ARBITER_USER_ZDOTDIR", orig);
                 }
@@ -339,5 +367,35 @@ pub fn build_shell_command(shell: Option<&str>) -> CommandBuilder {
         }
         apply_agent_shim(&mut cmd);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_integration;
+
+    // A shell starting up holds its integration file open, and on Windows that refuses a
+    // rewrite (os error 32). An unchanged file is never rewritten, so that refusal never
+    // comes up, and a changed one that cannot be rewritten is still used as it is.
+    #[test]
+    fn integration_files_in_use_are_left_alone_and_still_used() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("arbiter-integrationtest-{}-{nanos}", std::process::id()));
+        assert!(install_integration(&dir, &[("init.ps1", "v1")]), "written when missing");
+        assert_eq!(std::fs::read_to_string(dir.join("init.ps1")).unwrap(), "v1");
+
+        // What PowerShell does while it reads a `-File` script: shares reading only.
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut open, 0x1);
+        let held = open.open(dir.join("init.ps1")).unwrap();
+        assert!(install_integration(&dir, &[("init.ps1", "v1")]), "unchanged: nothing to write");
+        assert!(install_integration(&dir, &[("init.ps1", "v2")]), "changed but held: the old one serves");
+        drop(held);
+
+        assert!(install_integration(&dir, &[("init.ps1", "v2")]));
+        assert_eq!(std::fs::read_to_string(dir.join("init.ps1")).unwrap(), "v2", "updated once free");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

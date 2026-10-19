@@ -33,15 +33,17 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   change and runs the status again, forever. The explorer shipped that loop once
   (`git::file_status`, 4.7% of a core on an idle repo). Measure idle CPU after touching
   anything a watcher triggers.
-- **Two iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`, and so is
+- **Three iced crates are forked** under `vendor/` and applied via `[patch.crates-io]`, and so is
   `wgpu-hal` (the DX12 swapchain presents 1:1, see the graphics bullet under Memory):
-  `iced_winit` (inactive notification windows, no present while occluded, and
+  `iced_winit` (inactive notification windows, no present while occluded,
   `conversion::OCCLUSION_HOOK`, which tells the app a window was hidden or shown
-  again: macOS only, winit reports no occlusion on Windows) and `iced_widget` (two changes: the text
+  again: macOS only, winit reports no occlusion on Windows, and the rebuild after a
+  lost GPU device, `recover_graphics`), `iced_widget` (two changes: the text
   editor hit-tests with the padding on swapped axes, and `Content` does not expose the
   editor whose scroll the line-number gutter is drawn from; see
-  `vendor/iced_widget/ARBITER-FORK.md`). An iced upgrade means re-copying both from the
-  registry and re-applying their diffs.
+  `vendor/iced_widget/ARBITER-FORK.md`) and `iced_wgpu` (what lets a lost device be
+  freed; see "A lost GPU device" below and `vendor/iced_wgpu/ARBITER-FORK.md`). An iced
+  upgrade means re-copying all three from the registry and re-applying their diffs.
 - **Verify UI changes with a debug build**, not just `--release`. iced states several
   layout contracts as `debug_assert!`, which release compiles out: a release build runs
   a mis-specified layout silently where `cargo run` panics at once. A panic goes to
@@ -307,6 +309,56 @@ launched shell, and a command under it staying normal) and
 `an_agent_its_hook_binds_is_raised` (a copy of the test binary named `claude-probe-*.exe`
 as the agent). Use a bounded burner for any load test: it freezes the panes of an older
 Arbiter, this session's included.
+
+## A lost GPU device: a driver update is survived, not a crash (2026-10-19)
+
+Installing an NVIDIA driver under a running Arbiter crashed it: wgpu 0.19 panics when the
+device is lost (`Error in Queue::submit ... Parent device is lost`; a failed submit,
+present or surface configure is fatal there, no error handler sees it). Now:
+
+- **The iced_winit fork catches it** (`gpu_call` around present, surface configure and
+  window creation) and runs `recover_graphics`: every window moves to iced's software
+  renderer (`C::with_backend(.., Some("tiny-skia"))`) so all of the old device's objects
+  can go first, then a new compositor is made and every window gets a new surface and
+  renderer from it. App state is untouched; the terminal renderers live in iced's
+  shader storage and are rebuilt by the next `prepare`. It waits up to 4 s for a
+  hardware adapter (mid-update only WARP is listed), then settles for a fallback and
+  tries for the GPU again on frames, every 10 s for 5 minutes.
+- **The old device must really be freed.** On DX12, while anything of a removed device
+  lived, every device made after it on that adapter was removed too, and the window's
+  old swapchain blocked a new one. Three things in wgpu 0.19 kept it alive: a resource
+  dropped after its device is never freed (iced dropped its engine after the device),
+  the staging belt's `map_async` callbacks hold buffers until a poll, and a panic inside
+  present dropped the frame, view and encoder while unwinding, when wgpu skips their
+  cleanup. The iced_wgpu fork fixes all three (`vendor/iced_wgpu/ARBITER-FORK.md`).
+- **Arbiter's own errors never panic.** `on_new_device` (first terminal frame on each
+  device) replaces wgpu's panicking error handler with logging: `TermPrimitive::prepare`
+  uploads while holding the pane's terminal lock, and a panic there poisoned it, which
+  killed the pane's reader for good. A lost D3D12 device does not always say "lost": an
+  upload fails as "Creation of a resource failed".
+- **Test it with `ARBITER_TEST_GPU_LOSS=<seconds>`**: each device is removed that long
+  after its first terminal frame (`ID3D12Device5::RemoveDevice` on DX12, `destroy()`
+  elsewhere), three times a run at most. The loss shows on the next frame, so something
+  must redraw (a resize does). Never force a system-wide reset (`dxcap -forcetdr`): it
+  takes down every other Arbiter running.
+
+## Pane folders survive a crash (2026-10-19)
+
+A crash used to bring panes back in the wrong folder, for three reasons, all fixed:
+
+- **Shell integration is installed once per run** (`shell::install_integration`). Every
+  pane spawn rewrote `arbiter-init.ps1` (and the zsh files), and a PowerShell started a
+  moment earlier holds it open, so the write failed with os error 32 and the pane fell
+  back to a bare `powershell -NoExit`: no OSC 7, no OSC 133, no private history. Four of
+  26 PowerShell panes of one restore came up like that (their command lines show it).
+  A file whose content is unchanged is never rewritten, and one that cannot be updated is
+  used as it is. The scripts live under `app_data_dir()`, so a debug build no longer
+  rewrites the installed app's copy.
+- **A pane's cwd starts as the folder it was spawned in** (`Session::spawn`), so a save
+  before the first prompt, or from a shell that never reports one, keeps it.
+- **A local `cd` sets `SAVE_DIRTY`** (the OSC 7 handler), so it is on disk at once. The
+  remote folder always did. `persist::save` writes a sibling file and renames it over
+  `session.json`, so a crash mid-save leaves the old layout whole.
 
 ## The editor is the viewport, and the gutter follows it (2026-09-22)
 

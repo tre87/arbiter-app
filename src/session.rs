@@ -857,6 +857,10 @@ impl Session {
         // (set on the command by the shell layer) is a second source for its startup
         // command when keystroke tracking gives up on an up-arrow recall.
         let histfile = cmd.get_env("ARBITER_HISTFILE").map(std::path::PathBuf::from);
+        // The folder the shell starts in is its cwd until it reports one, so a save
+        // before the first prompt, or from a shell that never reports (no integration),
+        // keeps the folder rather than writing none.
+        let start_dir = cmd.get_cwd().map(|d| d.to_string_lossy().into_owned());
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -881,7 +885,7 @@ impl Session {
         });
 
         let term: SharedTerm = Arc::new(Mutex::new(VtTerm::new(cols as usize, rows as usize)));
-        let cwd = Arc::new(Mutex::new(None));
+        let cwd = Arc::new(Mutex::new(start_dir));
         let shell_idle = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(false));
         let git = Arc::new(Mutex::new(None));
@@ -1877,6 +1881,9 @@ fn reader_loop(
                                 *cwd.lock().unwrap() = Some(path.clone());
                                 if changed {
                                     prev_cwd = Some(path.clone());
+                                    // Saved at once: a crash keeps every `cd`, not
+                                    // only those some other change happened to save.
+                                    SAVE_DIRTY.store(true, Ordering::Relaxed);
                                     recompute_git(cwd.clone(), git.clone());
                                     // Re-point the FS watcher at the new repo so external
                                     // edits (made outside the terminal) refresh git too.
@@ -2154,6 +2161,33 @@ fn hex(c: u8) -> Option<u8> {
 mod tests {
     use super::{git_relevant_change, TypedLine};
     use std::path::Path;
+
+    // A pane knows the folder its shell started in before the shell reports one, so a
+    // save in between, or from a shell that never reports, keeps the folder; a folder the
+    // shell reports asks for a save at once, so a crash cannot lose the `cd`.
+    #[cfg(windows)]
+    #[test]
+    fn a_pane_knows_its_folder_from_the_start_and_saves_a_change() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let start = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_string();
+        let mut cmd = portable_pty::CommandBuilder::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Milliseconds 500; [Console]::Write([char]27 + ']7;file:///C:/Windows' + [char]7); Start-Sleep 2",
+        ]);
+        cmd.cwd(&start);
+        let session = super::Session::spawn(80, 24, cmd).unwrap();
+        assert_eq!(session.cwd().as_deref(), Some(start.as_str()), "known before the shell says");
+        super::SAVE_DIRTY.store(false, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while session.cwd().as_deref() != Some(r"C:\Windows") {
+            assert!(Instant::now() < deadline, "the reported folder never arrived: {:?}", session.cwd());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(super::SAVE_DIRTY.load(Ordering::Relaxed), "a new folder asks for a save");
+    }
 
     /// Type `s` a byte at a time (as real keystrokes arrive) and return the last
     /// command submitted.

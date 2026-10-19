@@ -182,6 +182,10 @@ iced_widget = { path = "vendor/iced_widget" }
 # instead of STRETCH, so an unmaximised borderless window is not drawn soft.
 # See vendor/wgpu-hal/ARBITER-FORK.md.
 wgpu-hal = { path = "vendor/wgpu-hal" }
+# Recovery from a lost GPU device (a driver update): a panic in `present` no longer
+# leaks the frame and pins the window's swapchain, and the compositor frees what it
+# made before its device. See vendor/iced_wgpu/ARBITER-FORK.md.
+iced_wgpu = { path = "vendor/iced_wgpu" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -201,6 +205,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Imaging",
     "Win32_Graphics_Dxgi_Common",
+    # ID3D12Device5::RemoveDevice, for ARBITER_TEST_GPU_LOSS (a GPU reset on demand).
+    "Win32_Graphics_Direct3D12",
 ] }
 # WebView2 suspend/resume (ICoreWebView2_3) for the hidden usage helper — keeps the
 # backgrounded renderer fetching. Same version wry 0.45 uses (windows-core 0.58, so

@@ -330,7 +330,10 @@ where
                 }
 
                 sender
-                    .send(Boot { compositor })
+                    .send(Boot {
+                        compositor,
+                        graphics_settings,
+                    })
                     .ok()
                     .expect("Send boot event");
 
@@ -645,6 +648,8 @@ where
 
 struct Boot<C> {
     compositor: C,
+    // VENDORED: kept to build a new compositor after the GPU device is lost.
+    graphics_settings: graphics::Settings,
 }
 
 #[derive(Debug)]
@@ -672,6 +677,174 @@ enum Control {
     },
 }
 
+// VENDORED: how long `recover_graphics` waits for a hardware adapter to come back before
+// settling for a fallback one (WARP, or the software renderer), and the pause between
+// tries. Under five seconds in all: the event loop is blocked meanwhile, and Windows
+// marks a window that pumps no messages for five as not responding.
+const RECOVERY_PATIENCE: std::time::Duration = std::time::Duration::from_millis(4000);
+const RECOVERY_STEP: std::time::Duration = std::time::Duration::from_millis(250);
+// VENDORED: how often, at most, a frame tries again for the GPU while on a fallback, and
+// how many times before it stops (five minutes): a GPU gone for good costs a device
+// made and dropped on each try.
+const FALLBACK_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+const FALLBACK_TRIES: u32 = 30;
+
+// VENDORED: runs a call into the graphics backend, turning a panic into an error. wgpu
+// 0.19 panics instead of returning an error when the device is lost (a driver update or
+// reset): a failed submit, present or surface configure is fatal there. Relies on
+// panic = "unwind".
+fn gpu_call<R>(f: impl FnOnce() -> R) -> Result<R, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
+}
+
+// VENDORED: whether a compositor runs on real graphics hardware. Matches the adapter
+// names of WARP ("Microsoft Basic Render Driver") and iced's software renderer.
+fn is_hardware(information: &compositor::Information) -> bool {
+    !information.adapter.contains("Basic Render")
+        && !information.backend.contains("tiny-skia")
+}
+
+// VENDORED: make `fresh` the compositor, give every window a surface and renderer made
+// from it, and let go of the old ones, then redraw. A window holds one swapchain at a
+// time, so a GPU surface is made unconfigured (size 0) and configured once the old one
+// is gone; the software renderer panics on a surface of size 0 and has no swapchain, so
+// it gets the real size at once.
+fn swap_graphics<P, C>(
+    fresh: C,
+    compositor: &mut C,
+    window_manager: &mut WindowManager<P, C>,
+) where
+    P: Program,
+    C: Compositor<Renderer = P::Renderer>,
+    P::Theme: DefaultStyle,
+{
+    let old = std::mem::replace(compositor, fresh);
+    let software = compositor.fetch_information().backend.contains("tiny-skia");
+    for (_id, window) in window_manager.iter_mut() {
+        let size = window.state.physical_size();
+        let surface = if software {
+            compositor.create_surface(
+                window.raw.clone(),
+                size.width.max(1),
+                size.height.max(1),
+            )
+        } else {
+            compositor.create_surface(window.raw.clone(), 0, 0)
+        };
+        let old_surface = std::mem::replace(&mut window.surface, surface);
+        let old_renderer = std::mem::replace(
+            &mut window.renderer,
+            compositor.create_renderer(),
+        );
+        let _ = gpu_call(move || drop((old_renderer, old_surface)));
+        if !software && size.width > 0 && size.height > 0 {
+            let _ = gpu_call(|| {
+                compositor.configure_surface(
+                    &mut window.surface,
+                    size.width,
+                    size.height,
+                )
+            });
+        }
+        window.viewport_version = window.state.viewport_version();
+        window.raw.request_redraw();
+    }
+    let _ = gpu_call(move || drop(old));
+}
+
+// VENDORED: replace a compositor whose device was lost with a new one, and give every
+// window a new surface and renderer made from it. The application's state is untouched;
+// what the renderers held on the GPU is rebuilt as it is drawn again. `compatible` is
+// the window to request an adapter for when no window exists yet.
+//
+// Every GPU object of the old device goes first, the windows drawn meanwhile by iced's
+// software renderer: while anything of a removed D3D12 device lived, each device made
+// after it on that adapter was removed too, and the window's old swapchain kept a new
+// one from being made (tested with `ID3D12Device5::RemoveDevice`, 2026-10-19). The
+// iced_wgpu fork is what lets the old device go at all.
+//
+// Waits up to `RECOVERY_PATIENCE` for a hardware adapter: in the middle of a driver
+// update only WARP is listed, and a device made on it would never be lost again to
+// prompt a return to the GPU. Settling for a fallback returns when it did, so a later
+// frame tries again (`retrying`: one try, the current compositor kept, and only a
+// hardware adapter replaces it); `None` when on hardware.
+async fn recover_graphics<P, C>(
+    compositor: &mut C,
+    window_manager: &mut WindowManager<P, C>,
+    settings: graphics::Settings,
+    compatible: Option<&Arc<winit::window::Window>>,
+    retrying: bool,
+) -> Option<Instant>
+where
+    P: Program,
+    C: Compositor<Renderer = P::Renderer>,
+    P::Theme: DefaultStyle,
+{
+    use crate::futures::futures::FutureExt;
+
+    let Some(compatible) = compatible.cloned().or_else(|| {
+        window_manager.iter_mut().next().map(|(_, w)| w.raw.clone())
+    }) else {
+        return None;
+    };
+    if !retrying {
+        let placeholder = std::panic::AssertUnwindSafe(C::with_backend(
+            settings,
+            compatible.clone(),
+            Some("tiny-skia"),
+        ))
+        .catch_unwind()
+        .await;
+        if let Ok(Ok(placeholder)) = placeholder {
+            swap_graphics(placeholder, compositor, window_manager);
+        }
+    }
+    let patience = if retrying {
+        std::time::Duration::ZERO
+    } else {
+        RECOVERY_PATIENCE
+    };
+    let started = Instant::now();
+    let mut fallback = None;
+    let fresh = loop {
+        let made = std::panic::AssertUnwindSafe(C::new(
+            settings,
+            compatible.clone(),
+        ))
+        .catch_unwind()
+        .await;
+        match made {
+            Ok(Ok(made)) if is_hardware(&made.fetch_information()) => {
+                break Some(made)
+            }
+            Ok(Ok(made)) => fallback = Some(made),
+            Ok(Err(error)) => {
+                log::error!("No compositor after a lost device: {error}");
+            }
+            Err(_) => {}
+        }
+        if started.elapsed() >= patience {
+            break None;
+        }
+        std::thread::sleep(RECOVERY_STEP);
+    };
+    let on_fallback = fresh.is_none();
+    if retrying && on_fallback {
+        return Some(Instant::now());
+    }
+    let Some(fresh) = fresh.or(fallback) else {
+        // Nothing made: stay on what there is (the software placeholder), and a later
+        // frame tries again.
+        return Some(Instant::now());
+    };
+    swap_graphics(fresh, compositor, window_manager);
+    log::warn!(
+        "Graphics rebuilt after a lost device: {:?}",
+        compositor.fetch_information()
+    );
+    on_fallback.then(Instant::now)
+}
+
 async fn run_instance<P, C>(
     mut program: P,
     mut runtime: Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
@@ -689,7 +862,14 @@ async fn run_instance<P, C>(
     use winit::event;
     use winit::event_loop::ControlFlow;
 
-    let Boot { mut compositor } = boot.await.expect("Receive boot");
+    let Boot {
+        mut compositor,
+        graphics_settings,
+    } = boot.await.expect("Receive boot");
+    // VENDORED: set while a recovery from a lost device had to settle for a fallback
+    // adapter (see `recover_graphics`), with the tries for the GPU made since.
+    let mut on_fallback_since: Option<Instant> = None;
+    let mut fallback_tries = 0;
 
     let mut window_manager = WindowManager::new();
     let mut is_window_opening = !is_daemon;
@@ -724,13 +904,38 @@ async fn run_instance<P, C>(
                 make_visible,
                 on_open,
             } => {
-                let window = window_manager.insert(
-                    id,
-                    Arc::new(window),
-                    &program,
-                    &mut compositor,
-                    exit_on_close_request,
-                );
+                // VENDORED: a surface made on a lost device panics; build a new
+                // compositor and make it there.
+                let raw = Arc::new(window);
+                let inserted = gpu_call(|| {
+                    let _ = window_manager.insert(
+                        id,
+                        raw.clone(),
+                        &program,
+                        &mut compositor,
+                        exit_on_close_request,
+                    );
+                });
+                if inserted.is_err() {
+                    on_fallback_since = recover_graphics(
+                        &mut compositor,
+                        &mut window_manager,
+                        graphics_settings,
+                        Some(&raw),
+                        false,
+                    )
+                    .await;
+                    fallback_tries = 0;
+                    let _ = window_manager.insert(
+                        id,
+                        raw,
+                        &program,
+                        &mut compositor,
+                        exit_on_close_request,
+                    );
+                }
+                let window =
+                    window_manager.get_mut(id).expect("Get inserted window");
 
                 let logical_size = window.state.logical_size();
 
@@ -803,6 +1008,8 @@ async fn run_instance<P, C>(
                         else {
                             continue;
                         };
+                        // VENDORED: set when this frame found the GPU device lost.
+                        let mut lost = false;
 
                         // TODO: Avoid redrawing all the time by forcing widgets to
                         // request redraws on state changes
@@ -921,11 +1128,15 @@ async fn run_instance<P, C>(
                                     new_mouse_interaction;
                             }
 
-                            compositor.configure_surface(
-                                &mut window.surface,
-                                physical_size.width,
-                                physical_size.height,
-                            );
+                            // VENDORED: see `recover_graphics`.
+                            lost |= gpu_call(|| {
+                                compositor.configure_surface(
+                                    &mut window.surface,
+                                    physical_size.width,
+                                    physical_size.height,
+                                )
+                            })
+                            .is_err();
 
                             window.viewport_version =
                                 window.state.viewport_version();
@@ -937,19 +1148,31 @@ async fn run_instance<P, C>(
                         // window stops being composited — the ~0.5s refocus lag.
                         // The Occluded handler above requests a redraw on
                         // un-occlude so the first visible frame still paints at once.
-                        if !window.occluded {
+                        if !window.occluded && !lost {
                         debug.render_started();
-                        match compositor.present(
-                            &mut window.renderer,
-                            &mut window.surface,
-                            window.state.viewport(),
-                            window.state.background_color(),
-                            &debug.overlay(),
-                        ) {
-                            Ok(()) => {
+                        // VENDORED: a lost device panics inside wgpu (a failed
+                        // submit is fatal in 0.19); caught here and recovered from
+                        // below, as is a lost surface, which would otherwise ask for
+                        // a redraw that fails the same way, forever.
+                        let overlay = debug.overlay();
+                        let presented = gpu_call(|| {
+                            compositor.present(
+                                &mut window.renderer,
+                                &mut window.surface,
+                                window.state.viewport(),
+                                window.state.background_color(),
+                                &overlay,
+                            )
+                        });
+                        match presented {
+                            Err(()) | Ok(Err(compositor::SurfaceError::Lost)) => {
+                                debug.render_finished();
+                                lost = true;
+                            }
+                            Ok(Ok(())) => {
                                 debug.render_finished();
                             }
-                            Err(error) => match error {
+                            Ok(Err(error)) => match error {
                                 // This is an unrecoverable error.
                                 compositor::SurfaceError::OutOfMemory => {
                                     panic!("{:?}", error);
@@ -972,6 +1195,25 @@ async fn run_instance<P, C>(
                             },
                         }
                         } // VENDORED: end `if !window.occluded`
+
+                        // VENDORED: rebuild after a lost device, and after settling
+                        // for a fallback adapter, try for the GPU again on a later
+                        // frame (at most every `FALLBACK_RETRY`).
+                        let retry_fallback = fallback_tries < FALLBACK_TRIES
+                            && on_fallback_since
+                                .is_some_and(|at| at.elapsed() >= FALLBACK_RETRY);
+                        if lost || retry_fallback {
+                            on_fallback_since = recover_graphics(
+                                &mut compositor,
+                                &mut window_manager,
+                                graphics_settings,
+                                None,
+                                !lost,
+                            )
+                            .await;
+                            fallback_tries =
+                                if lost { 0 } else { fallback_tries + 1 };
+                        }
                     }
                     event::Event::WindowEvent {
                         event: window_event,

@@ -532,8 +532,23 @@ pub fn save(state: &SavedState) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(&p, json);
+        write_replacing(&p, &json);
     }
+}
+
+/// Write `bytes` to a sibling file and rename it over `path`, so a crash mid-save leaves
+/// the previous file whole: a truncated one loads as nothing, and the next save would then
+/// write a fresh layout over everything. Falls back to writing in place if the rename is
+/// refused (something holding the old file open).
+fn write_replacing(path: &std::path::Path, bytes: &[u8]) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::write(path, bytes);
 }
 
 /// Delete the saved layout on disk (Settings → "Clear saved data"). Best-effort;
@@ -887,5 +902,22 @@ mod tests {
         assert!(back.agent_enabled(AgentKind::Codex));
         assert!(!back.agent_enabled(AgentKind::Claude));
         assert!(!back.agent_enabled(AgentKind::Copilot));
+    }
+
+    // A save lands whole through a sibling file, which it leaves nothing of, over an old
+    // file and over a temp file a crash left behind.
+    #[test]
+    fn a_save_replaces_the_file_whole() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("arbiter-savetest-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session.json");
+        std::fs::write(&file, b"old layout").unwrap();
+        std::fs::write(dir.join("session.json.tmp"), b"half a sav").unwrap();
+        write_replacing(&file, b"new layout");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new layout");
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, ["session.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

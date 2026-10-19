@@ -164,6 +164,14 @@ fn stamp(now: SystemTime) -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// `YYYY-MM-DD HH:MM:SS UTC`, for logs.
+pub fn utc_time(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let rem = secs % 86_400;
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
 /// The number of the UTC day `now` falls in, for once-a-day bookkeeping.
 pub fn day_number(now: SystemTime) -> i64 {
     now.duration_since(UNIX_EPOCH).map(|d| (d.as_secs() / 86_400) as i64).unwrap_or(0)

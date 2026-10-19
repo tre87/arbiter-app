@@ -16,26 +16,27 @@ fn shared_system() -> &'static SharedSystem {
 }
 
 struct SharedSystem {
-    sys: Mutex<(System, Instant)>,
+    /// The snapshot and when it was last refreshed (None: never). Not "now minus a
+    /// minute": an `Instant` counts from boot, and that subtraction panics in the first
+    /// minute after it.
+    sys: Mutex<(System, Option<Instant>)>,
 }
 
 impl SharedSystem {
     fn new() -> Self {
-        Self {
-            sys: Mutex::new((System::new(), Instant::now() - Duration::from_secs(60))),
-        }
+        Self { sys: Mutex::new((System::new(), None)) }
     }
 
     fn with<T>(&self, max_age: Duration, f: impl FnOnce(&System) -> T) -> T {
         let mut guard = self.sys.lock().unwrap();
         let (sys, last) = &mut *guard;
-        if last.elapsed() >= max_age {
+        if last.map_or(true, |at| at.elapsed() >= max_age) {
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
                 ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
             );
-            *last = Instant::now();
+            *last = Some(Instant::now());
         }
         f(sys)
     }

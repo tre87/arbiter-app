@@ -36,6 +36,27 @@ history belongs to the prior Tauri/Vue web app it replaced.
 - **Each workspace remembers its focused terminal across a restart.** A relaunch used
   to focus the first terminal of every workspace; it now comes back to the one that had
   focus when Arbiter closed.
+- **A graphics driver update no longer crashes Arbiter.** Installing a GPU driver (or
+  a driver reset) lost the GPU device under Arbiter, and it quit with "Parent device is
+  lost". It now rebuilds its graphics in place: terminals, agents and running programs
+  carry on, and the window may go still for up to four seconds while the driver comes
+  back. If only the software renderer is there by then, Arbiter uses it and tries for
+  the GPU again every ten seconds for five minutes.
+- **Terminals come back in the folder they were in.** On a restore with many terminals,
+  a few PowerShell panes started without Arbiter's shell integration (the script they
+  all read was being rewritten for the next pane): such a pane never reported its
+  folder, so it was saved without one, came back in the home folder next time, and a
+  Claude restored there could not find its conversation. The script is now written
+  once per run. A pane also knows the folder it started in before its shell says so,
+  and every change of folder (`cd`) is saved at once, so a crash loses none of them.
+- **The saved layout is written whole.** A crash in the middle of a save could leave
+  `session.json` cut short, which loads as nothing and starts Arbiter fresh. It is now
+  written beside the old one and swapped in.
+- **Arbiter started within a minute of boot no longer loses its agent detection.** The
+  process scan computed "a minute ago" on a clock that starts at boot, which panicked
+  the scan's thread in that first minute.
+- **`panic.log` entries carry the time and a backtrace**, so a panic in a library can be
+  traced to its caller.
 
 ## [1.6.2] - 2026-10-02
 

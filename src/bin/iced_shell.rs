@@ -10159,6 +10159,73 @@ fn push_mouse_pos(out: &mut Vec<u8>, pos: usize, utf8: bool) {
 #[derive(Default)]
 struct Renderers(HashMap<u64, TermGpu>);
 
+/// When the first terminal frame was drawn on the device the shader store belongs to,
+/// and whether `ARBITER_TEST_GPU_LOSS` has removed that device yet.
+struct DeviceAge {
+    born: std::time::Instant,
+    removed: bool,
+}
+
+/// Set up a GPU device the first time a terminal is drawn on it. Errors on it are
+/// logged, never raised: wgpu's default handler panics, and `prepare` uploads while
+/// holding the pane's terminal lock, so a lost device (a driver update) poisoned the
+/// lock and took the pane with it, even once the iced fork had rebuilt the graphics
+/// (`recover_graphics` in vendor/iced_winit). The loss does not always say "lost": a
+/// removed D3D12 device fails an upload as "Creation of a resource failed".
+fn on_new_device(device: &wgpu::Device) {
+    device.on_uncaptured_error(Box::new(|error| {
+        eprintln!("wgpu error: {error}");
+        arbiter_native::debug::debug_log(&format!("wgpu error: {error}"));
+    }));
+}
+
+/// `ARBITER_TEST_GPU_LOSS=<seconds>`: remove each GPU device that long after its first
+/// terminal frame, three times a run at most, to test the recovery from a lost device
+/// without a driver update.
+fn gpu_loss_test_after() -> Option<std::time::Duration> {
+    static AFTER: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        let secs: f32 = std::env::var("ARBITER_TEST_GPU_LOSS").ok()?.parse().ok()?;
+        Some(std::time::Duration::from_secs_f32(secs.max(0.0)))
+    })
+}
+
+fn gpu_loss_test(device: &wgpu::Device, age: &mut DeviceAge) {
+    static REMOVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(after) = gpu_loss_test_after() else { return };
+    if age.removed || age.born.elapsed() < after || REMOVED.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+        return;
+    }
+    age.removed = true;
+    REMOVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("ARBITER_TEST_GPU_LOSS: removing the GPU device");
+    remove_device(device);
+}
+
+/// Lose `device` the way a driver update does: on DX12 the device is removed
+/// (`ID3D12Device5::RemoveDevice`, so every later call fails as DXGI reports a reset),
+/// elsewhere it is destroyed, which wgpu reports as the same loss.
+fn remove_device(device: &wgpu::Device) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Device5};
+        // SAFETY: the raw device is only borrowed for the call, and the wgpu device
+        // outlives it.
+        let removed = unsafe {
+            device.as_hal::<wgpu::hal::api::Dx12, _, _>(|hal| {
+                let raw = hal?.raw_device().as_mut_ptr() as *mut std::ffi::c_void;
+                ID3D12Device::from_raw_borrowed(&raw)?.cast::<ID3D12Device5>().ok()?.RemoveDevice();
+                Some(())
+            })
+        };
+        if removed.flatten().is_some() {
+            return;
+        }
+    }
+    device.destroy();
+}
+
 struct TermProgram {
     /// Notified when this pane's PTY is resized here, so a queued startup command can
     /// wait for the real size (see `arbiter_native::session::StartupGate`).
@@ -10533,8 +10600,15 @@ impl shader::Primitive for TermPrimitive {
         viewport: &shader::Viewport,
     ) {
         let scale = viewport.scale_factor() as f32;
+        // The store is the device's: a new one comes with each device the iced fork
+        // builds after a loss.
         if !storage.has::<Renderers>() {
+            on_new_device(device);
             storage.store(Renderers::default());
+            storage.store(DeviceAge { born: std::time::Instant::now(), removed: false });
+        }
+        if let Some(age) = storage.get_mut::<DeviceAge>() {
+            gpu_loss_test(device, age);
         }
         let renderers = storage.get_mut::<Renderers>().unwrap();
         // Renderers of panes that closed since the last frame (a dropped Session retires
@@ -10673,6 +10747,10 @@ fn wordmark_font() -> iced::Font {
 #[global_allocator]
 static GLOBAL: arbiter_native::memdiag::DiagAlloc = arbiter_native::memdiag::DiagAlloc;
 
+/// Backtrace lines kept per panic in `panic.log`: two per frame, and the caller sits
+/// some 15 frames down, under the panic machinery.
+const PANIC_LOG_BACKTRACE_LINES: usize = 80;
+
 /// Append panics to `<data dir>/panic.log` as well as stderr.
 ///
 /// A release build on Windows is a GUI-subsystem binary with no console, so an
@@ -10692,9 +10770,20 @@ fn install_panic_log() {
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "panic".to_string());
         let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        // The backtrace names the caller where `where_` is a std or dependency line
+        // (an `Instant` subtraction reports time.rs). Symbols come from the build's PDB.
+        // Lines are cut short: iced's generic type names run to thousands of characters.
+        let backtrace: Vec<String> = std::backtrace::Backtrace::force_capture()
+            .to_string()
+            .lines()
+            .take(PANIC_LOG_BACKTRACE_LINES)
+            .map(|l| l.chars().take(200).collect())
+            .collect();
         let line = format!(
-            "[{}] thread '{thread}' panicked at {where_}:\n  {what}\n",
+            "[{}] [{}] thread '{thread}' panicked at {where_}:\n  {what}\n  {}\n",
+            arbiter_native::attach::utc_time(std::time::SystemTime::now()),
             arbiter_native::about::Build::current().one_line(),
+            backtrace.join("\n  "),
         );
         if let Some(dir) = arbiter_native::shell::app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);
