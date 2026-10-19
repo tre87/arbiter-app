@@ -76,6 +76,17 @@ resume (`resume_local` never falls back to "most recent here", `resume_remote` d
   pane whose agent is not running are dropped except `SessionBound`, and the OSC-133 idle
   edge deletes the log (`AgentHandle::end_session`). The 1.6 subcommands stay for one
   release: `claude-hook` runs the Claude hook, `claude-statusline` does nothing.
+- **Each agent can be switched off (Settings, Agents, 2026-10-09).** `Settings::agents`
+  holds the choices made by hand, by `Agent::id`; an agent absent there is on unless
+  `Agent::experimental()` (Copilot, Codex). The app applies them at startup, before the
+  first shell sets up the launchers, into `agent::set_enabled` (a bitmask; every agent
+  until then, which is what the tests see). Off means no new binding by any source:
+  `procscan::agent_under`, `VtTerm::detect`, `session::classify_launch` and hook events
+  in `agent_watch` (except for a pane already bound to that agent, followed until it
+  exits) all skip it, a saved pane's agent is not resumed (`saved_to_config`), and its
+  launchers leave the PATH (`ShimSetup::sync_launchers`, also run on each toggle). The
+  launch env is exported for every agent regardless, so one switched on works at once in
+  an open shell. Tests flip nothing global: `sync_launchers_by` takes the decision.
 - **Arbiter no longer owns any agent's status line.** Claude's session id comes from a
   `SessionStart` hook (startup, resume, `/clear`, compaction), with `transcript_path`,
   which is what the resumable check tests. A user with `disableAllHooks` gets no id and

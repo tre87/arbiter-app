@@ -11,6 +11,7 @@
 //! its conversations.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub mod claude;
 pub mod codex;
@@ -39,6 +40,28 @@ agents! {
 /// Every registered agent, in `AgentKind` order.
 pub fn all() -> &'static [&'static dyn Agent] {
     ALL
+}
+
+/// One bit per `AgentKind`. Every agent until the app applies the user's settings at
+/// startup, so the library and its tests see the whole registry.
+static ENABLED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Whether Arbiter integrates with `kind`: its launcher and hooks, recognising it in a
+/// pane, its status, and resuming it on restore. Off, its CLI is a program like any other.
+/// An agent already bound in a pane keeps its status until it exits.
+pub fn enabled(kind: AgentKind) -> bool {
+    ENABLED.load(Ordering::Relaxed) & (1 << kind as u32) != 0
+}
+
+/// Switch `kind` on or off for every launch from now on (the launchers on disk follow
+/// through `shell::sync_agent_launchers`).
+pub fn set_enabled(kind: AgentKind, on: bool) {
+    let bit = 1 << kind as u32;
+    if on {
+        ENABLED.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        ENABLED.fetch_and(!bit, Ordering::Relaxed);
+    }
 }
 
 pub fn get(kind: AgentKind) -> &'static dyn Agent {
@@ -125,6 +148,12 @@ pub trait Agent: Sync {
     /// Stable lowercase name: the hook subcommand's argument and the env-var infix.
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
+    /// What its Settings row says under the name: what Arbiter does with it.
+    fn description(&self) -> &'static str;
+    /// Off until the user switches it on, and badged as experimental in Settings.
+    fn experimental(&self) -> bool {
+        false
+    }
     fn icon_svg(&self) -> &'static str;
     /// The command names its launcher shadows on the pane's PATH.
     fn binaries(&self) -> &'static [&'static str];

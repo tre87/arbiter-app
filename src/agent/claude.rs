@@ -150,6 +150,11 @@ impl Agent for Claude {
         "Claude"
     }
 
+    fn description(&self) -> &'static str {
+        "Claude Code (`claude`). Arbiter shows when it is working, waiting on you or finished, \
+         raises its cards and office desk, and resumes its conversation when a terminal is restored."
+    }
+
     fn icon_svg(&self) -> &'static str {
         ICON
     }

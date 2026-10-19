@@ -90,13 +90,16 @@ fn looks_like_env_assignment(s: &str) -> bool {
 
 /// The agent running as a descendant of `shell_pid`, and its pid, if any: the one nearest
 /// the shell, since an agent's own children can be agents too (Claude running
-/// `codex mcp-server`).
+/// `codex mcp-server`). Agents switched off are not looked for.
 pub fn agent_under(shell_pid: u32) -> Option<(AgentKind, u32)> {
     shared_system().with(Duration::from_millis(250), |sys| {
         let mut best: Option<(usize, AgentKind, u32)> = None;
         for (pid, proc) in sys.processes() {
             let cmd: Vec<String> = proc.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-            let Some(kind) = agent_of(&proc.name().to_string_lossy(), &cmd) else { continue };
+            let Some(kind) = agent_of(&proc.name().to_string_lossy(), &cmd).filter(|k| crate::agent::enabled(*k))
+            else {
+                continue;
+            };
             let Some(depth) = depth_below(sys, pid.as_u32(), shell_pid) else { continue };
             if best.map_or(true, |(d, _, _)| depth < d) {
                 best = Some((depth, kind, pid.as_u32()));

@@ -575,10 +575,13 @@ impl VtTerm {
     /// Which agent's chrome is on screen, for a remote pane whose agent is not known yet:
     /// the first whose markers match on a row that none of its vetoes share. Per row, so
     /// Codex's footer ("? for shortcuts" beside "100% context left") vetoes Claude while
-    /// a Claude whose own status line prints "72% context left" is still Claude.
+    /// a Claude whose own status line prints "72% context left" is still Claude. Agents
+    /// switched off are not looked for; Claude's veto still keeps an off Codex from passing
+    /// for Claude.
     pub fn detect(&self) -> Option<AgentKind> {
         crate::agent::all()
             .iter()
+            .filter(|a| crate::agent::enabled(a.kind()))
             .find(|a| {
                 let p = a.screen();
                 let has = |row: &str, markers: &[&str]| markers.iter().any(|m| row.contains(m));

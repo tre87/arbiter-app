@@ -222,6 +222,15 @@ impl Agent for Codex {
         "Codex"
     }
 
+    fn description(&self) -> &'static str {
+        "OpenAI Codex CLI (`codex`), followed the way Claude is. Experimental: built from Codex's \
+         source and not yet checked against the real CLI, so expect rough edges."
+    }
+
+    fn experimental(&self) -> bool {
+        true
+    }
+
     fn icon_svg(&self) -> &'static str {
         ICON
     }

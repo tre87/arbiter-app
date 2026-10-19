@@ -86,6 +86,15 @@ impl Agent for Copilot {
         "Copilot"
     }
 
+    fn description(&self) -> &'static str {
+        "GitHub Copilot CLI (`copilot`), followed the way Claude is. Experimental: built from \
+         Copilot's documentation and not yet checked against the real CLI, so expect rough edges."
+    }
+
+    fn experimental(&self) -> bool {
+        true
+    }
+
     fn icon_svg(&self) -> &'static str {
         ICON
     }

@@ -59,7 +59,39 @@ pub fn real_binary_env(bin: &str) -> String {
 /// and the environment for it (real binaries, the events dir, each agent's launch env).
 pub struct ShimSetup {
     pub bin_dir: PathBuf,
+    /// Exported for every agent, on or off: only the launchers read it, so an agent
+    /// switched on later works in a shell that was already open.
     pub env: Vec<(String, String)>,
+    launchers: Vec<Launcher>,
+}
+
+/// One binary's launcher, kept so that switching its agent on or off can write or remove
+/// it while Arbiter runs.
+struct Launcher {
+    kind: AgentKind,
+    bin: &'static str,
+    real_env: String,
+    args: Vec<(&'static str, String)>,
+}
+
+impl ShimSetup {
+    /// Puts on the PATH the launchers of the agents that are on (`agent::enabled`) and
+    /// takes off those of the ones that are off, whose binaries then run as installed.
+    pub fn sync_launchers(&self) {
+        self.sync_launchers_by(agent::enabled);
+    }
+
+    fn sync_launchers_by(&self, on: impl Fn(AgentKind) -> bool) {
+        for l in &self.launchers {
+            if on(l.kind) {
+                if write_launchers(&self.bin_dir, l.bin, &l.real_env, &l.args).is_some() {
+                    continue;
+                }
+                debug_log(&format!("setup: could not write the {} launcher", l.bin));
+            }
+            remove_launchers(&self.bin_dir, l.bin);
+        }
+    }
 }
 
 /// Prepare the launchers and every agent's launch files under `data_dir`. Returns `None`
@@ -83,13 +115,14 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
     // the genuine binary is found, never a shim that would exec us right back.
     let parent_shim = std::env::var_os(SHIM_BIN_ENV).map(PathBuf::from);
     let mut env = vec![(EVENTS_DIR_ENV.to_string(), events_dir.display().to_string())];
+    let mut launchers = Vec::new();
     for a in agent::all() {
         let dir = shim_dir.join(a.id());
         let spec = a
             .launch(&LaunchCtx { arbiter_exe: arbiter_bin, dir: &dir })
             .filter(|spec| write_files(&spec.files));
         let args = spec.as_ref().map(|s| s.args.as_slice()).unwrap_or(&[]);
-        for bin in a.binaries() {
+        for &bin in a.binaries() {
             let real_env = real_binary_env(bin);
             let real = find_real(bin, original_path, &bin_dir, parent_shim.as_deref());
             if cfg!(windows) && real.is_none() {
@@ -99,10 +132,7 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
             if let Some(real) = real {
                 env.push((real_env.clone(), real.display().to_string()));
             }
-            if write_launchers(&bin_dir, bin, &real_env, args).is_none() {
-                debug_log(&format!("setup: could not write the {bin} launcher"));
-                remove_launchers(&bin_dir, bin);
-            }
+            launchers.push(Launcher { kind: a.kind(), bin, real_env, args: args.to_vec() });
         }
         if let Some(spec) = spec {
             env.extend(spec.env);
@@ -110,7 +140,9 @@ pub fn setup(data_dir: &Path, original_path: &str, arbiter_bin: &Path) -> Option
     }
     write_about_launchers(&bin_dir);
     debug_log(&format!("setup: bin_dir={} arbiter_bin={}", bin_dir.display(), arbiter_bin.display()));
-    Some(ShimSetup { bin_dir, env })
+    let setup = ShimSetup { bin_dir, env, launchers };
+    setup.sync_launchers();
+    Some(setup)
 }
 
 fn write_files(files: &[(PathBuf, String)]) -> bool {
@@ -521,6 +553,39 @@ mod tests {
                 assert!(is_arbiter_launcher(&s.bin_dir.join(bin)), "{bin}");
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Switching an agent off takes its launcher off the PATH, so its binary runs as
+    // installed with no hooks; switching it back on puts the launcher back. The
+    // environment stays, so a shell already open can run it the moment it is on again.
+    #[test]
+    fn an_agent_switched_off_loses_its_launcher_until_switched_on() {
+        let root = tmpdir("toggle");
+        let real_dir = root.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = put_claude(&real_dir, false);
+        #[cfg(windows)]
+        std::fs::rename(&real, real_dir.join("claude.exe")).unwrap();
+        #[cfg(not(windows))]
+        let _ = real;
+        let s = setup(&root.join("data"), &real_dir.display().to_string(), Path::new("/opt/arbiter")).expect("setup");
+        let launchers = |bin: &str| {
+            let posix = is_arbiter_launcher(&s.bin_dir.join(bin));
+            if cfg!(windows) {
+                posix && is_arbiter_launcher(&s.bin_dir.join(format!("{bin}.cmd")))
+            } else {
+                posix
+            }
+        };
+        assert!(launchers("claude"));
+
+        s.sync_launchers_by(|k| k != AgentKind::Claude);
+        assert!(!s.bin_dir.join("claude").exists() && !s.bin_dir.join("claude.cmd").exists());
+        assert!(s.env.iter().any(|(k, _)| k == "ARBITER_REAL_CLAUDE"));
+
+        s.sync_launchers_by(|_| true);
+        assert!(launchers("claude"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

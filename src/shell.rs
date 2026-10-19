@@ -41,6 +41,14 @@ fn shim() -> Option<&'static agent_shim::ShimSetup> {
     .as_ref()
 }
 
+/// Bring the launchers on disk in line with which agents are on (see `agent::set_enabled`).
+/// Before the first shell the shim is not set up yet, and setting it up does this.
+pub fn sync_agent_launchers() {
+    if let Some(s) = SHIM.get().and_then(Option::as_ref) {
+        s.sync_launchers();
+    }
+}
+
 /// Prepend the shim `bin/` to PATH and export the shim env, so an agent's command in
 /// the spawned shell resolves to Arbiter's launcher (which runs the real binary with
 /// the agent's hooks). Best-effort; a missing shim just means no agent status, never a

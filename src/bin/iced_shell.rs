@@ -566,6 +566,7 @@ struct RenameConfirm {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsTab {
     General,
+    Agents,
     Display,
     Files,
     ClaudeUsage,
@@ -677,6 +678,8 @@ enum Message {
     ToggleShowTerminalButtons(bool),
     ToggleConfirmOnQuit(bool),
     ToggleNameRemoteSessions(bool),
+    /// Settings, Agents: switch Arbiter's support for one agent CLI on or off.
+    SetAgentEnabled(AgentKind, bool),
     /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
     SetIntenseStyle(persist::IntenseStyle),
     #[cfg(windows)]
@@ -1057,7 +1060,8 @@ fn saved_to_config(
     node: persist::SavedNode,
     git_bash: Option<&str>,
 ) -> pane_grid::Configuration<PaneData> {
-    let agent = node.saved_agent();
+    // An agent switched off since the save comes back as a plain terminal.
+    let agent = node.saved_agent().filter(|a| arbiter_native::agent::enabled(a.kind));
     match node {
         persist::SavedNode::Split { vertical, ratio, a, b } => pane_grid::Configuration::Split {
             axis: if vertical { pane_grid::Axis::Vertical } else { pane_grid::Axis::Horizontal },
@@ -2815,6 +2819,12 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             state.settings.confirm_on_quit = v;
             save_session(state);
         }
+        Message::SetAgentEnabled(kind, on) => {
+            state.settings.agents.insert(kind.agent().id().to_string(), on);
+            arbiter_native::agent::set_enabled(kind, on);
+            arbiter_native::shell::sync_agent_launchers();
+            save_session(state);
+        }
         Message::ToggleNameRemoteSessions(v) => {
             state.settings.name_remote_claude_sessions = v;
             save_session(state);
@@ -4568,6 +4578,36 @@ fn settings_toggle(
         .into()
 }
 
+/// One agent's switch in Settings, Agents: its icon and name, the Experimental badge for an
+/// agent that is, and what Arbiter does with it.
+fn settings_agent_row(agent: &'static dyn arbiter_native::agent::Agent, on: bool) -> Element<'static, Message> {
+    let kind = agent.kind();
+    let mut title = row![agent_icon(agent, 14.0), text(agent.display_name()).size(13).color(TXT_SECONDARY)]
+        .spacing(6)
+        .align_y(iced::Center);
+    if agent.experimental() {
+        title = title.push(experimental_badge());
+    }
+    let labels = column![title, text(agent.description()).size(11).color(TXT_MUTED)].spacing(4);
+    let tog = toggler(on).size(20.0).on_toggle(move |v| Message::SetAgentEnabled(kind, v)).style(toggle_style);
+    container(row![labels.width(Length::Fill), tog].spacing(12).align_y(iced::Center))
+        .padding([10, 4])
+        .into()
+}
+
+/// "Experimental" as an amber pill, so it is seen before the description is read.
+fn experimental_badge() -> Element<'static, Message> {
+    let amber = iced::Color::from_rgb8(0xe5, 0xa0, 0x3c);
+    container(text("Experimental").size(10).font(ui_semibold()).color(amber))
+        .padding([1, 6])
+        .style(move |_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color { a: 0.14, ..amber })),
+            border: iced::Border { color: iced::Color { a: 0.5, ..amber }, width: 1.0, radius: 4.0.into() },
+            ..Default::default()
+        })
+        .into()
+}
+
 /// The app's toggler look: azure when on, borderless, white knob. Shared by Settings and
 /// the sign-in dialog's per-connection switches.
 fn toggle_style(_t: &iced::Theme, s: toggler::Status) -> toggler::Style {
@@ -4871,6 +4911,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
             text("Settings").size(15).font(ui_semibold()).color(TXT_PRIMARY),
             column![
                 settings_tab_item("General", SettingsTab::General, state.settings_tab),
+                settings_tab_item("Agents", SettingsTab::Agents, state.settings_tab),
                 settings_tab_item("Display", SettingsTab::Display, state.settings_tab),
                 settings_tab_item("Files", SettingsTab::Files, state.settings_tab),
                 settings_tab_item("Claude Usage", SettingsTab::ClaudeUsage, state.settings_tab),
@@ -5101,6 +5142,22 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 state.settings.show_wol_button,
                 Message::ToggleWolButton,
             ));
+            col
+        }
+        SettingsTab::Agents => {
+            let mut col = column![
+                settings_section("Agents"),
+                settings_hint(
+                    "The agent CLIs Arbiter follows in its terminals: whether each is working, waiting \
+                     on you or finished, with its cards and office desk, and its conversation resumed \
+                     when a terminal is restored. Switched off, the CLI runs like any other program. \
+                     A change applies to agents started from now on."
+                ),
+            ]
+            .spacing(12);
+            for a in arbiter_native::agent::all() {
+                col = col.push(settings_agent_row(*a, state.settings.agent_enabled(a.kind())));
+            }
             col
         }
         SettingsTab::Notifications => column![
@@ -10718,6 +10775,11 @@ fn main() -> iced::Result {
     let _ = iced_winit::conversion::OCCLUSION_HOOK.set(on_occluded);
     arbiter_native::memdiag::start_summary_thread();
     let saved = arbiter_native::persist::load();
+    // Before any terminal spawns: the first one sets up the launchers, by these.
+    let settings = saved.as_ref().map(|s| s.settings.clone()).unwrap_or_default();
+    for a in arbiter_native::agent::all() {
+        arbiter_native::agent::set_enabled(a.kind(), settings.agent_enabled(a.kind()));
+    }
     #[cfg(windows)]
     choose_graphics_backend(saved.as_ref().map(|s| s.settings.graphics_backend).unwrap_or_default());
     let font = Arc::new(arbiter_native::font::load());

@@ -7,6 +7,7 @@
 //! `pane_grid` layout + how to spawn a `Session`); this module is just the
 //! serialisable shape + the on-disk read/write.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
@@ -320,6 +321,19 @@ pub struct Settings {
     /// at startup, so a change applies after a restart.
     #[serde(default)]
     pub graphics_backend: GraphicsBackend,
+    /// Agents switched on or off in Settings, Agents, by `Agent::id`. One absent here has
+    /// its default (see `agent_enabled`), so a new agent needs no migration.
+    #[serde(default)]
+    pub agents: BTreeMap<String, bool>,
+}
+
+impl Settings {
+    /// Whether Arbiter integrates with `kind`: as set in Settings, else on unless the agent
+    /// is experimental.
+    pub fn agent_enabled(&self, kind: crate::agent::AgentKind) -> bool {
+        let agent = kind.agent();
+        self.agents.get(agent.id()).copied().unwrap_or(!agent.experimental())
+    }
 }
 
 /// Default background colour. `#0a0a0c` — near-black with a faint cool cast.
@@ -469,6 +483,7 @@ impl Default for Settings {
             office_weather: 0,
             office_weather_auto: true,
             graphics_backend: GraphicsBackend::Auto,
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -852,5 +867,25 @@ mod tests {
             agent: None,
         };
         assert!(!serde_json::to_string(&plain).unwrap().contains("agent"));
+    }
+
+    // Out of the box, and for a save from before the setting: Claude on, the experimental
+    // agents off. A choice made in Settings wins either way, and survives a save.
+    #[test]
+    fn agents_default_to_claude_alone_and_keep_a_choice() {
+        use crate::agent::AgentKind;
+        let old: Settings = serde_json::from_str(r#"{"confirm_on_quit":true}"#).unwrap();
+        for s in [Settings::default(), old] {
+            assert!(s.agent_enabled(AgentKind::Claude));
+            assert!(!s.agent_enabled(AgentKind::Copilot));
+            assert!(!s.agent_enabled(AgentKind::Codex));
+        }
+        let mut s = Settings::default();
+        s.agents.insert("codex".into(), true);
+        s.agents.insert("claude".into(), false);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.agent_enabled(AgentKind::Codex));
+        assert!(!back.agent_enabled(AgentKind::Claude));
+        assert!(!back.agent_enabled(AgentKind::Copilot));
     }
 }

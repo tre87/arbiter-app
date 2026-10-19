@@ -350,12 +350,15 @@ fn cd_cmd(dir: &str) -> String {
 }
 
 /// Which agent a command typed at the far prompt launches, and what it means for the
-/// conversation, by the first agent that recognises it.
+/// conversation, by the first agent that is on and recognises it.
 fn classify_launch(cmd: &str) -> Option<(AgentKind, TypedLaunch)> {
-    crate::agent::all().iter().find_map(|a| match a.classify_launch(cmd) {
-        TypedLaunch::NotThis => None,
-        launch => Some((a.kind(), launch)),
-    })
+    crate::agent::all()
+        .iter()
+        .filter(|a| crate::agent::enabled(a.kind()))
+        .find_map(|a| match a.classify_launch(cmd) {
+            TypedLaunch::NotThis => None,
+            launch => Some((a.kind(), launch)),
+        })
 }
 
 /// A fresh conversation id for a far agent, in the UUID form `--session-id` accepts.

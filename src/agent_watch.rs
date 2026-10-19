@@ -94,6 +94,11 @@ pub(crate) fn apply_lines(h: &Arc<AgentHandle>, text: &str) {
             h.pane_id,
             h.running.load(Ordering::Relaxed)
         ));
+        // An agent switched off binds no pane; one bound before the switch is followed
+        // until it exits.
+        if !crate::agent::enabled(kind) && h.kind() != Some(kind) {
+            continue;
+        }
         h.apply(kind, session.as_deref(), &event);
         let bound = matches!(event, AgentEvent::SessionBound { .. })
             && h.kind() == Some(kind)

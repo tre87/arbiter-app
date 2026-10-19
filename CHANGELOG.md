@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **Settings, Agents: switch each agent CLI on or off.** Claude is on by default. Copilot
+  and Codex are badged Experimental and are now off until you switch them on there. An
+  agent that is off is left alone: no launcher or hooks, no status, cards or office desk,
+  and no resume when its terminal is restored. A change applies to agents started from
+  then on; one already running keeps its status until it exits.
+
 ### Changed
 - **A shell Claude leaves running no longer counts as working.** A dev server started in
   the background kept its pane "working" for as long as it ran: the animation never
