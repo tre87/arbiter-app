@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-11-10
+
 ### Changed
 - **Terminals in workspaces you have not opened yet start at their real size.** A
   terminal used to learn its size when it was first drawn, so a pane in a background
