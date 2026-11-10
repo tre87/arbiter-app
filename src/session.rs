@@ -2200,8 +2200,9 @@ mod tests {
     // Live harness, needing a signed-in Claude on PATH, the debug `arbiter` built beside
     // the test binary, and `ARBITER_LIVE_CWD` naming a folder Claude already trusts (it
     // asks before working anywhere else). A real interactive Claude in a headless pane
-    // is told to start two sub-agents in the background and report as each finishes:
-    // its turn ends at once and it is woken twice, which is three turns for one job.
+    // is told to start three sub-agents of different lengths in the background and
+    // report as each finishes: its turn ends at once and it is woken for each report,
+    // which is four turns for one job, with reports arriving during those turns.
     // The pane must read as working from the prompt to the last reply without a break,
     // and count one finish. It spends a few short turns and two small sub-agents.
     // `cargo build --bin arbiter && ARBITER_LIVE_CWD=~/some/trusted/folder cargo test --lib session::tests::live_background -- --ignored --nocapture`
@@ -2228,11 +2229,12 @@ mod tests {
         let t0 = Instant::now();
         let at = |t0: Instant| t0.elapsed().as_millis();
         let mut session = super::Session::spawn(140, 45, cmd).unwrap();
-        let prompt = "Test of a terminal UI; change no files. In ONE message start two general-purpose \
-                      sub-agents with run_in_background true; the task of each is exactly: \"Reply with the \
-                      integers 1 to 500, one per line, and nothing else.\" Then end your turn with the \
-                      single word WAITING. Each time you are notified that one finished, reply only with \
-                      the single word NOTED, unless both have finished, in which case reply only DONE.";
+        let prompt = "Test of a terminal UI; change no files. In ONE message start three general-purpose \
+                      sub-agents with run_in_background true. The task of each is exactly: \"Reply with the \
+                      integers 1 to N, one per line, and nothing else.\" with N being 250 for the first, \
+                      300 for the second and 900 for the third. Then end your turn with the single word \
+                      WAITING. Each time you are notified that one finished, reply only with the single \
+                      word NOTED, unless all three have finished, in which case reply only DONE.";
         let (mut sent, mut last) = (false, String::new());
         // The longest the pane read as idle between the prompt and the finish.
         let (mut working_since_prompt, mut idle_from, mut longest_idle) = (false, None::<Instant>, Duration::ZERO);
@@ -2281,7 +2283,7 @@ mod tests {
         println!("--- screen at the end:\n{}", rows.join("\n"));
         println!("longest idle reading before the finish: {longest_idle:?}");
         assert!(sent, "Claude never came up");
-        assert_eq!(most_helpers, 2, "both sub-agents were counted");
+        assert_eq!(most_helpers, 3, "every sub-agent was counted");
         assert!(finished_at.is_some(), "the job never counted as finished");
         assert!(rows.iter().any(|r| r.contains("DONE")), "Claude did not get to the end");
         assert!(longest_idle < Duration::from_millis(300), "the pane read as idle mid-job for {longest_idle:?}");

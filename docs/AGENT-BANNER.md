@@ -174,8 +174,9 @@ A live interactive Claude in a headless pane, told to start two sub-agents and a
   list, `agent_type` empty, about a second after each Stop. This is why the running
   sub-agents are a set of ids and not a counter: an unknown id changes nothing.
 - **`UserPromptSubmit` fires when Claude is woken** by a report (the prompt is an
-  `<agent-message>` or a `<task-notification>`), as well as for a typed prompt. Not
-  registered: it might also fire for slash commands, and it is not needed.
+  `<agent-message>` or a `<task-notification>`), as well as for a typed prompt. It
+  follows the Stop before it within a tenth of a second. Used for the wake-ups only
+  (see "An empty list is not always the end").
 - **`idle_prompt`** arrived 60 seconds after the last Stop. The docs say Claude holds
   it back while a background agent runs.
 
@@ -192,6 +193,39 @@ A live interactive Claude in a headless pane, told to start two sub-agents and a
 
 Result in the live test: working without a break from the prompt to the last reply,
 one finish instead of three.
+
+### An empty list is not always the end
+
+The first real run after that change (its debug log, 2026-11-10) showed the pane
+idle for a second, twice in one job, each with a false "finished":
+
+```
+20.2  Stop            tasks = [subagent running]      held, as intended
+20.5  SubagentStop    the one that was running
+21.5  Stop            tasks = []                      read as the end: idle, finish
+22.7  working again   Claude woken for that last report
+```
+
+The sub-agent finished while Claude was in a wake-up turn of a second. That turn's
+Stop listed nothing, which was true, but the report had not been heard: Claude is
+woken for it as soon as the turn is over. So:
+
+- `UserPromptSubmit` is registered, only to hear the wake-ups. Its prompt then
+  starts with `<agent-message` or `<task-notification`; a typed prompt emits nothing,
+  because the hook may also fire for input that starts no turn.
+- A sub-agent that a Stop has named (it outlived a turn, so it is a background one)
+  sets `report_owed_ms` when it stops. Later than the last wake-up, the report is
+  still owed.
+- A Stop with a report owed holds Working for `WAKE_WAIT_MS` (1.5 s) and judges the
+  finish only then: a wake-up in between cancels it, none means the turn was the end.
+- A turn start reported after a stop now wins over the "just stopped" rule in
+  `lifecycle`, or the wake-up itself would read idle for a moment.
+
+Known cost: Claude can hand a report over in the middle of a turn that is still
+calling tools. Then nothing is owed, Arbiter cannot tell, and the pane stays working
+for 1.5 s after the real end. A sub-agent that starts and finishes inside one turn
+is taken for a foreground one and owes nothing; if it was a background one, the
+second of idle comes back for that case.
 
 ## Decisions worth knowing before changing things
 

@@ -114,6 +114,14 @@ pub struct AgentHandle {
     logged_lifecycle: AtomicU32,
     /// When the last running sub-agent reported its stop (see `lifecycle`).
     agents_done_ms: AtomicU64,
+    /// Sub-agents a turn's end has named as still running: the background ones, whose
+    /// reports reach the agent by waking it.
+    outlived_a_turn: Mutex<Vec<String>>,
+    /// When one of those last stopped. Later than the agent's last wake-up
+    /// (`turn_started_ms`), its report has not been heard yet.
+    report_owed_ms: AtomicU64,
+    /// Working is held until then: a turn ended with a report still owed.
+    wake_hold_until_ms: AtomicU64,
     /// Sub-agents reported started and not yet stopped, each with when it started. By
     /// id rather than a count, so a stop whose start was missed changes nothing.
     subagents: Mutex<Vec<(String, u64)>>,
@@ -234,6 +242,11 @@ const INTERRUPT_WINDOW_MS: u64 = 1500;
 /// inside the window is still seen by its row, title or progress, which are levels,
 /// and a prompt submitted inside it ends the window (`clear_suppression`).
 const START_QUIET_MS: u64 = 3000;
+/// How long a turn that ended with a sub-agent's report still owed is held as working
+/// while the agent is woken for it. Claude's wake-up follows its Stop within a tenth of
+/// a second (measured); if none comes in this long, the turn was the finish after all
+/// and is counted then.
+const WAKE_WAIT_MS: u64 = 1500;
 /// A sub-agent whose stop has not come after this long is taken to be gone. An hour:
 /// well past any real one, and it bounds how long a lost stop report can show.
 const SUBAGENT_MAX_MS: u64 = 3_600_000;
@@ -279,6 +292,9 @@ impl AgentHandle {
             background_shells: AtomicU32::new(0),
             logged_lifecycle: AtomicU32::new(Lifecycle::Closed as u32),
             agents_done_ms: AtomicU64::new(0),
+            outlived_a_turn: Mutex::new(Vec::new()),
+            report_owed_ms: AtomicU64::new(0),
+            wake_hold_until_ms: AtomicU64::new(0),
             subagents: Mutex::new(Vec::new()),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
@@ -409,7 +425,7 @@ impl AgentHandle {
         }
         self.turn_started_ms.store(0, Ordering::Relaxed);
         self.background_shells.store(0, Ordering::Relaxed);
-        self.subagents.lock().unwrap().clear();
+        self.forget_subagents();
         if !self.on_screen() {
             self.clear_kind();
         }
@@ -554,7 +570,7 @@ impl AgentHandle {
             }
             self.record_session(kind, id, transcript.as_deref());
             // A new conversation (startup, resume, `/clear`) has no sub-agents yet.
-            self.subagents.lock().unwrap().clear();
+            self.forget_subagents();
             self.suppress_activity(START_QUIET_MS);
             return;
         }
@@ -567,7 +583,13 @@ impl AgentHandle {
         match event {
             AgentEvent::SessionBound { .. } => {}
             AgentEvent::TurnStarted => {
-                self.turn_started_ms.store(now_ms(), Ordering::Relaxed);
+                // After the turn end it follows, even inside the same millisecond: an
+                // agent woken by a report starts its next turn the instant one ends.
+                let after_stop = self.stop_ms.load(Ordering::Relaxed) + 1;
+                self.turn_started_ms.store(now_ms().max(after_stop), Ordering::Relaxed);
+                // The wake-up a turn's end was waiting for, if it was: from here the
+                // turn itself says the pane is working.
+                self.wake_hold_until_ms.store(0, Ordering::Relaxed);
                 self.hook_attention.store(false, Ordering::Relaxed);
                 self.worked_since_finish.store(true, Ordering::Relaxed);
             }
@@ -578,11 +600,11 @@ impl AgentHandle {
                 self.interrupt_ms.store(now, Ordering::Relaxed);
                 self.stop_ms.store(now, Ordering::Relaxed);
                 self.hook_attention.store(false, Ordering::Relaxed);
-                self.subagents.lock().unwrap().clear();
+                self.forget_subagents();
             }
             AgentEvent::SessionEnded => {
                 self.hook_attention.store(false, Ordering::Relaxed);
-                self.subagents.lock().unwrap().clear();
+                self.forget_subagents();
             }
             AgentEvent::SubagentStarted { id } => {
                 let mut subs = self.subagents.lock().unwrap();
@@ -591,13 +613,22 @@ impl AgentHandle {
                 }
             }
             AgentEvent::SubagentStopped { id } => {
+                let now = now_ms();
                 let mut subs = self.subagents.lock().unwrap();
                 let before = subs.len();
                 subs.retain(|(s, _)| s != id);
                 // The last one in: the agent is about to be woken with its report, and
                 // until that turn draws its row nothing else says the pane is busy.
                 if before > 0 && subs.is_empty() {
-                    self.agents_done_ms.store(now_ms(), Ordering::Relaxed);
+                    self.agents_done_ms.store(now, Ordering::Relaxed);
+                }
+                // One that outlived a turn reports by waking the agent (see
+                // `report_owed_ms`). One that never did is taken for a sub-agent whose
+                // result came back inside the turn that started it.
+                let mut outlived = self.outlived_a_turn.lock().unwrap();
+                if outlived.iter().any(|s| s == id) {
+                    outlived.retain(|s| s != id);
+                    self.report_owed_ms.store(now, Ordering::Relaxed);
                 }
             }
             AgentEvent::BackgroundAgents { ids } => {
@@ -608,7 +639,18 @@ impl AgentHandle {
                     .iter()
                     .map(|id| (id.clone(), known.iter().find(|(s, _)| s == id).map_or(now, |(_, at)| *at)))
                     .collect();
+                // Named at a turn's end: these are running in the background.
+                *self.outlived_a_turn.lock().unwrap() = ids.clone();
             }
+        }
+    }
+
+    /// No sub-agent is running, none owes a report, nothing is being waited for.
+    fn forget_subagents(&self) {
+        self.subagents.lock().unwrap().clear();
+        self.outlived_a_turn.lock().unwrap().clear();
+        for t in [&self.agents_done_ms, &self.report_owed_ms, &self.wake_hold_until_ms] {
+            t.store(0, Ordering::Relaxed);
         }
     }
 
@@ -635,9 +677,21 @@ impl AgentHandle {
     }
 
     fn turn_ended(self: &Arc<Self>) {
-        self.stop_ms.store(now_ms(), Ordering::Relaxed);
+        let now = now_ms();
+        self.stop_ms.store(now, Ordering::Relaxed);
         self.hook_attention.store(false, Ordering::Relaxed);
-        self.count_stop();
+        // A background sub-agent that finished after this turn began has not been
+        // heard by the agent yet: its report wakes it as soon as this turn is over. So
+        // the turn's end is not the job's, though it leaves nothing running. Measured
+        // from Claude 2.1.322: the last of several finished during a wake-up turn of a
+        // second, that turn's Stop listed no task, and the pane read idle (and counted
+        // a finish) for the second before Claude was woken again.
+        let woken = self.turn_started_ms.load(Ordering::Relaxed);
+        let owed = self.report_owed_ms.load(Ordering::Relaxed) > woken && !self.waiting_on_agents();
+        if owed {
+            self.wake_hold_until_ms.store(now + WAKE_WAIT_MS, Ordering::Relaxed);
+        }
+        self.count_stop(now, if owed { WAKE_WAIT_MS } else { STOP_CONFIRM_MS });
     }
 
     fn record_session(&self, kind: AgentKind, id: &str, transcript: Option<&str>) {
@@ -935,14 +989,21 @@ impl AgentHandle {
     /// fires then too and it resumes by itself. The hook can be handled before the reader
     /// has seen the row that says so, so the check is made `STOP_CONFIRM_MS` later rather
     /// than at once.
-    fn count_stop(self: &Arc<Self>) {
+    ///
+    /// `stopped_ms` is when the turn ended. `after_ms` is how long to wait before
+    /// judging it: longer when a sub-agent's report is still owed, and then a turn the
+    /// agent has been woken for in the meantime means this end was not the finish.
+    fn count_stop(self: &Arc<Self>, stopped_ms: u64, after_ms: u64) {
         let weak = Arc::downgrade(self);
-        let at = std::time::Instant::now() + Duration::from_millis(STOP_CONFIRM_MS);
+        let at = std::time::Instant::now() + Duration::from_millis(after_ms);
         crate::session::schedule(at, move || {
             let Some(h) = weak.upgrade() else { return };
-            if !h.waiting_on_agents() && h.count_finish() {
-                crate::session::wake_ui();
+            let woken_since = h.turn_started_ms.load(Ordering::Relaxed) > stopped_ms;
+            if !woken_since && !h.waiting_on_agents() {
+                h.count_finish();
             }
+            // Counted or not, the hold has run out: the pane is to be read again.
+            crate::session::wake_ui();
         });
     }
 
@@ -967,8 +1028,7 @@ impl AgentHandle {
     pub fn note_interrupt(&self) {
         self.interrupt_ms.store(now_ms(), Ordering::Relaxed);
         // An interrupted turn's sub-agents go with it, and no stop is promised for them.
-        self.subagents.lock().unwrap().clear();
-        self.agents_done_ms.store(0, Ordering::Relaxed);
+        self.forget_subagents();
     }
 
     /// When the user last pressed Esc or Ctrl+C here; 0 if never.
@@ -1104,6 +1164,10 @@ impl AgentHandle {
         {
             return Lifecycle::Working;
         }
+        // Its turn has ended with a sub-agent's report still to come (see `turn_ended`).
+        if now_ms() < self.wake_hold_until_ms.load(Ordering::Relaxed) {
+            return Lifecycle::Working;
+        }
         // The agent's own screen, title or progress says it is working. Levels, so they
         // hold through a frozen row and a stalled read, where the spinner stream below
         // would decay into "ready" and read as a turn end.
@@ -1120,15 +1184,18 @@ impl AgentHandle {
         let act = self.activity_ms.load(Ordering::Relaxed);
         let stop = self.stop_ms.load(Ordering::Relaxed);
         let now = now_ms();
+        // A prompt was submitted and nothing on screen has spoken yet. Ahead of the
+        // just-stopped rule below: a turn reported as starting after a stop is a new
+        // turn, however soon (an agent woken by a sub-agent's report starts one a
+        // tenth of a second after the last ended), not that stop's last frames.
+        let started = self.turn_started_ms.load(Ordering::Relaxed);
+        if started > stop && now.saturating_sub(started) < TURN_START_HOLD_MS {
+            return Lifecycle::Working;
+        }
         // Just stopped: clean turn-end; ignore a trailing spinner frame so it doesn't
         // flicker working→ready→working.
         if stop != 0 && now.saturating_sub(stop) < STOP_SUPPRESS_MS {
             return Lifecycle::Ready;
-        }
-        // A prompt was submitted and nothing on screen has spoken yet.
-        let started = self.turn_started_ms.load(Ordering::Relaxed);
-        if started > stop && now.saturating_sub(started) < TURN_START_HOLD_MS {
-            return Lifecycle::Working;
         }
         // Fallback for a pane whose agent draws no row we recognise: activity fresh and
         // more recent than the last turn-end. This decays on a timeout, so it drives the
@@ -1148,11 +1215,12 @@ impl AgentHandle {
         let stop = self.stop_ms.load(Ordering::Relaxed);
         let started = self.turn_started_ms.load(Ordering::Relaxed);
         format!(
-            "running={} lc={:?} waiting={} subagents={} row={} title={} progress={} started_hold={} activity={} menu={} hook_att={}",
+            "running={} lc={:?} waiting={} subagents={} report_owed={} row={} title={} progress={} started_hold={} activity={} menu={} hook_att={}",
             on(&self.running),
             self.lifecycle(),
             on(&self.waiting_background),
             self.subagent_count(),
+            now < self.wake_hold_until_ms.load(Ordering::Relaxed),
             on(&self.working_row),
             on(&self.title_working),
             on(&self.progress_working),
@@ -1310,6 +1378,7 @@ mod tests {
         ev(stopped("a"));
         assert_eq!(h.snapshot().subagents, 1);
         // Woken by the first report, a turn of a second, and a Stop that names the other.
+        ev(AgentEvent::TurnStarted);
         ev(running(&["b"]));
         ev(AgentEvent::TurnEnded);
         settle();
@@ -1319,13 +1388,90 @@ mod tests {
         ev(stopped("b"));
         assert_eq!(h.snapshot().subagents, 0);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
-        // "DONE": nothing left running, so this Stop is the finish, and at once.
+        // Woken with the last report. "DONE": nothing left running and nothing unheard,
+        // so this Stop is the finish, and at once.
+        std::thread::sleep(Duration::from_millis(5));
+        ev(AgentEvent::TurnStarted);
         ev(running(&[]));
         ev(AgentEvent::TurnEnded);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
         settle();
         assert_eq!(h.finish_seq(), 1);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+    }
+
+    // From a real run's log (2026-11-10): the last of three background sub-agents
+    // finished while Claude was in a wake-up turn of a second. That turn's Stop named no
+    // task, which was true, and Claude was woken for the last report a second later.
+    // The pane read idle for that second and counted a finish in the middle of the job.
+    #[test]
+    fn a_report_still_owed_at_a_turns_end_is_not_the_finish() {
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        let started = |id: &str| AgentEvent::SubagentStarted { id: id.into() };
+        let stopped = |id: &str| AgentEvent::SubagentStopped { id: id.into() };
+        let running = |ids: &[&str]| AgentEvent::BackgroundAgents { ids: ids.iter().map(|s| s.to_string()).collect() };
+        for id in ["a", "b", "c"] {
+            ev(started(id));
+        }
+        ev(running(&["a", "b", "c"]));
+        ev(AgentEvent::TurnEnded);
+        ev(stopped("b"));
+        ev(stopped("c"));
+        // Woken for those two; its turn ends with "a" still running.
+        ev(AgentEvent::TurnStarted);
+        ev(running(&["a"]));
+        ev(AgentEvent::TurnEnded);
+        // Woken again at once (the second report), and "a" finishes during that turn.
+        ev(AgentEvent::TurnStarted);
+        std::thread::sleep(Duration::from_millis(5));
+        ev(stopped("a"));
+        ev(running(&[]));
+        ev(AgentEvent::TurnEnded);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working, "a's report is still to come");
+        std::thread::sleep(Duration::from_millis(super::STOP_CONFIRM_MS + 80));
+        assert_eq!(h.finish_seq(), 0);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        // The wake-up for it, and the turn that really is the last.
+        ev(AgentEvent::TurnStarted);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        ev(running(&[]));
+        ev(AgentEvent::TurnEnded);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready, "nothing owed: done at once");
+        std::thread::sleep(Duration::from_millis(super::WAKE_WAIT_MS + 150));
+        assert_eq!(h.finish_seq(), 1, "one job, one finish");
+    }
+
+    // The wait for a wake-up is bounded: if the agent had heard the report after all
+    // (it can be handed one in the middle of a turn), the turn is counted as the finish
+    // when the wait runs out. And a sub-agent that never outlived a turn owes nothing.
+    #[test]
+    fn a_wake_up_that_never_comes_is_given_up_on() {
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        ev(AgentEvent::SubagentStarted { id: "a".into() });
+        ev(AgentEvent::BackgroundAgents { ids: vec!["a".into()] });
+        ev(AgentEvent::TurnEnded);
+        ev(AgentEvent::TurnStarted);
+        std::thread::sleep(Duration::from_millis(5));
+        ev(AgentEvent::SubagentStopped { id: "a".into() });
+        ev(AgentEvent::BackgroundAgents { ids: Vec::new() });
+        ev(AgentEvent::TurnEnded);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        std::thread::sleep(Duration::from_millis(super::WAKE_WAIT_MS + 150));
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        assert_eq!(h.finish_seq(), 1);
+
+        // Started and finished inside one turn: its result came back in that turn.
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        ev(AgentEvent::SubagentStarted { id: "f".into() });
+        ev(AgentEvent::SubagentStopped { id: "f".into() });
+        ev(AgentEvent::BackgroundAgents { ids: Vec::new() });
+        ev(AgentEvent::TurnEnded);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        std::thread::sleep(Duration::from_millis(super::STOP_CONFIRM_MS + 80));
+        assert_eq!(h.finish_seq(), 1);
     }
 
     // A stop report that never arrived cannot leave the pane working: the next account

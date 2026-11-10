@@ -379,6 +379,17 @@ or what counts as working. Three files:
     change nothing, which is why this is a set and not a counter.
   - When the last sub-agent stops, `agents_done_ms` holds Working for one TTL, until
     the turn Claude is woken for draws its row; a Stop since ends the hold.
+  - **An empty list is not always the end.** A sub-agent that finishes while Claude
+    is in a wake-up turn has not been heard yet: that turn's Stop lists nothing, and
+    Claude is woken for the report a tenth of a second later. A real run's log showed
+    the pane idle for a second there, twice in one job, each with a false finish. So
+    `UserPromptSubmit` is registered, only to hear the wake-ups (a prompt starting
+    `<agent-message` or `<task-notification`; a typed one emits nothing), and a Stop
+    is held (`turn_ended`, `WAKE_WAIT_MS`) when a sub-agent that had outlived a turn
+    stopped after the last wake-up (`report_owed_ms` against `turn_started_ms`). The
+    finish is counted when that wait runs out with no wake-up; a wake-up cancels it.
+    Claude can also hand a report over in the middle of a turn that is still calling
+    tools, and then the wait is 1.5 s of working after the real end: bounded, rare.
   A `shell` entry is deliberately not counted (see "A background shell is not work"):
   nothing tells `sleep 20` from a dev server, so a Claude waiting on a background
   command still reads as idle between turns. The other task types (monitor, workflow,

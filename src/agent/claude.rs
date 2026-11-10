@@ -221,6 +221,8 @@ impl Agent for Claude {
                 // The sub-agents a turn has running, for the banner's helper robots.
                 "SubagentStart": entry.clone(),
                 "SubagentStop": entry.clone(),
+                // Only to hear Claude being woken by a sub-agent's report.
+                "UserPromptSubmit": entry.clone(),
                 "Stop": entry,
             }
         });
@@ -245,7 +247,20 @@ impl Agent for Claude {
                 },
                 None => return HookOutcome::default(),
             },
-            "UserPromptSubmit" => AgentEvent::TurnStarted,
+            // Claude "submits" a prompt to itself when background work reports back: an
+            // `<agent-message …>` from a sub-agent, a `<task-notification>` for a
+            // command. That is a turn starting with nobody at the keyboard, which
+            // nothing on screen says until the turn draws its row. A prompt somebody
+            // typed is left to the screen, as it always was: this also fires for input
+            // that starts no turn at all, and the turn-start hold would show those as
+            // five seconds of work.
+            "UserPromptSubmit" => {
+                let prompt = field(&v, &["prompt"]).unwrap_or("").trim_start();
+                if !(prompt.starts_with("<agent-message") || prompt.starts_with("<task-notification")) {
+                    return HookOutcome::default();
+                }
+                AgentEvent::TurnStarted
+            }
             // The turn is over, and the hook says what it leaves running: sub-agents
             // still at work mean Claude is paused and will be woken, not finished. The
             // list goes first, so the turn's end is judged against it.
@@ -506,6 +521,19 @@ mod tests {
             let json = format!(r#"{{"session_id":"s","hook_event_name":"Notification","notification_type":"{ignored}"}}"#);
             assert!(hook(&json).events.is_empty(), "{ignored}");
         }
+        // Claude woken by background work is a turn starting (both prompts captured from
+        // 2.1.322); a prompt somebody typed says nothing here.
+        for wake in [
+            r#"<agent-message from=\"a1b818190cc0ffd7e\">\n[Subagent hand-back] The text below"#,
+            r#"<task-notification>\n<task-id>bnzmou8bu</task-id>"#,
+        ] {
+            let json = format!(r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{wake}"}}"#);
+            assert_eq!(hook(&json).events, vec![AgentEvent::TurnStarted], "{wake}");
+        }
+        for typed in ["hello", "/model", "fix the <agent-message> parser"] {
+            let json = format!(r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{typed}"}}"#);
+            assert!(hook(&json).events.is_empty(), "{typed}");
+        }
         // Idle for a minute: never attention, and no sub-agent can still be running.
         assert_eq!(
             hook(r#"{"session_id":"s","hook_event_name":"Notification","notification_type":"idle_prompt"}"#).events,
@@ -579,7 +607,7 @@ mod tests {
         assert_eq!(path, &dir.join("settings.json"));
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(v.get("statusLine").is_none());
-        for ev in ["SessionStart", "Notification", "PermissionRequest", "SubagentStart", "SubagentStop", "Stop"] {
+        for ev in ["SessionStart", "Notification", "PermissionRequest", "SubagentStart", "SubagentStop", "UserPromptSubmit", "Stop"] {
             let cmd = v.pointer(&format!("/hooks/{ev}/0/hooks/0/command")).and_then(|c| c.as_str());
             assert_eq!(cmd, Some("\"/opt/arbiter\" agent-hook claude"), "{ev}");
         }
