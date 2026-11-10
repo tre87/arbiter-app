@@ -400,6 +400,18 @@ or what counts as working. Three files:
 - **`src/bin/banner_preview.rs`** is a test window (`ARBITER_OPEN_BANNER=1`): one fake
   pane, a menu for the state, helpers, hour and weather. Use it to work on the art.
 
+## Claude usage bars: a webview in a helper process
+
+The titlebar meters (5h, 7d, per-model weekly caps) come from claude.ai's own usage API,
+read by a hidden webview signed in to claude.ai, in a second process that is this same
+binary run with `--usage-helper` (`src/bin/usage_helper.rs`). It posts one JSON line per
+fetch on stdout; the app drives it over stdin (`show`, `fetch`, `reload`, `org:<uuid>`,
+`signout`), owns the 120 s cadence on a background thread, and climbs a ladder when the
+helper goes silent (refetch, reload, restart the process). Nothing here touches Claude
+Code's login, token or hooks. `docs/CLAUDE-USAGE.md` has the whole of it: the protocol,
+the Windows hidden-renderer handling, the state rules, the dead ends, and what to change
+where. Read it before touching the helper or the poll.
+
 ## Priority under full CPU load (Windows, 2026-10-09)
 
 With a CPU-bound program on every core (the Fenfire balance runner), the window stayed
