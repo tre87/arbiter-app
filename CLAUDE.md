@@ -546,7 +546,8 @@ after `SHELL_MAX` / `AGENT_MAX`. Everything still starts at launch.
   - **Left to the first drawing:** a workspace showing the editor, a banner with
     rows of its own (it takes rows once the agent runs), and anything that changes
     the window before the first visit (a resize, another display, the font size).
-    Not run on Windows or at a fractional scale.
+    Windows (2026-11-10, 31 panes, scale 1): 29 sized, none on screen differed and
+    none was drawn at another size. Not run at a fractional scale.
 - **To time a launch:** copy `session.json` to a scratch folder, run the release build
   with `ARBITER_DATA_DIR` there plus `ARBITER_RECORD_PTY=1` and `ARBITER_CLAUDE_DEBUG=1`
   from a clean environment (`env -i`), and read each pane's first `OSC 133` from the
