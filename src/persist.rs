@@ -292,31 +292,16 @@ pub struct Settings {
     /// who only wants terminals. Off hides an open explorer without forgetting it.
     #[serde(default)]
     pub show_file_explorer: bool,
-    /// Offer the Agents Office: a titlebar button and Ctrl+Shift+G opening a popout
-    /// room where one desk is one running agent. Off by default, and experimental:
-    /// turning it off closes the window, so nothing is left without a way to dismiss
-    /// it.
+    /// Show the agent banner (`agent_banner`) at the top of a terminal that runs an
+    /// agent. Off by default: it takes rows from the terminal. The titlebar's robot
+    /// button switches it too.
     #[serde(default)]
-    pub show_agents_office: bool,
-    /// Keep the Agents Office above other windows. Off by default, unlike the
-    /// overview: the overview is a panel you consult, this is a picture you leave in
-    /// a corner, and a picture that sits on top of your work is in the way.
-    #[serde(default)]
-    pub office_topmost: bool,
-    /// Draw the workspace and terminal name under each desk. On by default; off
-    /// gives the room back as art.
+    pub show_agent_banner: bool,
+    /// Show the banner only while the agent works, which is the default. Off, it
+    /// stays between turns, held still, and the terminal is not resized at every
+    /// turn's start and end.
     #[serde(default = "default_true")]
-    pub office_show_names: bool,
-    /// Which sky, as an index into `agents_office::Weather::ALL`. Only consulted when
-    /// `office_weather_auto` is off.
-    #[serde(default)]
-    pub office_weather: usize,
-    /// Let the sky drift on its own. On by default, and free: it drifts on the
-    /// room's own clock, which only runs while some agent is working, so the weather
-    /// changes through working time and holds still when the room goes quiet. It can
-    /// never be the reason a frame is drawn.
-    #[serde(default = "default_true")]
-    pub office_weather_auto: bool,
+    pub banner_hide_idle: bool,
     /// Windows: the graphics backend to ask for (Settings, Display, Graphics). Read once
     /// at startup, so a change applies after a restart.
     #[serde(default)]
@@ -477,11 +462,8 @@ impl Default for Settings {
             notify_finished: true,
             split_keeps_cwd: true,
             show_file_explorer: false,
-            show_agents_office: false,
-            office_topmost: false,
-            office_show_names: true,
-            office_weather: 0,
-            office_weather_auto: true,
+            show_agent_banner: false,
+            banner_hide_idle: true,
             graphics_backend: GraphicsBackend::Auto,
             agents: BTreeMap::new(),
         }
@@ -501,12 +483,6 @@ pub struct SavedState {
     /// Whether the overview popout was open at save time → reopen it on startup.
     #[serde(default)]
     pub overview_visible: bool,
-    /// Agents Office popout geometry; defaulted likewise.
-    #[serde(default)]
-    pub office_window: Option<SavedWindow>,
-    /// Whether the Agents Office was open at save time → reopen it on startup.
-    #[serde(default)]
-    pub office_visible: bool,
     /// Chosen claude.ai org uuid for the usage bars (so the picker isn't re-shown).
     #[serde(default)]
     pub usage_org: Option<String>,
@@ -570,8 +546,6 @@ mod tests {
             main_window: Some(SavedWindow { width: 1200.0, height: 800.0, x: Some(10.0), y: Some(20.0) }),
             overview_window: None,
             overview_visible: true,
-            office_window: None,
-            office_visible: false,
             usage_org: None,
             settings: Settings::default(),
             workspaces: vec![
@@ -725,8 +699,9 @@ mod tests {
         assert!(!s.settings.show_fable_usage);
         // The file explorer is opt-in, and a save from before it existed has none.
         assert!(!s.settings.show_file_explorer);
-        // So is the Agents Office.
-        assert!(!s.settings.show_agents_office);
+        // The agent banner is opt-in, and once on shows only while the agent works.
+        assert!(!s.settings.show_agent_banner);
+        assert!(s.settings.banner_hide_idle);
         assert!(s.workspaces[0].explorer.is_none());
         assert!(s.workspaces[0].editor_tabs.is_empty());
         match &s.workspaces[0].layout {

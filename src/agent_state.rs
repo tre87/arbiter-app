@@ -36,6 +36,9 @@ pub struct AgentStatus {
     /// Shells the agent left running in the background, by its footer. Not work: the
     /// lifecycle never reads it, since a dev server can run for as long as the session.
     pub shells: u32,
+    /// Sub-agents the agent has running, by its own start and stop reports. Not work
+    /// either: the lifecycle never reads it.
+    pub subagents: u32,
 }
 
 /// What said which agent a pane runs. A weaker source never overrides a stronger one
@@ -107,6 +110,9 @@ pub struct AgentHandle {
     waiting_background: AtomicBool,
     /// Background shells by the footer's count (see `AgentStatus::shells`).
     background_shells: AtomicU32,
+    /// Sub-agents reported started and not yet stopped, each with when it started. By
+    /// id rather than a count, so a stop whose start was missed changes nothing.
+    subagents: Mutex<Vec<(String, u64)>>,
     /// Spinner detection is ignored until this time: set briefly on app-initiated
     /// repaints (window/PTY resize) whose rapid redraws would otherwise look animated.
     suppress_until_ms: AtomicU64,
@@ -216,6 +222,9 @@ const ROW_END_CONFIRM_MS: u64 = 400;
 /// A row leaving within this long of Esc or Ctrl+C is the interrupt landing, not a
 /// finish. Claude takes a few hundred ms to cancel the request and redraw.
 const INTERRUPT_WINDOW_MS: u64 = 1500;
+/// A sub-agent whose stop has not come after this long is taken to be gone. An hour:
+/// well past any real one, and it bounds how long a lost stop report can show.
+const SUBAGENT_MAX_MS: u64 = 3_600_000;
 /// How long after a Stop hook the background-work check is made (see `count_stop`).
 /// The hook and the waiting row are written together; this covers the reader drawing it.
 const STOP_CONFIRM_MS: u64 = 250;
@@ -256,6 +265,7 @@ impl AgentHandle {
             scroll_holds_working: AtomicBool::new(false),
             waiting_background: AtomicBool::new(false),
             background_shells: AtomicU32::new(0),
+            subagents: Mutex::new(Vec::new()),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
             menu_gap: AtomicU64::new(0),
@@ -384,6 +394,7 @@ impl AgentHandle {
         }
         self.turn_started_ms.store(0, Ordering::Relaxed);
         self.background_shells.store(0, Ordering::Relaxed);
+        self.subagents.lock().unwrap().clear();
         if !self.on_screen() {
             self.clear_kind();
         }
@@ -527,6 +538,8 @@ impl AgentHandle {
                 SAVE_DIRTY.store(true, Ordering::Relaxed);
             }
             self.record_session(kind, id, transcript.as_deref());
+            // A new conversation (startup, resume, `/clear`) has no sub-agents yet.
+            self.subagents.lock().unwrap().clear();
             return;
         }
         if !self.running.load(Ordering::Relaxed) || self.kind() != Some(kind) {
@@ -549,9 +562,29 @@ impl AgentHandle {
                 self.interrupt_ms.store(now, Ordering::Relaxed);
                 self.stop_ms.store(now, Ordering::Relaxed);
                 self.hook_attention.store(false, Ordering::Relaxed);
+                self.subagents.lock().unwrap().clear();
             }
-            AgentEvent::SessionEnded => self.hook_attention.store(false, Ordering::Relaxed),
+            AgentEvent::SessionEnded => {
+                self.hook_attention.store(false, Ordering::Relaxed);
+                self.subagents.lock().unwrap().clear();
+            }
+            AgentEvent::SubagentStarted { id } => {
+                let mut subs = self.subagents.lock().unwrap();
+                if !subs.iter().any(|(s, _)| s == id) {
+                    subs.push((id.clone(), now_ms()));
+                }
+            }
+            AgentEvent::SubagentStopped { id } => self.subagents.lock().unwrap().retain(|(s, _)| s != id),
         }
+    }
+
+    /// Sub-agents running now. One whose stop never arrived (the agent was killed, a
+    /// hook was lost) is given up on after `SUBAGENT_MAX_MS`.
+    fn subagent_count(&self) -> u32 {
+        let now = now_ms();
+        let mut subs = self.subagents.lock().unwrap();
+        subs.retain(|(_, started)| now.saturating_sub(*started) < SUBAGENT_MAX_MS);
+        subs.len() as u32
     }
 
     fn turn_ended(self: &Arc<Self>) {
@@ -886,6 +919,8 @@ impl AgentHandle {
     /// UI: the user sent Esc or Ctrl+C to this pane.
     pub fn note_interrupt(&self) {
         self.interrupt_ms.store(now_ms(), Ordering::Relaxed);
+        // An interrupted turn's sub-agents go with it, and no stop is promised for them.
+        self.subagents.lock().unwrap().clear();
     }
 
     fn interrupted_recently(&self) -> bool {
@@ -1049,6 +1084,7 @@ impl AgentHandle {
             kind: self.kind(),
             epoch: self.epoch.load(Ordering::Relaxed),
             shells: self.background_shells.load(Ordering::Relaxed),
+            subagents: self.subagent_count(),
         }
     }
 }
@@ -1088,6 +1124,35 @@ mod tests {
     fn menu_gone(h: &Arc<AgentHandle>) {
         h.set_menu(false, false);
         assert!(h.confirm_menu_gone(h.menu_gap.load(Ordering::Relaxed)), "a gap was pending");
+    }
+
+    // Sub-agents are counted by id: a repeated start is one, a stop for one never seen
+    // changes nothing, and an interrupt or a new conversation leaves none.
+    #[test]
+    fn subagents_are_counted_by_their_start_and_stop_reports() {
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        let started = |id: &str| AgentEvent::SubagentStarted { id: id.into() };
+        let stopped = |id: &str| AgentEvent::SubagentStopped { id: id.into() };
+        assert_eq!(h.snapshot().subagents, 0);
+        ev(started("a"));
+        ev(started("b"));
+        ev(started("a"));
+        assert_eq!(h.snapshot().subagents, 2);
+        ev(stopped("zzz"));
+        ev(stopped("a"));
+        assert_eq!(h.snapshot().subagents, 1);
+        // The turn ending does not end them: a background one outlives its turn.
+        ev(AgentEvent::TurnEnded);
+        assert_eq!(h.snapshot().subagents, 1);
+        h.note_interrupt();
+        assert_eq!(h.snapshot().subagents, 0);
+        ev(started("c"));
+        ev(AgentEvent::SessionBound { id: "s2".into(), transcript: None });
+        assert_eq!(h.snapshot().subagents, 0);
+        ev(started("d"));
+        h.end_session();
+        assert_eq!(h.snapshot().subagents, 0);
     }
 
     // A full repaint (a resize, the wheel nudge) clears the screen and redraws the prompt.

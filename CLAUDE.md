@@ -277,10 +277,52 @@ a row resize (shifts the whole layout for a frame; a column does not).
   read only with the chrome on screen; a chooser over the footer keeps the last count. It
   shows as a static muted chip (console icon, "1 shell") in the pane header and the
   overview, a hollow green ring around the workspace tab's dot (a layer apart: the dot
-  keeps its amber > azure > green order and the ring hides nothing), a server box with a
-  lit LED under the office desk (`Scene::servers`, at most three), and "· 1 shell
+  keeps its amber > azure > green order and the ring hides nothing), and "· 1 shell
   running" on the "finished" card. The quit dialog Claude shows ("Background work is
   running", each shell listed) is this same count.
+
+## The agent banner: pixel art at the top of an agent's terminal (2026-11-10)
+
+It replaced the Agents Office (a room of desks in its own window, removed). Three files:
+
+- **`src/agent_banner.rs` draws it**, with rectangle fills only: `render(scene, w, t)` is
+  a pure function to an RGBA strip `H` (46) art pixels tall at any width, the world
+  anchored on the centre column so a resize never moves scenery already in view. Robots
+  do rounds (`stop`, `act`): three jobs near one another, then somewhere else in the
+  strip; a stop within `WALK_MAX` is walked to, a further one flown to. `Troupe` is the
+  one stateful part: it remembers where each robot was drawn and flies it to a place
+  that has jumped (strip resized, turn ended and it goes fishing, helper added).
+  `cargo test --lib agent_banner::tests::sheet -- --ignored --nocapture` writes frames to
+  the temp dir; judge art changes by looking at them.
+- **`src/bin/pane_banner.rs` puts it in panes.** One `PaneBanner` per pane in
+  `State::banners`, keyed by `history_id` (survives a reconnect and a shell switch).
+  `refresh` runs after every message (the `update` wrapper), draws only frames that
+  changed, and only for the workspace on screen. No clock of its own: frames come from
+  the fast tick, which runs while any agent works, plus `needs_fast_tick` while a robot
+  is flying to its place (`settling`). Scene time is the pane's working time since the
+  app started and is never reset, so the day and the weather carry on between turns.
+- **The banner takes rows from the terminal**, so showing or hiding it resizes the PTY
+  and the agent repaints; `show` calls `suppress_activity` on that edge so the repaint
+  is not read as work. With `banner_hide_idle` (the default) that happens at every
+  turn's start and end. Its slot in the pane's column is always there, at no height
+  without a banner, so the terminal keeps its place in the widget tree (see the iced
+  conditional-wrap note). A pane under `MIN_W` art pixels wide or `MIN_PANE_H` high
+  gets no banner and an icon in its header instead (`pane_banner::fit`).
+- **Settings:** `show_agent_banner` (off by default; the titlebar's robot button toggles
+  it) and `banner_hide_idle` (on by default).
+- **Sub-agents are helper robots** (`Scene::helpers`, up to `MAX_HELPERS`), counted from
+  the agent's own reports: `AgentEvent::SubagentStarted` / `SubagentStopped`, which
+  Claude's adapter maps from its `SubagentStart` and `SubagentStop` hooks (`agent_id`).
+  `AgentHandle` keeps the live ids, not a number, so a repeated start is one and a stop
+  whose start was missed changes nothing; `AgentStatus::subagents` is the count and the
+  lifecycle never reads it. A turn's end does not clear them (a background sub-agent
+  outlives its turn); Esc or Ctrl+C (`note_interrupt`), a new conversation and the agent
+  exiting do, and one with no stop after `SUBAGENT_MAX_MS` is dropped. Copilot and Codex
+  report none. Live check: `cargo test --lib
+  agent_shim::tests::live_claude_reports_a_subagent -- --ignored --nocapture` (measured
+  with Claude 2.1.322: start and stop carry the same `agent_id`).
+- **`src/bin/banner_preview.rs`** is a test window (`ARBITER_OPEN_BANNER=1`): one fake
+  pane, a menu for the state, helpers, hour and weather. Use it to work on the art.
 
 ## Priority under full CPU load (Windows, 2026-10-09)
 

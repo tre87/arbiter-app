@@ -8,19 +8,39 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ## [Unreleased]
 
 ### Added
+- **Agent banner: pixel art at the top of a terminal while its agent works.** A strip
+  under the pane's header in which a robot walks from job to job outdoors (watering,
+  fencing, digging, stacking crates, painting) under a day and night cycle and changing
+  weather. Robots use the whole width: a nearby job is walked to, a far one flown to by
+  jetpack, and a robot left outside a narrowed terminal flies straight back into view. The
+  antenna lamp is the pane's status: blue working, amber when the agent needs you, green
+  for half a minute after a turn ends. The day and the weather carry on from turn to turn
+  for as long as the terminal lives. Off by default: the robot button in the titlebar
+  switches it, as does Settings, Display, "Show the agent banner". "Hide the banner when
+  the agent is idle" (on by default) shows it only while the agent works; off, it stays
+  between turns, held still. A terminal too narrow or too low for it keeps its rows and
+  gets an icon in its header that says why. Each sub-agent Claude has running is a
+  smaller robot of its own colour on its own round, up to six, flying in when it starts
+  (Claude reports them through its SubagentStart and SubagentStop hooks; Copilot and Codex
+  report none). `ARBITER_OPEN_BANNER=1` opens a test window with one fake
+  pane and a menu for the state, the helpers, the hour and the weather.
 - **Settings, Agents: switch each agent CLI on or off.** Claude is on by default. Copilot
   and Codex are badged Experimental and are now off until you switch them on there. An
-  agent that is off is left alone: no launcher or hooks, no status, cards or office desk,
+  agent that is off is left alone: no launcher or hooks, no status, cards or banner,
   and no resume when its terminal is restored. A change applies to agents started from
   then on; one already running keeps its status until it exits.
+
+### Removed
+- **The Agents Office.** The pixel-art room in its own window, its titlebar button,
+  Ctrl+Shift+G, its settings and the `agents-office-demo` harness are gone; the agent
+  banner replaces it. A saved layout that had the office open simply opens without it.
 
 ### Changed
 - **A shell Claude leaves running no longer counts as working.** A dev server started in
   the background kept its pane "working" for as long as it ran: the animation never
   stopped, Arbiter never went idle, and the turn's "finished" card never came. The turn
   now finishes like any other, and the shell shows as a quiet marker instead: "1 shell"
-  beside the pane's name and in the overview, a ring around the workspace tab's dot, a
-  small server box under the desk in the Agents Office, and "1 shell running" on the
+  beside the pane's name and in the overview, a ring around the workspace tab's dot, and "1 shell running" on the
   "finished" card. None of it animates. Waiting on background agents still shows as
   working, since those always finish and Claude carries on by itself.
 

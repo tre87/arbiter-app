@@ -3,11 +3,11 @@
 
 pub mod about;
 pub mod agent;
+pub mod agent_banner;
 pub mod agent_screen;
 pub mod agent_shim;
 pub mod agent_state;
 pub mod agent_watch;
-pub mod agents_office;
 pub mod attach;
 pub mod conn;
 pub mod debug;

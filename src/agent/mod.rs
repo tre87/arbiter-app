@@ -100,6 +100,10 @@ pub enum AgentEvent {
     Interrupted,
     /// The conversation ended. Not the process: Claude fires this on `/clear` too.
     SessionEnded,
+    /// The agent started a sub-agent; `id` is the agent's own name for it.
+    SubagentStarted { id: String },
+    /// That sub-agent finished.
+    SubagentStopped { id: String },
 }
 
 /// A hook invocation, normalized: the conversation it came from (for agents that host

@@ -152,7 +152,7 @@ impl Agent for Claude {
 
     fn description(&self) -> &'static str {
         "Claude Code (`claude`). Arbiter shows when it is working, waiting on you or finished, \
-         raises its cards and office desk, and resumes its conversation when a terminal is restored."
+         raises its cards and banner, and resumes its conversation when a terminal is restored."
     }
 
     fn icon_svg(&self) -> &'static str {
@@ -200,6 +200,9 @@ impl Agent for Claude {
                 "SessionStart": entry.clone(),
                 "Notification": entry.clone(),
                 "PermissionRequest": entry.clone(),
+                // The sub-agents a turn has running, for the banner's helper robots.
+                "SubagentStart": entry.clone(),
+                "SubagentStop": entry.clone(),
                 "Stop": entry,
             }
         });
@@ -228,6 +231,12 @@ impl Agent for Claude {
             "Stop" => AgentEvent::TurnEnded,
             "SessionEnd" => AgentEvent::SessionEnded,
             "PermissionRequest" => AgentEvent::NeedsAttention,
+            // Counted by id, so one without an id cannot be counted at all.
+            name @ ("SubagentStart" | "SubagentStop") => match field(&v, &["agent_id"]) {
+                Some(id) if name == "SubagentStart" => AgentEvent::SubagentStarted { id: id.to_string() },
+                Some(id) => AgentEvent::SubagentStopped { id: id.to_string() },
+                None => return HookOutcome::default(),
+            },
             "Notification" => match field(&v, &["notification_type"]).unwrap_or("") {
                 // `idle_prompt` is intentionally excluded: it fires after ~60s idle and
                 // would turn a merely-idle pane amber (idle stays grey).
@@ -471,6 +480,15 @@ mod tests {
             assert!(hook(&json).events.is_empty(), "{ignored}");
         }
         assert!(hook(r#"{"session_id":"s","hook_event_name":"PreToolUse"}"#).events.is_empty());
+        assert_eq!(
+            hook(r#"{"session_id":"s","hook_event_name":"SubagentStart","agent_id":"a1b2","agent_type":"Explore"}"#).events,
+            vec![AgentEvent::SubagentStarted { id: "a1b2".into() }]
+        );
+        assert_eq!(
+            hook(r#"{"session_id":"s","hook_event_name":"SubagentStop","agent_id":"a1b2","agent_type":"Explore","last_assistant_message":"done"}"#).events,
+            vec![AgentEvent::SubagentStopped { id: "a1b2".into() }]
+        );
+        assert!(hook(r#"{"session_id":"s","hook_event_name":"SubagentStart"}"#).events.is_empty());
         assert!(hook("not json").events.is_empty());
         // A session id that could escape a file name is dropped with its event.
         assert!(hook(r#"{"session_id":"../x","hook_event_name":"SessionStart"}"#).events.is_empty());
@@ -512,7 +530,7 @@ mod tests {
         assert_eq!(path, &dir.join("settings.json"));
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(v.get("statusLine").is_none());
-        for ev in ["SessionStart", "Notification", "PermissionRequest", "Stop"] {
+        for ev in ["SessionStart", "Notification", "PermissionRequest", "SubagentStart", "SubagentStop", "Stop"] {
             let cmd = v.pointer(&format!("/hooks/{ev}/0/hooks/0/command")).and_then(|c| c.as_str());
             assert_eq!(cmd, Some("\"/opt/arbiter\" agent-hook claude"), "{ev}");
         }

@@ -367,65 +367,6 @@ pub fn restore_if_minimized(hwnd: isize) {
     }
 }
 
-/// Stop the desktop offering to resize a window when it is dragged against a screen
-/// edge. Wanted by a window whose size is its own business: the Agents Office is a
-/// picture at a whole-number zoom, and half a screen is not one of those.
-///
-/// Windows drives Aero Snap off the maximize box, so taking that one style bit away
-/// disables snapping while leaving the window freely resizable by its edges.
-#[cfg(windows)]
-pub fn disable_snap(hwnd: isize) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_MAXIMIZEBOX,
-    };
-    let hwnd = HWND(hwnd as *mut _);
-    unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        if style == 0 {
-            return;
-        }
-        let stripped = style & !(WS_MAXIMIZEBOX.0 as isize);
-        if stripped != style {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
-}
-
-/// Keeps a window out of full-screen Split View tiles, which is all
-/// `NSWindowCollectionBehaviorFullScreenDisallowsTiling` governs (NSWindow.h). macOS
-/// 15's drag-to-edge tiling has no public opt-out; it rides AppKit's own window drag,
-/// which the office never uses, since `trafficlights::begin_drag` moves it by hand.
-/// Takes the `NSView` iced hands out, and asks it for its window.
-#[cfg(target_os = "macos")]
-pub fn disable_snap_view(ns_view: *mut std::ffi::c_void) {
-    use objc2::{msg_send, runtime::AnyObject};
-    /// `NSWindowCollectionBehaviorFullScreenDisallowsTiling`, 1 << 12 in NSWindow.h.
-    const DISALLOWS_TILING: usize = 1 << 12;
-    if ns_view.is_null() {
-        return;
-    }
-    unsafe {
-        let view = ns_view as *mut AnyObject;
-        let window: *mut AnyObject = msg_send![view, window];
-        if window.is_null() {
-            return;
-        }
-        let behavior: usize = msg_send![window, collectionBehavior];
-        let _: () = msg_send![window, setCollectionBehavior: behavior | DISALLOWS_TILING];
-    }
-}
-
 /// Mark a window so that clicking it never activates it (`WS_EX_NOACTIVATE`): a click
 /// on a notification card leaves the keyboard where it was.
 #[cfg(windows)]
