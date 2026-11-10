@@ -4126,7 +4126,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 ),
                 settings_toggle(
                     "Hide the banner when the agent is idle",
-                    Some("Show it only while the agent is working. Off, it stays between turns, held still."),
+                    Some("Show it only while the agent or its sub-agents work and for half a minute after a turn ends, over the terminal's first rows. Off, it stays between turns, held still, in rows of its own above the terminal."),
                     state.settings.banner_hide_idle,
                     Message::ToggleBannerHideIdle,
                 ),
@@ -6344,12 +6344,14 @@ fn main_view(state: &State) -> Element<'_, Message> {
             };
             (o, h, s, alpha)
         };
-        // The agent banner sits between the header and the terminal, and carries the
-        // working bar when it is there.
+        // The agent banner carries the working bar when it is there. One with rows of
+        // its own sits between the header and the terminal; otherwise it is a layer
+        // over the terminal's first rows, which leaves the terminal its size.
         let banner = pane_banner::slot(state, data, working, pane_w);
         let bar_on_term = working && !pane_banner::shown(state, data);
         let term_area: Element<Message> = iced::widget::Stack::new()
             .push(term)
+            .push_maybe(pane_banner::overlay(state, data, working, pane_w))
             .push_maybe(bar_on_term.then(|| working_bar(pane_w)))
             .push_maybe(
                 (scroll_alpha > 0.0 && scroll_hist > 0)
@@ -8861,7 +8863,8 @@ fn needs_fast_tick(state: &State) -> bool {
     if !state.attach_inflight.is_empty() {
         return true;
     }
-    // A banner robot flying to its place after a resize, for the second that takes.
+    // A banner whose picture moves while its agent is between turns: a robot flying to
+    // its place for a second, or sub-agents at work.
     if pane_banner::settling(state) {
         return true;
     }

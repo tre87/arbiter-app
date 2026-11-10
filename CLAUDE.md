@@ -291,7 +291,8 @@ It replaced the Agents Office (a room of desks in its own window, removed). Thre
   do rounds (`stop`, `act`): three jobs near one another, then somewhere else in the
   strip; a stop within `WALK_MAX` is walked to, a further one flown to. `Troupe` is the
   one stateful part: it remembers where each robot was drawn and flies it to a place
-  that has jumped (strip resized, turn ended and it goes fishing, helper added).
+  that has jumped (strip resized, turn ended and it goes fishing, helper added), and
+  flies a helper that is no longer wanted off by the nearer edge instead of dropping it.
   `cargo test --lib agent_banner::tests::sheet -- --ignored --nocapture` writes frames to
   the temp dir; judge art changes by looking at them.
 - **`src/bin/pane_banner.rs` puts it in panes.** One `PaneBanner` per pane in
@@ -301,15 +302,35 @@ It replaced the Agents Office (a room of desks in its own window, removed). Thre
   the fast tick, which runs while any agent works, plus `needs_fast_tick` while a robot
   is flying to its place (`settling`). Scene time is the pane's working time since the
   app started and is never reset, so the day and the weather carry on between turns.
-- **The banner takes rows from the terminal**, so showing or hiding it resizes the PTY
-  and the agent repaints; `show` calls `suppress_activity` on that edge so the repaint
-  is not read as work. With `banner_hide_idle` (the default) that happens at every
-  turn's start and end. Its slot in the pane's column is always there, at no height
-  without a banner, so the terminal keeps its place in the widget tree (see the iced
-  conditional-wrap note). A pane under `MIN_W` art pixels wide or `MIN_PANE_H` high
+- **A banner that comes and goes lies over the terminal; only a permanent one has rows
+  of its own.** With `banner_hide_idle` (the default) the banner is a layer over the
+  terminal's first rows (`pane_banner::overlay`, in the terminal's own stack): the PTY
+  is never resized for it, and what it covers is hidden while the agent works. It
+  first took rows from the terminal instead, which resized the PTY and made the agent
+  repaint at every turn's start and end; the content jumped each time, and it looped
+  (2026-11-10): the banner went, the repaint read as work, the banner came back, for
+  as long as the pane sat idle. The misread was an old "Waiting for N background
+  agents" row in the transcript, which counts as live while a repaint has not drawn
+  the input box yet. With the setting off the banner stays between turns, so it has
+  rows of its own (`pane_banner::slot`, `PaneBanner::pushing`) and the PTY is resized
+  when the agent starts and exits, or when the banner stops fitting. For that mode
+  the guards stay: `settle` calls `suppress_activity` on the edge,
+  `AgentHandle::set_waiting_background` does not believe a row first seen inside that
+  window, and a banner that changed within `RECENT_FLIP_MS` only changes back once the
+  opposite has been asked for `STEADY_MS` without a break (`follow`). The slot in the
+  pane's column is always there, at no height without a banner of that kind, so the
+  terminal keeps its place in the widget tree (see the iced conditional-wrap note). A pane under `MIN_W` art pixels wide or `MIN_PANE_H` high
   gets no banner and an icon in its header instead (`pane_banner::fit`).
 - **Settings:** `show_agent_banner` (off by default; the titlebar's robot button toggles
   it) and `banner_hide_idle` (on by default).
+- **What "idle" means for hiding** (`pane_banner::wanted`). Not the lifecycle alone: a
+  Claude told to do long work starts its sub-agents and shells in the background, ends
+  its turn, and is woken as each reports, so one job is dozens of turns a second or two
+  long with gaps of up to twenty between them (measured from a transcript, 2026-11-10),
+  and a banner that followed the lifecycle came and went the whole time. So the banner
+  shows the robots at work while the lifecycle is Working OR any sub-agent is running,
+  and stays, as the green flag, for `DONE_MS` after a turn's end; only then is the pane
+  idle. A background shell alone does not hold it (a dev server runs all day).
 - **Sub-agents are helper robots** (`Scene::helpers`, up to `MAX_HELPERS`), counted from
   the agent's own reports: `AgentEvent::SubagentStarted` / `SubagentStopped`, which
   Claude's adapter maps from its `SubagentStart` and `SubagentStop` hooks (`agent_id`).

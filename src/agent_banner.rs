@@ -405,6 +405,8 @@ struct Member {
     who: Option<usize>,
     act: Act,
     pose: Pose,
+    // A helper whose sub-agent is done, on its way out: it has no work to show.
+    leaving: bool,
 }
 
 // Everybody in the strip at `t`, last helper first and the main robot last, so it
@@ -424,7 +426,7 @@ fn cast(scene: &Scene, w: i32, t: f32) -> Vec<Member> {
             // Wherever the turn left it, on the ground.
             Pose { x: act.x, lift: 0, flip: act.now.flip, mode: Mode::Stand }
         };
-        Member { who, act, pose }
+        Member { who, act, pose, leaving: false }
     };
     let mut all: Vec<Member> =
         (0..helpers_shown(w, scene.helpers)).rev().map(|i| member(Some(i))).collect();
@@ -443,16 +445,21 @@ pub fn render(scene: &Scene, w: i32, t: f32) -> Buf {
 
 // Draws the strip like `render`, and remembers where each robot was drawn, so one
 // whose place has jumped (the strip was resized, the turn ended and it goes
-// fishing, a helper has just been added) flies there instead of appearing there.
+// fishing, a helper has just been added) flies there instead of appearing there,
+// and a helper that is no longer wanted flies off instead of vanishing.
 #[derive(Default)]
 pub struct Troupe {
     // Where each robot was last drawn, in world x: the main robot, then the helpers.
     seen: [Option<f32>; MAX_HELPERS + 1],
+    // Seconds each helper has been on its way out; 0 for one that is staying.
+    away: [f32; MAX_HELPERS + 1],
     settling: bool,
 }
 
 // Art pixels a second, flying to where it should be.
 const RESCUE_SPEED: f32 = 160.0;
+// Art pixels a second, flying off. Slower, so a departure is seen.
+const LEAVE_SPEED: f32 = 110.0;
 // A jump this small is a robot's own movement, not a displacement.
 const RESCUE_SNAP: f32 = 3.0;
 
@@ -463,10 +470,11 @@ impl Troupe {
         let mut all = cast(scene, w, t);
         let mut seen = [None; MAX_HELPERS + 1];
         self.settling = false;
+        // Just past the strip's edge: out of sight.
+        let edge = (w / 2 + 12) as f32;
         for m in &mut all {
             let slot = m.who.map_or(0, |i| i + 1);
             let want = m.pose.x as f32;
-            let edge = (w / 2 + 12) as f32;
             let was = match (self.seen[slot], m.who) {
                 // One left far outside by a narrowed strip starts from just past the
                 // edge, so it is in view at once.
@@ -493,6 +501,32 @@ impl Troupe {
             }
             seen[slot] = Some(want + lag);
         }
+        // A helper that was here and is not wanted any more (its sub-agent finished,
+        // or the strip has no room for it now) leaves by the nearer edge, climbing.
+        let lim = (w / 2 - REACH).max(0);
+        for i in 0..MAX_HELPERS {
+            let slot = i + 1;
+            if seen[slot].is_some() {
+                self.away[slot] = 0.0;
+                continue;
+            }
+            let Some(from) = self.seen[slot] else { continue };
+            self.away[slot] += dt;
+            let dir = if from > 0.0 || (from == 0.0 && i % 2 == 0) { 1.0 } else { -1.0 };
+            let x = from + dir * LEAVE_SPEED * dt;
+            if x.abs() > edge {
+                continue;
+            }
+            seen[slot] = Some(x);
+            self.settling = true;
+            let pose = Pose {
+                x: x.round() as i32,
+                lift: 1 + (self.away[slot] * 40.0).min(12.0) as i32,
+                flip: dir < 0.0,
+                mode: Mode::Fly,
+            };
+            all.insert(0, Member { who: Some(i), act: act(i as i64, lim, t), pose, leaving: true });
+        }
         self.seen = seen;
         draw(scene, w, t, &all)
     }
@@ -513,7 +547,7 @@ fn draw(scene: &Scene, w: i32, t: f32, cast: &[Member]) -> Buf {
     land(&mut p, scene, &l, t);
 
     // Everything made goes down before anybody walks in front of it.
-    for m in cast {
+    for m in cast.iter().filter(|m| !m.leaving) {
         let hw = if m.who.is_some() { HELPER.hw } else { MAIN.hw };
         let at = |s: Stop| Frame { ox: w / 2 + s.x, lift: 0, flip: s.flip };
         made(&mut p, at(m.act.before), hw, m.act.before.job, 1.0);
@@ -1376,6 +1410,48 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_that_is_done_flies_off() {
+        let mut s = scene(State::Working, 2, Weather::Clear, Daytime::Day);
+        let mut tr = Troupe::default();
+        for _ in 0..80 {
+            tr.render(&s, 300, 1.0, 0.05);
+        }
+        assert!(!tr.settling());
+        let before = places(&tr);
+        assert_eq!(before.len(), 3);
+
+        // One sub-agent finishes: its robot is still there on the next frame, where
+        // it stood, and then leaves over several.
+        s.helpers = 1;
+        let with = tr.render(&s, 300, 1.0, 0.0);
+        assert_eq!(places(&tr), before);
+        assert!(tr.settling());
+        assert_ne!(with.px, render(&s, 300, 1.0).px, "the leaving robot is drawn");
+        let mut frames = 0;
+        while tr.settling() {
+            tr.render(&s, 300, 1.0, 0.05);
+            frames += 1;
+            assert!(frames < 100, "never left");
+        }
+        assert!(frames > 3);
+        assert_eq!(places(&tr).len(), 2);
+        assert_eq!(tr.render(&s, 300, 1.0, 0.05).px, render(&s, 300, 1.0).px);
+
+        // Back before it has gone: it turns round instead of starting from the edge.
+        s.helpers = 2;
+        for _ in 0..80 {
+            tr.render(&s, 300, 1.0, 0.05);
+        }
+        s.helpers = 1;
+        tr.render(&s, 300, 1.0, 0.05);
+        tr.render(&s, 300, 1.0, 0.05);
+        let leaving = places(&tr)[2];
+        s.helpers = 2;
+        tr.render(&s, 300, 1.0, 0.0);
+        assert_eq!(places(&tr)[2], leaving);
+    }
+
+    #[test]
     fn a_robot_at_work_is_never_taken_for_displaced() {
         let s = scene(State::Working, MAX_HELPERS, Weather::Clear, Daytime::Day);
         let mut tr = Troupe::default();
@@ -1500,5 +1576,13 @@ mod tests {
         }
         tr.render(&s, 140, 50.0, 0.0);
         save(&tr.render(&s, 140, 50.0, 0.1), 4, "rescue");
+        // A helper whose sub-agent has finished, on its way out.
+        let mut tr = Troupe::default();
+        for _ in 0..80 {
+            tr.render(&s, 300, 50.0, 0.05);
+        }
+        let one = Scene { helpers: 1, ..s };
+        tr.render(&one, 300, 50.0, 0.0);
+        save(&tr.render(&one, 300, 50.0, 0.3), 4, "leaving");
     }
 }

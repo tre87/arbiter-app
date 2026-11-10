@@ -17,11 +17,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
   for half a minute after a turn ends. The day and the weather carry on from turn to turn
   for as long as the terminal lives. Off by default: the robot button in the titlebar
   switches it, as does Settings, Display, "Show the agent banner". "Hide the banner when
-  the agent is idle" (on by default) shows it only while the agent works; off, it stays
-  between turns, held still. A terminal too narrow or too low for it keeps its rows and
+  the agent is idle" (on by default) shows it only while the agent or its sub-agents work and
+  for half a minute after a turn ends (so an agent waiting on background work, whose
+  turns are a second long, does not make it come and go), laid over the terminal's first
+  rows so the terminal is never resized for it; off, it stays between
+  turns, held still, in rows of its own above the terminal. A terminal too narrow or too low for it keeps its rows and
   gets an icon in its header that says why. Each sub-agent Claude has running is a
   smaller robot of its own colour on its own round, up to six, flying in when it starts
-  (Claude reports them through its SubagentStart and SubagentStop hooks; Copilot and Codex
+  and flying off when it is done (Claude reports them through its SubagentStart and SubagentStop hooks; Copilot and Codex
   report none). `ARBITER_OPEN_BANNER=1` opens a test window with one fake
   pane and a menu for the state, the helpers, the hour and the weather.
 - **Settings, Agents: switch each agent CLI on or off.** Claude is on by default. Copilot

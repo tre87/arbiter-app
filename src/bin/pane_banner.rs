@@ -74,10 +74,18 @@ pub struct PaneBanner {
     key: Option<(banner::Scene, i32)>,
     // The pane wants a banner and has no room for one.
     hidden: Option<Hidden>,
-    // The banner is in the pane, taking rows from its terminal.
+    // The banner is in the pane.
     shown: bool,
-    // A robot is flying to its place, which wants frames whatever the agent does.
+    // It has rows of its own above the terminal, which is that much lower for it.
+    // Otherwise a banner in the pane lies over the terminal's first rows.
+    pushing: bool,
+    // The picture is moving (a robot flying to its place, sub-agents at work), which
+    // wants frames whatever the agent itself is doing.
     settling: bool,
+    // When `shown` last changed.
+    flipped_ms: u64,
+    // Since when the opposite of `shown` has been asked for without a break.
+    asked_ms: Option<u64>,
 }
 
 // What the banner of pane `d` should show, and how many sub-agents its agent has
@@ -95,11 +103,18 @@ fn wanted(
     let state = match status.lifecycle {
         Lifecycle::Working => banner::State::Working,
         Lifecycle::Attention => banner::State::Attention,
+        // An agent that starts its sub-agents in the background ends its turn and is
+        // woken as each reports: by its own lifecycle it is idle in between, and the
+        // work is going on all the same.
+        _ if status.subagents > 0 => banner::State::Working,
         _ if done.get(&d.history_id).is_some_and(|until| now < *until) => banner::State::Done,
         _ => banner::State::Idle,
     };
-    (state == banner::State::Working || !settings.banner_hide_idle)
-        .then_some((state, status.subagents as usize))
+    // "Idle" for hiding starts when the flag of the last turn comes down. An agent
+    // waiting on background work has a turn of a second or two every so often, and a
+    // banner that left at each turn's end came and went the whole time.
+    let present = !settings.banner_hide_idle || matches!(state, banner::State::Working | banner::State::Done);
+    present.then_some((state, status.subagents as usize))
 }
 
 // Each pane of the active workspace, with its size in the grid.
@@ -150,26 +165,28 @@ pub fn refresh(state: &mut State) {
                 b.t += dt;
             }
             // Only the workspace on screen is drawn; the others just keep time.
-            let size = if wi == active { sizes.get(pane) } else { None };
-            let (Some((showing, helpers)), Some(size)) = (want, size) else {
-                if wi == active {
-                    b.hidden = None;
-                    show(b, d, false);
-                }
+            if wi != active {
+                b.settling = false;
+                b.asked_ms = None;
+                continue;
+            }
+            let fitted = want.zip(sizes.get(pane)).map(|((state, helpers), size)| {
+                fit(size.width, size.height, scale).map(|w| (state, helpers, w))
+            });
+            b.hidden = match fitted {
+                Some(Err(why)) => Some(why),
+                _ => None,
+            };
+            if !b.settle(matches!(fitted, Some(Ok(_))), !settings.banner_hide_idle, now, d) {
+                b.frame = None;
+                b.key = None;
                 b.settling = false;
                 continue;
+            }
+            // Held in the pane a moment past its time: the last frame stays as it is.
+            let Some(Ok((showing, helpers, w))) = fitted else {
+                continue;
             };
-            let w = match fit(size.width, size.height, scale) {
-                Ok(w) => w,
-                Err(why) => {
-                    b.hidden = Some(why);
-                    b.settling = false;
-                    show(b, d, false);
-                    continue;
-                }
-            };
-            b.hidden = None;
-            show(b, d, true);
             let scene = banner::Scene {
                 state: showing,
                 helpers,
@@ -182,29 +199,104 @@ pub fn refresh(state: &mut State) {
                 let buf = b.troupe.render(&scene, w, b.t, dt);
                 b.frame = Some(iced::widget::image::Handle::from_rgba(buf.w as u32, buf.h as u32, buf.px));
                 b.key = Some(key);
-                b.settling = b.troupe.settling();
+                // Sub-agents at work under an agent between turns move the picture
+                // while nothing else keeps the app's clock running.
+                b.settling = b.troupe.settling() || scene.animates();
             }
         }
     }
     banners.retain(|id, _| live.contains(id.as_str()));
 }
 
-// Put the banner in the pane or take it out. Either way the terminal under it
-// changes height and its agent repaints, which must not read as the agent working.
-fn show(b: &mut PaneBanner, d: &PaneData, shown: bool) {
-    if b.shown != shown {
-        b.shown = shown;
-        d.session.suppress_activity(500);
+// How long the agent's repaint after the banner's resize is kept from reading as work.
+const REPAINT_MS: u64 = 800;
+// A banner put in or taken out this recently is suspect of having caused whatever
+// asks for the opposite now: its own resize makes the agent repaint, and a repaint
+// can read as the agent working (or as it having stopped).
+const RECENT_FLIP_MS: u64 = 4000;
+// So the opposite must be asked for this long without a break before it is believed.
+// Longer than a misread lasts (the working TTL, 2 s), or the banner would go in and
+// out for as long as the pane sat there, resizing the terminal each time.
+const STEADY_MS: u64 = 3000;
+
+impl PaneBanner {
+    // Whether the banner is in the pane, given whether it should be, and whether it
+    // takes rows of its own (`rows`) or lies over the terminal's first ones.
+    //
+    // Over the terminal it comes and goes freely: nothing is resized. With rows of its
+    // own, putting it in or taking it out changes the terminal's height and the agent
+    // repaints, so it follows at once only if it has not just changed (see
+    // `RECENT_FLIP_MS`).
+    fn settle(&mut self, wanted: bool, rows: bool, now: u64, d: &PaneData) -> bool {
+        if rows {
+            self.follow(wanted, now);
+        } else {
+            self.shown = wanted;
+            self.asked_ms = None;
+        }
+        let pushing = self.shown && rows;
+        if pushing != self.pushing {
+            self.pushing = pushing;
+            d.session.suppress_activity(REPAINT_MS);
+        }
+        self.shown
     }
-    if !shown {
-        b.frame = None;
-        b.key = None;
+
+    // Move `shown` towards `wanted` as the rule above allows; true if it changed.
+    fn follow(&mut self, wanted: bool, now: u64) -> bool {
+        if wanted == self.shown {
+            self.asked_ms = None;
+            return false;
+        }
+        let asked = *self.asked_ms.get_or_insert(now);
+        // Never yet changed is not recent, whatever the clock says.
+        let recent = self.flipped_ms != 0 && now.saturating_sub(self.flipped_ms) < RECENT_FLIP_MS;
+        if recent && now.saturating_sub(asked) < STEADY_MS {
+            return false;
+        }
+        self.shown = wanted;
+        self.flipped_ms = now;
+        self.asked_ms = None;
+        true
     }
 }
 
-// Whether a banner on screen needs frames though no agent is working.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The loop this guards against: the banner goes, the terminal is resized, the
+    // agent's repaint reads as work for a couple of seconds, the banner comes back,
+    // the terminal is resized again, and so on for as long as the pane sits idle.
+    #[test]
+    fn a_banner_that_just_changed_does_not_change_back_on_a_passing_signal() {
+        let mut b = PaneBanner::default();
+        let t = 1_000_000;
+        // A turn starts, then ends a minute later: both followed at once.
+        assert!(b.follow(true, t));
+        assert!(b.follow(false, t + 60_000));
+        // The repaint reads as work for 2.5 s: not followed, and forgotten after.
+        let misread = t + 60_100;
+        for ms in (0..2500).step_by(50) {
+            assert!(!b.follow(true, misread + ms), "{ms} ms in");
+            assert!(b.asked_ms.is_some());
+        }
+        assert!(!b.follow(false, misread + 2500));
+        assert!(b.asked_ms.is_none() && !b.shown);
+        // Real work started right after a turn end is followed once it has lasted.
+        let again = t + 70_000;
+        assert!(b.follow(true, again));
+        assert!(b.follow(false, again + 5000), "a turn of five seconds ends at once");
+        assert!(!b.follow(true, again + 5100));
+        assert!(!b.follow(true, again + 5100 + STEADY_MS - 1));
+        assert!(b.follow(true, again + 5100 + STEADY_MS));
+    }
+}
+
+// Whether a banner on screen needs frames though no agent is working: its picture
+// is moving, or a change of mind is waiting to be believed.
 pub fn settling(state: &State) -> bool {
-    state.banners.values().any(|b| b.settling)
+    state.banners.values().any(|b| b.settling || b.asked_ms.is_some())
 }
 
 // Whether pane `d` has a banner drawn in it.
@@ -217,14 +309,31 @@ pub fn hidden(state: &State, d: &PaneData) -> Option<&'static str> {
     state.banners.get(&d.history_id)?.hidden.map(Hidden::why)
 }
 
-// The banner's place in a pane's column, between the header and the terminal. It
-// is always there, at no height when the pane has no banner, so the terminal under
-// it keeps its place in the widget tree. `working` puts the working bar on top.
+// The banner's place in a pane's column, between the header and the terminal, for
+// a banner with rows of its own. It is always there, at no height otherwise, so the
+// terminal under it keeps its place in the widget tree.
 pub fn slot<'a>(state: &'a State, d: &PaneData, working: bool, pane_w: f32) -> Element<'a, Message> {
-    let drawn = state.banners.get(&d.history_id).and_then(|b| Some((b.frame.as_ref()?, b.key?.1)));
-    let Some((frame, w)) = drawn else {
-        return Space::new(Length::Fill, Length::Fixed(0.0)).into();
-    };
+    art(state, d, true, working, pane_w)
+        .unwrap_or_else(|| Space::new(Length::Fill, Length::Fixed(0.0)).into())
+}
+
+// The banner as a layer over the terminal's first rows, for one without rows of its
+// own. The terminal is not resized for it; what it covers is hidden while it shows.
+pub fn overlay<'a>(state: &'a State, d: &PaneData, working: bool, pane_w: f32) -> Option<Element<'a, Message>> {
+    art(state, d, false, working, pane_w)
+}
+
+// The banner's picture, if pane `d` has one of the asked kind (`rows`: with rows of
+// its own). `working` puts the working bar on top.
+fn art<'a>(
+    state: &'a State,
+    d: &PaneData,
+    rows: bool,
+    working: bool,
+    pane_w: f32,
+) -> Option<Element<'a, Message>> {
+    let b = state.banners.get(&d.history_id).filter(|b| b.pushing == rows)?;
+    let (frame, w) = (b.frame.as_ref()?, b.key?.1);
     let k = zoom(ui_scale());
     let h = banner::H as f32 * k;
     let art = iced::widget::image(frame.clone())
@@ -233,5 +342,5 @@ pub fn slot<'a>(state: &'a State, d: &PaneData, working: bool, pane_w: f32) -> E
         .content_fit(iced::ContentFit::Fill)
         .filter_method(iced::widget::image::FilterMethod::Nearest);
     let art = container(art).width(Length::Fill).height(Length::Fixed(h)).clip(true);
-    iced::widget::Stack::new().push(art).push_maybe(working.then(|| working_bar(pane_w))).into()
+    Some(iced::widget::Stack::new().push(art).push_maybe(working.then(|| working_bar(pane_w))).into())
 }

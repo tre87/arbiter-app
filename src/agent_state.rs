@@ -969,6 +969,12 @@ impl AgentHandle {
     /// up is not read as a turn end. A wait the user broke off with Escape ends the same
     /// way, one TTL later.
     pub fn set_waiting_background(&self, on: bool) {
+        // A row first seen inside an app-initiated repaint (a resize) is not believed:
+        // midway through one the input box is not drawn yet, and with no box on screen
+        // an old "Waiting for N background agents" row in the transcript counts as the
+        // live one. A real wait is still there when the window has passed.
+        let repainting = now_ms() < self.suppress_until_ms.load(Ordering::Relaxed);
+        let on = on && (!repainting || self.waiting_background.load(Ordering::Relaxed));
         let was = self.waiting_background.swap(on, Ordering::Relaxed);
         if was && !on {
             self.activity_ms.store(now_ms(), Ordering::Relaxed);
@@ -1330,6 +1336,24 @@ mod tests {
         h.set_scrolled(true);
         assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
         assert_eq!(h.finish_seq(), 0);
+    }
+
+    // A resize repaints the screen, and midway the input box is missing, so an old
+    // "Waiting for N background agents" row in the transcript reads as live. That turned
+    // an idle pane to working, which brought its banner back, which resized it again.
+    #[test]
+    fn a_waiting_row_first_seen_during_a_repaint_is_not_believed() {
+        let h = handle();
+        h.suppress_activity(300);
+        h.set_waiting_background(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        // One that was already there is kept through a repaint.
+        std::thread::sleep(Duration::from_millis(320));
+        h.set_waiting_background(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.suppress_activity(300);
+        h.set_waiting_background(true);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
     }
 
     // 1.5.1's background-agent hold, defeated by scrolling: the Stop hook has already

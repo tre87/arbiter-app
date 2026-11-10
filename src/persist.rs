@@ -297,9 +297,9 @@ pub struct Settings {
     /// button switches it too.
     #[serde(default)]
     pub show_agent_banner: bool,
-    /// Show the banner only while the agent works, which is the default. Off, it
-    /// stays between turns, held still, and the terminal is not resized at every
-    /// turn's start and end.
+    /// Show the banner only while the agent works, which is the default. It then lies
+    /// over the terminal's first rows, so coming and going resizes nothing. Off, it
+    /// stays between turns, held still, in rows of its own above the terminal.
     #[serde(default = "default_true")]
     pub banner_hide_idle: bool,
     /// Windows: the graphics backend to ask for (Settings, Display, Graphics). Read once
