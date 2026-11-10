@@ -100,21 +100,34 @@ fn wanted(
         return None;
     }
     let status = d.session.agent_status();
+    let helpers = status.subagents as usize;
+    // Hidden when idle, the banner is there exactly when the pane's working bar is:
+    // one rule for both, so they can never disagree. Holding it longer (through a
+    // turn's end, or while sub-agents ran under an agent between turns) was tried and
+    // read as work that would not stop.
+    if settings.banner_hide_idle {
+        return (status.lifecycle == Lifecycle::Working).then_some((banner::State::Working, helpers));
+    }
     let state = match status.lifecycle {
         Lifecycle::Working => banner::State::Working,
         Lifecycle::Attention => banner::State::Attention,
         // An agent that starts its sub-agents in the background ends its turn and is
         // woken as each reports: by its own lifecycle it is idle in between, and the
         // work is going on all the same.
-        _ if status.subagents > 0 => banner::State::Working,
-        _ if done.get(&d.history_id).is_some_and(|until| now < *until) => banner::State::Done,
+        _ if helpers > 0 => banner::State::Working,
+        _ if flag_is_up(done.get(&d.history_id).copied(), d.session.last_interrupt_ms(), now) => {
+            banner::State::Done
+        }
         _ => banner::State::Idle,
     };
-    // "Idle" for hiding starts when the flag of the last turn comes down. An agent
-    // waiting on background work has a turn of a second or two every so often, and a
-    // banner that left at each turn's end came and went the whole time.
-    let present = !settings.banner_hide_idle || matches!(state, banner::State::Working | banner::State::Done);
-    present.then_some((state, status.subagents as usize))
+    Some((state, helpers))
+}
+
+// Whether the banner still shows a turn that ended, its flag due down at `until`.
+// Esc or Ctrl+C since that turn ended takes it down at once: whoever cancels wants
+// the pane to stop, and a flag left standing for half a minute read as work going on.
+fn flag_is_up(until: Option<u64>, interrupted_ms: u64, now: u64) -> bool {
+    until.is_some_and(|until| now < until && interrupted_ms < until.saturating_sub(DONE_MS))
 }
 
 // Each pane of the active workspace, with its size in the grid.
@@ -265,6 +278,19 @@ impl PaneBanner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_cancel_takes_the_done_flag_down() {
+        let ended = 1_000_000;
+        let until = ended + DONE_MS;
+        assert!(flag_is_up(Some(until), 0, ended + 10));
+        assert!(!flag_is_up(Some(until), 0, until));
+        assert!(!flag_is_up(None, 0, ended));
+        // An Esc from before that turn ended says nothing about it.
+        assert!(flag_is_up(Some(until), ended - 5000, ended + 10));
+        // One since then does.
+        assert!(!flag_is_up(Some(until), ended + 2000, ended + 2001));
+    }
+
     // The loop this guards against: the banner goes, the terminal is resized, the
     // agent's repaint reads as work for a couple of seconds, the banner comes back,
     // the terminal is resized again, and so on for as long as the pane sits idle.
@@ -319,7 +345,12 @@ pub fn slot<'a>(state: &'a State, d: &PaneData, working: bool, pane_w: f32) -> E
 
 // The banner as a layer over the terminal's first rows, for one without rows of its
 // own. The terminal is not resized for it; what it covers is hidden while it shows.
+// It is drawn only while the pane's working bar is (`working`), whatever frame is
+// held: the view reads the agent's state afresh, and the two must not part for a frame.
 pub fn overlay<'a>(state: &'a State, d: &PaneData, working: bool, pane_w: f32) -> Option<Element<'a, Message>> {
+    if !working {
+        return None;
+    }
     art(state, d, false, working, pane_w)
 }
 

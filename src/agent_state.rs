@@ -110,6 +110,8 @@ pub struct AgentHandle {
     waiting_background: AtomicBool,
     /// Background shells by the footer's count (see `AgentStatus::shells`).
     background_shells: AtomicU32,
+    /// The lifecycle the debug log last recorded for this pane (see `snapshot`).
+    logged_lifecycle: AtomicU32,
     /// Sub-agents reported started and not yet stopped, each with when it started. By
     /// id rather than a count, so a stop whose start was missed changes nothing.
     subagents: Mutex<Vec<(String, u64)>>,
@@ -222,6 +224,14 @@ const ROW_END_CONFIRM_MS: u64 = 400;
 /// A row leaving within this long of Esc or Ctrl+C is the interrupt landing, not a
 /// finish. Claude takes a few hundred ms to cancel the request and redraw.
 const INTERRUPT_WINDOW_MS: u64 = 1500;
+/// How long after an agent is bound, or reports a conversation starting, spinner frames
+/// cannot START working. A continued conversation is painted in chunks, and its
+/// transcript holds old spinner rows ("✻ Brewed for 56s"): two chunks with different
+/// stars read as a spinner animating, and the pane showed working for a TTL at every
+/// resume (measured 2026-11-10: 46 ms after SessionStart). A turn that really starts
+/// inside the window is still seen by its row, title or progress, which are levels,
+/// and a prompt submitted inside it ends the window (`clear_suppression`).
+const START_QUIET_MS: u64 = 3000;
 /// A sub-agent whose stop has not come after this long is taken to be gone. An hour:
 /// well past any real one, and it bounds how long a lost stop report can show.
 const SUBAGENT_MAX_MS: u64 = 3_600_000;
@@ -265,6 +275,7 @@ impl AgentHandle {
             scroll_holds_working: AtomicBool::new(false),
             waiting_background: AtomicBool::new(false),
             background_shells: AtomicU32::new(0),
+            logged_lifecycle: AtomicU32::new(Lifecycle::Closed as u32),
             subagents: Mutex::new(Vec::new()),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
@@ -335,6 +346,7 @@ impl AgentHandle {
         }
         self.kind.store(kind as u8 + 1, Ordering::Relaxed);
         self.kind_source.store(source as u8, Ordering::Relaxed);
+        self.suppress_activity(START_QUIET_MS);
         crate::debug::debug_log(&format!("pane {}: agent {kind:?} bound by {source:?}", self.pane_id));
         true
     }
@@ -540,6 +552,7 @@ impl AgentHandle {
             self.record_session(kind, id, transcript.as_deref());
             // A new conversation (startup, resume, `/clear`) has no sub-agents yet.
             self.subagents.lock().unwrap().clear();
+            self.suppress_activity(START_QUIET_MS);
             return;
         }
         if !self.running.load(Ordering::Relaxed) || self.kind() != Some(kind) {
@@ -923,6 +936,11 @@ impl AgentHandle {
         self.subagents.lock().unwrap().clear();
     }
 
+    /// When the user last pressed Esc or Ctrl+C here; 0 if never.
+    pub fn last_interrupt_ms(&self) -> u64 {
+        self.interrupt_ms.load(Ordering::Relaxed)
+    }
+
     fn interrupted_recently(&self) -> bool {
         let at = self.interrupt_ms.load(Ordering::Relaxed);
         at != 0 && now_ms().saturating_sub(at) < INTERRUPT_WINDOW_MS
@@ -1077,6 +1095,29 @@ impl AgentHandle {
         Lifecycle::Ready
     }
 
+    /// Every input `lifecycle` reads, for the debug log: which of them made a pane
+    /// working is otherwise unrecoverable after the fact.
+    fn why(&self) -> String {
+        let now = now_ms();
+        let on = |b: &AtomicBool| b.load(Ordering::Relaxed);
+        let act = self.activity_ms.load(Ordering::Relaxed);
+        let stop = self.stop_ms.load(Ordering::Relaxed);
+        let started = self.turn_started_ms.load(Ordering::Relaxed);
+        format!(
+            "running={} lc={:?} waiting={} row={} title={} progress={} started_hold={} activity={} menu={} hook_att={}",
+            on(&self.running),
+            self.lifecycle(),
+            on(&self.waiting_background),
+            on(&self.working_row),
+            on(&self.title_working),
+            on(&self.progress_working),
+            started > stop && now.saturating_sub(started) < TURN_START_HOLD_MS,
+            act > stop && now.saturating_sub(act) < WORKING_TTL_MS,
+            on(&self.menu_on_screen),
+            on(&self.hook_attention),
+        )
+    }
+
     /// Milliseconds since a chunk last carried a spinner glyph, None if none has yet.
     pub fn star_age_ms(&self) -> Option<u64> {
         let t = self.last_star_ms.load(Ordering::Relaxed);
@@ -1085,8 +1126,15 @@ impl AgentHandle {
 
     /// Snapshot for the view.
     pub fn snapshot(&self) -> AgentStatus {
+        let lifecycle = self.lifecycle();
+        // With `ARBITER_CLAUDE_DEBUG`, each change of state is logged with its reasons.
+        if self.logged_lifecycle.swap(lifecycle as u32, Ordering::Relaxed) != lifecycle as u32
+            && crate::debug::debug_enabled()
+        {
+            crate::debug::debug_log(&format!("lifecycle: pane {} {}", self.pane_id, self.why()));
+        }
         AgentStatus {
-            lifecycle: self.lifecycle(),
+            lifecycle,
             kind: self.kind(),
             epoch: self.epoch.load(Ordering::Relaxed),
             shells: self.background_shells.load(Ordering::Relaxed),
@@ -1123,7 +1171,38 @@ mod tests {
     fn handle() -> Arc<AgentHandle> {
         let h = AgentHandle::new(1, Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(true)));
         h.bind(AgentKind::Claude, KindSource::Scan);
+        // Long past its start, which is where these tests begin.
+        h.suppress_until_ms.store(0, Ordering::Relaxed);
         h
+    }
+
+    // A continued conversation is painted in chunks whose old spinner rows differ, which
+    // pairs like a spinner animating. That showed the pane working at every resume.
+    #[test]
+    fn a_conversation_being_painted_at_its_start_is_not_work() {
+        let h = handle();
+        let pair = |h: &Arc<AgentHandle>| {
+            h.note_activity(1);
+            std::thread::sleep(FRAME);
+            h.note_activity(2);
+        };
+        h.apply(AgentKind::Claude, None, &AgentEvent::SessionBound { id: "s1".into(), transcript: None });
+        pair(&h);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        // A turn that starts inside the window is seen by its row all the same.
+        h.working_row.store(true, Ordering::Relaxed);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        h.working_row.store(false, Ordering::Relaxed);
+        // Past the window, frames start work as ever.
+        h.suppress_until_ms.store(0, Ordering::Relaxed);
+        pair(&h);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+
+        // An agent only just found in a pane by its process is in the same position.
+        let fresh = AgentHandle::new(2, Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(true)));
+        fresh.bind(AgentKind::Claude, KindSource::Scan);
+        pair(&fresh);
+        assert_eq!(fresh.snapshot().lifecycle, Lifecycle::Ready);
     }
 
     /// The menu leaves the screen and stays gone past the confirmation.

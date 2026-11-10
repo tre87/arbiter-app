@@ -1422,6 +1422,10 @@ impl Session {
     }
 
     /// The user sent Esc or Ctrl+C here (see `AgentHandle::note_interrupt`).
+    pub fn last_interrupt_ms(&self) -> u64 {
+        self.agent.last_interrupt_ms()
+    }
+
     pub fn note_interrupt(&self) {
         self.agent.note_interrupt();
     }
@@ -2730,7 +2734,9 @@ mod tests {
     fn chrome_gone_during_a_live_turn_does_not_clear() {
         let (conn, agent) = pair();
         super::note_screen(&conn, &agent, CLAUDE);
-        // Two differing spinner frames an animation gap apart = a turn is under way.
+        // A prompt is submitted, then two differing spinner frames an animation gap
+        // apart = a turn is under way.
+        agent.clear_suppression();
         agent.note_activity(0b1000);
         std::thread::sleep(std::time::Duration::from_millis(40));
         agent.note_activity(0b0100);

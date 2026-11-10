@@ -4126,7 +4126,7 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 ),
                 settings_toggle(
                     "Hide the banner when the agent is idle",
-                    Some("Show it only while the agent or its sub-agents work and for half a minute after a turn ends, over the terminal's first rows. Off, it stays between turns, held still, in rows of its own above the terminal."),
+                    Some("Show it only while the agent is working, together with the working bar, over the terminal's first rows. Off, it stays between turns, held still, in rows of its own above the terminal."),
                     state.settings.banner_hide_idle,
                     Message::ToggleBannerHideIdle,
                 ),

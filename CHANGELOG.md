@@ -13,14 +13,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
   fencing, digging, stacking crates, painting) under a day and night cycle and changing
   weather. Robots use the whole width: a nearby job is walked to, a far one flown to by
   jetpack, and a robot left outside a narrowed terminal flies straight back into view. The
-  antenna lamp is the pane's status: blue working, amber when the agent needs you, green
-  for half a minute after a turn ends. The day and the weather carry on from turn to turn
+  antenna lamp is the pane's status: blue working and, when the banner is kept between
+  turns, amber when the agent needs you and green for half a minute after a turn ends. The day and the weather carry on from turn to turn
   for as long as the terminal lives. Off by default: the robot button in the titlebar
   switches it, as does Settings, Display, "Show the agent banner". "Hide the banner when
-  the agent is idle" (on by default) shows it only while the agent or its sub-agents work and
-  for half a minute after a turn ends (so an agent waiting on background work, whose
-  turns are a second long, does not make it come and go), laid over the terminal's first
-  rows so the terminal is never resized for it; off, it stays between
+  the agent is idle" (on by default) shows it exactly when the pane's working bar shows,
+  laid over the terminal's first rows so the terminal is never resized for it; off, it stays between
   turns, held still, in rows of its own above the terminal. A terminal too narrow or too low for it keeps its rows and
   gets an icon in its header that says why. Each sub-agent Claude has running is a
   smaller robot of its own colour on its own round, up to six, flying in when it starts
@@ -48,6 +46,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
   working, since those always finish and Claude carries on by itself.
 
 ### Fixed
+- **Continuing a conversation no longer flashes "working".** A continued Claude paints
+  its old transcript in chunks, and the spinner rows in it ("✻ Brewed for 56s") read as a
+  spinner animating: the working bar, the dot and now the banner showed for two seconds at
+  every resume. Spinner frames can no longer start "working" in the first three seconds
+  after an agent starts; a turn that really begins then is still seen by its status row,
+  and submitting a prompt ends the wait at once.
 - **Terminals stay live while another program uses every core (Windows).** A CPU-bound
   job on all cores (a simulation, a big build) left Arbiter's window responsive but its
   terminals frozen: output showed seconds or minutes late, typing went nowhere, and the

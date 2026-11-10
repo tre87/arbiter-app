@@ -252,6 +252,16 @@ a row resize (shifts the whole layout for a frame; a column does not).
   menu counts as gone only after `MENU_GONE_CONFIRM_MS` without it
   (`AgentHandle::menu_gap`), and only then are the hook's attention and the slash-command
   claim cleared.
+- **A conversation being painted at its start is not work (2026-11-10).** Continuing a
+  conversation (`claude -c`, `--resume`) flashed working for one TTL: the transcript is
+  painted in chunks, its old spinner rows ("✻ Brewed for 56s") differ between chunks,
+  and that pairs like a spinner animating (`note_activity`). A new conversation has no
+  such rows, so a first launch never did it. `bind` and `SessionBound` now open a
+  `START_QUIET_MS` window in which frames cannot START working (the same
+  `suppress_activity` a resize uses); the status row, title and progress are levels and
+  still do, and Enter ends the window (`clear_suppression`). Found with
+  `ARBITER_CLAUDE_DEBUG=1`, which logs each lifecycle change with every input it read
+  (`lifecycle:` lines, `AgentHandle::why`); a headless resume did not reproduce it.
 - **One finish is counted once.** The Stop hook and the row end (or, for Codex, `notify`
   and its OSC 9) report the same turn end; a second within `FINISH_DEDUPE_MS` with no
   work in between is dropped (`AgentHandle::count_finish`).
@@ -323,14 +333,19 @@ It replaced the Agents Office (a room of desks in its own window, removed). Thre
   gets no banner and an icon in its header instead (`pane_banner::fit`).
 - **Settings:** `show_agent_banner` (off by default; the titlebar's robot button toggles
   it) and `banner_hide_idle` (on by default).
-- **What "idle" means for hiding** (`pane_banner::wanted`). Not the lifecycle alone: a
-  Claude told to do long work starts its sub-agents and shells in the background, ends
-  its turn, and is woken as each reports, so one job is dozens of turns a second or two
-  long with gaps of up to twenty between them (measured from a transcript, 2026-11-10),
-  and a banner that followed the lifecycle came and went the whole time. So the banner
-  shows the robots at work while the lifecycle is Working OR any sub-agent is running,
-  and stays, as the green flag, for `DONE_MS` after a turn's end; only then is the pane
-  idle. A background shell alone does not hold it (a dev server runs all day).
+- **Hidden when idle, the banner follows the working bar, exactly** (`pane_banner::wanted`,
+  `overlay`): there while the lifecycle is Working, gone otherwise, the same rule the
+  bar uses, so the two cannot disagree. Do not add holds to it. Three were tried on
+  2026-11-10 and each read as wrong to the user: staying while sub-agents ran under an
+  agent between turns, staying as the green flag for `DONE_MS` after a turn's end
+  ("work did not stop" after a cancel), and waiting before leaving (still blinked). The
+  cost, accepted: a Claude doing long work starts its sub-agents and shells in the
+  background, ends its turn and is woken as each reports, so one job is dozens of turns
+  a second or two long (measured from a transcript), and the banner comes and goes
+  with them, as the bar does. Making that steadier means changing what counts as
+  working for the whole pane, not the banner. With the setting off the banner is
+  permanent, and there it shows the done flag for `DONE_MS` (`flag_is_up`: Esc or
+  Ctrl+C since takes it down) and robots at work while sub-agents run between turns.
 - **Sub-agents are helper robots** (`Scene::helpers`, up to `MAX_HELPERS`), counted from
   the agent's own reports: `AgentEvent::SubagentStarted` / `SubagentStopped`, which
   Claude's adapter maps from its `SubagentStart` and `SubagentStop` hooks (`agent_id`).
