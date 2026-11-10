@@ -50,9 +50,9 @@ pub const H: i32 = 46;
 // Narrowest strip worth drawing, in art pixels: the robot, a tree and the near
 // shore of the lake. A caller with less room hides the banner instead.
 pub const MIN_W: i32 = 80;
-// Helper robots drawn at most; a wider strip is needed to fit them all, see
-// `helpers_shown`.
-pub const MAX_HELPERS: usize = 6;
+// Helper slots. How many are drawn is a matter of width (`helper_room`); this is
+// only the ceiling, which a strip reaches at 380 art pixels.
+pub const MAX_HELPERS: usize = 12;
 // Scene seconds for one day and night.
 pub const DAY_SECS: f32 = 240.0;
 // Scene seconds one kind of weather lasts under `Weather::drifting`.
@@ -199,8 +199,11 @@ pub fn day_phase(t: f32) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scene {
     pub state: State,
-    // Sub-agents at work beside the main robot. Clamped to `MAX_HELPERS`.
-    pub helpers: usize,
+    // Sub-agents at work beside the main robot: bit `i` set is a helper in slot `i`,
+    // below `MAX_HELPERS`. A slot is a robot of its own (its colour, its round), so a
+    // caller that keeps each sub-agent in one slot sees that robot leave when that
+    // sub-agent is done. `helper_slots(n)` is the first `n`, for one that only counts.
+    pub helpers: u32,
     pub weather: Weather,
     // Time of day in [0, 1): 0 sunrise, 0.25 noon, 0.5 sunset, 0.75 midnight.
     pub day: f32,
@@ -220,10 +223,20 @@ impl Scene {
     }
 }
 
-// How many of `n` helpers a strip `w` art pixels wide has room for: one for every
-// 30 pixels past the main robot's own.
+// The helper mask with the first `n` slots taken.
+pub fn helper_slots(n: usize) -> u32 {
+    (1u32 << n.min(MAX_HELPERS)) - 1
+}
+
+// How many helpers a strip `w` art pixels wide has room for: one for every 30
+// pixels past the main robot's own.
+pub fn helper_room(w: i32) -> usize {
+    (((w - 20) / 30).max(0) as usize).min(MAX_HELPERS)
+}
+
+// How many of `n` helpers a strip `w` art pixels wide shows.
 pub fn helpers_shown(w: i32, n: usize) -> usize {
-    n.min(MAX_HELPERS).min(((w - 20) / 30).max(0) as usize)
+    n.min(helper_room(w))
 }
 
 pub struct Buf {
@@ -397,6 +410,12 @@ const HELPER_COLOURS: [Rgba; MAX_HELPERS] = [
     rgb(0xe8, 0x7a, 0xa8),
     rgb(0x8f, 0xc8, 0x4a),
     rgb(0x5a, 0xa8, 0xe8),
+    rgb(0xe8, 0x8a, 0x4a),
+    rgb(0x4a, 0xc8, 0x7a),
+    rgb(0xc8, 0x6a, 0xd8),
+    rgb(0xd8, 0xd8, 0x5a),
+    rgb(0x6a, 0x8a, 0xe8),
+    rgb(0xd8, 0x5a, 0x6a),
 ];
 
 // One robot in one frame: who it is (None is the main robot), where its round has
@@ -428,8 +447,13 @@ fn cast(scene: &Scene, w: i32, t: f32) -> Vec<Member> {
         };
         Member { who, act, pose, leaving: false }
     };
-    let mut all: Vec<Member> =
-        (0..helpers_shown(w, scene.helpers)).rev().map(|i| member(Some(i))).collect();
+    // The lowest slots taken, as many as there is room for.
+    let mut all: Vec<Member> = (0..MAX_HELPERS)
+        .filter(|i| scene.helpers & (1 << i) != 0)
+        .take(helper_room(w))
+        .map(|i| member(Some(i)))
+        .collect();
+    all.reverse();
     all.push(member(None));
     all
 }
@@ -1300,7 +1324,7 @@ mod tests {
     use super::*;
 
     fn scene(state: State, helpers: usize, weather: Weather, day: Daytime) -> Scene {
-        Scene { state, helpers, weather, day: day.phase() }
+        Scene { state, helpers: helper_slots(helpers), weather, day: day.phase() }
     }
 
     #[test]
@@ -1357,9 +1381,37 @@ mod tests {
     fn helpers_fit_by_width() {
         assert_eq!(helpers_shown(MIN_W, 0), 0);
         assert_eq!(helpers_shown(MIN_W, 2), 2);
-        assert!(helpers_shown(MIN_W, MAX_HELPERS) < MAX_HELPERS);
-        assert_eq!(helpers_shown(200, MAX_HELPERS), MAX_HELPERS);
-        assert_eq!(helpers_shown(400, MAX_HELPERS + 5), MAX_HELPERS);
+        assert_eq!(helpers_shown(MIN_W, MAX_HELPERS), 2);
+        assert_eq!(helper_room(200), 6);
+        assert_eq!(helper_room(380), MAX_HELPERS);
+        assert_eq!(helpers_shown(1000, MAX_HELPERS + 5), MAX_HELPERS);
+        assert_eq!(helper_slots(3), 0b111);
+        assert_eq!(helper_slots(MAX_HELPERS + 5).count_ones() as usize, MAX_HELPERS);
+    }
+
+    // Each slot is a robot of its own: when the sub-agent in the middle one is done,
+    // that robot leaves and the others carry on where they were.
+    #[test]
+    fn the_helper_whose_slot_is_freed_is_the_one_that_leaves() {
+        let mut s = scene(State::Working, 3, Weather::Clear, Daytime::Day);
+        let mut tr = Troupe::default();
+        for _ in 0..80 {
+            tr.render(&s, 300, 1.0, 0.05);
+        }
+        let before = tr.seen;
+        s.helpers = 0b101;
+        tr.render(&s, 300, 1.0, 0.0);
+        tr.render(&s, 300, 1.0, 0.1);
+        // Slot 1 (the troupe's third place: the main robot is its first) is moving out.
+        assert_eq!((tr.seen[1], tr.seen[3]), (before[1], before[3]));
+        assert_ne!(tr.seen[2], before[2]);
+        while tr.settling() {
+            tr.render(&s, 300, 1.0, 0.05);
+        }
+        assert_eq!((tr.seen[1], tr.seen[2], tr.seen[3]), (before[1], None, before[3]));
+        // A strip with room for one helper shows the lowest slot taken, not slot 0.
+        let only = Scene { helpers: 0b100, ..s };
+        assert_ne!(render(&only, MIN_W, 1.0).px, render(&Scene { helpers: 0, ..s }, MIN_W, 1.0).px);
     }
 
     // World x each robot is drawn at, main robot first.
@@ -1403,7 +1455,7 @@ mod tests {
         let mut tr = Troupe::default();
         tr.render(&s, 300, 1.0, 0.05);
         assert!(!tr.settling());
-        s.helpers = 1;
+        s.helpers = helper_slots(1);
         tr.render(&s, 300, 1.0, 0.0);
         assert!(tr.settling());
         assert_eq!(places(&tr)[1].abs(), 162.0);
@@ -1422,7 +1474,7 @@ mod tests {
 
         // One sub-agent finishes: its robot is still there on the next frame, where
         // it stood, and then leaves over several.
-        s.helpers = 1;
+        s.helpers = helper_slots(1);
         let with = tr.render(&s, 300, 1.0, 0.0);
         assert_eq!(places(&tr), before);
         assert!(tr.settling());
@@ -1438,15 +1490,15 @@ mod tests {
         assert_eq!(tr.render(&s, 300, 1.0, 0.05).px, render(&s, 300, 1.0).px);
 
         // Back before it has gone: it turns round instead of starting from the edge.
-        s.helpers = 2;
+        s.helpers = helper_slots(2);
         for _ in 0..80 {
             tr.render(&s, 300, 1.0, 0.05);
         }
-        s.helpers = 1;
+        s.helpers = helper_slots(1);
         tr.render(&s, 300, 1.0, 0.05);
         tr.render(&s, 300, 1.0, 0.05);
         let leaving = places(&tr)[2];
-        s.helpers = 2;
+        s.helpers = helper_slots(2);
         tr.render(&s, 300, 1.0, 0.0);
         assert_eq!(places(&tr)[2], leaving);
     }
@@ -1581,7 +1633,7 @@ mod tests {
         for _ in 0..80 {
             tr.render(&s, 300, 50.0, 0.05);
         }
-        let one = Scene { helpers: 1, ..s };
+        let one = Scene { helpers: helper_slots(1), ..s };
         tr.render(&one, 300, 50.0, 0.0);
         save(&tr.render(&one, 300, 50.0, 0.3), 4, "leaving");
     }

@@ -86,27 +86,51 @@ pub struct PaneBanner {
     flipped_ms: u64,
     // Since when the opposite of `shown` has been asked for without a break.
     asked_ms: Option<u64>,
+    // Which sub-agent (by the agent's own id) has which helper robot. A sub-agent
+    // keeps its slot for as long as it runs, so it is its own robot that leaves.
+    slots: [Option<String>; banner::MAX_HELPERS],
 }
 
-// What the banner of pane `d` should show, and how many sub-agents its agent has
-// running, or None for no banner.
+impl PaneBanner {
+    // Bring the slots in line with the sub-agents running now, `ids`, and give the
+    // scene's helper mask. One that is done frees its slot; a new one takes the lowest
+    // free slot, and waits without a robot while every slot is taken.
+    fn seat(&mut self, ids: &[String]) -> u32 {
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|id| !ids.contains(id)) {
+                *slot = None;
+            }
+        }
+        for id in ids {
+            if self.slots.iter().flatten().any(|seated| seated == id) {
+                continue;
+            }
+            match self.slots.iter_mut().find(|slot| slot.is_none()) {
+                Some(free) => *free = Some(id.clone()),
+                None => break,
+            }
+        }
+        self.slots.iter().enumerate().filter(|(_, slot)| slot.is_some()).fold(0, |mask, (i, _)| mask | 1 << i)
+    }
+}
+
+// What the banner of pane `d` should show, or None for no banner.
 fn wanted(
     settings: &persist::Settings,
     done: &HashMap<String, u64>,
     d: &PaneData,
     now: u64,
-) -> Option<(banner::State, usize)> {
+) -> Option<banner::State> {
     if !settings.show_agent_banner || !d.session.agent_running() {
         return None;
     }
     let status = d.session.agent_status();
-    let helpers = status.subagents as usize;
     // Hidden when idle, the banner is there exactly when the pane's working bar is:
     // one rule for both, so they can never disagree. Whether an agent paused on its
     // sub-agents is working is the lifecycle's business, not the banner's; holds added
     // here instead read as work that would not stop.
     if settings.banner_hide_idle {
-        return (status.lifecycle == Lifecycle::Working).then_some((banner::State::Working, helpers));
+        return (status.lifecycle == Lifecycle::Working).then_some(banner::State::Working);
     }
     let state = match status.lifecycle {
         Lifecycle::Working => banner::State::Working,
@@ -116,7 +140,7 @@ fn wanted(
         }
         _ => banner::State::Idle,
     };
-    Some((state, helpers))
+    Some(state)
 }
 
 // Whether the banner still shows a turn that ended, its flag due down at `until`.
@@ -170,7 +194,7 @@ pub fn refresh(state: &mut State) {
             let ticks = frame.saturating_sub(b.at_frame).min(MAX_CATCH_UP);
             let dt = ticks as f32 * FRAME_MS as f32 / 1000.0;
             b.at_frame = frame;
-            if want.is_some_and(|(state, _)| state == banner::State::Working) {
+            if want == Some(banner::State::Working) {
                 b.t += dt;
             }
             // Only the workspace on screen is drawn; the others just keep time.
@@ -179,9 +203,9 @@ pub fn refresh(state: &mut State) {
                 b.asked_ms = None;
                 continue;
             }
-            let fitted = want.zip(sizes.get(pane)).map(|((state, helpers), size)| {
-                fit(size.width, size.height, scale).map(|w| (state, helpers, w))
-            });
+            let fitted = want
+                .zip(sizes.get(pane))
+                .map(|(state, size)| fit(size.width, size.height, scale).map(|w| (state, w)));
             b.hidden = match fitted {
                 Some(Err(why)) => Some(why),
                 _ => None,
@@ -193,12 +217,12 @@ pub fn refresh(state: &mut State) {
                 continue;
             }
             // Held in the pane a moment past its time: the last frame stays as it is.
-            let Some(Ok((showing, helpers, w))) = fitted else {
+            let Some(Ok((showing, w))) = fitted else {
                 continue;
             };
             let scene = banner::Scene {
                 state: showing,
-                helpers,
+                helpers: b.seat(&d.session.subagent_ids()),
                 weather: banner::Weather::drifting(b.t),
                 day: banner::day_phase(b.t),
             };
@@ -273,6 +297,24 @@ impl PaneBanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subagent_keeps_its_robot_until_it_is_done() {
+        let ids = |s: &[&str]| s.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let mut b = PaneBanner::default();
+        assert_eq!(b.seat(&ids(&["a", "b", "c"])), 0b111);
+        // The middle one finishes: its slot empties, the others stay where they were.
+        assert_eq!(b.seat(&ids(&["a", "c"])), 0b101);
+        // A new one takes the free slot, whatever order the agent lists them in.
+        assert_eq!(b.seat(&ids(&["d", "c", "a"])), 0b111);
+        assert_eq!(b.slots[1].as_deref(), Some("d"));
+        assert_eq!(b.seat(&[]), 0);
+        // More than there are slots: the extra ones wait, and get a robot as one frees.
+        let many: Vec<String> = (0..banner::MAX_HELPERS + 2).map(|i| format!("s{i}")).collect();
+        assert_eq!(b.seat(&many), banner::helper_slots(banner::MAX_HELPERS));
+        assert_eq!(b.seat(&many[1..]), banner::helper_slots(banner::MAX_HELPERS));
+        assert_eq!(b.slots[0].as_deref(), Some(format!("s{}", banner::MAX_HELPERS).as_str()));
+    }
 
     #[test]
     fn a_cancel_takes_the_done_flag_down() {

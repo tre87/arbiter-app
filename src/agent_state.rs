@@ -612,6 +612,12 @@ impl AgentHandle {
         }
     }
 
+    /// The agent's own names for the sub-agents running now, oldest first.
+    pub fn subagent_ids(&self) -> Vec<String> {
+        self.subagent_count();
+        self.subagents.lock().unwrap().iter().map(|(id, _)| id.clone()).collect()
+    }
+
     /// Whether the agent is paused on sub-agents it left running: by the row on its
     /// screen, or by its own reports. Its turn has ended and it resumes by itself when
     /// they report, so the pane is working and no finish is counted.

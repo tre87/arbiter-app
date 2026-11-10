@@ -293,7 +293,10 @@ a row resize (shifts the whole layout for a frame; a column does not).
 
 ## The agent banner: pixel art at the top of an agent's terminal (2026-11-10)
 
-It replaced the Agents Office (a room of desks in its own window, removed). Three files:
+It replaced the Agents Office (a room of desks in its own window, removed). The long
+version of this section, with what was tried and thrown away, what was measured and what
+is still open, is `docs/AGENT-BANNER.md`; read it before changing when the banner shows
+or what counts as working. Three files:
 
 - **`src/agent_banner.rs` draws it**, with rectangle fills only: `render(scene, w, t)` is
   a pure function to an RGBA strip `H` (46) art pixels tall at any width, the world
@@ -343,8 +346,11 @@ It replaced the Agents Office (a room of desks in its own window, removed). Thre
   agent paused on its sub-agents is working" below), not the banner. With the setting
   off the banner is permanent, and there it shows the done flag for `DONE_MS`
   (`flag_is_up`: Esc or Ctrl+C since takes it down).
-- **Sub-agents are helper robots** (`Scene::helpers`, up to `MAX_HELPERS`), counted from
-  the agent's own reports: `AgentEvent::SubagentStarted` / `SubagentStopped`, which
+- **Sub-agents are helper robots.** `Scene::helpers` is a mask of slots, each a robot of
+  its own (colour, round); `PaneBanner::seat` keeps a sub-agent in one slot while it
+  runs, so the robot that leaves is the one whose sub-agent finished. Width decides how
+  many are drawn (`helper_room`, one per 30 art pixels); `MAX_HELPERS` is the ceiling.
+  They are known from the agent's own reports: `AgentEvent::SubagentStarted` / `SubagentStopped`, which
   Claude's adapter maps from its `SubagentStart` and `SubagentStop` hooks (`agent_id`).
   `AgentHandle` keeps the live ids, not a number, so a repeated start is one and a stop
   whose start was missed changes nothing; `AgentStatus::subagents` is the count. A

@@ -1426,6 +1426,10 @@ impl Session {
         self.agent.last_interrupt_ms()
     }
 
+    pub fn subagent_ids(&self) -> Vec<String> {
+        self.agent.subagent_ids()
+    }
+
     pub fn note_interrupt(&self) {
         self.agent.note_interrupt();
     }

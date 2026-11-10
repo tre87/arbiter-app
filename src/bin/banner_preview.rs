@@ -112,7 +112,7 @@ impl Preview {
     fn scene(&self) -> banner::Scene {
         banner::Scene {
             state: self.state,
-            helpers: self.helpers,
+            helpers: banner::helper_slots(self.helpers),
             weather: self.weather.unwrap_or_else(|| banner::Weather::drifting(self.t)),
             day: self.time.map_or_else(|| banner::day_phase(self.t), banner::Daytime::phase),
         }

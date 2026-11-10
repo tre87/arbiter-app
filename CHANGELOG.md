@@ -21,8 +21,9 @@ history belongs to the prior Tauri/Vue web app it replaced.
   laid over the terminal's first rows so the terminal is never resized for it; off, it stays between
   turns, held still, in rows of its own above the terminal. A terminal too narrow or too low for it keeps its rows and
   gets an icon in its header that says why. Each sub-agent Claude has running is a
-  smaller robot of its own colour on its own round, up to six, flying in when it starts
-  and flying off when it is done (Claude reports them through its SubagentStart and SubagentStop hooks; Copilot and Codex
+  smaller robot of its own colour on its own round, as many as the width has room for (up
+  to twelve), flying in when it starts and flying off when it is done: each sub-agent
+  keeps its own robot, so the one that leaves is the one that finished (Claude reports them through its SubagentStart and SubagentStop hooks; Copilot and Codex
   report none). `ARBITER_OPEN_BANNER=1` opens a test window with one fake
   pane and a menu for the state, the helpers, the hour and the weather.
 - **Settings, Agents: switch each agent CLI on or off.** Claude is on by default. Copilot
