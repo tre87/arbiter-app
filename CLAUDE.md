@@ -521,8 +521,10 @@ after `SHELL_MAX` / `AGENT_MAX`. Everything still starts at launch.
   report, the Claudes took 4 s to report from there, not 1.
 - **Measured** (macOS, ten cores, one run each): visible panes at 1.2 s, Claude
   reporting at 3 s, the last shell at 8 s (2 s later than before), all ready at 8 s
-  (was 9 s). Not run on Windows: the ConPTY there is now created some seconds before
-  its child is, which is untested.
+  (was 9 s). Windows, 31 panes with 11 Claudes, PowerShell and Git Bash (2026-11-10,
+  from the debug log of two runs): focused shells at 0.5 s, every Claude reporting by
+  3.5 to 5.3 s, the rest started after that, no pane left blank. A restored ssh pane
+  under the queue is untested on either platform.
 - **To time a launch:** copy `session.json` to a scratch folder, run the release build
   with `ARBITER_DATA_DIR` there plus `ARBITER_RECORD_PTY=1` and `ARBITER_CLAUDE_DEBUG=1`
   from a clean environment (`env -i`), and read each pane's first `OSC 133` from the
