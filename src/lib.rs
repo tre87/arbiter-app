@@ -26,6 +26,7 @@ pub mod raster;
 pub mod remote;
 pub mod session;
 pub mod shell;
+pub mod start_queue;
 pub mod term;
 pub mod term_signal;
 pub mod wol;

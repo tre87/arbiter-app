@@ -67,6 +67,9 @@ pub struct AgentHandle {
     pub pane_id: u64,
     /// The pane's shell process, set once it is spawned; where agents are looked for.
     pub shell_pid: OnceLock<u32>,
+    /// A restored agent pane's hold on its rank in the start queue, given up when the
+    /// agent's hook reports a session (`agent_watch`). Unset for every other pane.
+    pub start_slot: OnceLock<crate::start_queue::StartSlot>,
     pub cwd: Arc<Mutex<Option<String>>>,
     /// A LOCAL agent process runs in this pane (the scan saw it, or its hook spoke).
     pub running: Arc<AtomicBool>,
@@ -274,6 +277,7 @@ impl AgentHandle {
         Arc::new(Self {
             pane_id,
             shell_pid: OnceLock::new(),
+            start_slot: OnceLock::new(),
             cwd,
             running,
             kind: AtomicU8::new(0),

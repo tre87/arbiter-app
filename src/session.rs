@@ -66,6 +66,10 @@ pub struct StartupGate {
     prompt_seen: AtomicBool,
     resized: AtomicBool,
     tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// This shell's hold on its rank in the start queue, given up at its first prompt.
+    /// Unset for a pane that was started at once, and for one that waits for its
+    /// agent instead (`AgentHandle::start_slot`).
+    slot: OnceLock<crate::start_queue::StartSlot>,
 }
 
 impl StartupGate {
@@ -75,6 +79,7 @@ impl StartupGate {
             prompt_seen: AtomicBool::new(false),
             resized: AtomicBool::new(false),
             tx,
+            slot: OnceLock::new(),
         }
     }
 
@@ -86,6 +91,9 @@ impl StartupGate {
 
     /// The shell reached a prompt (an OSC-133 idle edge).
     pub fn note_prompt(&self) {
+        if let Some(slot) = self.slot.get() {
+            slot.release();
+        }
         self.prompt_seen.store(true, Ordering::Relaxed);
         self.release_if_ready();
     }
@@ -838,8 +846,84 @@ impl Drop for Session {
     }
 }
 
+/// The half of a session's start that runs the shell: everything that needs the child
+/// process. Apart from the rest so a restored pane can exist, and be laid out, before
+/// its turn in the start queue comes.
+struct Launch {
+    slave: Box<dyn portable_pty::SlavePty + Send>,
+    cmd: CommandBuilder,
+    agent: Arc<AgentHandle>,
+    conn: Arc<ConnHandle>,
+    shell_idle: Arc<Mutex<Option<bool>>>,
+    cmd_epoch: CmdEpoch,
+    closed: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    exit_code: Arc<Mutex<Option<u32>>>,
+    /// Dropped with this, which is what lets the writer thread begin: input written
+    /// before the shell exists (a restored agent's command) goes in after it does, as
+    /// it did when the shell was started first.
+    _started: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Launch {
+    fn run(self, slot: Option<crate::start_queue::StartSlot>) -> std::io::Result<()> {
+        let Launch { slave, cmd, agent, conn, shell_idle, cmd_epoch, closed, exited, exit_code, _started } = self;
+        let child = slave.spawn_command(cmd).map_err(io_err)?;
+        drop(slave); // child keeps its own handle
+        // Event-driven agent monitor: on each busy edge, scan the shell's descendants
+        // for an agent process (it execs shortly after the edge), or for an ssh/mosh
+        // client, which means the foreground program is on another machine.
+        if let Some(pid) = child.process_id() {
+            let _ = agent.shell_pid.set(pid);
+            let agent = agent.clone();
+            let conn = conn.clone();
+            std::thread::spawn(move || agent_monitor(pid, cmd_epoch, shell_idle, agent, conn, closed));
+        }
+        // The shell's exit is watched on its own thread: ConPTY gives the reader no EOF
+        // when the child ends, so without this a pane whose shell exited sat on a frozen
+        // screen with nothing knowing. The code is recorded before `exited` is raised, so
+        // whoever sees the flag can read it. Closing the PTY (Session drop) ends the child
+        // and so this thread; nothing is left behind.
+        let mut child = child;
+        std::thread::spawn(move || {
+            let status = child.wait().ok();
+            *exit_code.lock().unwrap_or_else(PoisonError::into_inner) = status.map(|s| s.exit_code());
+            exited.store(true, Ordering::Release);
+            agent.running.store(false, Ordering::Relaxed);
+            connection_edge(&conn, &agent, false);
+            if let Some(slot) = slot {
+                slot.release();
+            }
+            wake_ui();
+        });
+        Ok(())
+    }
+}
+
 impl Session {
-    pub fn spawn(cols: u16, rows: u16, mut cmd: CommandBuilder) -> std::io::Result<Self> {
+    pub fn spawn(cols: u16, rows: u16, cmd: CommandBuilder) -> std::io::Result<Self> {
+        Self::build(cols, rows, cmd, None)
+    }
+
+    /// A session whose shell starts when its turn in the start queue comes
+    /// (`start_queue::Queue::start`). Until then it is a blank pane that takes input,
+    /// resizes and can be dropped like any other. A shell that then fails to start
+    /// leaves the pane as one whose shell exited.
+    pub fn spawn_queued(
+        cols: u16,
+        rows: u16,
+        cmd: CommandBuilder,
+        rank: crate::start_queue::Rank,
+    ) -> std::io::Result<Self> {
+        Self::build(cols, rows, cmd, Some(rank))
+    }
+
+    fn build(
+        cols: u16,
+        rows: u16,
+        mut cmd: CommandBuilder,
+        queued: Option<crate::start_queue::Rank>,
+    ) -> std::io::Result<Self> {
         // Unique pane id, tagged onto the shell env so an agent's hook subcommand keys
         // its events to THIS pane: robust when many agents launch at once or several
         // share a cwd.
@@ -865,16 +949,16 @@ impl Session {
         let pair = pty
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(io_err)?;
-        let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
-        let shell_pid = child.process_id();
-        drop(pair.slave); // child keeps its own handle
         let raw_writer = pair.master.take_writer().map_err(io_err)?;
         let reader = pair.master.try_clone_reader().map_err(io_err)?;
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         // Dedicated writer thread: serializes all PTY input (keystrokes + query
         // replies) off the reader/UI threads. A blocking write here can't deadlock
         // the reader, which must keep draining output for the slave to make progress.
         let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
+            // Returns when the `Launch` is gone, whether the shell started or not.
+            let _ = started_rx.recv();
             let mut w = raw_writer;
             while let Ok(bytes) = writer_rx.recv() {
                 if w.write_all(&bytes).is_err() {
@@ -903,9 +987,6 @@ impl Session {
         // routes by pane id) + the reader (screen/spinner/signals → activity/attention).
         // Created before the reader so it gets a clone.
         let agent = AgentHandle::new(id, cwd.clone(), running.clone());
-        if let Some(pid) = shell_pid {
-            let _ = agent.shell_pid.set(pid);
-        }
         crate::agent_state::register(&agent);
         let conn = Arc::new(ConnHandle::new(histfile));
 
@@ -933,39 +1014,44 @@ impl Session {
             });
         }
 
-        // Event-driven agent monitor: on each busy edge, scan the shell's descendants
-        // for an agent process (it execs shortly after the edge), or for an ssh/mosh
-        // client, which means the foreground program is on another machine.
         let closed = Arc::new(AtomicBool::new(false));
-        if let Some(pid) = shell_pid {
-            let shell_idle = shell_idle.clone();
-            let agent = agent.clone();
-            let conn = conn.clone();
-            let cmd_epoch = cmd_epoch.clone();
-            let closed = closed.clone();
-            std::thread::spawn(move || agent_monitor(pid, cmd_epoch, shell_idle, agent, conn, closed));
-        }
-
-        // The shell's exit is watched on its own thread: ConPTY gives the reader no EOF
-        // when the child ends, so without this a pane whose shell exited sat on a frozen
-        // screen with nothing knowing. The code is recorded before `exited` is raised, so
-        // whoever sees the flag can read it. Closing the PTY (Session drop) ends the child
-        // and so this thread; nothing is left behind.
         let exit_code: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
-        {
-            let mut child = child;
-            let exit_code = exit_code.clone();
-            let exited = exited.clone();
-            let agent = agent.clone();
-            let conn = conn.clone();
-            std::thread::spawn(move || {
-                let status = child.wait().ok();
-                *exit_code.lock().unwrap_or_else(PoisonError::into_inner) = status.map(|s| s.exit_code());
-                exited.store(true, Ordering::Release);
-                agent.running.store(false, Ordering::Relaxed);
-                connection_edge(&conn, &agent, false);
-                wake_ui();
-            });
+        let launch = Launch {
+            slave: pair.slave,
+            cmd,
+            agent: agent.clone(),
+            conn: conn.clone(),
+            shell_idle: shell_idle.clone(),
+            cmd_epoch: cmd_epoch.clone(),
+            closed: closed.clone(),
+            exited: exited.clone(),
+            exit_code: exit_code.clone(),
+            _started: Some(started_tx),
+        };
+        match queued {
+            None => launch.run(None)?,
+            Some(rank) => {
+                let startup = startup.clone();
+                crate::start_queue::global().push(rank, move |slot| {
+                    // Closed while it waited: dropping the launch closes the PTY's
+                    // other end, which is what ends the reader.
+                    if launch.closed.load(Ordering::Relaxed) {
+                        slot.release();
+                        return;
+                    }
+                    let exited = launch.exited.clone();
+                    // Who gives the slot up: the agent's hook, or the first prompt.
+                    let _ = match rank {
+                        crate::start_queue::Rank::Agent => launch.agent.start_slot.set(slot.clone()),
+                        _ => startup.slot.set(slot.clone()),
+                    };
+                    if launch.run(Some(slot.clone())).is_err() {
+                        exited.store(true, Ordering::Release);
+                        slot.release();
+                        wake_ui();
+                    }
+                });
+            }
         }
 
         Ok(Self {
@@ -2195,6 +2281,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(super::SAVE_DIRTY.load(Ordering::Relaxed), "a new folder asks for a save");
+    }
+
+    // A queued pane has no shell until the queue is started, and what was typed into it
+    // before then (a restored agent's command) is the first thing its shell reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_queued_pane_starts_with_the_queue_and_keeps_what_was_typed_before() {
+        use std::time::{Duration, Instant};
+        let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "read line; [ \"$line\" = resume ] && exit 7; exit 1"]);
+        let mut session = super::Session::spawn_queued(80, 24, cmd, crate::start_queue::Rank::Rest).unwrap();
+        session.write(b"resume\n");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(session.agent.shell_pid.get().is_none(), "started before the queue was");
+        assert!(!session.exited());
+        crate::start_queue::global().start();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !session.exited() {
+            assert!(Instant::now() < deadline, "the queued shell never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(session.exit_status(), Some(7), "the shell did not read the line typed before it started");
     }
 
     // Live harness, needing a signed-in Claude on PATH, the debug `arbiter` built beside

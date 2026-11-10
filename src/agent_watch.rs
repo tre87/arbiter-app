@@ -100,6 +100,11 @@ pub(crate) fn apply_lines(h: &Arc<AgentHandle>, text: &str) {
             continue;
         }
         h.apply(kind, session.as_deref(), &event);
+        if matches!(event, AgentEvent::SessionBound { .. }) {
+            if let Some(slot) = h.start_slot.get() {
+                slot.release();
+            }
+        }
         let bound = matches!(event, AgentEvent::SessionBound { .. })
             && h.kind() == Some(kind)
             && h.running.load(Ordering::Relaxed);

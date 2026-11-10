@@ -29,6 +29,7 @@ use arbiter_native::agent::AgentKind;
 use arbiter_native::agent_state::Lifecycle;
 use arbiter_native::gpu::TermGpu;
 use arbiter_native::session::{Secret, Session, SharedMaster, SharedTerm};
+use arbiter_native::start_queue::Rank;
 use arbiter_native::persist;
 use arbiter_native::term::{MouseModes, SelectKind};
 
@@ -850,6 +851,12 @@ enum Message {
 /// Some(path) = Git Bash) starting in `cwd` if given. OSC-7/OSC-133 emitters are
 /// injected so the Session tracks cwd + busy/idle.
 fn spawn_session(shell: Option<&str>, cwd: Option<&str>, history_id: &str) -> Session {
+    start_session(shell, cwd, history_id, None)
+}
+
+/// `spawn_session`, with the shell started at once (`None`) or when its turn in the
+/// start queue comes, which is how a restored layout's panes start.
+fn start_session(shell: Option<&str>, cwd: Option<&str>, history_id: &str, queued: Option<Rank>) -> Session {
     let mut cmd = arbiter_native::shell::build_shell_command(shell);
     if let Some(dir) = cwd {
         cmd.cwd(dir);
@@ -866,7 +873,11 @@ fn spawn_session(shell: Option<&str>, cwd: Option<&str>, history_id: &str) -> Se
         trim_history_file(&path, HISTORY_MAX_LINES);
         cmd.env("ARBITER_HISTFILE", path.to_string_lossy().to_string());
     }
-    Session::spawn(80, 24, cmd).expect("spawn session")
+    match queued {
+        None => Session::spawn(80, 24, cmd),
+        Some(rank) => Session::spawn_queued(80, 24, cmd, rank),
+    }
+    .expect("spawn session")
 }
 
 /// Max lines kept in a pane's private history file (see `trim_history_file`).
@@ -924,16 +935,17 @@ fn spawn_restored(
     credential_kind: Option<persist::CredentialKind>,
     credential_detail: Option<&str>,
     remote_cwd: Option<&str>,
+    rank: Rank,
 ) -> (Session, ShellKind) {
     // A saved cwd that no longer exists falls back to the shell's default dir.
     let cwd = cwd.filter(|d| std::path::Path::new(d).is_dir());
     let (mut session, kind) = match shell {
         persist::SavedShell::GitBash => match git_bash {
-            Some(gb) => (spawn_session(Some(gb), cwd, history_id), ShellKind::GitBash),
-            None => (spawn_session(None, cwd, history_id), ShellKind::PowerShell),
+            Some(gb) => (start_session(Some(gb), cwd, history_id, Some(rank)), ShellKind::GitBash),
+            None => (start_session(None, cwd, history_id, Some(rank)), ShellKind::PowerShell),
         },
         persist::SavedShell::PowerShell => {
-            (spawn_session(None, cwd, history_id), ShellKind::PowerShell)
+            (start_session(None, cwd, history_id, Some(rank)), ShellKind::PowerShell)
         }
     };
     // A remote pane replays the command that built it (its ssh line). Where the far
@@ -965,9 +977,12 @@ fn spawn_restored(
 }
 
 /// Build a workspace's `pane_grid` from its saved split tree, respawning each leaf.
+/// The shells are queued, not started (see `restore_workspaces`); `focused` is whether
+/// this is the workspace the app opens on, whose panes start first.
 fn saved_to_config(
     node: persist::SavedNode,
     git_bash: Option<&str>,
+    focused: bool,
 ) -> pane_grid::Configuration<PaneData> {
     // An agent switched off since the save comes back as a plain terminal.
     let agent = node.saved_agent().filter(|a| arbiter_native::agent::enabled(a.kind));
@@ -975,8 +990,8 @@ fn saved_to_config(
         persist::SavedNode::Split { vertical, ratio, a, b } => pane_grid::Configuration::Split {
             axis: if vertical { pane_grid::Axis::Vertical } else { pane_grid::Axis::Horizontal },
             ratio,
-            a: Box::new(saved_to_config(*a, git_bash)),
-            b: Box::new(saved_to_config(*b, git_bash)),
+            a: Box::new(saved_to_config(*a, git_bash, focused)),
+            b: Box::new(saved_to_config(*b, git_bash, focused)),
         },
         persist::SavedNode::Leaf {
             name,
@@ -992,6 +1007,13 @@ fn saved_to_config(
         } => {
             // Old saves (pre-history) have no id → a fresh one, i.e. an empty history.
             let history_id = history_id.unwrap_or_else(new_history_id);
+            // An agent on a far host reports nothing here that the queue could wait for.
+            let local_agent = startup_cmd.is_none() && agent.as_ref().is_some_and(|a| !a.remote);
+            let rank = match (focused, local_agent) {
+                (true, _) => Rank::Focused,
+                (false, true) => Rank::Agent,
+                (false, false) => Rank::Rest,
+            };
             let (session, kind) = spawn_restored(
                 shell,
                 cwd.as_deref(),
@@ -1003,6 +1025,7 @@ fn saved_to_config(
                 credential_kind,
                 credential_detail.as_deref(),
                 remote_cwd.as_deref(),
+                rank,
             );
             pane_grid::Configuration::Pane(PaneData { session, name, shell: kind, history_id })
         }
@@ -1312,8 +1335,10 @@ fn restore_workspaces(
 ) -> Option<(Vec<Workspace>, usize)> {
     let explorer_on = saved.settings.show_file_explorer;
     let mut workspaces = Vec::new();
-    for sw in saved.workspaces {
-        let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash));
+    let last = saved.workspaces.len().saturating_sub(1);
+    for (i, sw) in saved.workspaces.into_iter().enumerate() {
+        let focused = i == saved.active.min(last);
+        let panes = pane_grid::State::with_configuration(saved_to_config(sw.layout, git_bash, focused));
         let Some(focus) = restored_focus(panes.layout(), sw.focus) else { continue };
         workspaces.push(Workspace {
             panes,
@@ -1328,6 +1353,8 @@ fn restore_workspaces(
             editor: files_pane::editor_from_saved(&sw.editor_tabs, sw.editor_active),
         });
     }
+    // Every pane is queued by now, so the first rank is chosen from the whole layout.
+    arbiter_native::start_queue::global().start();
     if workspaces.is_empty() {
         return None;
     }

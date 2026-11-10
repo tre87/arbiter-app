@@ -40,6 +40,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
   banner replaces it. A saved layout that had the office open simply opens without it.
 
 ### Changed
+- **A saved layout comes back in order: the workspace on screen first, then the agents,
+  then everything else.** Every terminal's shell used to start at the same moment, so
+  they all reached their prompts together and the panes in view waited as long as the
+  ones in other workspaces. Now the visible workspace's shells start alone, then the
+  panes with an agent to resume (the rest wait until each agent has reported its
+  session, or five seconds), then the remaining shells. Everything is still started at
+  launch, whether viewed or not. Measured on a 42-terminal, 11-workspace layout with
+  seven Claude sessions to resume (macOS, ten cores, one run each): the visible panes
+  at their prompts after 1.2 s, was 6 s; Claude reporting after 3 s, was 7 s; the last
+  plain shell after 8 s, was 6 s; all of it ready after 8 s, was 9 s.
 - **Claude waiting on its sub-agents counts as working, and finishes once.** Given long
   work, Claude starts sub-agents in the background, ends its turn at once and is woken as
   each reports, so one job was dozens of turns a second long: the working bar, the dot

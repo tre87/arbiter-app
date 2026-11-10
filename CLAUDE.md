@@ -498,6 +498,37 @@ present or surface configure is fatal there, no error handler sees it). Now:
   must redraw (a resize does). Never force a system-wide reset (`dxcap -forcetdr`): it
   takes down every other Arbiter running.
 
+## A restored layout starts in order (2026-11-10)
+
+All of a saved layout's shells used to start at once. On 42 panes they reached their
+prompts together 5 to 6 s after launch, the visible ones included, and the 7 Claudes
+they resumed reported at 7 s. `src/start_queue.rs` starts them a `Rank` at a time:
+the workspace on screen, then panes with a local agent to resume, then the rest. The
+next rank begins when every shell of the one before gave up its `StartSlot`: at its
+first prompt (`StartupGate::note_prompt`), or for an agent pane when the agent's hook
+reports a session (`agent_watch`, `AgentHandle::start_slot`), or when it exits, or
+after `SHELL_MAX` / `AGENT_MAX`. Everything still starts at launch.
+
+- **A restored pane exists before its shell does.** `Session::spawn_queued` builds
+  the session and queues a `Launch` (the child, its exit watcher, the agent monitor);
+  `restore_workspaces` calls `start_queue::global().start()` once the whole layout is
+  queued. Until its turn the pane is blank, resizes, and holds what is typed into it:
+  the writer thread waits for the launch, so a resumed agent's command goes in after
+  the shell exists, as before. Every other pane (`Session::spawn`) starts at once.
+- **No cap on how many start together.** Five at a time put the last shell at 10.7 s
+  against 6 s: about half a second of a shell's start is waiting, so a cap only lowers
+  the rate. And with the rest released at the agents' prompts, not at their session
+  report, the Claudes took 4 s to report from there, not 1.
+- **Measured** (macOS, ten cores, one run each): visible panes at 1.2 s, Claude
+  reporting at 3 s, the last shell at 8 s (2 s later than before), all ready at 8 s
+  (was 9 s). Not run on Windows: the ConPTY there is now created some seconds before
+  its child is, which is untested.
+- **To time a launch:** copy `session.json` to a scratch folder, run the release build
+  with `ARBITER_DATA_DIR` there plus `ARBITER_RECORD_PTY=1` and `ARBITER_CLAUDE_DEBUG=1`
+  from a clean environment (`env -i`), and read each pane's first `OSC 133` from the
+  recordings and the `SessionBound` lines from the debug log. It resumes the saved
+  agents a second time, so leave out any conversation in use.
+
 ## Pane folders survive a crash (2026-10-19)
 
 A crash used to bring panes back in the wrong folder, for three reasons, all fixed:
