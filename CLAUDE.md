@@ -525,6 +525,28 @@ after `SHELL_MAX` / `AGENT_MAX`. Everything still starts at launch.
   from the debug log of two runs): focused shells at 0.5 s, every Claude reporting by
   3.5 to 5.3 s, the rest started after that, no pane left blank. A restored ssh pane
   under the queue is untested on either platform.
+- **Panes not on screen get their size at launch too** (`src/bin/presize.rs`). A
+  terminal learns its size in `TermPrimitive::prepare`, which only the workspace on
+  screen runs, so the others sat at 80x24 until first opened: a resumed agent started
+  at that size and repainted on the first visit, and a restored ssh command, which
+  waits for the real size (`StartupGate`), went out on its 5 s fallback. Now the first
+  terminal drawn reports its widget size, the scale and the cell (`note_first_frame`),
+  and `presize::run` (after each message, working once) sizes every other pane: its
+  rectangle from iced's own `pane_regions` over `presize::grid_size` (window less the
+  40 px titlebar, the 6 px frame, that workspace's explorer), less the pane's chrome,
+  which is the reporting pane's rectangle less its terminal (2 x 35 px), in cells by
+  `presize::cells`, the arithmetic the renderer uses. Nothing is worked out before
+  the window exists: the scale and the size the window really got are not known then.
+  It runs about 0.2 s after launch, before any shell has a prompt.
+  - **Checked** by launching the 42-pane layout once per workspace (2026-11-10,
+    macOS, scale 1): the sizes worked out for the workspace on screen matched what
+    its panes were drawn at, for all 42 panes. With `ARBITER_CLAUDE_DEBUG=1` the
+    `presize:` lines say how many panes were sized, how many on screen differ, and
+    name any pane that was drawn at another size than it was given.
+  - **Left to the first drawing:** a workspace showing the editor, a banner with
+    rows of its own (it takes rows once the agent runs), and anything that changes
+    the window before the first visit (a resize, another display, the font size).
+    Not run on Windows or at a fractional scale.
 - **To time a launch:** copy `session.json` to a scratch folder, run the release build
   with `ARBITER_DATA_DIR` there plus `ARBITER_RECORD_PTY=1` and `ARBITER_CLAUDE_DEBUG=1`
   from a clean environment (`env -i`), and read each pane's first `OSC 133` from the

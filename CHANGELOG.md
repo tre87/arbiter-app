@@ -7,6 +7,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Changed
+- **Terminals in workspaces you have not opened yet start at their real size.** A
+  terminal used to learn its size when it was first drawn, so a pane in a background
+  workspace sat at 80x24 until you switched to it: an agent resumed there started at
+  that size and repainted its whole screen on your first visit, and a restored ssh
+  connection waited five seconds before it was started. Now every pane is sized right
+  after the window's first frame, about 0.2 s after launch and before any shell has
+  reached its prompt. A workspace showing the editor, and a pane whose banner is kept
+  between turns, are still sized when first opened.
+
 ## [1.7.0] - 2026-11-10
 
 ### Added

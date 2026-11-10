@@ -152,17 +152,11 @@ fn flag_is_up(until: Option<u64>, interrupted_ms: u64, now: u64) -> bool {
 
 // Each pane of the active workspace, with its size in the grid.
 fn pane_sizes(state: &State) -> HashMap<pane_grid::Pane, iced::Size> {
-    // The grid is the window less the titlebar (40), the 6 px frame on the other
-    // three sides, and the file explorer.
-    let w = state.main_size.width
-        - 12.0
-        - files_pane::shown(state).map_or(0.0, |e| e.width + files_pane::HANDLE_W);
-    let h = state.main_size.height - 46.0;
     state
         .active()
         .panes
         .layout()
-        .pane_regions(2.0, iced::Size::new(w.max(1.0), h.max(1.0)))
+        .pane_regions(2.0, presize::grid_size(state, state.active()))
         .into_iter()
         .map(|(p, r)| (p, r.size()))
         .collect()

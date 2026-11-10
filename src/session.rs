@@ -70,6 +70,9 @@ pub struct StartupGate {
     /// Unset for a pane that was started at once, and for one that waits for its
     /// agent instead (`AgentHandle::start_slot`).
     slot: OnceLock<crate::start_queue::StartSlot>,
+    /// The pane was given a size worked out before it was ever drawn
+    /// (`Session::presize`), which its first drawing checks.
+    presized: AtomicBool,
 }
 
 impl StartupGate {
@@ -80,7 +83,13 @@ impl StartupGate {
             resized: AtomicBool::new(false),
             tx,
             slot: OnceLock::new(),
+            presized: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the size the pane has was worked out and not yet drawn at. True once.
+    pub fn take_presized(&self) -> bool {
+        self.presized.swap(false, Ordering::Relaxed)
     }
 
     /// Hold `cmd` until the pane is ready. Replaces anything already queued.
@@ -1578,6 +1587,13 @@ impl Session {
         }
         self.startup.note_resized();
         self.term.lock().unwrap().resize(cols as usize, rows as usize);
+    }
+
+    /// `resize` to a size worked out for a pane that has not been drawn yet. It counts
+    /// as the real size, so a queued startup command no longer waits for a drawing.
+    pub fn presize(&self, cols: u16, rows: u16) {
+        self.startup.presized.store(true, Ordering::Relaxed);
+        self.resize(cols, rows);
     }
 }
 

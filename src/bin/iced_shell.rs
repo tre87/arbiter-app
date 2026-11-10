@@ -49,6 +49,8 @@ mod gutter;
 mod banner_preview;
 /// The agent banner at the top of each terminal that runs an agent.
 mod pane_banner;
+/// Sizes the panes of workspaces not on screen, once, after the first frame.
+mod presize;
 
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).
@@ -142,6 +144,8 @@ struct State {
     /// Each pane's banner, by `PaneData.history_id`, which outlives a reconnect and a
     /// shell switch where a `Session` does not.
     banners: HashMap<String, pane_banner::PaneBanner>,
+    /// The panes not on screen were given their sizes (`presize::run`), once per run.
+    presized: bool,
     /// Agent (`PaneData.history_id`) -> until when its banner shows the turn that just
     /// ended. Set by the same turn-end event that raises "Claude finished", so it is
     /// never guessed from a silence.
@@ -1708,6 +1712,7 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
 /// iced rebuilds every window's tree on every message.
 fn update(state: &mut State, message: Message) -> Task<Message> {
     let task = update_app(state, message);
+    presize::run(state);
     pane_banner::refresh(state);
     banner_preview::refresh(state);
     task
@@ -9790,8 +9795,11 @@ impl shader::Primitive for TermPrimitive {
 
         let pw = (bounds.width * scale).max(1.0) as u32;
         let ph = (bounds.height * scale).max(1.0) as u32;
-        let cols = (pw / gpu.cell_w).max(1) as usize;
-        let rows = (ph / gpu.cell_h).max(1) as usize;
+        let cell = (gpu.cell_w, gpu.cell_h);
+        let (cols, rows) = presize::cells(bounds.size(), scale, cell);
+        if !presize::first_frame_known() {
+            presize::note_first_frame(presize::FirstFrame { id: self.id, size: bounds.size(), scale, cell });
+        }
         // The grid fills `rows × cell_h`, not the whole widget: the remainder is a blank
         // strip at the bottom (and right). The mouse hit test needs the real cell size,
         // not the widget size divided by the row count, or every row boundary drifts
@@ -9800,6 +9808,14 @@ impl shader::Primitive for TermPrimitive {
         {
             let mut t = self.term.lock().unwrap();
             let resized = t.size() != (cols, rows);
+            if self.startup.take_presized() && resized {
+                arbiter_native::debug::debug_log(&format!(
+                    "presize: pane {} was sized {:?} and drew at {:?}",
+                    self.id,
+                    t.size(),
+                    (cols, rows)
+                ));
+            }
             if resized {
                 t.resize(cols, rows);
                 if let Ok(m) = self.master.lock() {
@@ -9811,8 +9827,9 @@ impl shader::Primitive for TermPrimitive {
                     });
                 }
                 // A pane is spawned at 80x24 and gets its real size HERE, on its first
-                // rendered frame. A queued startup command must not go in before this,
-                // so the resize is announced (see `StartupGate`).
+                // rendered frame, or before that from `presize::run`. A queued startup
+                // command must not go in before either, so the resize is announced (see
+                // `StartupGate`).
                 self.startup.note_resized();
             }
             // Between two chunks of one screen update the grid is half-drawn, and the
@@ -10195,6 +10212,7 @@ fn main() -> iced::Result {
                 overview_pos,
                 banner: banner_preview::Preview::default(),
                 banners: HashMap::new(),
+                presized: false,
                 turn_done: HashMap::new(),
                 main_focused: true,
                 wheel_nudge: 0,
