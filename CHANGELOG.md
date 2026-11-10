@@ -10,8 +10,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
 ### Added
 - **Agent banner: pixel art at the top of a terminal while its agent works.** A strip
   under the pane's header in which a robot walks from job to job outdoors (watering,
-  fencing, digging, stacking crates, painting) under a day and night cycle and changing
-  weather. Robots use the whole width: a nearby job is walked to, a far one flown to by
+  fencing, digging, stacking crates, painting, chopping wood, picking apples, laying a
+  campfire, and a snowman when it snows) under a day and night cycle and changing
+  weather. Now and then a dig turns up a treasure chest, a bird perches on an antenna,
+  or a shooting star crosses the night sky and the robots look up. Robots use the whole width: a nearby job is walked to, a far one flown to by
   jetpack, and a robot left outside a narrowed terminal flies straight back into view. The
   antenna lamp is the pane's status: blue working and, when the banner is kept between
   turns, amber when the agent needs you and green for half a minute after a turn ends. The day and the weather carry on from turn to turn

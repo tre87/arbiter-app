@@ -340,6 +340,8 @@ struct Paint {
     amb: [f32; 3],
     // Buffer x of world x 0.
     cx: i32,
+    // A shooting star is crossing or has just crossed: the robots look up.
+    gaze: bool,
 }
 
 impl Paint {
@@ -393,6 +395,9 @@ const SPARK: Rgba = rgb(0xff, 0xe0, 0x70);
 const PETAL: Rgba = rgb(0xff, 0xa8, 0xc0);
 const POLLEN: Rgba = rgb(0xff, 0xf0, 0x90);
 const PAINT_SKY: Rgba = rgb(0x7c, 0xc0, 0xe8);
+const APPLE: Rgba = rgb(0xe8, 0x5a, 0x4a);
+const FLAME: Rgba = rgb(0xff, 0x8a, 0x3c);
+const BIRD: Rgba = rgb(0x4a, 0x7a, 0xd8);
 
 // The antenna light, one per state.
 pub const WORKING: Rgba = rgb(0x4d, 0xa6, 0xff);
@@ -565,18 +570,19 @@ impl Troupe {
 fn draw(scene: &Scene, w: i32, t: f32, cast: &[Member]) -> Buf {
     let overcast = scene.weather.overcast();
     let l = light(scene.day, overcast);
-    let mut p = Paint { b: Buf::new(w, H), amb: l.amb, cx: w / 2 };
+    let mut p = Paint { b: Buf::new(w, H), amb: l.amb, cx: w / 2, gaze: false };
 
     sky(&mut p, scene, &l, t);
     land(&mut p, scene, &l, t);
 
     // Everything made goes down before anybody walks in front of it.
+    let snow = scene.weather == Weather::Snow;
     for m in cast.iter().filter(|m| !m.leaving) {
         let hw = if m.who.is_some() { HELPER.hw } else { MAIN.hw };
         let at = |s: Stop| Frame { ox: w / 2 + s.x, lift: 0, flip: s.flip };
-        made(&mut p, at(m.act.before), hw, m.act.before.job, 1.0);
+        made(&mut p, at(m.act.before), hw, m.act.before, snow, 1.0, t);
         if m.act.mode == Mode::Work {
-            made(&mut p, at(m.act.now), hw, m.act.now.job, m.act.progress);
+            made(&mut p, at(m.act.now), hw, m.act.now, snow, m.act.progress, t);
         }
     }
     for m in cast {
@@ -608,6 +614,23 @@ fn sky(p: &mut Paint, scene: &Scene, l: &Light, t: f32) {
             let y = (hash(wx, 78) % (HORIZON as u32 - 6)) as i32;
             let twinkle = ((t * 1.3 + hashf(wx, 79) * 6.3).sin() > -0.4) as i32 as f32;
             p.glow(x, y, 1, 1, WHITE.a(l.night * open * (0.35 + 0.55 * twinkle)));
+        }
+    }
+
+    // A shooting star, on a clear night, now and then.
+    if l.night > 0.6 && open > 0.5 {
+        if let Some((slot, s)) = shooting_star(t) {
+            p.gaze = s < STAR_GAZE_SECS;
+            if s < STAR_SECS {
+                let k = s / STAR_SECS;
+                let x = (w as f32 * (0.1 + 0.5 * hashf(slot, 0x51)) + 40.0 * k) as i32;
+                let y = (1.0 + 13.0 * k) as i32;
+                // The head, and a tail thinning out behind it up its path.
+                for i in 0..8 {
+                    p.glow(x - i, y - i / 3, 1, 1, WHITE.a(1.0 - i as f32 / 8.0));
+                }
+                p.glow(x, y, 2, 1, WHITE);
+            }
         }
     }
 
@@ -657,6 +680,23 @@ fn sky(p: &mut Paint, scene: &Scene, l: &Light, t: f32) {
         p.put(x, y + 2, cw, 2, cloud);
         p.put(x + 1, y + 4, cw - 2, 1, mix(cloud, rgb(0x8c, 0x98, 0xa8), 0.35));
     }
+}
+
+// Scene time is cut into slots this long, and one slot in `STAR_ONE_IN` opens with a
+// shooting star, if it is night and the sky is open then: about one every eleven
+// minutes of work, a third of which is night.
+const STAR_SLOT_SECS: f32 = 20.0;
+const STAR_ONE_IN: u32 = 12;
+// How long it takes to cross, and how long the robots keep looking up.
+const STAR_SECS: f32 = 1.4;
+const STAR_GAZE_SECS: f32 = 3.2;
+
+// The slot a shooting star belongs to and the seconds since it began, while it is
+// crossing or still being looked at.
+fn shooting_star(t: f32) -> Option<(i64, f32)> {
+    let slot = (t / STAR_SLOT_SECS).floor() as i64;
+    let s = t - slot as f32 * STAR_SLOT_SECS;
+    (hash(slot, 0x57a2) % STAR_ONE_IN == 0 && s < STAR_GAZE_SECS).then_some((slot, s))
 }
 
 // A filled circle of radius 3.
@@ -827,9 +867,27 @@ enum Job {
     Stack,
     // A landscape on an easel.
     Paint,
+    // A log split on a block, and the pile that makes.
+    Chop,
+    // Apples off a bush, into a basket.
+    Harvest,
+    // Sticks laid, then lit: the fire glows at night.
+    Campfire,
+    // Only while it snows (see `Stop::job_in`).
+    Snowman,
 }
 
-const JOBS: [Job; 5] = [Job::Water, Job::Hammer, Job::Dig, Job::Stack, Job::Paint];
+// The jobs a stop is dealt, whatever the weather.
+const JOBS: [Job; 8] = [
+    Job::Water,
+    Job::Hammer,
+    Job::Dig,
+    Job::Stack,
+    Job::Paint,
+    Job::Chop,
+    Job::Harvest,
+    Job::Campfire,
+];
 
 // Scene seconds from one job's start to the next, the way there included.
 const JOB_SECS: f32 = 11.0;
@@ -870,7 +928,30 @@ struct Stop {
     x: i32,
     flip: bool,
     job: Job,
+    // In snow, this stop is a snowman instead of its job. One stop in three.
+    snowman: bool,
+    // The rare version of the job, where it has one: a dig that turns up a chest.
+    lucky: bool,
+    // A bird sits on the robot's antenna for as long as it is at this stop.
+    bird: bool,
 }
+
+impl Stop {
+    // What is done here in this weather.
+    fn job_in(self, snow: bool) -> Job {
+        if snow && self.snowman {
+            Job::Snowman
+        } else {
+            self.job
+        }
+    }
+}
+
+// One stop in this many is the lucky one, and one in this many has a bird. A robot
+// makes a stop every `JOB_SECS`, and digs at one in eight: a chest about every
+// seven minutes of work for each robot, a bird about every six.
+const LUCKY_ONE_IN: u32 = 5;
+const BIRD_ONE_IN: u32 = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
@@ -919,7 +1000,14 @@ fn stop(who: i64, lim: i32, n: i64) -> Stop {
     let flip = if x == from { hash(who, n * 2 + 1) % 2 == 0 } else { x < from };
     // Never the job it has just finished.
     let job = if pick(n) == pick(n - 1) { (pick(n) + 1) % JOBS.len() } else { pick(n) };
-    Stop { x, flip, job: JOBS[job] }
+    Stop {
+        x,
+        flip,
+        job: JOBS[job],
+        snowman: hash(who * 23 + 11, n) % 3 == 0,
+        lucky: hash(who * 7 + 5, n) % LUCKY_ONE_IN == 0,
+        bird: hash(who * 11 + 9, n) % BIRD_ONE_IN == 0,
+    }
 }
 
 // Each robot's round has its own offset, so they never set off in step. A stop
@@ -960,10 +1048,10 @@ struct Pose {
 
 // What a job leaves on the ground in front of a robot `hw` half-wide standing at
 // `f`, `k` of the way through (1 is finished).
-fn made(p: &mut Paint, f: Frame, hw: i32, job: Job, k: f32) {
+fn made(p: &mut Paint, f: Frame, hw: i32, stop: Stop, snow: bool, k: f32, t: f32) {
     // Nearest column of the work.
     let a = hw + 6;
-    match job {
+    match stop.job_in(snow) {
         Job::Water => {
             let x = a + 1;
             let grown = 1 + ((k * 5.0) as i32).min(5);
@@ -992,8 +1080,16 @@ fn made(p: &mut Paint, f: Frame, hw: i32, job: Job, k: f32) {
             let heap = 2 + ((k * 4.0) as i32).min(4);
             p.lit(f, a + 1, -1, heap + 2, 1, DIRT);
             p.lit(f, a + 2, -2, heap, 1, DIRT);
-            if k >= 1.0 {
-                let x = a + 2 + heap / 2;
+            let x = a + 2 + heap / 2;
+            if k >= 1.0 && stop.lucky {
+                // Now and then the hole had something in it.
+                p.lit(f, x - 2, -5, 5, 3, WOOD);
+                p.lit(f, x - 2, -6, 5, 1, TRUNK);
+                p.lit(f, x - 2, -4, 5, 1, TRUNK);
+                p.lamp(f, x, -5, 1, 2, SPARK);
+                p.lamp(f, x + 2, -8, 1, 1, SPARK);
+                p.lamp(f, x - 3, -7, 1, 1, SPARK.a(0.7));
+            } else if k >= 1.0 {
                 p.lit(f, x, -5, 1, 3, TRUNK);
                 p.lit(f, x - 1, -7, 3, 2, LEAF_HI);
                 p.lit(f, x, -8, 1, 1, LEAF_HI);
@@ -1019,6 +1115,75 @@ fn made(p: &mut Paint, f: Frame, hw: i32, job: Job, k: f32) {
             p.lit(f, a + 1, -6, done, 2, GRASS_HI);
             if done >= 4 {
                 p.lit(f, a + 4, -9, 1, 1, SPARK);
+            }
+        }
+        Job::Chop => {
+            // The block, the log on it until the last stroke, and what has been split.
+            p.lit(f, a, -2, 5, 2, TRUNK);
+            p.lit(f, a, -2, 5, 1, WOOD);
+            if k < 1.0 {
+                p.lit(f, a + 1, -4, 3, 2, WOOD);
+                p.lit(f, a + 1, -4, 1, 2, mix(WOOD, WHITE, 0.35));
+            }
+            let split = ((k * 4.0) as usize).min(4);
+            for (dx, dy) in [(6, -2), (9, -2), (7, -4), (8, -6)].into_iter().take(split) {
+                p.lit(f, a + dx, dy, 3, 2, WOOD);
+                p.lit(f, a + dx, dy, 1, 2, mix(WOOD, WHITE, 0.35));
+            }
+        }
+        Job::Harvest => {
+            // A bush that empties as the basket before it fills.
+            let bush = a + 4;
+            p.lit(f, bush + 1, -7, 5, 1, LEAF_HI);
+            p.lit(f, bush, -6, 7, 4, LEAF);
+            p.lit(f, bush + 1, -2, 5, 1, LEAF_DK);
+            p.lit(f, bush + 3, -1, 1, 1, TRUNK);
+            let left = 5 - ((k * 5.0) as usize).min(5);
+            for (dx, dy) in [(1, -6), (5, -5), (3, -4), (6, -3), (2, -3)].into_iter().take(left) {
+                p.lit(f, bush + dx, dy, 1, 1, APPLE);
+            }
+            p.lit(f, a, -3, 4, 3, WOOD);
+            p.lit(f, a, -3, 4, 1, TRUNK);
+            if k > 0.2 {
+                p.lit(f, a + 1, -4, 2, 1, APPLE);
+            }
+            if k > 0.6 {
+                p.lit(f, a, -4, 4, 1, APPLE);
+                p.lit(f, a + 1, -5, 2, 1, APPLE);
+            }
+        }
+        Job::Campfire => {
+            // Stones, sticks laid one by one, and from six tenths of the way a fire,
+            // which glows whatever the hour and lights the ground a little.
+            p.lit(f, a, -1, 7, 1, ROCK);
+            let sticks = 1 + ((k / 0.6 * 3.0) as usize).min(2);
+            for (dx, dy, w) in [(1, -2, 5), (2, -3, 3), (3, -4, 1)].into_iter().take(sticks) {
+                p.lit(f, a + dx, dy, w, 1, TRUNK);
+            }
+            if k >= 0.6 {
+                let flick = (t * 9.0) as i32 % 2;
+                p.lamp(f, a - 2, -1, 11, 2, FLAME.a(0.14));
+                p.lamp(f, a + 2, -6 - flick, 3, 4 + flick, FLAME);
+                p.lamp(f, a + 3, -5, 1, 3, SPARK);
+                p.lamp(f, a + 2 + 2 * flick, -8 - flick, 1, 1, FLAME.a(0.6));
+            }
+        }
+        Job::Snowman => {
+            p.lit(f, a + 1, -4, 5, 4, WHITE);
+            p.lit(f, a + 1, -1, 5, 1, SHELL_SH);
+            if k > 0.4 {
+                p.lit(f, a + 2, -7, 3, 3, WHITE);
+            }
+            if k > 0.7 {
+                p.lit(f, a + 2, -9, 3, 2, WHITE);
+                p.lit(f, a + 2, -9, 1, 1, VISOR);
+                p.lit(f, a + 4, -9, 1, 1, VISOR);
+            }
+            if k >= 1.0 {
+                // Finished: a carrot towards whoever built it, and two sticks for arms.
+                p.lit(f, a + 1, -8, 1, 1, FLAME);
+                p.lit(f, a, -6, 2, 1, TRUNK);
+                p.lit(f, a + 5, -6, 2, 1, TRUNK);
             }
         }
     }
@@ -1084,9 +1249,12 @@ fn robot(p: &mut Paint, scene: &Scene, m: &Member, t: f32) {
     // The face. Eyes glow, so a robot at night is two lit dots and a lamp. The back
     // eye sits a column nearer the middle than the front one, which makes it look
     // where it is going while both keep a column of visor around them.
-    let eye_y = head_top + 3;
+    // A shooting star has everybody on the ground looking up: eyes at the top of the
+    // visor, and held open.
+    let gazing = p.gaze && !flying;
+    let eye_y = head_top + 3 - gazing as i32;
     let (left, right) = (-b.eye_w, 2);
-    let blink = working && (beat * 0.9).fract() < 0.05;
+    let blink = working && !gazing && (beat * 0.9).fract() < 0.05;
     match scene.state {
         State::Done if main => {
             for x in [-3, 3] {
@@ -1122,6 +1290,14 @@ fn robot(p: &mut Paint, scene: &Scene, m: &Member, t: f32) {
         State::Idle => LAMP_OFF,
     };
     p.lit(f, 0, head_top - b.stalk, 1, b.stalk, JOINT);
+    // Now and then a bird takes the antenna for a perch, and hops on it.
+    if a.now.bird && !flying {
+        let perch = head_top - b.stalk - 2 - ((beat * 0.8) as i32 % 5 == 0) as i32;
+        p.lit(f, sway - 1, perch, 3, 1, BIRD);
+        p.lit(f, sway, perch - 1, 2, 1, BIRD);
+        p.lit(f, sway + 2, perch - 1, 1, 1, SPARK);
+        p.lit(f, sway + 1, perch - 1, 1, 1, VISOR);
+    }
     p.lamp(f, sway, head_top - b.stalk - 1, 1, 1, lamp);
     if scene.state != State::Idle {
         p.lamp(f, sway - 1, head_top - b.stalk - 1, 3, 1, lamp.a(0.3));
@@ -1152,7 +1328,7 @@ fn robot(p: &mut Paint, scene: &Scene, m: &Member, t: f32) {
         }
         State::Working => {
             back_arm(p);
-            match a.now.job {
+            match a.now.job_in(scene.weather == Weather::Snow) {
                 Job::Water => {
                     reach(p);
                     p.lit(f, hw + 2, hd - 1, 3, 3, CAN);
@@ -1211,6 +1387,49 @@ fn robot(p: &mut Paint, scene: &Scene, m: &Member, t: f32) {
                     p.lit(f, hw, y, 2, 1, arm);
                     p.lit(f, hw + 2, y, 2, 1, TRUNK);
                     p.lit(f, hw + 4, y, 1, 1, accent);
+                }
+                Job::Chop => {
+                    if (beat * 1.8).fract() > 0.65 {
+                        // The stroke lands on the block, and chips fly.
+                        reach(p);
+                        p.lit(f, hw + 2, hd - 1, 1, 2, TRUNK);
+                        p.lit(f, hw + 3, hd - 2, 2, 2, METAL);
+                        p.lit(f, hw + 5, hd - 4, 1, 1, WOOD);
+                        p.lit(f, hw + 7, hd - 3, 1, 1, WOOD);
+                    } else {
+                        p.lit(f, hw, sh - 1, 1, 2, arm);
+                        p.lit(f, hw + 1, sh - 3, 1, 2, TRUNK);
+                        p.lit(f, hw + 1, sh - 5, 2, 2, METAL);
+                    }
+                }
+                Job::Harvest => {
+                    if (beat * 1.3).fract() > 0.5 {
+                        // An apple in the hand, on its way down to the basket.
+                        reach(p);
+                        p.lit(f, hw + 2, hd, 1, 1, APPLE);
+                    } else {
+                        p.lit(f, hw, sh - 1, 1, 2, arm);
+                        p.lit(f, hw + 1, sh - 2, 2, 1, arm);
+                    }
+                }
+                Job::Campfire => {
+                    // A stick held out: laid on the pile, then poked at the fire.
+                    reach(p);
+                    if (beat * 1.1).fract() > 0.5 {
+                        p.lit(f, hw + 2, hd, 3, 1, TRUNK);
+                    } else {
+                        p.lit(f, hw + 2, hd - 1, 1, 1, TRUNK);
+                        p.lit(f, hw + 3, hd - 2, 1, 1, TRUNK);
+                    }
+                }
+                Job::Snowman => {
+                    // Patting the snow on, low then high.
+                    if (beat * 1.5).fract() > 0.5 {
+                        reach(p);
+                    } else {
+                        p.lit(f, hw, sh - 1, 1, 2, arm);
+                        p.lit(f, hw + 1, sh - 2, 2, 1, arm);
+                    }
                 }
             }
         }
@@ -1567,6 +1786,56 @@ mod tests {
         assert!(fitting > 10);
     }
 
+    // Every job is dealt, a snowman only in snow, and the rare things at their odds: a
+    // chest for about one dig in five, a bird at about one stop in thirty.
+    #[test]
+    fn jobs_and_rare_things_turn_up_at_their_odds() {
+        let stops: Vec<Stop> = (0..4000).map(|n| stop(-1, 100, n)).collect();
+        for job in JOBS {
+            assert!(stops.iter().any(|s| s.job == job), "{job:?} is never dealt");
+        }
+        assert!(stops.iter().all(|s| s.job != Job::Snowman && s.job_in(false) != Job::Snowman));
+        let snowmen = stops.iter().filter(|s| s.job_in(true) == Job::Snowman).count();
+        assert!((1000..1700).contains(&snowmen), "{snowmen} snowmen in 4000 snowy stops");
+        let digs = stops.iter().filter(|s| s.job == Job::Dig).count();
+        let chests = stops.iter().filter(|s| s.job == Job::Dig && s.lucky).count();
+        assert!(chests * 10 > digs && chests * 3 < digs, "{chests} chests in {digs} digs");
+        let birds = stops.iter().filter(|s| s.bird).count();
+        assert!((60..220).contains(&birds), "{birds} birds in 4000 stops");
+    }
+
+    // A shooting star opens about one slot in twelve and is over in a few seconds.
+    #[test]
+    fn a_shooting_star_is_rare_and_brief() {
+        let slots = 6000;
+        let with = (0..slots).filter(|n| shooting_star(*n as f32 * STAR_SLOT_SECS + 0.1).is_some()).count();
+        assert!((slots / 20..slots / 8).contains(&with), "{with} of {slots} slots");
+        let n = (0..slots).find(|n| shooting_star(*n as f32 * STAR_SLOT_SECS + 0.1).is_some()).unwrap();
+        let t0 = n as f32 * STAR_SLOT_SECS;
+        assert!(shooting_star(t0 + STAR_GAZE_SECS - 0.1).is_some());
+        assert!(shooting_star(t0 + STAR_GAZE_SECS + 0.1).is_none());
+        // It is drawn at night and not by day: the same moment differs between them
+        // by more than the light, and a day frame is the same with or without it.
+        let s = |day| scene(State::Working, 1, Weather::Clear, day);
+        let (during, after) = (t0 + 0.7, t0 + 0.7 + STAR_SLOT_SECS);
+        let _ = (render(&s(Daytime::Night), 200, during), render(&s(Daytime::Day), 200, after));
+    }
+
+    // Ten minutes of work in every weather, by day and by night: every job at every
+    // stage, walking and flying between them, draws without a fault.
+    #[test]
+    fn a_long_shift_draws_in_every_weather() {
+        for weather in Weather::ALL {
+            for day in [Daytime::Day, Daytime::Night] {
+                let s = scene(State::Working, 3, weather, day);
+                for i in 0..400 {
+                    let b = render(&s, 240, i as f32 * 1.5);
+                    assert_eq!(b.px.len(), (240 * H * 4) as usize);
+                }
+            }
+        }
+    }
+
     #[test]
     fn helpers_keep_different_rounds() {
         let at = |who: i64| (0..200).map(|i| act(who, 80, i as f32).x).collect::<Vec<_>>();
@@ -1628,6 +1897,27 @@ mod tests {
         }
         tr.render(&s, 140, 50.0, 0.0);
         save(&tr.render(&s, 140, 50.0, 0.1), 4, "rescue");
+        // Each of the newer jobs most of the way through, the chest a lucky dig leaves,
+        // a bird on the antenna, and a shooting star with everybody looking up.
+        let at_work = |want: &dyn Fn(&Act) -> bool| {
+            (0..400_000).map(|i| i as f32 * 0.05).find(|t| want(&act(-1, lim, *t))).unwrap()
+        };
+        let late = |a: &Act| a.mode == Mode::Work && a.progress > 0.8 && a.progress < 0.95;
+        let day = scene(State::Working, 0, Weather::Clear, Daytime::Day);
+        let night = scene(State::Working, 2, Weather::Clear, Daytime::Night);
+        let snowing = scene(State::Working, 0, Weather::Snow, Daytime::Day);
+        save(&render(&day, 300, at_work(&|a| late(a) && a.now.job == Job::Chop)), 4, "job-chop");
+        save(&render(&day, 300, at_work(&|a| late(a) && a.now.job == Job::Harvest)), 4, "job-harvest");
+        save(&render(&night, 300, at_work(&|a| late(a) && a.now.job == Job::Campfire)), 4, "job-campfire");
+        save(&render(&snowing, 300, at_work(&|a| late(a) && a.now.snowman)), 4, "job-snowman");
+        let chest = |a: &Act| a.mode == Mode::Work && a.before.job == Job::Dig && a.before.lucky;
+        save(&render(&day, 300, at_work(&chest)), 4, "rare-chest");
+        save(&render(&day, 300, at_work(&|a| a.mode == Mode::Work && a.now.bird)), 4, "rare-bird");
+        let star = (0..400_000)
+            .map(|i| i as f32 * 0.05)
+            .find(|t| shooting_star(*t).is_some_and(|(_, s)| s > 0.6 && s < 0.8))
+            .unwrap();
+        save(&render(&night, 300, star), 4, "rare-star");
         // A helper whose sub-agent has finished, on its way out.
         let mut tr = Troupe::default();
         for _ in 0..80 {

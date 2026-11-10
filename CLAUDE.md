@@ -28,6 +28,32 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   vice-versa — they're separate (CoreText vs DirectWrite) and easy to regress.
 - **No polling.** Every live signal must be event-driven (file watchers / PTY reader
   callbacks); web parity depends on it.
+- **True idle: when nothing is moving, Arbiter draws no frames.** Not few: none. A
+  window that keeps presenting, even once a second, makes the Windows GPU driver hold
+  the system timer at 1 ms and keeps the display and GPU awake, so a focused Arbiter
+  stopped the machine idling or sleeping (fixed in 1.0.11). The rule, concretely:
+  - **One clock, and one gate on it.** The only repaint clock is the 16 ms `Tick`, and
+    it exists only while `needs_fast_tick` says so (`subscription`). Everything else
+    repaints on an event: PTY output (`term_wake`), input, a window event, a hook.
+  - **What may turn the clock on is something moving on screen that will stop by
+    itself:** an agent that is Working (its bar, its banner), a robot flying to its
+    place, a scroll indicator fading, a refresh the user clicked (capped at
+    `USAGE_SPIN_MAX_MS`), a file copy in flight, the first usage load (capped at
+    `USAGE_PENDING_TIMEOUT_MS`), the Wake-on-LAN checkmark. Each entry is tied to
+    work in progress or has a time limit. Adding one without either breaks the rule.
+  - **Waiting is not moving.** An agent at a prompt (Attention), an idle agent, a
+    finished turn, a shell left running: all are still pictures. That is why the
+    attention dot is solid and not pulsing, the usage button has no countdown, and an
+    idle banner is a still. An idea that needs motion while idle (a fish biting) can
+    only be done as a different still.
+  - **A deadline is one event, not a clock.** Something due later (a card closing, the
+    banner's done flag coming down, a hold running out) is a single scheduled message
+    or a `session::schedule` deadline. A cadence that must run while idle (the 120 s
+    usage refresh) lives on a background thread and wakes the UI only when it has
+    something to show.
+  - **Check it:** leave Arbiter with idle agents and nothing on screen changing, and
+    its CPU should sit at zero with no frames presented. Do this after touching
+    `needs_fast_tick`, a subscription, or anything a watcher triggers.
 - **Every `git` read reached from a watcher needs `--no-optional-locks`.** A plain
   `git status` refreshes `.git/index`, and a watcher over the working tree sees that as a
   change and runs the status again, forever. The explorer shipped that loop once

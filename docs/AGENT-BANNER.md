@@ -58,10 +58,19 @@ and `banner_hide_idle` (on by default).
   built: a head nod, a chest light pulse, a lean on each tool stroke, eye glances.
 - **Rounds** (`stop`, `act`): three jobs near one another, then somewhere else in the
   strip. A stop within `WALK_MAX` (34) is walked to, a further one flown to by jetpack
-  in an arc. Five jobs, never the same twice running: watering a plant that grows and
+  in an arc. Eight jobs, never the same twice running: watering a plant that grows and
   flowers, a fence built post by post, a mound that ends with a sapling, crates
-  stacked, a landscape painted on an easel. The last finished piece of work stays
-  standing until the next is done.
+  stacked, a landscape painted on an easel, a log split into a woodpile, apples picked
+  from a bush into a basket, a campfire laid and lit (it glows at night). While it
+  snows, one stop in three is a snowman instead (`Stop::job_in`). The last finished
+  piece of work stays standing until the next is done.
+- **Rare things**, each from a hash so they need no state (`LUCKY_ONE_IN`,
+  `BIRD_ONE_IN`, `STAR_ONE_IN`):
+  - a dig that turns up a treasure chest instead of a sapling, about one dig in five
+    (a chest per robot every seven minutes of work or so);
+  - a bird that perches on a robot's antenna for one stop, about one stop in 32;
+  - a shooting star on a clear night, about once in eleven minutes of work, with
+    every robot on the ground looking up for three seconds (`Paint::gaze`).
 - **States other than working are still pictures:** idle fishes in the lake (main
   robot, no helpers), needs-you raises an arm under an amber "!" bubble, done raises
   both arms beside a green flag.
@@ -264,6 +273,41 @@ second of idle comes back for that case.
 - **A helper that no longer fits after narrowing** flies off like one that is done;
   it comes back if the strip widens.
 - **Not saved:** scene time and helper slots start over with the app.
+
+## Ideas kept for later
+
+Suggested on 2026-11-10 and not built. Adding a job means: a `Job` variant, an entry in
+`JOBS` (or a condition in `Stop::job_in`, as for the snowman), what it leaves on the
+ground in `made`, and the robot's arms in `robot`. A rare thing is a hash test on the
+stop or on scene time. Add a frame for it to the `sheet` test and look at it.
+
+**Jobs**
+
+- Planting a row: seeds go in one by one and become a row of sprouts.
+- Sweeping or raking: a pile of leaves that grows.
+- Repairing another robot: a wrench on a helper's back panel, with sparks. Only with
+  helpers present, and it needs the two robots at the same stop.
+- Carrying water: a walk to the lake with a bucket and back.
+- Stargazing through a telescope, at night only.
+- Flying a kite, on clear days only.
+
+**Rare things**
+
+- A rainbow after rain clears. Needs the weather before this one, which a pure
+  `render` can get from `Weather::drifting` at an earlier time, but not when the
+  caller fixes the weather.
+- A UFO that drifts across the sky and blinks at the robots.
+- A robot dance: every robot stops and does a few moves together.
+- A cat that wanders through, and a robot that pets it.
+- A tiny rocket: a long build that ends with a launch and a smoke trail.
+
+**Idle only** (seen only with "Hide the banner when the agent is idle" off)
+
+- A fish on the line. As animation (a bite, a lift) it would break the rule that an
+  idle pane draws no frames. It can only be a still: now and then the idle robot is
+  drawn with a fish on its line, chosen by a hash of the scene time the turn ended
+  at, with no motion.
+- A nap under a tree at night with a "z" over it. The same applies: a still.
 
 ## Working on it
 
