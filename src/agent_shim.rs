@@ -367,8 +367,9 @@ pub fn encode_event(kind: AgentKind, session: Option<&str>, ev: &AgentEvent, t: 
         AgentEvent::SessionEnded => ("ended", None, None),
         AgentEvent::SubagentStarted { id } => ("sub_started", Some(id.as_str()), None),
         AgentEvent::SubagentStopped { id } => ("sub_stopped", Some(id.as_str()), None),
+        AgentEvent::BackgroundAgents { .. } => ("sub_running", None, None),
     };
-    serde_json::json!({
+    let mut line = serde_json::json!({
         "v": 1,
         "agent": kind,
         "ev": name,
@@ -376,8 +377,11 @@ pub fn encode_event(kind: AgentKind, session: Option<&str>, ev: &AgentEvent, t: 
         "id": id,
         "transcript": transcript,
         "t": t,
-    })
-    .to_string()
+    });
+    if let AgentEvent::BackgroundAgents { ids } = ev {
+        line["ids"] = serde_json::json!(ids);
+    }
+    line.to_string()
 }
 
 /// The inverse of `encode_event`. Tolerant: unknown fields are ignored, and a line whose
@@ -395,6 +399,9 @@ pub fn decode_event(line: &str) -> Option<(AgentKind, Option<String>, AgentEvent
         "ended" => AgentEvent::SessionEnded,
         "sub_started" => AgentEvent::SubagentStarted { id: text("id")? },
         "sub_stopped" => AgentEvent::SubagentStopped { id: text("id")? },
+        "sub_running" => AgentEvent::BackgroundAgents {
+            ids: v.get("ids")?.as_array()?.iter().filter_map(|id| id.as_str().map(str::to_string)).collect(),
+        },
         _ => return None,
     };
     Some((kind, text("sid"), ev))
@@ -509,6 +516,8 @@ mod tests {
             AgentEvent::SessionEnded,
             AgentEvent::SubagentStarted { id: "a1b2".into() },
             AgentEvent::SubagentStopped { id: "a1b2".into() },
+            AgentEvent::BackgroundAgents { ids: vec!["a1b2".into(), "c3d4".into()] },
+            AgentEvent::BackgroundAgents { ids: Vec::new() },
         ];
         for ev in events {
             let line = encode_event(AgentKind::Copilot, Some("s9"), &ev, 7);

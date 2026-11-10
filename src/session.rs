@@ -2193,6 +2193,99 @@ mod tests {
         assert!(super::SAVE_DIRTY.load(Ordering::Relaxed), "a new folder asks for a save");
     }
 
+    // Live harness, needing a signed-in Claude on PATH, the debug `arbiter` built beside
+    // the test binary, and `ARBITER_LIVE_CWD` naming a folder Claude already trusts (it
+    // asks before working anywhere else). A real interactive Claude in a headless pane
+    // is told to start two sub-agents in the background and report as each finishes:
+    // its turn ends at once and it is woken twice, which is three turns for one job.
+    // The pane must read as working from the prompt to the last reply without a break,
+    // and count one finish. It spends a few short turns and two small sub-agents.
+    // `cargo build --bin arbiter && ARBITER_LIVE_CWD=~/some/trusted/folder cargo test --lib session::tests::live_background -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_background_subagents_hold_the_pane_working() {
+        use crate::agent_state::Lifecycle;
+        use std::time::{Duration, Instant};
+        let cwd = std::env::var("ARBITER_LIVE_CWD").expect("ARBITER_LIVE_CWD: a folder Claude trusts");
+        let data = std::env::temp_dir().join(format!("arbiter-live-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("ARBITER_DATA_DIR", &data);
+        let test_exe = std::env::current_exe().unwrap();
+        let arbiter = test_exe.parent().unwrap().parent().unwrap().join(if cfg!(windows) { "arbiter.exe" } else { "arbiter" });
+        assert!(arbiter.is_file(), "build the binary first: {}", arbiter.display());
+        let s = crate::agent_shim::setup(&data, &std::env::var("PATH").unwrap_or_default(), &arbiter).expect("setup");
+        let _watch = crate::agent_watch::start_watcher();
+        let mut cmd = portable_pty::CommandBuilder::new(s.bin_dir.join(if cfg!(windows) { "claude.cmd" } else { "claude" }));
+        cmd.cwd(cwd);
+        for (k, v) in &s.env {
+            cmd.env(k, v);
+        }
+        cmd.env_remove(crate::agent_shim::LAUNCHED_ENV);
+        let t0 = Instant::now();
+        let at = |t0: Instant| t0.elapsed().as_millis();
+        let mut session = super::Session::spawn(140, 45, cmd).unwrap();
+        let prompt = "Test of a terminal UI; change no files. In ONE message start two general-purpose \
+                      sub-agents with run_in_background true; the task of each is exactly: \"Reply with the \
+                      integers 1 to 500, one per line, and nothing else.\" Then end your turn with the \
+                      single word WAITING. Each time you are notified that one finished, reply only with \
+                      the single word NOTED, unless both have finished, in which case reply only DONE.";
+        let (mut sent, mut last) = (false, String::new());
+        // The longest the pane read as idle between the prompt and the finish.
+        let (mut working_since_prompt, mut idle_from, mut longest_idle) = (false, None::<Instant>, Duration::ZERO);
+        let mut most_helpers = 0;
+        let mut finished_at = None::<Instant>;
+        while t0.elapsed() < Duration::from_secs(150) {
+            if !sent && session.agent_running() && t0.elapsed() > Duration::from_secs(6) {
+                sent = true;
+                session.write(prompt.as_bytes());
+                std::thread::sleep(Duration::from_millis(400));
+                session.clear_suppression();
+                session.write(b"\r");
+                println!("[{:>6} ms] prompt sent", at(t0));
+            }
+            let st = session.agent_status();
+            let now = format!("{:?} subagents={} finishes={}", st.lifecycle, st.subagents, session.finish_seq());
+            if now != last {
+                println!("[{:>6} ms] {now}", at(t0));
+                last = now;
+            }
+            most_helpers = most_helpers.max(st.subagents);
+            if sent && finished_at.is_none() {
+                match st.lifecycle {
+                    Lifecycle::Working => {
+                        working_since_prompt = true;
+                        if let Some(from) = idle_from.take() {
+                            longest_idle = longest_idle.max(from.elapsed());
+                        }
+                    }
+                    _ if working_since_prompt && session.finish_seq() == 0 => {
+                        idle_from.get_or_insert_with(Instant::now);
+                    }
+                    _ => {}
+                }
+                if session.finish_seq() > 0 {
+                    finished_at = Some(Instant::now());
+                }
+            }
+            // Ten seconds past the finish: long enough to see that nothing comes back.
+            if finished_at.is_some_and(|f| f.elapsed() > Duration::from_secs(10)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let rows = session.term().lock().unwrap().visible_rows();
+        println!("--- screen at the end:\n{}", rows.join("\n"));
+        println!("longest idle reading before the finish: {longest_idle:?}");
+        assert!(sent, "Claude never came up");
+        assert_eq!(most_helpers, 2, "both sub-agents were counted");
+        assert!(finished_at.is_some(), "the job never counted as finished");
+        assert!(rows.iter().any(|r| r.contains("DONE")), "Claude did not get to the end");
+        assert!(longest_idle < Duration::from_millis(300), "the pane read as idle mid-job for {longest_idle:?}");
+        let st = session.agent_status();
+        assert_eq!((st.lifecycle, st.subagents, session.finish_seq()), (Lifecycle::Ready, 0, 1), "one job, one finish, then idle");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     /// Type `s` a byte at a time (as real keystrokes arrive) and return the last
     /// command submitted.
     fn typed(s: &str) -> Option<String> {

@@ -37,6 +37,15 @@ history belongs to the prior Tauri/Vue web app it replaced.
   banner replaces it. A saved layout that had the office open simply opens without it.
 
 ### Changed
+- **Claude waiting on its sub-agents counts as working, and finishes once.** Given long
+  work, Claude starts sub-agents in the background, ends its turn at once and is woken as
+  each reports, so one job was dozens of turns a second long: the working bar, the dot
+  and the banner came and went with each, and "Claude finished" was raised at every one.
+  Arbiter now reads what Claude itself reports as still running (its sub-agent start and
+  stop hooks, and the list every turn end carries) and keeps the terminal working until
+  the last sub-agent has reported and Claude has answered; that answer is the one finish.
+  Esc or Ctrl+C ends it at once. A command Claude left running in the background is still
+  not work, so a wait on one reads as idle between turns.
 - **A shell Claude leaves running no longer counts as working.** A dev server started in
   the background kept its pane "working" for as long as it ran: the animation never
   stopped, Arbiter never went idle, and the turn's "finished" card never came. The turn

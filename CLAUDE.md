@@ -338,25 +338,48 @@ It replaced the Agents Office (a room of desks in its own window, removed). Thre
   bar uses, so the two cannot disagree. Do not add holds to it. Three were tried on
   2026-11-10 and each read as wrong to the user: staying while sub-agents ran under an
   agent between turns, staying as the green flag for `DONE_MS` after a turn's end
-  ("work did not stop" after a cancel), and waiting before leaving (still blinked). The
-  cost, accepted: a Claude doing long work starts its sub-agents and shells in the
-  background, ends its turn and is woken as each reports, so one job is dozens of turns
-  a second or two long (measured from a transcript), and the banner comes and goes
-  with them, as the bar does. Making that steadier means changing what counts as
-  working for the whole pane, not the banner. With the setting off the banner is
-  permanent, and there it shows the done flag for `DONE_MS` (`flag_is_up`: Esc or
-  Ctrl+C since takes it down) and robots at work while sub-agents run between turns.
+  ("work did not stop" after a cancel), and waiting before leaving (still blinked).
+  What made it steady was fixing what counts as working for the whole pane (see "An
+  agent paused on its sub-agents is working" below), not the banner. With the setting
+  off the banner is permanent, and there it shows the done flag for `DONE_MS`
+  (`flag_is_up`: Esc or Ctrl+C since takes it down).
 - **Sub-agents are helper robots** (`Scene::helpers`, up to `MAX_HELPERS`), counted from
   the agent's own reports: `AgentEvent::SubagentStarted` / `SubagentStopped`, which
   Claude's adapter maps from its `SubagentStart` and `SubagentStop` hooks (`agent_id`).
   `AgentHandle` keeps the live ids, not a number, so a repeated start is one and a stop
-  whose start was missed changes nothing; `AgentStatus::subagents` is the count and the
-  lifecycle never reads it. A turn's end does not clear them (a background sub-agent
-  outlives its turn); Esc or Ctrl+C (`note_interrupt`), a new conversation and the agent
-  exiting do, and one with no stop after `SUBAGENT_MAX_MS` is dropped. Copilot and Codex
-  report none. Live check: `cargo test --lib
-  agent_shim::tests::live_claude_reports_a_subagent -- --ignored --nocapture` (measured
-  with Claude 2.1.322: start and stop carry the same `agent_id`).
+  whose start was missed changes nothing; `AgentStatus::subagents` is the count. A
+  turn's end does not clear them (a background sub-agent outlives its turn); Esc or
+  Ctrl+C (`note_interrupt`), a new conversation and the agent exiting do, and one with
+  no stop after `SUBAGENT_MAX_MS` is dropped. Copilot and Codex report none. Live check:
+  `cargo test --lib agent_shim::tests::live_claude_reports_a_subagent -- --ignored
+  --nocapture` (measured with Claude 2.1.322: start and stop carry the same `agent_id`).
+- **An agent paused on its sub-agents is working (2026-11-10).** A Claude given long
+  work starts sub-agents in the background, ends its turn at once (the Stop hook
+  fires), and is woken as each reports for a turn of a second: one job was dozens of
+  turns, and the bar, the dot, the banner and the "finished" card followed every one.
+  Now `AgentHandle::waiting_on_agents` (the old screen row OR any sub-agent running)
+  holds the lifecycle at Working and keeps a Stop or a row end from counting as a
+  finish. The signals, all Claude's own and measured live:
+  - `SubagentStart` / `SubagentStop` keep the set of running ids current.
+  - Every `Stop` carries `background_tasks` (`{"id","type","status",…}`; documented as
+    there to tell "done" from "paused waiting for background work"). The adapter turns
+    its running `subagent` entries into `AgentEvent::BackgroundAgents`, emitted BEFORE
+    `TurnEnded`, which replaces the set: a lost start or stop is put right at the next
+    turn end. A final Stop has an empty list and is the one finish.
+  - The `idle_prompt` notification (a minute after a real stop, and held back by
+    Claude while a background agent runs) empties the set too.
+  - Claude also fires `SubagentStop` for helpers of its own it never announced (ids
+    not in any list, `agent_type` empty, about a second after each Stop). Unknown ids
+    change nothing, which is why this is a set and not a counter.
+  - When the last sub-agent stops, `agents_done_ms` holds Working for one TTL, until
+    the turn Claude is woken for draws its row; a Stop since ends the hold.
+  A `shell` entry is deliberately not counted (see "A background shell is not work"):
+  nothing tells `sleep 20` from a dev server, so a Claude waiting on a background
+  command still reads as idle between turns. The other task types (monitor, workflow,
+  teammate, cloud session, MCP task) are unseen and left out. Live check, which fails
+  if the pane reads idle mid-job or counts more than one finish:
+  `ARBITER_LIVE_CWD=<a folder Claude trusts> cargo test --lib
+  session::tests::live_background -- --ignored --nocapture`.
 - **`src/bin/banner_preview.rs`** is a test window (`ARBITER_OPEN_BANNER=1`): one fake
   pane, a menu for the state, helpers, hour and weather. Use it to work on the art.
 

@@ -137,6 +137,24 @@ pub fn transcript_in(config_dir: &std::path::Path, cwd: &str, session: &str) -> 
     config_dir.join("projects").join(encode_project_dir(cwd)).join(format!("{session}.jsonl"))
 }
 
+/// The sub-agents a Stop payload says are still running, from its `background_tasks`
+/// (Claude 2.1.322: `[{"id","type","status","description",…}]`, there "when the task
+/// registry is reachable"). None when the payload has no such list, which says nothing.
+///
+/// Only `subagent` entries count. A `shell` is a command left running, and one of
+/// those can be a dev server that never ends (see "A background shell is not work");
+/// the other types (monitor, workflow, teammate, cloud session, MCP task) have not
+/// been seen and are left out until one has.
+fn running_subagents(stop: &serde_json::Value) -> Option<AgentEvent> {
+    let tasks = stop.get("background_tasks")?.as_array()?;
+    let ids = tasks
+        .iter()
+        .filter(|t| field(t, &["type"]) == Some("subagent") && field(t, &["status"]) == Some("running"))
+        .filter_map(|t| field(t, &["id"]).map(str::to_string))
+        .collect();
+    Some(AgentEvent::BackgroundAgents { ids })
+}
+
 impl Agent for Claude {
     fn kind(&self) -> AgentKind {
         AgentKind::Claude
@@ -228,7 +246,13 @@ impl Agent for Claude {
                 None => return HookOutcome::default(),
             },
             "UserPromptSubmit" => AgentEvent::TurnStarted,
-            "Stop" => AgentEvent::TurnEnded,
+            // The turn is over, and the hook says what it leaves running: sub-agents
+            // still at work mean Claude is paused and will be woken, not finished. The
+            // list goes first, so the turn's end is judged against it.
+            "Stop" => {
+                let events = running_subagents(&v).into_iter().chain([AgentEvent::TurnEnded]).collect();
+                return HookOutcome { session, events };
+            }
             "SessionEnd" => AgentEvent::SessionEnded,
             "PermissionRequest" => AgentEvent::NeedsAttention,
             // Counted by id, so one without an id cannot be counted at all.
@@ -238,8 +262,11 @@ impl Agent for Claude {
                 None => return HookOutcome::default(),
             },
             "Notification" => match field(&v, &["notification_type"]).unwrap_or("") {
-                // `idle_prompt` is intentionally excluded: it fires after ~60s idle and
-                // would turn a merely-idle pane amber (idle stays grey).
+                // `idle_prompt` is never attention: it fires after ~60s idle and would
+                // turn a merely-idle pane amber (idle stays grey). What it does say is
+                // that no background agent is running (Claude holds it back while one
+                // is), so a sub-agent whose stop was lost is given up on here.
+                "idle_prompt" => AgentEvent::BackgroundAgents { ids: Vec::new() },
                 //
                 // `elicitation_dialog` (AskUserQuestion) is ALSO excluded: it is detected
                 // level-based from the rendered menu (`ScreenProfile::menu`), which clears
@@ -475,10 +502,32 @@ mod tests {
             hook(r#"{"session_id":"s","hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}"#).events,
             vec![AgentEvent::NeedsAttention]
         );
-        for ignored in ["idle_prompt", "elicitation_dialog", "auth_success"] {
+        for ignored in ["elicitation_dialog", "auth_success"] {
             let json = format!(r#"{{"session_id":"s","hook_event_name":"Notification","notification_type":"{ignored}"}}"#);
             assert!(hook(&json).events.is_empty(), "{ignored}");
         }
+        // Idle for a minute: never attention, and no sub-agent can still be running.
+        assert_eq!(
+            hook(r#"{"session_id":"s","hook_event_name":"Notification","notification_type":"idle_prompt"}"#).events,
+            vec![AgentEvent::BackgroundAgents { ids: Vec::new() }]
+        );
+        // A Stop says what it leaves running (captured from Claude 2.1.322): the two
+        // sub-agents count, the shell does not, and the list comes before the turn's end.
+        let paused = hook(
+            r#"{"session_id":"s","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"WAITING","background_tasks":[{"id":"a937666627ba24ea9","type":"subagent","status":"running","description":"Count 1 to 500","agent_type":"general-purpose"},{"id":"a1b818190cc0ffd7e","type":"subagent","status":"running","description":"Count 1 to 500 again","agent_type":"general-purpose"},{"id":"bnzmou8bu","type":"shell","status":"running","description":"Wait 25 seconds in background","command":"sleep 25"}],"session_crons":[]}"#,
+        );
+        assert_eq!(
+            paused.events,
+            vec![
+                AgentEvent::BackgroundAgents { ids: vec!["a937666627ba24ea9".into(), "a1b818190cc0ffd7e".into()] },
+                AgentEvent::TurnEnded
+            ]
+        );
+        // Only a shell left: nothing that will wake Claude by itself is counted.
+        let shell = hook(
+            r#"{"session_id":"s","hook_event_name":"Stop","background_tasks":[{"id":"bnzmou8bu","type":"shell","status":"running","command":"sleep 25"}],"session_crons":[]}"#,
+        );
+        assert_eq!(shell.events, vec![AgentEvent::BackgroundAgents { ids: Vec::new() }, AgentEvent::TurnEnded]);
         assert!(hook(r#"{"session_id":"s","hook_event_name":"PreToolUse"}"#).events.is_empty());
         assert_eq!(
             hook(r#"{"session_id":"s","hook_event_name":"SubagentStart","agent_id":"a1b2","agent_type":"Explore"}"#).events,
@@ -514,7 +563,7 @@ mod tests {
             r#"{"session_id":"3e2c0e76-f20c-4916-a498-c6d24cd6091b","transcript_path":"C:\\x.jsonl","cwd":"C:\\tmp\\live","prompt_id":"3e98fe5a-b779-40e9-984e-2bafd507ba12","permission_mode":"auto","effort":{"level":"xhigh"},"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"ok","background_tasks":[],"session_crons":[]}"#,
         );
         assert_eq!(stop.session.as_deref(), Some("3e2c0e76-f20c-4916-a498-c6d24cd6091b"));
-        assert_eq!(stop.events, vec![AgentEvent::TurnEnded]);
+        assert_eq!(stop.events, vec![AgentEvent::BackgroundAgents { ids: Vec::new() }, AgentEvent::TurnEnded]);
         // The transcript Claude named is where Arbiter would have looked for it.
         let derived = transcript_in(std::path::Path::new("C:\\Users\\TRE\\.claude"), "C:\\tmp\\live", "3e2c0e76-f20c-4916-a498-c6d24cd6091b");
         assert!(derived.ends_with(std::path::Path::new("C--tmp-live").join("3e2c0e76-f20c-4916-a498-c6d24cd6091b.jsonl")));

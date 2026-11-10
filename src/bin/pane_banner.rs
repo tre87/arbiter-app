@@ -102,19 +102,15 @@ fn wanted(
     let status = d.session.agent_status();
     let helpers = status.subagents as usize;
     // Hidden when idle, the banner is there exactly when the pane's working bar is:
-    // one rule for both, so they can never disagree. Holding it longer (through a
-    // turn's end, or while sub-agents ran under an agent between turns) was tried and
-    // read as work that would not stop.
+    // one rule for both, so they can never disagree. Whether an agent paused on its
+    // sub-agents is working is the lifecycle's business, not the banner's; holds added
+    // here instead read as work that would not stop.
     if settings.banner_hide_idle {
         return (status.lifecycle == Lifecycle::Working).then_some((banner::State::Working, helpers));
     }
     let state = match status.lifecycle {
         Lifecycle::Working => banner::State::Working,
         Lifecycle::Attention => banner::State::Attention,
-        // An agent that starts its sub-agents in the background ends its turn and is
-        // woken as each reports: by its own lifecycle it is idle in between, and the
-        // work is going on all the same.
-        _ if helpers > 0 => banner::State::Working,
         _ if flag_is_up(done.get(&d.history_id).copied(), d.session.last_interrupt_ms(), now) => {
             banner::State::Done
         }

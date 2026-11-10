@@ -104,6 +104,10 @@ pub enum AgentEvent {
     SubagentStarted { id: String },
     /// That sub-agent finished.
     SubagentStopped { id: String },
+    /// The agent's own account of the sub-agents it has running right now, which
+    /// replaces whatever was counted from starts and stops: a report lost on the way
+    /// is put right by the next of these.
+    BackgroundAgents { ids: Vec<String> },
 }
 
 /// A hook invocation, normalized: the conversation it came from (for agents that host

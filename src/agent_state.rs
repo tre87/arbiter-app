@@ -112,6 +112,8 @@ pub struct AgentHandle {
     background_shells: AtomicU32,
     /// The lifecycle the debug log last recorded for this pane (see `snapshot`).
     logged_lifecycle: AtomicU32,
+    /// When the last running sub-agent reported its stop (see `lifecycle`).
+    agents_done_ms: AtomicU64,
     /// Sub-agents reported started and not yet stopped, each with when it started. By
     /// id rather than a count, so a stop whose start was missed changes nothing.
     subagents: Mutex<Vec<(String, u64)>>,
@@ -276,6 +278,7 @@ impl AgentHandle {
             waiting_background: AtomicBool::new(false),
             background_shells: AtomicU32::new(0),
             logged_lifecycle: AtomicU32::new(Lifecycle::Closed as u32),
+            agents_done_ms: AtomicU64::new(0),
             subagents: Mutex::new(Vec::new()),
             suppress_until_ms: AtomicU64::new(0),
             menu_on_screen: AtomicBool::new(false),
@@ -587,8 +590,33 @@ impl AgentHandle {
                     subs.push((id.clone(), now_ms()));
                 }
             }
-            AgentEvent::SubagentStopped { id } => self.subagents.lock().unwrap().retain(|(s, _)| s != id),
+            AgentEvent::SubagentStopped { id } => {
+                let mut subs = self.subagents.lock().unwrap();
+                let before = subs.len();
+                subs.retain(|(s, _)| s != id);
+                // The last one in: the agent is about to be woken with its report, and
+                // until that turn draws its row nothing else says the pane is busy.
+                if before > 0 && subs.is_empty() {
+                    self.agents_done_ms.store(now_ms(), Ordering::Relaxed);
+                }
+            }
+            AgentEvent::BackgroundAgents { ids } => {
+                let now = now_ms();
+                let mut subs = self.subagents.lock().unwrap();
+                let known = std::mem::take(&mut *subs);
+                *subs = ids
+                    .iter()
+                    .map(|id| (id.clone(), known.iter().find(|(s, _)| s == id).map_or(now, |(_, at)| *at)))
+                    .collect();
+            }
         }
+    }
+
+    /// Whether the agent is paused on sub-agents it left running: by the row on its
+    /// screen, or by its own reports. Its turn has ended and it resumes by itself when
+    /// they report, so the pane is working and no finish is counted.
+    fn waiting_on_agents(&self) -> bool {
+        self.waiting_background.load(Ordering::Relaxed) || self.subagent_count() > 0
     }
 
     /// Sub-agents running now. One whose stop never arrived (the agent was killed, a
@@ -870,7 +898,7 @@ impl AgentHandle {
         let edge = self.row_edge_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let ended = !on
             && idle_box
-            && !self.waiting_background.load(Ordering::Relaxed)
+            && !self.waiting_on_agents()
             && !self.interrupted_recently()
             && now_ms() >= self.suppress_until_ms.load(Ordering::Relaxed);
         if crate::debug::debug_enabled() {
@@ -891,7 +919,7 @@ impl AgentHandle {
             && !self.working_row.load(Ordering::Relaxed)
             && self.idle_box.load(Ordering::Relaxed)
             && !self.menu_on_screen.load(Ordering::Relaxed)
-            && !self.waiting_background.load(Ordering::Relaxed)
+            && !self.waiting_on_agents()
             && !self.interrupted_recently();
         holds && self.count_finish()
     }
@@ -906,7 +934,7 @@ impl AgentHandle {
         let at = std::time::Instant::now() + Duration::from_millis(STOP_CONFIRM_MS);
         crate::session::schedule(at, move || {
             let Some(h) = weak.upgrade() else { return };
-            if !h.waiting_background.load(Ordering::Relaxed) && h.count_finish() {
+            if !h.waiting_on_agents() && h.count_finish() {
                 crate::session::wake_ui();
             }
         });
@@ -934,6 +962,7 @@ impl AgentHandle {
         self.interrupt_ms.store(now_ms(), Ordering::Relaxed);
         // An interrupted turn's sub-agents go with it, and no stop is promised for them.
         self.subagents.lock().unwrap().clear();
+        self.agents_done_ms.store(0, Ordering::Relaxed);
     }
 
     /// When the user last pressed Esc or Ctrl+C here; 0 if never.
@@ -967,7 +996,7 @@ impl AgentHandle {
         // already fired: the agent resumes by itself, so scrolling away mid-wait must
         // hold the turn exactly as scrolling away mid-spinner does.
         let live = (act > stop && now.saturating_sub(act) < WORKING_TTL_MS)
-            || self.waiting_background.load(Ordering::Relaxed)
+            || self.waiting_on_agents()
             || self.working_row.load(Ordering::Relaxed);
         if on {
             self.scroll_holds_working.store(live, Ordering::Relaxed);
@@ -1057,7 +1086,16 @@ impl AgentHandle {
         }
         // Waiting on its own agents: the turn is over on paper (Stop hook, still spinner)
         // but the agent carries on by itself when they report.
-        if self.waiting_background.load(Ordering::Relaxed) {
+        if self.waiting_on_agents() {
+            return Lifecycle::Working;
+        }
+        // Its last sub-agent has just reported and it has not ended a turn since: it is
+        // being woken with the report. Held for one TTL at most, so an agent that is
+        // not woken after all (the user cancelled) reads as idle soon after.
+        let agents_done = self.agents_done_ms.load(Ordering::Relaxed);
+        if agents_done > self.stop_ms.load(Ordering::Relaxed)
+            && now_ms().saturating_sub(agents_done) < WORKING_TTL_MS
+        {
             return Lifecycle::Working;
         }
         // The agent's own screen, title or progress says it is working. Levels, so they
@@ -1104,10 +1142,11 @@ impl AgentHandle {
         let stop = self.stop_ms.load(Ordering::Relaxed);
         let started = self.turn_started_ms.load(Ordering::Relaxed);
         format!(
-            "running={} lc={:?} waiting={} row={} title={} progress={} started_hold={} activity={} menu={} hook_att={}",
+            "running={} lc={:?} waiting={} subagents={} row={} title={} progress={} started_hold={} activity={} menu={} hook_att={}",
             on(&self.running),
             self.lifecycle(),
             on(&self.waiting_background),
+            self.subagent_count(),
             on(&self.working_row),
             on(&self.title_working),
             on(&self.progress_working),
@@ -1238,6 +1277,66 @@ mod tests {
         ev(started("d"));
         h.end_session();
         assert_eq!(h.snapshot().subagents, 0);
+    }
+
+    // The sequence measured from Claude 2.1.322 given two sub-agents to run in the
+    // background: its turn ends at once, it is woken as each reports for a turn of a
+    // second, and only the last Stop leaves nothing running. One job, so one stretch of
+    // working and one finish; it used to be three of each.
+    #[test]
+    fn a_turn_that_leaves_subagents_running_is_not_a_finish() {
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        let started = |id: &str| AgentEvent::SubagentStarted { id: id.into() };
+        let stopped = |id: &str| AgentEvent::SubagentStopped { id: id.into() };
+        let running = |ids: &[&str]| AgentEvent::BackgroundAgents { ids: ids.iter().map(|s| s.to_string()).collect() };
+        let settle = || std::thread::sleep(Duration::from_millis(super::STOP_CONFIRM_MS + 80));
+        ev(started("a"));
+        ev(started("b"));
+        // "WAITING": the Stop names both as running, then ends the turn.
+        ev(running(&["a", "b"]));
+        ev(AgentEvent::TurnEnded);
+        settle();
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        assert_eq!(h.finish_seq(), 0, "paused on its sub-agents, not finished");
+        // A helper of Claude's own that was never announced stops: not ours to count.
+        ev(stopped("internal"));
+        ev(stopped("a"));
+        assert_eq!(h.snapshot().subagents, 1);
+        // Woken by the first report, a turn of a second, and a Stop that names the other.
+        ev(running(&["b"]));
+        ev(AgentEvent::TurnEnded);
+        settle();
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        assert_eq!(h.finish_seq(), 0);
+        // The last one in: still working, for the moment before Claude is woken.
+        ev(stopped("b"));
+        assert_eq!(h.snapshot().subagents, 0);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        // "DONE": nothing left running, so this Stop is the finish, and at once.
+        ev(running(&[]));
+        ev(AgentEvent::TurnEnded);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+        settle();
+        assert_eq!(h.finish_seq(), 1);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
+    }
+
+    // A stop report that never arrived cannot leave the pane working: the next account
+    // of what is running (a Stop, or the idle notice a minute after one) puts it right.
+    #[test]
+    fn a_lost_stop_report_is_put_right_by_the_agents_own_account() {
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        ev(AgentEvent::SubagentStarted { id: "a".into() });
+        ev(AgentEvent::SubagentStarted { id: "b".into() });
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Working);
+        // One it never heard start is taken on trust; one it thought running is dropped.
+        ev(AgentEvent::BackgroundAgents { ids: vec!["b".into(), "c".into()] });
+        assert_eq!(h.snapshot().subagents, 2);
+        ev(AgentEvent::BackgroundAgents { ids: Vec::new() });
+        assert_eq!(h.snapshot().subagents, 0);
+        assert_eq!(h.snapshot().lifecycle, Lifecycle::Ready);
     }
 
     // A full repaint (a resize, the wheel nudge) clears the screen and redraws the prompt.
