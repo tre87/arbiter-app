@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-10
+
 ### Added
 - **Agent banner: pixel art at the top of a terminal while its agent works.** A strip
   under the pane's header in which a robot walks from job to job outdoors (watering,
