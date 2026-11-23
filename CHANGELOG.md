@@ -7,6 +7,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Typing while Claude works no longer raises "Claude finished".** Claude 2.1.330
+  removes "esc to interrupt" from its mode line while the input box holds text, and
+  Arbiter read the hint leaving as the turn ending, so the first keystrokes of a
+  follow-up raised the card (and could swallow the real one if it came within five
+  seconds). Text you typed in the box now holds that reading back; Claude's dim
+  placeholders ("Try …", "Press up to edit queued messages") do not. A turn that really
+  ends while your text is still in the box is reported by Claude's Stop hook as before;
+  over SSH, where there is no hook, that one turn end raises no card.
+
 ## [1.7.1] - 2026-11-10
 
 ### Changed

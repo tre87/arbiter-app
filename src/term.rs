@@ -516,8 +516,51 @@ impl VtTerm {
                 idle_box,
                 slash_input: self.input_row_is_slash(p),
                 shells: self.background_shells(p, idle_box),
+                draft: self.input_draft(p),
             }
         })
+    }
+
+    /// Whether the agent's input box holds text the user typed. Claude (2.1.330) drops
+    /// "esc to interrupt" from its footer while it does, so the hint leaving then is no
+    /// turn end. Its placeholders ("Try …", "Press up to edit queued messages") are drawn
+    /// dim (SGR 2) and are not a draft. The agent keeps the cursor on the draft's last
+    /// line, so the box's prompt row is the cursor's row or a row above it inside the
+    /// box; `None` when there is none.
+    pub fn input_draft(&self, p: &ScreenProfile) -> Option<bool> {
+        let rows = self.term.screen_lines();
+        let cols = self.term.columns();
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point.line.0.max(0) as usize;
+        if cursor >= rows {
+            return None;
+        }
+        let text = |row: usize| -> String { (0..cols).map(|c| grid[Line(row as i32)][Column(c)].c).collect() };
+        // A row more than the box holds on each side, for `is_prompt_at` to see its borders.
+        let lo = cursor.saturating_sub(p.prompt.box_lines + 1);
+        let hi = rows.min(cursor + p.prompt.box_lines + 2);
+        let window: Vec<String> = (lo..hi).map(text).collect();
+        let mut prompt = None;
+        for i in (0..=cursor - lo).rev() {
+            if agent_screen::is_prompt_at(p, &window, i) {
+                prompt = Some(i);
+                break;
+            }
+            if agent_screen::is_box_rule(p, &window[i]) {
+                break;
+            }
+        }
+        let prompt = prompt?;
+        let from = agent_screen::prompt_text_column(p, &window[prompt]).unwrap_or(0);
+        let typed = (lo + prompt..=cursor).any(|row| {
+            let line = &grid[Line(row as i32)];
+            let start = if row == lo + prompt { from } else { 0 };
+            (start..cols).any(|c| {
+                let cell = &line[Column(c)];
+                !cell.c.is_whitespace() && cell.c != p.prompt.side && !cell.flags.contains(Flags::DIM)
+            })
+        });
+        Some(typed)
     }
 
     /// The footer's count of background shells, 0 when the footer shows none. Read only
@@ -1008,6 +1051,40 @@ mod tests {
         assert_eq!(shells("  ⏸ manual mode on"), Some(0));
         // No chrome under the cursor (a chooser over the box): the count is unknown.
         assert_eq!(shells("  ↑/↓ to navigate · Enter to select"), None);
+    }
+
+    // Claude's input box as 2.1.330 draws it (captured in a ConPTY): the cursor on the
+    // draft's last line and the placeholders dim. Typing mid-turn drops the interrupt
+    // hint while the mode line stays, which read as a turn end until the draft was seen.
+    #[test]
+    fn only_typed_text_in_the_input_box_is_a_draft() {
+        let rule = "────────────────────────────────────────";
+        let screen = |input: &[&str], footer: &str, cursor: &str| {
+            let mut t = super::VtTerm::new(80, 10);
+            let mut lines = vec!["✶ Accomplishing… (1s · ↓ 2 tokens)", rule];
+            lines.extend_from_slice(input);
+            lines.extend_from_slice(&[rule, footer]);
+            t.feed(lines.join("\r\n").as_bytes());
+            t.feed(cursor.as_bytes());
+            let st = t.screen_state(&CLAUDE);
+            (st.working, st.idle_box, st.draft)
+        };
+        let mode = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+        let working = "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt";
+
+        assert_eq!(screen(&["❯ "], working, "\x1b[3;3H"), (true, true, Some(false)));
+        // The keystroke that dropped the hint.
+        assert_eq!(screen(&["❯ hello"], mode, "\x1b[3;8H"), (false, true, Some(true)));
+        // Wrapped: the cursor is on the second line, the prompt glyph on the first.
+        let wrapped = ["❯ hello reply only with the word OK reply only with the word", "  OK reply only"];
+        assert_eq!(screen(&wrapped, mode, "\x1b[4;18H"), (false, true, Some(true)));
+        // Placeholders: the idle suggestion, and a draft sent with Enter mid-turn.
+        let tip = "❯ \x1b[2mTry \"fix lint errors\"\x1b[22m";
+        assert_eq!(screen(&[tip], mode, "\x1b[3;3H"), (false, true, Some(false)));
+        let queued = "❯ \x1b[2mPress up to edit queued messages\x1b[22m";
+        assert_eq!(screen(&[queued], working, "\x1b[3;3H"), (true, true, Some(false)));
+        // The cursor out on the footer, mid-repaint: no reading.
+        assert_eq!(screen(&["❯ hello"], mode, "\x1b[5;3H").2, None);
     }
 
     // With the input box on screen, the row has to be the last thing above it. The

@@ -20,6 +20,9 @@ pub struct ScreenState {
     /// Background shells by the footer's count; `None` while the footer is not on screen
     /// (a chooser covers it), which says nothing about them.
     pub shells: Option<u32>,
+    /// The input box holds text the user typed (see `VtTerm::input_draft`); `None` while
+    /// the cursor is not in the box (mid-repaint, a chooser over it), which says nothing.
+    pub draft: Option<bool>,
 }
 
 /// The last `n` of `rows`.
@@ -123,6 +126,19 @@ pub fn is_input_prompt_row(p: &ScreenProfile, row: &str) -> bool {
     let side = p.prompt.side;
     let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == side);
     body.chars().next().is_some_and(|c| p.prompt.glyphs.contains(&c))
+}
+
+/// The column the typed text starts at on a prompt row (`is_prompt_at`): past the prompt
+/// glyph, or past the boxed form's marker. `None` if the row has neither.
+pub fn prompt_text_column(p: &ScreenProfile, row: &str) -> Option<usize> {
+    let edge = |c: char| c.is_whitespace() || c == p.prompt.side;
+    let lead = row.chars().take_while(|&c| edge(c)).count();
+    let body = row.trim_start_matches(edge);
+    if body.chars().next().is_some_and(|c| p.prompt.glyphs.contains(&c)) {
+        return Some(lead + 1);
+    }
+    let boxed = p.prompt.boxed?;
+    body.starts_with(boxed).then(|| lead + boxed.chars().count())
 }
 
 /// Whether `rows[i]` is the prompt line of the input box. A prompt glyph is enough on its

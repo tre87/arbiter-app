@@ -1798,15 +1798,25 @@ fn reader_loop(
             // a stale star left on screen can't pin it to "working").
             let profile = kind.agent().screen();
             let state = term.lock().unwrap().screen_state(profile);
-            let crate::agent_screen::ScreenState { menu, scrolled, waiting, working, idle_box, slash_input, shells } =
-                state;
+            let crate::agent_screen::ScreenState {
+                menu,
+                scrolled,
+                waiting,
+                working,
+                idle_box,
+                slash_input,
+                shells,
+                draft,
+            } = state;
             // Scrolled away, everything on screen is history: an approval box the user
             // is reading back over is not a prompt waiting on them.
             let menu = menu && !scrolled;
             // Order matters: the two holds below read `waiting_background` and
-            // `working_row`, so both must be current before the scroll edge is taken.
+            // `working_row`, so both must be current before the scroll edge is taken,
+            // and the row's edge reads the draft.
             agent.set_waiting_background(waiting);
             agent.set_background_shells(shells);
+            agent.set_draft(draft);
             // While scrolled, Claude draws no status row, so its absence says nothing and
             // must not count as a turn end. Leave the last reading standing; the redraw
             // that puts the view back at the bottom refreshes it.

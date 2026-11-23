@@ -159,6 +159,10 @@ pub struct AgentHandle {
     working_row: AtomicBool,
     /// The idle input box was on screen at the last reading (`VtTerm::chrome`).
     idle_box: AtomicBool,
+    /// The input box held text the user typed at the last reading that could tell
+    /// (`VtTerm::input_draft`). Claude hides its interrupt hint while it does, so the hint
+    /// leaving then is not a turn end.
+    draft: AtomicBool,
     /// Moves on every edge of `working_row`. A turn end read from the row is confirmed
     /// `ROW_END_CONFIRM_MS` later, and only if this has not moved since.
     row_edge_seq: AtomicU64,
@@ -309,6 +313,7 @@ impl AgentHandle {
             menu_user_opened: AtomicBool::new(false),
             working_row: AtomicBool::new(false),
             idle_box: AtomicBool::new(false),
+            draft: AtomicBool::new(false),
             row_edge_seq: AtomicU64::new(0),
             interrupt_ms: AtomicU64::new(0),
             finish_seq: AtomicU64::new(0),
@@ -405,6 +410,7 @@ impl AgentHandle {
             &self.menu_user_opened,
             &self.working_row,
             &self.idle_box,
+            &self.draft,
             &self.title_working,
             &self.title_attention,
             &self.progress_working,
@@ -927,8 +933,10 @@ impl AgentHandle {
     ///
     /// Requiring the box is what makes it safe: a resize or a reflow can catch the agent
     /// mid-redraw, with neither the row nor the box on screen, and that must not read as
-    /// a finish. Claude swaps one hint for the other, so exactly one is present whenever
-    /// it is drawing at all.
+    /// a finish. It is not enough on its own: Claude's mode line ("⏸ manual mode on")
+    /// counts as the box and stays up all turn, and Claude drops the hint from it while
+    /// the user types (2.1.330), so the row leaving with a draft in the box is no end
+    /// (`set_draft`, read before this).
     ///
     /// The edge is one sampled chunk, and a repaint split across reads (ConPTY rewrites
     /// rows piecemeal) can drop the row for one of them while a mode line keeps the box
@@ -960,28 +968,40 @@ impl AgentHandle {
             self.worked_since_finish.store(true, Ordering::Relaxed);
         }
         let edge = self.row_edge_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let draft = self.draft.load(Ordering::Relaxed);
         let ended = !on
             && idle_box
+            && !draft
             && !self.waiting_on_agents()
             && !self.interrupted_recently()
             && now_ms() >= self.suppress_until_ms.load(Ordering::Relaxed);
         if crate::debug::debug_enabled() {
             crate::debug::debug_log(&format!(
-                "working row {}: idle_box={idle_box} candidate_end={ended}",
+                "working row {}: idle_box={idle_box} draft={draft} candidate_end={ended}",
                 if on { "on" } else { "off" }
             ));
         }
         ended.then_some(edge)
     }
 
+    /// Reader: whether the input box holds text the user typed (see `draft`). `None`, a
+    /// reading taken with the cursor outside the box, leaves the last one standing: a
+    /// repaint split across reads can catch the cursor out on the footer it is redrawing.
+    pub fn set_draft(&self, draft: Option<bool>) {
+        if let Some(d) = draft {
+            self.draft.store(d, Ordering::Relaxed);
+        }
+    }
+
     /// Counts the turn end read at `edge` if nothing has contradicted it since: the row
-    /// has not come back, the box is still there, no chooser has opened (a permission
-    /// prompt replacing the row is a question, not a finish) and the user did not
-    /// interrupt. True when it was counted.
+    /// has not come back, the box is still there and holds no draft, no chooser has
+    /// opened (a permission prompt replacing the row is a question, not a finish) and
+    /// the user did not interrupt. True when it was counted.
     fn confirm_row_end(&self, edge: u64) -> bool {
         let holds = self.row_edge_seq.load(Ordering::Relaxed) == edge
             && !self.working_row.load(Ordering::Relaxed)
             && self.idle_box.load(Ordering::Relaxed)
+            && !self.draft.load(Ordering::Relaxed)
             && !self.menu_on_screen.load(Ordering::Relaxed)
             && !self.waiting_on_agents()
             && !self.interrupted_recently();
@@ -1660,6 +1680,37 @@ mod tests {
         h.note_interrupt();
         assert!(!h.confirm_row_end(edge));
         assert_eq!(h.finish_seq(), 0);
+    }
+
+    // Typing a follow-up mid-turn: Claude drops "esc to interrupt" while the box holds a
+    // draft, and its mode line keeps reading as the box. The first keystrokes raised
+    // "Claude finished" (2.1.330).
+    #[test]
+    fn a_draft_typed_during_a_turn_is_not_a_turn_end() {
+        let h = handle();
+        h.working_row_edge(true, true);
+        h.set_draft(Some(true));
+        assert_eq!(h.working_row_edge(false, true), None);
+        assert_eq!(h.finish_seq(), 0);
+        // A read with the cursor out of the box keeps the draft it last saw.
+        let h = handle();
+        h.working_row_edge(true, true);
+        h.set_draft(Some(true));
+        h.set_draft(None);
+        assert_eq!(h.working_row_edge(false, true), None);
+        // The repaint dropped the hint a read before it drew the keystroke.
+        let h = handle();
+        h.working_row_edge(true, true);
+        let edge = h.working_row_edge(false, true).expect("a candidate end");
+        h.set_draft(Some(true));
+        assert!(!h.confirm_row_end(edge));
+        assert_eq!(h.finish_seq(), 0);
+        // Erased, the hint is back, and then the turn really ends.
+        h.set_draft(Some(false));
+        h.working_row_edge(true, true);
+        let edge = h.working_row_edge(false, true).expect("a candidate end");
+        assert!(h.confirm_row_end(edge));
+        assert_eq!(h.finish_seq(), 1);
     }
 
     // The row is gone because the user scrolled, not because the turn ended.

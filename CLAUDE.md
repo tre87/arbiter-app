@@ -271,7 +271,14 @@ a row resize (shifts the whole layout for a frame; a column does not).
   chooser up (`AgentHandle::confirm_row_end`): a mode line keeps the box reading as present
   all turn, so one split repaint would otherwise be a finish. Esc or Ctrl+C
   (`note_interrupt`) voids it; the Stop hook never fires then. Esc arrives as
-  `Message::EscapeKey`, not `Message::Input`, so both handlers call it.
+  `Message::EscapeKey`, not `Message::Input`, so both handlers call it. A draft voids
+  it too (2026-11-22): 2.1.330 appends the hint to the mode line ("⏸ manual mode on ·
+  esc to interrupt"; every mode has a mode line now, the default included) and drops it
+  while the input box holds text, so typing mid-turn raised "Claude finished".
+  `VtTerm::input_draft` reads the box from the cursor, which Claude keeps on the
+  draft's last line; its placeholders ("Try …", "Press up to edit queued messages")
+  are SGR 2 dim and do not count. A turn that ends with a draft in the box is left to
+  the Stop hook, so over SSH it raises no card.
 - **A prompt leaving the screen is confirmed, not read.** A full repaint (resize, the wheel
   nudge) clears the screen before redrawing a chooser, and reading that gap as "answered"
   raised a second card and turned a user-opened `/model` into Claude's question. So the
