@@ -260,6 +260,10 @@ pub struct Settings {
     /// is a surprise to anyone who did not ask for it.
     #[serde(default)]
     pub name_remote_claude_sessions: bool,
+    /// Write the debug log (`debug::log_path`): what Arbiter read from each agent and
+    /// why it decided what it did. For troubleshooting only.
+    #[serde(default)]
+    pub debug_log: bool,
     /// Machines the Wake-on-LAN menu can wake (Settings, Wake on LAN), in list order.
     #[serde(default)]
     pub wol_hosts: Vec<WolHost>,
@@ -454,6 +458,7 @@ impl Default for Settings {
             background: default_bg_hex(),
             confirm_on_quit: true,
             name_remote_claude_sessions: false,
+            debug_log: false,
             wol_hosts: Vec::new(),
             show_wol_button: false,
             notifications: false,

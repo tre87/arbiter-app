@@ -17,6 +17,12 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   platform PTY forwards (ConPTY forwards OSC 0, 9, 9;4, 777 and BEL, 2026-09-24).
 - **Compile-check Windows code from macOS/Linux** (the DirectWrite path only builds on
   Windows): `cargo check --bin arbiter --target x86_64-pc-windows-gnu --features usage-helper`
+- **The debug log** (`src/debug.rs`) is a setting (General, Troubleshooting, off by
+  default): `arbiter-debug.log` next to the executable, or in the data dir when that is
+  not writable, moved to `.old.log` at 32 MB. Hook subcommands are processes of their
+  own, so they follow the setting by a marker file in the data dir (`debug-log.on`).
+  `ARBITER_CLAUDE_DEBUG` forces it on and writes to `<temp>/arbiter-claude-debug.log`
+  instead, which is what the live tests point at a folder of their own (`TMP`).
 - **Always isolate GUI launches** so they can't clobber the real saved session:
   `ARBITER_DATA_DIR=/tmp/arbiter-test cargo run --bin arbiter`
 

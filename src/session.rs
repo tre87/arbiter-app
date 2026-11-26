@@ -1673,6 +1673,8 @@ fn reader_loop(
     let mut prev_agent_owns = false;
     let hide_wake_pending = Arc::new(AtomicBool::new(false));
     let mut recorder = crate::debug::PaneRecorder::new(agent.pane_id);
+    // The last working reading, for logging the screen when it goes.
+    let mut was_working = false;
 
     loop {
         let n = match reader.read(&mut buf) {
@@ -1821,6 +1823,13 @@ fn reader_loop(
             // must not count as a turn end. Leave the last reading standing; the redraw
             // that puts the view back at the bottom refreshes it.
             if !scrolled {
+                // What the reading that took the hint away saw, since nothing else can
+                // tell a turn's end from the hint giving way to something else.
+                if was_working && !working && crate::debug::debug_enabled() {
+                    let rows = term.lock().unwrap().rows_around_cursor(3, profile.chrome_rows_below);
+                    crate::debug::debug_log(&format!("pane {}: hint gone, draft={draft:?}, {rows}", agent.pane_id));
+                }
+                was_working = working;
                 agent.set_working_row(working, idle_box);
             }
             agent.set_menu(menu, slash_input);

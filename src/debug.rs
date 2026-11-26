@@ -1,31 +1,96 @@
-//! `ARBITER_CLAUDE_DEBUG` diagnostics, shared by every module that has something worth
-//! logging from a place whose stderr nobody sees (hook subcommands, the reader thread).
+//! The debug log, shared by every module that has something worth logging from a place
+//! whose stderr nobody sees (hook subcommands, the reader thread). Switched on in
+//! Settings, or by `ARBITER_CLAUDE_DEBUG` for development.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 
-/// Whether `ARBITER_CLAUDE_DEBUG` is set, for callers that would otherwise pay to build a
-/// message that `debug_log` throws away. The name predates other agents and is kept so
-/// existing setups keep logging.
-pub fn debug_enabled() -> bool {
-    std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some()
+/// What Settings said, in the app's own process: `UNSET` everywhere else (the hook
+/// subcommands), which read `MARKER` instead.
+static SETTING: AtomicU8 = AtomicU8::new(UNSET);
+const UNSET: u8 = 0;
+const OFF: u8 = 1;
+const ON: u8 = 2;
+
+/// In the data dir while the setting is on. A hook subcommand is a process of its own,
+/// started by the agent from a shell that may predate the setting, so a file is what
+/// reaches it.
+const MARKER: &str = "debug-log.on";
+const LOG_NAME: &str = "arbiter-debug.log";
+/// Past this the log is moved to `<name>.old.log` and begun again: one long session
+/// with it on wrote 165 MB.
+const LOG_CAP: u64 = 32 << 20;
+
+/// `ARBITER_CLAUDE_DEBUG`, the developers' switch: on whatever Settings say, and
+/// logging to the temp dir, which the shell → agent → subcommand chain shares and the
+/// live tests point at a folder of their own. The name predates other agents.
+fn forced() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("ARBITER_CLAUDE_DEBUG").is_some())
 }
 
-/// Append a line to `<temp>/arbiter-claude-debug.log` when `ARBITER_CLAUDE_DEBUG` is set.
-/// Off by default: hooks and the reader call this often enough to grow it without bound.
-/// The temp dir is shared down the shell → agent → subcommand chain, so every step lands
-/// in one findable file.
+/// Whether the debug log is on, for callers that would otherwise pay to build a
+/// message that `debug_log` throws away.
+pub fn debug_enabled() -> bool {
+    if forced() {
+        return true;
+    }
+    match SETTING.load(Ordering::Relaxed) {
+        ON => true,
+        OFF => false,
+        _ => {
+            static MARKED: OnceLock<bool> = OnceLock::new();
+            *MARKED.get_or_init(|| crate::shell::app_data_dir().is_some_and(|d| d.join(MARKER).exists()))
+        }
+    }
+}
+
+/// The app: Settings switched the log on or off (and at startup, what they say).
+pub fn set_enabled(on: bool) {
+    SETTING.store(if on { ON } else { OFF }, Ordering::Relaxed);
+    let Some(marker) = crate::shell::app_data_dir().map(|d| d.join(MARKER)) else { return };
+    if on {
+        let _ = std::fs::write(marker, b"");
+    } else {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Where the log is written: next to the executable, so it sits with the installed
+/// app, or in the data dir when that folder cannot be written to. `None` with nowhere
+/// to write. Probing for that creates the file, so this is only asked once the log is on.
+pub fn log_path() -> Option<&'static Path> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        if forced() {
+            return Some(std::env::temp_dir().join("arbiter-claude-debug.log"));
+        }
+        let writable = |p: &Path| std::fs::OpenOptions::new().create(true).append(true).open(p).is_ok();
+        let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join(LOG_NAME)));
+        beside
+            .filter(|p| writable(p))
+            .or_else(|| crate::shell::app_data_dir().map(|d| d.join(LOG_NAME)))
+    })
+    .as_deref()
+}
+
+/// Append a line to the log (`log_path`) when it is on.
 pub fn debug_log(msg: &str) {
     if !debug_enabled() {
         return;
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join("arbiter-claude-debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "[{ts}] {msg}");
+    let Some(path) = log_path() else { return };
+    let open = || std::fs::OpenOptions::new().create(true).append(true).open(path);
+    let Ok(mut f) = open() else { return };
+    if f.metadata().is_ok_and(|m| m.len() > LOG_CAP) {
+        drop(f);
+        let _ = std::fs::rename(path, path.with_extension("old.log"));
+        let Ok(fresh) = open() else { return };
+        f = fresh;
     }
+    let _ = writeln!(f, "[{}] {msg}", now_ms());
 }
 
 /// A recorder file stops growing past this.

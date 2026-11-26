@@ -684,6 +684,23 @@ impl VtTerm {
         buf.trim_end().to_string()
     }
 
+    /// The rows from `above` the cursor's row to `below` it, trailing blanks trimmed, and
+    /// where the cursor is: what the agent's box and footer readings were taken from,
+    /// for the debug log.
+    pub fn rows_around_cursor(&self, above: usize, below: usize) -> String {
+        let rows = self.term.screen_lines();
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point.line.0.max(0) as usize;
+        let col = grid.cursor.point.column.0;
+        let mut out = format!("cursor ({cursor}, {col})");
+        for row in cursor.saturating_sub(above)..rows.min(cursor + below + 1) {
+            let line = &grid[Line(row as i32)];
+            let text: String = (0..self.term.columns()).map(|c| line[Column(c)].c).collect();
+            out.push_str(&format!("\n    {row:>3}{}|{}", if row == cursor { '>' } else { ' ' }, text.trim_end()));
+        }
+        out
+    }
+
     /// Whether the row the cursor is on is a slash command in the agent's input box.
     /// Read at Enter, this says the user is about to open a chooser themselves
     /// (`/model`, `/config`), which no hook reports and which must not read as the agent

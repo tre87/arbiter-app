@@ -673,6 +673,7 @@ enum Message {
     ToggleShowTerminalButtons(bool),
     ToggleConfirmOnQuit(bool),
     ToggleNameRemoteSessions(bool),
+    ToggleDebugLog(bool),
     /// Settings, Agents: switch Arbiter's support for one agent CLI on or off.
     SetAgentEnabled(AgentKind, bool),
     /// Settings → how bold/intense (SGR 1) text renders (WT's intenseTextStyle).
@@ -2175,6 +2176,11 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleNameRemoteSessions(v) => {
             state.settings.name_remote_claude_sessions = v;
+            save_session(state);
+        }
+        Message::ToggleDebugLog(v) => {
+            state.settings.debug_log = v;
+            arbiter_native::debug::set_enabled(v);
             save_session(state);
         }
         Message::ToggleSplitKeepsCwd(v) => {
@@ -4218,6 +4224,22 @@ fn settings_dialog_view(state: &State) -> Element<'static, Message> {
                 state.settings.name_remote_claude_sessions,
                 Message::ToggleNameRemoteSessions,
             ),
+            Space::with_height(Length::Fixed(8.0)),
+            settings_section("Troubleshooting"),
+            settings_toggle(
+                "Debug log",
+                Some(
+                    "Record what Arbiter reads from each agent and what it made of it, to find out why a \
+                     terminal showed working or idle, or why a notification came. The log holds what was \
+                     sent to the agents and parts of their screens, so leave it off otherwise.",
+                ),
+                state.settings.debug_log,
+                Message::ToggleDebugLog,
+            ),
+            match state.settings.debug_log.then(arbiter_native::debug::log_path).flatten() {
+                Some(path) => settings_hint(&format!("Writing to {}", path.display())),
+                None => Space::new(Length::Shrink, Length::Shrink).into(),
+            },
             Space::with_height(Length::Fixed(8.0)),
             settings_section("Saved Data"),
             settings_hint(
@@ -10292,6 +10314,7 @@ fn main() -> iced::Result {
     for a in arbiter_native::agent::all() {
         arbiter_native::agent::set_enabled(a.kind(), settings.agent_enabled(a.kind()));
     }
+    arbiter_native::debug::set_enabled(settings.debug_log);
     #[cfg(windows)]
     choose_graphics_backend(saved.as_ref().map(|s| s.settings.graphics_backend).unwrap_or_default());
     let font = Arc::new(arbiter_native::font::load());

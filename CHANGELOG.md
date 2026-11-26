@@ -7,6 +7,14 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Added
+- **A debug log you switch on in Settings** (General, Troubleshooting), off by default.
+  It records what Arbiter reads from each agent and what it made of it, and is written
+  to `arbiter-debug.log` next to `arbiter.exe` (in Arbiter's data folder when that one
+  cannot be written to). It starts over at 32 MB, keeping the previous one as
+  `arbiter-debug.old.log`. The `ARBITER_CLAUDE_DEBUG` variable still forces it on, for
+  development, and then writes to the temp folder as before.
+
 ### Fixed
 - **Typing while Claude works no longer raises "Claude finished".** Claude 2.1.330
   removes "esc to interrupt" from its mode line while the input box holds text, and

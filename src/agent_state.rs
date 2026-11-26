@@ -993,7 +993,8 @@ impl AgentHandle {
             && now_ms() >= self.suppress_until_ms.load(Ordering::Relaxed);
         if crate::debug::debug_enabled() {
             crate::debug::debug_log(&format!(
-                "working row {}: idle_box={idle_box} draft={draft} candidate_end={ended}",
+                "pane {}: working row {}: idle_box={idle_box} draft={draft} candidate_end={ended}",
+                self.pane_id,
                 if on { "on" } else { "off" }
             ));
         }
