@@ -251,15 +251,16 @@ impl Agent for Claude {
             // `<agent-message …>` from a sub-agent, a `<task-notification>` for a
             // command. That is a turn starting with nobody at the keyboard, which
             // nothing on screen says until the turn draws its row. A prompt somebody
-            // typed is left to the screen, as it always was: this also fires for input
-            // that starts no turn at all, and the turn-start hold would show those as
-            // five seconds of work.
+            // typed is not a turn start: this also fires for input that starts no turn
+            // at all, and the turn-start hold would show those as five seconds of work.
+            // It is counted, for a follow-up sent while a turn runs (`prompts_open`).
             "UserPromptSubmit" => {
                 let prompt = field(&v, &["prompt"]).unwrap_or("").trim_start();
-                if !(prompt.starts_with("<agent-message") || prompt.starts_with("<task-notification")) {
-                    return HookOutcome::default();
+                if prompt.starts_with("<agent-message") || prompt.starts_with("<task-notification") {
+                    AgentEvent::TurnStarted
+                } else {
+                    AgentEvent::PromptTyped
                 }
-                AgentEvent::TurnStarted
             }
             // The turn is over, and the hook says what it leaves running: sub-agents
             // still at work mean Claude is paused and will be woken, not finished. The
@@ -522,7 +523,7 @@ mod tests {
             assert!(hook(&json).events.is_empty(), "{ignored}");
         }
         // Claude woken by background work is a turn starting (both prompts captured from
-        // 2.1.322); a prompt somebody typed says nothing here.
+        // 2.1.322); a prompt somebody typed is only that.
         for wake in [
             r#"<agent-message from=\"a1b818190cc0ffd7e\">\n[Subagent hand-back] The text below"#,
             r#"<task-notification>\n<task-id>bnzmou8bu</task-id>"#,
@@ -532,7 +533,7 @@ mod tests {
         }
         for typed in ["hello", "/model", "fix the <agent-message> parser"] {
             let json = format!(r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{typed}"}}"#);
-            assert!(hook(&json).events.is_empty(), "{typed}");
+            assert_eq!(hook(&json).events, vec![AgentEvent::PromptTyped], "{typed}");
         }
         // Idle for a minute: never attention, and no sub-agent can still be running.
         assert_eq!(

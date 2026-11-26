@@ -2426,6 +2426,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    // Live harness, set up as `live_background`: a follow-up typed into the box while a
+    // turn runs. Left there, it hides Claude's "esc to interrupt" hint, which read as the
+    // turn's end. Sent with Enter, Claude queues it and takes it up when the turn ends,
+    // with a Stop between the two. Either way the user sees one job, and one finish after
+    // the last reply is right.
+    // `cargo build --bin arbiter && ARBITER_LIVE_CWD=~/some/trusted/folder cargo test --lib session::tests::live_follow_up -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_follow_up_typed_during_a_turn_counts_no_finish() {
+        live_follow_up(false);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_follow_up_queued_during_a_turn_counts_one_finish() {
+        live_follow_up(true);
+    }
+
+    fn live_follow_up(send: bool) {
+        use std::time::{Duration, Instant};
+        let cwd = std::env::var("ARBITER_LIVE_CWD").expect("ARBITER_LIVE_CWD: a folder Claude trusts");
+        let data = std::env::temp_dir().join(format!("arbiter-live-follow-up-{}-{send}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("ARBITER_DATA_DIR", &data);
+        let test_exe = std::env::current_exe().unwrap();
+        let arbiter = test_exe.parent().unwrap().parent().unwrap().join(if cfg!(windows) { "arbiter.exe" } else { "arbiter" });
+        assert!(arbiter.is_file(), "build the binary first: {}", arbiter.display());
+        let s = crate::agent_shim::setup(&data, &std::env::var("PATH").unwrap_or_default(), &arbiter).expect("setup");
+        let _watch = crate::agent_watch::start_watcher();
+        let mut cmd = portable_pty::CommandBuilder::new(s.bin_dir.join(if cfg!(windows) { "claude.cmd" } else { "claude" }));
+        cmd.cwd(cwd);
+        for (k, v) in &s.env {
+            cmd.env(k, v);
+        }
+        cmd.env_remove(crate::agent_shim::LAUNCHED_ENV);
+        let profile = crate::agent::AgentKind::Claude.agent().screen();
+        let t0 = Instant::now();
+        let at = |t0: Instant| t0.elapsed().as_millis();
+        let mut session = super::Session::spawn(140, 45, cmd).unwrap();
+        // A reply long enough to still be streaming when the typing starts. Not a shell
+        // command: Claude's harness moves a long one to the background and ends the turn.
+        let prompt = "Test of a terminal UI; use no tools. Reply with the integers 1 to 1000, one per line, \
+                      then the word DONE on a line of its own, and nothing else.";
+        let (follow_up, last_word) = if send {
+            ("then reply only with the word AGAIN\r", "AGAIN")
+        } else {
+            ("and then tell me about the other thing", "DONE")
+        };
+        let (mut sent_at, mut typed, mut last) = (None::<Instant>, 0, String::new());
+        let mut typed_mid_turn = false;
+        let mut finish_before_reply = None::<String>;
+        let mut done_at = None::<Instant>;
+        while t0.elapsed() < Duration::from_secs(120) {
+            if sent_at.is_none() && session.agent_running() && t0.elapsed() > Duration::from_secs(6) {
+                session.write(prompt.as_bytes());
+                std::thread::sleep(Duration::from_millis(400));
+                session.clear_suppression();
+                session.write(b"\r");
+                sent_at = Some(Instant::now());
+                println!("[{:>6} ms] prompt sent", at(t0));
+            }
+            let (rows, st) = {
+                let term = session.term();
+                let term = term.lock().unwrap();
+                (term.visible_rows(), term.screen_state(profile))
+            };
+            let replied = rows.iter().any(|r| r.trim_start().trim_start_matches('●').trim() == last_word);
+            // A keystroke every 80 ms, from 2 s into the turn.
+            if let Some(sent) = sent_at {
+                let due = sent.elapsed().saturating_sub(Duration::from_secs(2)).as_millis() / 80;
+                if typed < follow_up.len() && due as usize > typed {
+                    session.write(&follow_up.as_bytes()[typed..typed + 1]);
+                    typed += 1;
+                    if typed == follow_up.len() {
+                        typed_mid_turn = !replied;
+                        println!("[{:>6} ms] follow-up typed, mid-turn: {typed_mid_turn}", at(t0));
+                    }
+                }
+            }
+            let now = format!(
+                "{:?} finishes={} working_row={} idle_box={} draft={:?} replied={replied}",
+                session.agent_status().lifecycle,
+                session.finish_seq(),
+                st.working,
+                st.idle_box,
+                st.draft
+            );
+            if now != last {
+                println!("[{:>6} ms] {now}", at(t0));
+                last = now;
+            }
+            if session.finish_seq() > 0 && !replied && finish_before_reply.is_none() {
+                let tail = rows.iter().rev().take(10).rev().cloned().collect::<Vec<_>>().join("\n");
+                println!("--- FINISH COUNTED BEFORE THE REPLY, screen:\n{tail}");
+                finish_before_reply = Some(tail);
+            }
+            if replied && done_at.is_none() {
+                done_at = Some(Instant::now());
+            }
+            if done_at.is_some_and(|d| d.elapsed() > Duration::from_secs(8)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let rows = session.term().lock().unwrap().visible_rows();
+        println!("--- screen at the end:\n{}", rows.join("\n"));
+        assert!(sent_at.is_some(), "Claude never came up");
+        assert!(typed_mid_turn, "the follow-up was not typed while the turn ran");
+        assert!(done_at.is_some(), "Claude did not reply");
+        assert!(finish_before_reply.is_none(), "a finish was counted mid-turn");
+        assert_eq!(session.finish_seq(), 1, "the reply is one finish");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     /// Type `s` a byte at a time (as real keystrokes arrive) and return the last
     /// command submitted.
     fn typed(s: &str) -> Option<String> {

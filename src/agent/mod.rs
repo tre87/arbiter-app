@@ -92,6 +92,9 @@ pub enum AgentEvent {
     SessionBound { id: String, transcript: Option<String> },
     /// The user submitted a prompt.
     TurnStarted,
+    /// A prompt the user typed reached the agent: sent at an idle box, or sent while a
+    /// turn ran and taken up when it ended. Not always a turn: a slash command is one too.
+    PromptTyped,
     /// The agent is blocked on the user (a permission prompt, an approval).
     NeedsAttention,
     /// The turn is over.

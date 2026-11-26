@@ -361,6 +361,7 @@ pub fn encode_event(kind: AgentKind, session: Option<&str>, ev: &AgentEvent, t: 
     let (name, id, transcript) = match ev {
         AgentEvent::SessionBound { id, transcript } => ("bound", Some(id.as_str()), transcript.as_deref()),
         AgentEvent::TurnStarted => ("turn_started", None, None),
+        AgentEvent::PromptTyped => ("prompt_typed", None, None),
         AgentEvent::NeedsAttention => ("attention", None, None),
         AgentEvent::TurnEnded => ("turn_ended", None, None),
         AgentEvent::Interrupted => ("interrupted", None, None),
@@ -393,6 +394,7 @@ pub fn decode_event(line: &str) -> Option<(AgentKind, Option<String>, AgentEvent
     let ev = match v.get("ev")?.as_str()? {
         "bound" => AgentEvent::SessionBound { id: text("id")?, transcript: text("transcript") },
         "turn_started" => AgentEvent::TurnStarted,
+        "prompt_typed" => AgentEvent::PromptTyped,
         "attention" => AgentEvent::NeedsAttention,
         "turn_ended" => AgentEvent::TurnEnded,
         "interrupted" => AgentEvent::Interrupted,
@@ -510,6 +512,7 @@ mod tests {
             AgentEvent::SessionBound { id: "abc-1".into(), transcript: Some("/t/abc-1.jsonl".into()) },
             AgentEvent::SessionBound { id: "abc-2".into(), transcript: None },
             AgentEvent::TurnStarted,
+            AgentEvent::PromptTyped,
             AgentEvent::NeedsAttention,
             AgentEvent::TurnEnded,
             AgentEvent::Interrupted,

@@ -16,6 +16,12 @@ history belongs to the prior Tauri/Vue web app it replaced.
   placeholders ("Try …", "Press up to edit queued messages") do not. A turn that really
   ends while your text is still in the box is reported by Claude's Stop hook as before;
   over SSH, where there is no hook, that one turn end raises no card.
+- **A follow-up sent while Claude works no longer raises "Claude finished" early.**
+  Claude queues it and takes it up the moment the current turn ends, still working,
+  but its Stop hook fires in between, and that raised the card; the real finish a
+  moment later was then dropped as a repeat. Arbiter now counts the prompts Claude
+  reports, and a turn end with one still queued while Claude's "esc to interrupt" is
+  still up is not the finish. The card comes once, when the follow-up is done.
 - **Many workspace tabs no longer push the titlebar's right side off the window.**
   With enough tabs that every name was cut to its shortest, the tab row kept its width
   and pushed the usage bars, the buttons and, on Windows, the minimise, maximise and

@@ -183,6 +183,15 @@ pub struct AgentHandle {
     /// When the user last submitted a prompt, by hook (0 = never). Holds Working briefly
     /// until a level signal takes over (see `TURN_START_HOLD_MS`).
     turn_started_ms: AtomicU64,
+    /// Prompts given to the agent whose turn has not been seen to end: each one typed
+    /// (`PromptTyped`) and each wake-up (`TurnStarted`), less one per Stop, none once a
+    /// finish is counted. Claude queues a prompt sent while a turn runs, reports it as
+    /// it is sent (2.1.332), and takes it up the moment the turn ends, with a Stop in
+    /// between and its hint never leaving the screen. So a Stop with another prompt
+    /// still open while the hint stays up is not the finish (`count_stop`). A slash
+    /// command is a prompt that starts no turn, so this can be too high; the hint is
+    /// what decides.
+    prompts_open: AtomicU32,
     /// Levels from terminal signals (see `note_signal`).
     title_working: AtomicBool,
     title_attention: AtomicBool,
@@ -320,6 +329,7 @@ impl AgentHandle {
             last_finish_ms: AtomicU64::new(0),
             worked_since_finish: AtomicBool::new(false),
             turn_started_ms: AtomicU64::new(0),
+            prompts_open: AtomicU32::new(0),
             title_working: AtomicBool::new(false),
             title_attention: AtomicBool::new(false),
             progress_working: AtomicBool::new(false),
@@ -435,7 +445,7 @@ impl AgentHandle {
         }
         self.turn_started_ms.store(0, Ordering::Relaxed);
         self.background_shells.store(0, Ordering::Relaxed);
-        self.forget_subagents();
+        self.forget_pending();
         if !self.on_screen() {
             self.clear_kind();
         }
@@ -579,8 +589,8 @@ impl AgentHandle {
                 SAVE_DIRTY.store(true, Ordering::Relaxed);
             }
             self.record_session(kind, id, transcript.as_deref());
-            // A new conversation (startup, resume, `/clear`) has no sub-agents yet.
-            self.forget_subagents();
+            // A new conversation (startup, resume, `/clear`) has nothing pending yet.
+            self.forget_pending();
             self.suppress_activity(START_QUIET_MS);
             return;
         }
@@ -602,6 +612,10 @@ impl AgentHandle {
                 self.wake_hold_until_ms.store(0, Ordering::Relaxed);
                 self.hook_attention.store(false, Ordering::Relaxed);
                 self.worked_since_finish.store(true, Ordering::Relaxed);
+                self.prompts_open.fetch_add(1, Ordering::Relaxed);
+            }
+            AgentEvent::PromptTyped => {
+                self.prompts_open.fetch_add(1, Ordering::Relaxed);
             }
             AgentEvent::NeedsAttention => self.hook_attention.store(true, Ordering::Relaxed),
             AgentEvent::TurnEnded => self.turn_ended(),
@@ -610,11 +624,11 @@ impl AgentHandle {
                 self.interrupt_ms.store(now, Ordering::Relaxed);
                 self.stop_ms.store(now, Ordering::Relaxed);
                 self.hook_attention.store(false, Ordering::Relaxed);
-                self.forget_subagents();
+                self.forget_pending();
             }
             AgentEvent::SessionEnded => {
                 self.hook_attention.store(false, Ordering::Relaxed);
-                self.forget_subagents();
+                self.forget_pending();
             }
             AgentEvent::SubagentStarted { id } => {
                 let mut subs = self.subagents.lock().unwrap();
@@ -655,8 +669,10 @@ impl AgentHandle {
         }
     }
 
-    /// No sub-agent is running, none owes a report, nothing is being waited for.
-    fn forget_subagents(&self) {
+    /// No sub-agent is running, none owes a report, no prompt is queued, nothing is
+    /// being waited for.
+    fn forget_pending(&self) {
+        self.prompts_open.store(0, Ordering::Relaxed);
         self.subagents.lock().unwrap().clear();
         self.outlived_a_turn.lock().unwrap().clear();
         for t in [&self.agents_done_ms, &self.report_owed_ms, &self.wake_hold_until_ms] {
@@ -1017,13 +1033,25 @@ impl AgentHandle {
     /// `stopped_ms` is when the turn ended. `after_ms` is how long to wait before
     /// judging it: longer when a sub-agent's report is still owed, and then a turn the
     /// agent has been woken for in the meantime means this end was not the finish.
+    ///
+    /// Nor is it while a prompt sent during the turn is open and the turn's hint is
+    /// still up: the agent has taken that prompt up (`prompts_open`). The hint leaving
+    /// is then the finish, counted from the row (`confirm_row_end`) or the next Stop.
     fn count_stop(self: &Arc<Self>, stopped_ms: u64, after_ms: u64) {
         let weak = Arc::downgrade(self);
         let at = std::time::Instant::now() + Duration::from_millis(after_ms);
         crate::session::schedule(at, move || {
             let Some(h) = weak.upgrade() else { return };
             let woken_since = h.turn_started_ms.load(Ordering::Relaxed) > stopped_ms;
-            if !woken_since && !h.waiting_on_agents() {
+            let open = h
+                .prompts_open
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
+                .unwrap_or(0);
+            let queued = open >= 2 && h.working_row.load(Ordering::Relaxed);
+            if crate::debug::debug_enabled() {
+                crate::debug::debug_log(&format!("stop: prompts_open={open} queued={queued} woken_since={woken_since}"));
+            }
+            if !woken_since && !queued && !h.waiting_on_agents() {
                 h.count_finish();
             }
             // Counted or not, the hold has run out: the pane is to be read again.
@@ -1045,14 +1073,16 @@ impl AgentHandle {
         self.finish_seq.fetch_add(1, Ordering::Relaxed);
         self.last_finish_ms.store(now, Ordering::Relaxed);
         self.worked_since_finish.store(false, Ordering::Relaxed);
+        self.prompts_open.store(0, Ordering::Relaxed);
         true
     }
 
     /// UI: the user sent Esc or Ctrl+C to this pane.
     pub fn note_interrupt(&self) {
         self.interrupt_ms.store(now_ms(), Ordering::Relaxed);
-        // An interrupted turn's sub-agents go with it, and no stop is promised for them.
-        self.forget_subagents();
+        // An interrupted turn's sub-agents go with it, and no stop is promised for them;
+        // nor for a prompt queued behind it.
+        self.forget_pending();
     }
 
     /// When the user last pressed Esc or Ctrl+C here; 0 if never.
@@ -1711,6 +1741,37 @@ mod tests {
         let edge = h.working_row_edge(false, true).expect("a candidate end");
         assert!(h.confirm_row_end(edge));
         assert_eq!(h.finish_seq(), 1);
+    }
+
+    // A follow-up sent mid-turn, as Claude 2.1.332 handles it (measured live): its prompt
+    // is reported as it is sent, and it is taken up the moment the turn ends, with a Stop
+    // in between and the hint up throughout. That Stop raised "Claude finished", and the
+    // real one a second later was then dropped as its repeat.
+    #[test]
+    fn a_stop_with_a_queued_prompt_taken_up_is_not_the_finish() {
+        let h = handle();
+        let ev = |e: AgentEvent| h.apply(AgentKind::Claude, Some("s1"), &e);
+        let settle = || std::thread::sleep(Duration::from_millis(super::STOP_CONFIRM_MS + 80));
+        ev(AgentEvent::PromptTyped);
+        h.working_row_edge(true, true);
+        ev(AgentEvent::PromptTyped);
+        ev(AgentEvent::TurnEnded);
+        settle();
+        assert_eq!(h.finish_seq(), 0, "the queued prompt was taken up");
+        // Its own turn ends: the hint goes with the Stop.
+        h.working_row_edge(false, true);
+        ev(AgentEvent::TurnEnded);
+        settle();
+        assert_eq!(h.finish_seq(), 1);
+        // A slash command is a prompt too, and starts no turn. With the next turn's
+        // prompt that is two open at its Stop, but the hint has gone: the finish.
+        ev(AgentEvent::PromptTyped);
+        ev(AgentEvent::PromptTyped);
+        h.working_row_edge(true, true);
+        h.working_row_edge(false, true);
+        ev(AgentEvent::TurnEnded);
+        settle();
+        assert_eq!(h.finish_seq(), 2);
     }
 
     // The row is gone because the user scrolled, not because the turn ended.

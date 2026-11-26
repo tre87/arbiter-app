@@ -279,6 +279,19 @@ a row resize (shifts the whole layout for a frame; a column does not).
   draft's last line; its placeholders ("Try …", "Press up to edit queued messages")
   are SGR 2 dim and do not count. A turn that ends with a draft in the box is left to
   the Stop hook, so over SSH it raises no card.
+- **A follow-up queued mid-turn makes that turn's Stop no finish (2026-11-26).** Sent
+  with Enter while a turn runs, Claude (2.1.332) queues it, fires `UserPromptSubmit`
+  at once, and takes it up the moment the turn ends: a Stop in between, the hint never
+  leaving. That Stop raised the card, and `FINISH_DEDUPE_MS` then dropped the real one.
+  Typed prompts are now `AgentEvent::PromptTyped` (still no turn-start hold: a slash
+  command fires it too), counted with wake-ups in `AgentHandle::prompts_open`, and a
+  Stop with two open while the hint is still up 250 ms later is not counted
+  (`count_stop`); the queued turn's own Stop or row end is. Slash commands make the
+  count too high, never too low, so the hint is what decides. Live check, both cases:
+  `ARBITER_LIVE_CWD=<a folder Claude trusts> cargo test --lib session::tests::live_follow_up
+  -- --ignored --nocapture --test-threads=1`. Claude's harness moves a long shell
+  command to the background and ends the turn, so the harness keeps Claude busy with
+  a long reply instead.
 - **A prompt leaving the screen is confirmed, not read.** A full repaint (resize, the wheel
   nudge) clears the screen before redrawing a chooser, and reading that gap as "answered"
   raised a second card and turned a user-opened `/model` into Claude's question. So the
@@ -416,8 +429,9 @@ or what counts as working. Three files:
     is in a wake-up turn has not been heard yet: that turn's Stop lists nothing, and
     Claude is woken for the report a tenth of a second later. A real run's log showed
     the pane idle for a second there, twice in one job, each with a false finish. So
-    `UserPromptSubmit` is registered, only to hear the wake-ups (a prompt starting
-    `<agent-message` or `<task-notification`; a typed one emits nothing), and a Stop
+    `UserPromptSubmit` is registered to hear the wake-ups (a prompt starting
+    `<agent-message` or `<task-notification`; a typed one is only counted, see "A
+    follow-up queued mid-turn"), and a Stop
     is held (`turn_ended`, `WAKE_WAIT_MS`) when a sub-agent that had outlived a turn
     stopped after the last wake-up (`report_owed_ms` against `turn_started_ms`). The
     finish is counted when that wait runs out with no wake-up; a wake-up cancels it.
