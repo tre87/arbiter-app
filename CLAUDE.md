@@ -284,7 +284,11 @@ a row resize (shifts the whole layout for a frame; a column does not).
   `VtTerm::input_draft` reads the box from the cursor, which Claude keeps on the
   draft's last line; its placeholders ("Try …", "Press up to edit queued messages")
   are SGR 2 dim and do not count. A turn that ends with a draft in the box is left to
-  the Stop hook, so over SSH it raises no card.
+  the Stop hook, so over SSH it raises no card. In the plain form Claude 2.1.332 draws
+  `>` and a no-break space (U+00A0), so a space in `PromptShape::boxed` matches any
+  blank (`agent_screen::boxed_marker`); read as a literal space, the box was never
+  found and typing still raised the card (2026-11-26, from the user's own pane: the
+  debug log records the rows around the cursor each time the hint goes).
 - **A follow-up queued mid-turn makes that turn's Stop no finish (2026-11-26).** Sent
   with Enter while a turn runs, Claude (2.1.332) queues it, fires `UserPromptSubmit`
   at once, and takes it up the moment the turn ends: a Stop in between, the hint never

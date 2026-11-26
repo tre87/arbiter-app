@@ -1102,6 +1102,9 @@ mod tests {
         assert_eq!(screen(&[queued], working, "\x1b[3;3H"), (true, true, Some(false)));
         // The cursor out on the footer, mid-repaint: no reading.
         assert_eq!(screen(&["❯ hello"], mode, "\x1b[5;3H").2, None);
+        // The plain form as a real pane drew it (2.1.332): `>` and a no-break space.
+        assert_eq!(screen(&[">\u{a0}a"], mode, "\x1b[3;4H"), (false, true, Some(true)));
+        assert_eq!(screen(&[">\u{a0}"], working, "\x1b[3;3H"), (true, true, Some(false)));
     }
 
     // With the input box on screen, the row has to be the last thing above it. The

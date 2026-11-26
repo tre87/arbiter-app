@@ -23,7 +23,10 @@ history belongs to the prior Tauri/Vue web app it replaced.
   seconds). Text you typed in the box now holds that reading back; Claude's dim
   placeholders ("Try …", "Press up to edit queued messages") do not. A turn that really
   ends while your text is still in the box is reported by Claude's Stop hook as before;
-  over SSH, where there is no hook, that one turn end raises no card.
+  over SSH, where there is no hook, that one turn end raises no card. This now also
+  works where Claude draws its prompt as a plain `>`: Claude 2.1.332 puts a no-break
+  space after it, and that box was never recognised, so typing there still raised the
+  card.
 - **A follow-up sent while Claude works no longer raises "Claude finished" early.**
   Claude queues it and takes it up the moment the current turn ends, still working,
   but its Stop hook fires in between, and that raised the card; the real finish a

@@ -137,8 +137,23 @@ pub fn prompt_text_column(p: &ScreenProfile, row: &str) -> Option<usize> {
     if body.chars().next().is_some_and(|c| p.prompt.glyphs.contains(&c)) {
         return Some(lead + 1);
     }
+    boxed_marker(p, body).map(|n| lead + n)
+}
+
+/// The length in chars of the boxed form's marker at the start of `body`, if it is there.
+/// A space in the marker matches any blank: Claude 2.1.332 draws its `>` with a no-break
+/// space after it (U+00A0, seen in a real pane 2026-11-26), and read as a plain space
+/// that box was never found, so a draft in it never counted.
+fn boxed_marker(p: &ScreenProfile, body: &str) -> Option<usize> {
     let boxed = p.prompt.boxed?;
-    body.starts_with(boxed).then(|| lead + boxed.chars().count())
+    let mut chars = body.chars();
+    for m in boxed.chars() {
+        let c = chars.next()?;
+        if c != m && !(m == ' ' && c.is_whitespace()) {
+            return None;
+        }
+    }
+    Some(boxed.chars().count())
 }
 
 /// Whether `rows[i]` is the prompt line of the input box. A prompt glyph is enough on its
@@ -150,10 +165,9 @@ pub fn is_prompt_at(p: &ScreenProfile, rows: &[String], i: usize) -> bool {
     if is_input_prompt_row(p, row) {
         return true;
     }
-    let Some(boxed) = p.prompt.boxed else { return false };
     let side = p.prompt.side;
     let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == side);
-    body.starts_with(boxed)
+    boxed_marker(p, body).is_some()
         && i > 0
         && is_box_rule(p, &rows[i - 1])
         && rows[i + 1..].iter().take(p.prompt.box_lines).any(|r| is_box_rule(p, r))
