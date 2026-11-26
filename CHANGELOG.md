@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-26
+
 ### Added
 - **A debug log you switch on in Settings** (General, Troubleshooting), off by default.
   It records what Arbiter reads from each agent and what it made of it, and is written
