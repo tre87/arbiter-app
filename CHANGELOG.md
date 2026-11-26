@@ -16,6 +16,22 @@ history belongs to the prior Tauri/Vue web app it replaced.
   placeholders ("Try …", "Press up to edit queued messages") do not. A turn that really
   ends while your text is still in the box is reported by Claude's Stop hook as before;
   over SSH, where there is no hook, that one turn end raises no card.
+- **Many workspace tabs no longer push the titlebar's right side off the window.**
+  With enough tabs that every name was cut to its shortest, the tab row kept its width
+  and pushed the usage bars, the buttons and, on Windows, the minimise, maximise and
+  close buttons out of view. Those now always keep their place.
+
+### Changed
+- **Workspace tabs that do not fit go behind an arrow.** Tab names are still cut to
+  make room, all to the same length, but never below three letters; the tabs that do
+  not fit even then go behind an arrow after the last one shown, with the number of
+  workspaces behind it and the dot of the one most in need of you, then "+". The
+  arrow is lit while the active workspace is one of them. Click it for the list.
+  Tabs move between the two by dragging: drag a workspace out of the list onto the
+  titlebar to put it there, drop a tab on the arrow to send it to the end, or rest it
+  on the arrow for half a second and the list opens so you can drop it where you want.
+- **A new workspace's tab is the last one shown**, not added after every other tab,
+  where with a full titlebar it went behind the arrow.
 
 ## [1.7.1] - 2026-11-10
 

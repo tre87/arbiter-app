@@ -51,6 +51,8 @@ mod banner_preview;
 mod pane_banner;
 /// Sizes the panes of workspaces not on screen, once, after the first frame.
 mod presize;
+/// The titlebar's workspace tabs: those that fit, then the arrow for the rest.
+mod tab_strip;
 
 /// Which shell a terminal is running. Windows can switch PowerShell ↔ Git Bash;
 /// other platforms only ever use the default (so the switch button never shows).
@@ -266,6 +268,18 @@ struct State {
     /// The workspace tab the cursor is over (for hover styling — the tabs are now
     /// mouse_areas, not buttons, so hover is tracked here).
     hovered_tab: Option<usize>,
+    /// How many tabs the titlebar shows and where its arrow is, as the strip was last
+    /// laid out (`tab_strip`). The workspaces past `shown` are in the arrow's menu.
+    tab_fit: tab_strip::Fit,
+    /// The arrow's menu is open.
+    overflow_open: bool,
+    /// A workspace was just added as the last tab shown. Its own tab can push it
+    /// behind the arrow (it was the one too many), so the next `TabsFit` moves it back
+    /// in front of whatever it displaced.
+    reveal_new: bool,
+    /// Bumped by every entry onto the arrow and exit from it; a dragged tab's hover
+    /// opens the menu only if it is still the latest when `OVERFLOW_SPRING_MS` is up.
+    overflow_spring: u32,
     /// Open file-explorer right-click menu (anchor + the row it was opened on).
     explorer_menu: Option<files_pane::Menu>,
     /// The one-field dialog behind Rename, New file and New folder.
@@ -280,12 +294,48 @@ struct State {
     send_target: Option<files_pane::SendTarget>,
 }
 
-/// A workspace-tab drag-reorder in progress.
+/// A workspace-tab drag-reorder in progress. `over` is the last target entered, so a
+/// release between targets drops at the one the cursor came from.
 #[derive(Clone, Copy)]
 struct TabDrag {
     from: usize,
-    over: usize,
+    over: DropOn,
 }
+
+/// What a dragged tab is over: a tab (in the titlebar or the arrow's menu), or the
+/// arrow itself, which puts it last.
+#[derive(Clone, Copy, PartialEq)]
+enum DropOn {
+    Tab(usize),
+    Arrow,
+}
+
+impl TabDrag {
+    /// The index the grabbed workspace ends up at, of `n`.
+    fn target(self, n: usize) -> usize {
+        match self.over {
+            DropOn::Tab(o) => {
+                // Once the tab is removed, a gap past its old slot shifts down by one.
+                let gap = drop_gap(self.from, o);
+                if gap > self.from { gap - 1 } else { gap }
+            }
+            DropOn::Arrow => n.saturating_sub(1),
+        }
+    }
+
+    /// The insertion gap (0..=n) to mark, when the drop would move the tab, with
+    /// the index of the tab that decides it.
+    fn gap(self) -> Option<(usize, usize)> {
+        match self.over {
+            DropOn::Tab(o) if o != self.from => Some((drop_gap(self.from, o), o)),
+            _ => None,
+        }
+    }
+}
+
+/// How long a dragged tab rests on the titlebar's arrow before its menu opens, so the
+/// tab can be dropped at a place in it rather than last.
+const OVERFLOW_SPRING_MS: u64 = 500;
 
 /// A terminal right-click context menu, anchored at the click. Its actions target
 /// the focused pane (the right-clicked pane is focused when the menu opens).
@@ -745,6 +795,12 @@ enum Message {
     TabDragOver(usize),
     TabExit(usize),
     TabDragEnd,
+    TabsFit(tab_strip::Fit),
+    OverflowToggle,
+    OverflowClose,
+    OverflowEnter,
+    OverflowExit,
+    OverflowSpring(u32),
     /// Close workspace tab `i` (never the last one).
     CloseWorkspace(usize),
     /// Ask before closing (opens the confirm dialog); its Close button sends CloseWorkspace.
@@ -1702,6 +1758,8 @@ fn dismiss_top_overlay(state: &mut State) -> bool {
     if state.rename_confirm.is_some() { take!(state.rename_confirm) }
     if state.shortcuts_open { take!(state.shortcuts_open) }
     if state.settings_open { take!(state.settings_open) }
+    // Below every modal (`overflow_layer`), so it goes last.
+    if state.overflow_open { take!(state.overflow_open) }
     false
 }
 
@@ -1960,9 +2018,12 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             state.active_mut().panes.resize(split, ratio);
         }
         Message::NewWorkspace => {
-            let n = state.workspaces.len() + 1;
-            state.workspaces.push(Workspace::new(format!("Workspace {n}")));
-            state.active = state.workspaces.len() - 1;
+            let n = state.workspaces.len();
+            let shown = shown_tabs(state);
+            let at = if shown < n { shown.saturating_sub(1) } else { n };
+            state.workspaces.insert(at, Workspace::new(format!("Workspace {}", n + 1)));
+            state.active = at;
+            state.reveal_new = true;
             save_session(state);
         }
         Message::CursorMoved(p) => {
@@ -2623,14 +2684,14 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
             // any reorder. A plain click ends with from == over → just a select.
             if i < state.workspaces.len() {
                 state.active = i;
-                state.tab_drag = Some(TabDrag { from: i, over: i });
+                state.tab_drag = Some(TabDrag { from: i, over: DropOn::Tab(i) });
             }
         }
         Message::TabDragOver(i) => {
             state.hovered_tab = Some(i);
             if let Some(d) = state.tab_drag.as_mut() {
                 if i < state.workspaces.len() {
-                    d.over = i;
+                    d.over = DropOn::Tab(i);
                 }
             }
         }
@@ -2641,18 +2702,56 @@ fn update_app(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::TabDragEnd => {
             if let Some(d) = state.tab_drag.take() {
-                // The grabbed tab drops into the insertion gap; once it's removed,
-                // a gap past its old slot shifts down by one.
-                let gap = drop_gap(d.from, d.over);
-                let target = if gap > d.from { gap - 1 } else { gap };
+                let target = d.target(state.workspaces.len());
                 if target != d.from {
                     move_workspace(state, d.from, target);
+                }
+                // A drop in the titlebar, or a click that picked a row of the menu, is
+                // done with the menu; a move inside it leaves it open to show the result.
+                if let DropOn::Tab(o) = d.over {
+                    if o < shown_tabs(state) || o == d.from {
+                        state.overflow_open = false;
+                    }
                 }
                 save_session(state); // persist the new order + selection
             }
             // A left release also ends any manual window drag (begin_drag → here).
             #[cfg(target_os = "macos")]
             trafficlights::end_drag();
+        }
+        Message::TabsFit(fit) => {
+            state.tab_fit = fit;
+            if fit.shown >= state.workspaces.len() {
+                state.overflow_open = false;
+            }
+            if std::mem::take(&mut state.reveal_new) && fit.shown > 0 && state.active >= fit.shown {
+                move_workspace(state, state.active, fit.shown - 1);
+                save_session(state);
+            }
+        }
+        Message::OverflowToggle => {
+            state.overflow_open = !state.overflow_open;
+            // The menu's rows are made anew on opening and never report leaving a row
+            // hovered when it last closed. The cursor is on the arrow here.
+            state.hovered_tab = None;
+        }
+        Message::OverflowClose => state.overflow_open = false,
+        Message::OverflowEnter => {
+            if let Some(d) = state.tab_drag.as_mut() {
+                d.over = DropOn::Arrow;
+                state.overflow_spring = state.overflow_spring.wrapping_add(1);
+                let seq = state.overflow_spring;
+                return Task::perform(tokio::time::sleep(Duration::from_millis(OVERFLOW_SPRING_MS)), move |_| {
+                    Message::OverflowSpring(seq)
+                });
+            }
+        }
+        Message::OverflowExit => state.overflow_spring = state.overflow_spring.wrapping_add(1),
+        Message::OverflowSpring(seq) => {
+            if seq == state.overflow_spring && state.tab_drag.is_some_and(|d| d.over == DropOn::Arrow) {
+                state.overflow_open = true;
+                state.hovered_tab = None;
+            }
         }
         Message::Noop => {}
         Message::ToggleWolMenu => {
@@ -3220,6 +3319,8 @@ const TITLEBAR_LEFT_PAD: f32 = 8.0;
 const TITLEBAR_RIGHT_PAD: f32 = 0.0;
 #[cfg(not(target_os = "windows"))]
 const TITLEBAR_RIGHT_PAD: f32 = 8.0;
+/// The main window's titlebar height (web 40px).
+const TITLEBAR_H: f32 = 40.0;
 
 /// The web's top-left azure glow (`.app::before` radial gradient over the WHOLE
 /// app chrome). iced has no radial gradient, so approximate with a diagonal
@@ -3415,6 +3516,7 @@ fn modal_is_open(state: &State) -> bool {
         || state.rename_confirm.is_some()
         || state.shortcuts_open
         || state.settings_open
+        || state.overflow_open
 }
 
 fn modal_overlay(state: &State) -> Option<Element<'_, Message>> {
@@ -4569,20 +4671,20 @@ fn nudge_up_1px(el: Element<'static, Message>) -> Element<'static, Message> {
 /// One workspace tab pill (web `.tab`): type icon + name + (×) close, 26px tall,
 /// translucent-white border, tinted bg when active. The close is a nested button
 /// (it captures its own clicks, so the tab's select fires only elsewhere). The
-/// name truncates to `max_chars` so tabs shrink on a narrow window; icon + × stay.
+/// name is cut by the titlebar's strip to fit (`tab_strip::Names`).
 fn tab_pill(
     i: usize,
     ws: &Workspace,
     active: bool,
     hovered: bool,
     show_close: bool,
-    max_chars: usize,
+    names: &tab_strip::Names,
     dragging_src: bool,
 ) -> Element<'static, Message> {
     let icon = mdi_path::CONSOLE;
     // Type icon + close go near-white on the active tab (visible), muted otherwise.
     let fg = if active { TXT_PRIMARY } else { TXT_MUTED };
-    let mut content = row![cmdi(icon, 12.0, fg), text(truncate_name(&ws.name, max_chars)).size(12)]
+    let mut content = row![cmdi(icon, 12.0, fg), names.name(&ws.name, 12.0)]
         .spacing(4)
         .align_y(iced::Center)
         .height(Length::Fixed(26.0));
@@ -4621,7 +4723,7 @@ fn tab_pill(
         (None, white_a(0.05), TXT_SECONDARY)
     };
     // The grabbed tab "lifts" (brighter fill) while dragging; the drop position is
-    // shown by an azure insertion line between tabs (see `tab_drop_line`).
+    // shown by an azure insertion line between tabs (drawn by `tab_strip`).
     if dragging_src {
         bg = Some(white_a(0.16));
     }
@@ -4636,14 +4738,170 @@ fn tab_pill(
         .into()
 }
 
-/// The azure insertion line shown between tabs while dragging, marking where the
-/// grabbed tab will drop (a 2px bar; the row's spacing seats it in the gap).
-fn tab_drop_line() -> Element<'static, Message> {
-    container(Space::new(Length::Fixed(2.0), Length::Fixed(22.0)))
-        .center_y(Length::Fixed(26.0))
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(AZURE)),
-            border: iced::Border { radius: 1.0.into(), ..Default::default() },
+/// How many workspaces have a tab in the titlebar; the rest are in the arrow's menu.
+fn shown_tabs(state: &State) -> usize {
+    state.tab_fit.shown.min(state.workspaces.len())
+}
+
+/// The titlebar's arrow for the workspaces it has no room for: how many there are, and
+/// the loudest of their status dots, so a prompt waiting behind it is not missed. Lit
+/// while the active workspace is behind it or its menu is open, outlined in azure while
+/// a dragged tab is over it. Fixed width, so its count never changes which tabs fit.
+fn tab_overflow_button(state: &State, shown: usize) -> Element<'static, Message> {
+    let hidden = &state.workspaces[shown..];
+    let active_inside = state.active >= shown;
+    let lit = active_inside || state.overflow_open;
+    let drop_here = state.tab_drag.is_some_and(|d| d.over == DropOn::Arrow);
+    let dot = hidden.iter().filter_map(workspace_dot).max_by_key(|d| match d {
+        Dot::Attention => 3,
+        Dot::Working => 2,
+        Dot::Running => 1,
+        _ => 0,
+    });
+    let fg = if lit { TXT_PRIMARY } else { TXT_SECONDARY };
+    let mut content = row![cmdi(mdi_path::CHEVRON_DOWN, 14.0, fg)].spacing(3).align_y(iced::Center);
+    if !hidden.is_empty() {
+        content = content.push(text(hidden.len().to_string()).size(11).color(fg));
+    }
+    if let Some(d) = dot {
+        content = content.push(nudge_down_1px(tab_status_dot(d)));
+    }
+    let b = button(container(content).center_x(Length::Fill).center_y(Length::Fill))
+        .width(Length::Fixed(52.0))
+        .height(Length::Fixed(26.0))
+        .padding(0)
+        .on_press(Message::OverflowToggle)
+        .style(move |_t: &iced::Theme, s| {
+            let hovered = matches!(s, button::Status::Hovered);
+            let (bg, bc) = if lit {
+                (Some(white_a(0.08)), white_a(0.14))
+            } else if hovered {
+                (Some(white_a(0.04)), white_a(0.10))
+            } else {
+                (None, white_a(0.05))
+            };
+            button::Style {
+                background: bg.map(iced::Background::Color),
+                text_color: fg,
+                border: iced::Border { color: if drop_here { AZURE } else { bc }, width: 1.0, radius: 6.0.into() },
+                ..Default::default()
+            }
+        });
+    mouse_area(b).on_enter(Message::OverflowEnter).on_exit(Message::OverflowExit).into()
+}
+
+const OVERFLOW_MENU_W: f32 = 260.0;
+const OVERFLOW_ROW_H: f32 = 28.0;
+
+/// The arrow's menu, as a window-wide layer that leaves the titlebar uncovered: the
+/// tabs stay pressable and stay drop targets while it is open, so a workspace can be
+/// dragged out of the menu into the titlebar. Below the titlebar, a press outside the
+/// menu closes it. Always present (empty while closed) so opening it never shifts
+/// the layers above it.
+fn overflow_layer(state: &State) -> Element<'_, Message> {
+    let shown = shown_tabs(state);
+    if !state.overflow_open || shown >= state.workspaces.len() {
+        return Space::new(Length::Fixed(0.0), Length::Fixed(0.0)).into();
+    }
+    // The drop mark between two rows takes a slot that is always there, so the rows
+    // never move under the cursor while it comes and goes.
+    let gap = state.tab_drag.and_then(|d| d.gap()).filter(|&(_, o)| o >= shown).map(|(g, _)| g);
+    let slot = |k: usize| -> Element<'static, Message> {
+        container(Space::new(Length::Fill, Length::Fixed(2.0)))
+            .padding([0, 8])
+            .style(move |_t: &iced::Theme| container::Style {
+                background: (gap == Some(k)).then_some(iced::Background::Color(AZURE)),
+                border: iced::Border { radius: 1.0.into(), ..Default::default() },
+                ..Default::default()
+            })
+            .into()
+    };
+    let n = state.workspaces.len();
+    let mut rows = column![].padding([2, 4]);
+    for i in shown..n {
+        rows = rows.push(slot(i));
+        let dragging = state.tab_drag.is_some_and(|d| d.from == i);
+        let hovered = state.tab_drag.is_none() && state.hovered_tab == Some(i);
+        rows = rows.push(
+            mouse_area(overflow_row(i, &state.workspaces[i], i == state.active, hovered, dragging))
+                .on_press(Message::TabDragStart(i))
+                .on_enter(Message::TabDragOver(i))
+                .on_exit(Message::TabExit(i))
+                .on_right_press(Message::WorkspaceTabMenuOpen(i)),
+        );
+    }
+    rows = rows.push(slot(n));
+    let win = state.main_size;
+    let max_h = (win.height - TITLEBAR_H - 16.0).max(OVERFLOW_ROW_H * 3.0);
+    let card = container(
+        scrollable(rows)
+            .width(Length::Fill)
+            .direction(scrollable::Direction::Vertical(thin_scrollbar()))
+            .style(thin_scrollbar_style),
+    )
+    .width(Length::Fixed(OVERFLOW_MENU_W))
+    .max_height(max_h)
+    .style(|_t: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x25, 0x25, 0x25))),
+        border: iced::Border { color: iced::Color::from_rgb8(0x2c, 0x2c, 0x2c), width: 1.0, radius: 6.0.into() },
+        ..Default::default()
+    });
+    let x = state.tab_fit.arrow_x.min((win.width - OVERFLOW_MENU_W - 8.0).max(4.0)).max(4.0);
+    let below = container(mouse_area(card).on_press(Message::Noop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding { top: 2.0, right: 0.0, bottom: 0.0, left: x });
+    column![Space::new(Length::Fill, Length::Fixed(TITLEBAR_H)), mouse_area(below).on_press(Message::OverflowClose)]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// One workspace in the arrow's menu: the tab's icon, name, status and close, as a
+/// row. A mouse_area around it, not a button, so a press can start a drag.
+fn overflow_row(i: usize, ws: &Workspace, active: bool, hovered: bool, dragging: bool) -> Element<'static, Message> {
+    let fg = if active || hovered { TXT_PRIMARY } else { TXT_MUTED };
+    let mut content = row![
+        cmdi(mdi_path::CONSOLE, 12.0, fg),
+        text(truncate_name(&ws.name, 34)).size(12).wrapping(iced::widget::text::Wrapping::None),
+        horizontal_space(),
+    ]
+    .spacing(6)
+    .align_y(iced::Center)
+    .height(Length::Fixed(OVERFLOW_ROW_H));
+    let dot = workspace_dot(ws);
+    if workspace_has_shells(ws) {
+        content = content.push(tab_ring(dot));
+    } else if let Some(dot) = dot {
+        content = content.push(nudge_down_1px(tab_status_dot(dot)));
+    }
+    content = content.push(
+        button(cmdi(mdi_path::CLOSE, 12.0, fg))
+            .padding(2)
+            .on_press(Message::RequestCloseWorkspace(i))
+            .style(|_t: &iced::Theme, s| button::Style {
+                background: matches!(s, button::Status::Hovered).then(|| iced::Background::Color(white_a(0.10))),
+                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            }),
+    );
+    let bg = if dragging {
+        Some(white_a(0.16))
+    } else if hovered {
+        Some(AZURE)
+    } else if active {
+        Some(white_a(0.08))
+    } else {
+        None
+    };
+    let tc = if active || hovered { TXT_PRIMARY } else { TXT_SECONDARY };
+    container(content)
+        .width(Length::Fill)
+        .padding([0, 8])
+        .style(move |_t: &iced::Theme| container::Style {
+            background: bg.map(iced::Background::Color),
+            text_color: Some(tc),
+            border: iced::Border { radius: 4.0.into(), ..Default::default() },
             ..Default::default()
         })
         .into()
@@ -6099,11 +6357,17 @@ fn usage_login_prompt_view() -> Element<'static, Message> {
     modal_scrim(modal_panel(panel.into()), Message::CancelUsageLoginPrompt)
 }
 
-/// The whole titlebar row, laid out for the available width `avail_w` (from
-/// `responsive`): the right-side action buttons always show and take priority;
-/// the usage bars + refresh drop out first when space is tight; the tabs shrink
-/// (names truncate to a char budget, with icon + × always visible) inside a
-/// clipped band so they never push the actions off-screen; "+" always shows.
+/// The whole titlebar row, laid out for the available width `avail_w` (the window's
+/// width less the titlebar padding): the right-side action buttons always show and
+/// take priority; the usage bars + refresh drop out when the window is too narrow
+/// for them; the tab names are cut down to three letters and the tabs that still do
+/// not fit go behind an arrow (`tab_strip`); "+" always shows.
+///
+/// The widths here are estimates and only decide whether the usage bars fit. What
+/// keeps the right side on screen is the structure: the tab strip is the row's only
+/// Fill child, so iced lays out everything else at its natural width first and the
+/// strip gets the rest. 16 tabs once pushed the caption buttons off a 2100 px
+/// window (2026-11-23), when the tabs were a Shrink row.
 fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     let brand = row![
         iced::widget::image(state.logo.clone())
@@ -6120,7 +6384,8 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
     // Approximate widths of the fixed regions (logical px) to budget the tab band.
     const BRAND_W: f32 = 106.0;
     const PLUS_W: f32 = 30.0;
-    const TAB_MIN: f32 = 60.0;
+    // One tab, the arrow and "+": below this the usage bars give way.
+    const STRIP_MIN: f32 = 160.0;
     #[cfg(target_os = "windows")]
     let caption_w = 140.0;
     #[cfg(not(target_os = "windows"))]
@@ -6131,7 +6396,6 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         + (if state.settings.show_wol_button { 34.0 } else { 0.0 })
         + (if state.settings.show_file_explorer { 34.0 } else { 0.0 })
         + caption_w;
-    let n = state.workspaces.len().max(1) as f32;
     let avail = (avail_w - BRAND_W - PLUS_W - actions_w - 30.0).max(0.0);
     // Usage section (bars / loading / sign-in / warning), built once with its own
     // width estimate so the tab budget and the actual push agree. Shown when its
@@ -6147,63 +6411,48 @@ fn titlebar_row(state: &State, avail_w: f32) -> Element<'_, Message> {
         )
     };
     let usage_w = usage_el.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
-    let show_usage = usage_el.is_some() && (avail - usage_w) >= (n * TAB_MIN);
-    let tab_area = (if show_usage { avail - usage_w } else { avail }).max(TAB_MIN);
-    let per = tab_area / n;
-    // The × always shows (even on the last tab — closing it resets to a fresh
-    // workspace), so budget for icon + padding + × on every tab.
-    let fixed = 52.0;
-    let max_chars = (((per - fixed) / 6.5).floor() as i32).clamp(3, 40) as usize;
+    let show_usage = usage_el.is_some() && (avail - usage_w) >= STRIP_MIN;
 
-    // Every tab truncates to the same `max_chars`, so each is ≤ tab_area/n and the
-    // row never exceeds the band — no clip needed (clipping cut the last tab's ×).
     // Right-click a tab to rename it.
-    let mut tabs = row![].spacing(3).align_y(iced::Center);
-    // While actively dragging to a different slot, an azure insertion line marks the
-    // drop gap (0..=n). Not shown on a plain press (over == from) — a marker there
-    // would shift the tabs and, via the hover churn, flip the over-tab flag.
-    let gap = state.tab_drag.filter(|d| d.over != d.from).map(|d| drop_gap(d.from, d.over));
-    let n = state.workspaces.len();
-    for (i, ws) in state.workspaces.iter().enumerate() {
-        if gap == Some(i) {
-            tabs = tabs.push(tab_drop_line());
-        }
-        let dragging_src = state.tab_drag.is_some_and(|d| d.from == i);
-        let hovered = state.hovered_tab == Some(i);
-        tabs = tabs.push(
-            mouse_area(tab_pill(i, ws, i == state.active, hovered, true, max_chars, dragging_src))
+    let shown = shown_tabs(state);
+    let names = tab_strip::Names::new();
+    let tabs: Vec<Element<Message>> = state
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, ws)| {
+            let dragging_src = state.tab_drag.is_some_and(|d| d.from == i);
+            let hovered = state.hovered_tab == Some(i);
+            // The × always shows, even on the last tab: closing it resets to a fresh
+            // workspace.
+            mouse_area(tab_pill(i, ws, i == state.active, hovered, true, &names, dragging_src))
                 // Press (mouse-down) selects + arms the drag; entering a tab sets the
                 // drop target (and hover); release anywhere commits (subscription).
                 .on_press(Message::TabDragStart(i))
                 .on_enter(Message::TabDragOver(i))
                 .on_exit(Message::TabExit(i))
-                .on_right_press(Message::WorkspaceTabMenuOpen(i)),
-        );
-    }
-    if gap == Some(n) {
-        tabs = tabs.push(tab_drop_line());
-    }
-
-    // Give the tabs clear breathing room from the wordmark — the same kind of gap the
-    // brand has (traffic-lights→logo, logo→title), instead of butting up against the
-    // title. 6px row gap + 8px leading pad ≈ a 14px title→tabs space.
-    let tabs =
-        container(tabs).padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 8.0 });
-    let mut bar = row![brand, tabs, tab_add_button()]
-        .spacing(6)
-        .align_y(iced::Center)
-        .height(Length::Fill);
-
+                .on_right_press(Message::WorkspaceTabMenuOpen(i))
+                .into()
+        })
+        .collect();
+    // While dragging to a different slot in the titlebar, an azure line marks the
+    // drop gap. Not on a plain press (over == from).
+    let gap = state.tab_drag.and_then(|d| d.gap()).filter(|&(_, o)| o < shown).map(|(g, _)| g);
+    let arrow = tab_overflow_button(state, shown);
     // Flexible middle: a window-drag region on the custom-titlebar platforms
     // (Windows + macOS), a plain spacer elsewhere.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        bar = bar.push(mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragWindow));
-    }
+    let rest: Element<Message> = mouse_area(Space::new(Length::Fill, Length::Fill)).on_press(Message::DragWindow).into();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        bar = bar.push(horizontal_space());
-    }
+    let rest: Element<Message> = horizontal_space().into();
+    // Give the tabs clear breathing room from the wordmark — the same kind of gap the
+    // brand has (traffic-lights→logo, logo→title), instead of butting up against the
+    // title. 6px row gap + 8px lead ≈ a 14px title→tabs space.
+    let strip = tab_strip::TabStrip::new(tabs, &names, arrow, tab_add_button(), rest, Message::TabsFit)
+        .spacing(3.0, 6.0)
+        .lead(8.0)
+        .gap(gap, AZURE);
+    let mut bar = row![brand, strip].spacing(6).align_y(iced::Center).height(Length::Fill);
 
     if let (true, Some((usage, _))) = (show_usage, usage_el) {
         bar = bar.push(usage);
@@ -6454,7 +6703,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     let bar_w = (state.main_size.width - TITLEBAR_LEFT_PAD - TITLEBAR_RIGHT_PAD).max(0.0);
     let titlebar = container(titlebar_row(state, bar_w))
         .width(Length::Fill)
-        .height(Length::Fixed(40.0))
+        .height(Length::Fixed(TITLEBAR_H))
         .padding(iced::Padding { top: 0.0, right: TITLEBAR_RIGHT_PAD, bottom: 0.0, left: TITLEBAR_LEFT_PAD });
 
     // The file explorer hugs the left edge as a sibling of the grid, so
@@ -6500,6 +6749,7 @@ fn main_view(state: &State) -> Element<'_, Message> {
     // without also triggering the titlebar drag beneath.
     #[cfg(target_os = "windows")]
     layers.push(resize_overlay());
+    layers.push(overflow_layer(state));
     // While the explorer's edge is being dragged, one window-wide layer collects
     // the moves and the release: a `mouse_area` only reports while the cursor is
     // inside it, and this one always is.
@@ -10261,6 +10511,10 @@ fn main() -> iced::Result {
                 vault,
                 tab_drag: None,
                 hovered_tab: None,
+                tab_fit: tab_strip::Fit::UNKNOWN,
+                overflow_open: false,
+                reveal_new: false,
+                overflow_spring: 0,
                 explorer_menu: None,
                 explorer_prompt: None,
                 explorer_delete: None,
@@ -10297,6 +10551,22 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::{encode_mouse, parse_usage_line, trim_history_file, usage_poke, MouseModes, UsagePoke};
+
+    #[test]
+    fn a_dragged_tab_lands_beside_the_tab_it_was_over_or_last_on_the_arrow() {
+        use super::{DropOn, TabDrag};
+        let at = |from, over| TabDrag { from, over }.target(6);
+        // Rightwards (or down the menu) it goes after the tab it is over, leftwards before.
+        assert_eq!(at(1, DropOn::Tab(4)), 4);
+        assert_eq!(at(4, DropOn::Tab(1)), 1);
+        // From the menu to the front of the titlebar.
+        assert_eq!(at(5, DropOn::Tab(0)), 0);
+        assert_eq!(at(2, DropOn::Tab(2)), 2, "a click moves nothing");
+        assert_eq!(at(0, DropOn::Arrow), 5);
+        assert_eq!(TabDrag { from: 1, over: DropOn::Tab(1) }.gap(), None, "nothing to mark for a click");
+        assert_eq!(TabDrag { from: 1, over: DropOn::Arrow }.gap(), None, "the arrow is lit instead");
+        assert_eq!(TabDrag { from: 1, over: DropOn::Tab(4) }.gap(), Some((5, 4)));
+    }
 
     #[test]
     fn a_restored_workspace_focuses_the_terminal_it_was_saved_with() {
