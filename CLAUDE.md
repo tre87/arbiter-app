@@ -76,6 +76,12 @@ the repo root. The user-facing binary is `arbiter` (source: `src/bin/iced_shell.
   `vendor/iced_widget/ARBITER-FORK.md`) and `iced_wgpu` (what lets a lost device be
   freed; see "A lost GPU device" below and `vendor/iced_wgpu/ARBITER-FORK.md`). An iced
   upgrade means re-copying all three from the registry and re-applying their diffs.
+  `winit` is forked too (`vendor/winit/ARBITER-FORK.md`): on Windows a scale change
+  (`WM_DPICHANGED`) puts the window at the rect Windows suggests, fitted onto its
+  monitor unless it is being dragged. Upstream computed its own and nudged it toward the
+  monitor it was on, which Microsoft warns can loop; a user dragging between 150% and
+  100% monitors saw it zoom and bounce back. `cargo test --lib winit_fork` fails if an
+  upgrade loses it.
 - **Verify UI changes with a debug build**, not just `--release`. iced states several
   layout contracts as `debug_assert!`, which release compiles out: a release build runs
   a mis-specified layout silently where `cargo run` panics at once. A panic goes to

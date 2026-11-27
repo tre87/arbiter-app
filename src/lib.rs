@@ -30,3 +30,5 @@ pub mod start_queue;
 pub mod term;
 pub mod term_signal;
 pub mod wol;
+#[cfg(all(test, windows))]
+mod winit_fork;

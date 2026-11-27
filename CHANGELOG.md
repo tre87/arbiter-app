@@ -7,6 +7,16 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Moving Arbiter between monitors with different scaling (Windows).** Dragging the
+  window from a 100% monitor to a 150% laptop, or sending it there with
+  Win+Shift+Arrow, could make it keep zooming and land back on the monitor it came
+  from. Windows suggests a size and position for a window whose scale changes, and
+  winit, the windowing library under Arbiter, ignored it and worked out its own.
+  Arbiter now uses Windows' suggestion, as Microsoft documents and as Firefox does. A
+  window that was not dragged there is also kept inside the monitor it moved to, so
+  growing to the new scale cannot leave it hanging over onto the next one.
+
 ## [1.8.0] - 2026-11-26
 
 ### Added

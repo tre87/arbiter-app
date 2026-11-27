@@ -179,6 +179,10 @@ wgpu-hal = { path = "vendor/wgpu-hal" }
 # leaks the frame and pins the window's swapchain, and the compositor frees what it
 # made before its device. See vendor/iced_wgpu/ARBITER-FORK.md.
 iced_wgpu = { path = "vendor/iced_wgpu" }
+# A window moved between monitors of different scales takes the rect Windows suggests,
+# not one winit works out, which Microsoft warns can set off one scale change after
+# another. See vendor/winit/ARBITER-FORK.md.
+winit = { path = "vendor/winit" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
