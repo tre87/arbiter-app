@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-11-27
+
 ### Fixed
 - **Typing while Claude works no longer raises "Claude finished" in a named session.**
   Claude writes a named session's name into the top border of its input box, and
