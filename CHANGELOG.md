@@ -7,6 +7,8 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-11-27
+
 ### Fixed
 - **Moving Arbiter between monitors with different scaling (Windows).** Dragging the
   window from a 100% monitor to a 150% laptop, or sending it there with
