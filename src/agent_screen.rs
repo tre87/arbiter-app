@@ -102,7 +102,7 @@ pub fn waiting_in(p: &ScreenProfile, rows: &[String]) -> bool {
         Some(prompt) => rows[..prompt]
             .iter()
             .rev()
-            .find(|r| !is_blank_or_border(p, r) && !is_task_list_row(p, r))
+            .find(|r| !is_blank_or_border(p, r) && !is_box_top(p, r) && !is_task_list_row(p, r))
             .is_some_and(|r| waiting(r)),
         None => bottom(rows, p.live_rows).iter().any(|r| waiting(r)),
     }
@@ -169,13 +169,25 @@ pub fn is_prompt_at(p: &ScreenProfile, rows: &[String], i: usize) -> bool {
     let body = row.trim_start_matches(|c: char| c.is_whitespace() || c == side);
     boxed_marker(p, body).is_some()
         && i > 0
-        && is_box_rule(p, &rows[i - 1])
+        && is_box_top(p, &rows[i - 1])
         && rows[i + 1..].iter().take(p.prompt.box_lines).any(|r| is_box_rule(p, r))
 }
 
 /// A border of the input box: border characters and blanks, and not blank alone.
 pub fn is_box_rule(p: &ScreenProfile, row: &str) -> bool {
     is_blank_or_border(p, row) && row.chars().any(|c| p.prompt.border.contains(c))
+}
+
+/// The input box's top border, which can carry a label between its border characters:
+/// Claude writes a named session's name into it (`────── admin-overhaul-map-stats ─`,
+/// seen in a real pane 2026-11-27). Read as a plain rule, that box was never found, so a
+/// draft in it never counted and typing mid-turn raised "Claude finished".
+pub fn is_box_top(p: &ScreenProfile, row: &str) -> bool {
+    let border = |c: char| p.prompt.border.contains(c);
+    let row = row.trim();
+    is_box_rule(p, row)
+        || (row.chars().take(3).filter(|&c| border(c)).count() == 3
+            && row.chars().next_back().is_some_and(border))
 }
 
 /// Whether a row holds nothing but blanks and border characters.

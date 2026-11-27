@@ -7,6 +7,13 @@ history belongs to the prior Tauri/Vue web app it replaced.
 
 ## [Unreleased]
 
+### Fixed
+- **Typing while Claude works no longer raises "Claude finished" in a named session.**
+  Claude writes a named session's name into the top border of its input box, and
+  Arbiter only recognised a border drawn from line characters alone. In such a session
+  it never found the box, so the text you typed did not count, and the interrupt hint
+  that Claude hides while the box holds text read as the turn ending.
+
 ## [1.8.1] - 2026-11-27
 
 ### Fixed

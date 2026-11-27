@@ -294,7 +294,11 @@ a row resize (shifts the whole layout for a frame; a column does not).
   `>` and a no-break space (U+00A0), so a space in `PromptShape::boxed` matches any
   blank (`agent_screen::boxed_marker`); read as a literal space, the box was never
   found and typing still raised the card (2026-11-26, from the user's own pane: the
-  debug log records the rows around the cursor each time the hint goes).
+  debug log records the rows around the cursor each time the hint goes). In a named
+  session Claude writes the name into the box's top border (`──── my-session ─`), so
+  the border above the prompt is read by `agent_screen::is_box_top`, which allows a
+  label between border characters; as a plain rule only, the box went unseen in named
+  sessions alone (2026-11-27).
 - **A follow-up queued mid-turn makes that turn's Stop no finish (2026-11-26).** Sent
   with Enter while a turn runs, Claude (2.1.332) queues it, fires `UserPromptSubmit`
   at once, and takes it up the moment the turn ends: a Stop in between, the hint never

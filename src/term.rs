@@ -546,7 +546,7 @@ impl VtTerm {
                 prompt = Some(i);
                 break;
             }
-            if agent_screen::is_box_rule(p, &window[i]) {
+            if agent_screen::is_box_top(p, &window[i]) {
                 break;
             }
         }
@@ -1076,9 +1076,9 @@ mod tests {
     #[test]
     fn only_typed_text_in_the_input_box_is_a_draft() {
         let rule = "────────────────────────────────────────";
-        let screen = |input: &[&str], footer: &str, cursor: &str| {
+        let screen_under = |top: &str, input: &[&str], footer: &str, cursor: &str| {
             let mut t = super::VtTerm::new(80, 10);
-            let mut lines = vec!["✶ Accomplishing… (1s · ↓ 2 tokens)", rule];
+            let mut lines = vec!["✶ Accomplishing… (1s · ↓ 2 tokens)", top];
             lines.extend_from_slice(input);
             lines.extend_from_slice(&[rule, footer]);
             t.feed(lines.join("\r\n").as_bytes());
@@ -1086,6 +1086,7 @@ mod tests {
             let st = t.screen_state(&CLAUDE);
             (st.working, st.idle_box, st.draft)
         };
+        let screen = |input: &[&str], footer: &str, cursor: &str| screen_under(rule, input, footer, cursor);
         let mode = "  ⏵⏵ auto mode on (shift+tab to cycle)";
         let working = "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt";
 
@@ -1105,6 +1106,11 @@ mod tests {
         // The plain form as a real pane drew it (2.1.332): `>` and a no-break space.
         assert_eq!(screen(&[">\u{a0}a"], mode, "\x1b[3;4H"), (false, true, Some(true)));
         assert_eq!(screen(&[">\u{a0}"], working, "\x1b[3;3H"), (true, true, Some(false)));
+        // A named session: Claude writes the name into the top border (a real pane, 2.1.332).
+        let named = "────────────────────────────────── admin-overhaul-map-stats ─";
+        assert_eq!(screen_under(named, &[">\u{a0}d"], mode, "\x1b[3;4H"), (false, true, Some(true)));
+        assert_eq!(screen_under(named, &["❯ hello"], mode, "\x1b[3;8H"), (false, true, Some(true)));
+        assert_eq!(screen_under(named, &[">\u{a0}"], working, "\x1b[3;3H"), (true, true, Some(false)));
     }
 
     // With the input box on screen, the row has to be the last thing above it. The
